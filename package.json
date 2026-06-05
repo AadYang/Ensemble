@@ -1,0 +1,24 @@
+{
+  "name": "ensemble",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Many minds. One workspace. — desktop multi-agent AI workbench",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "build": "pnpm -r build",
+    "desktop:prep": "pnpm -F @ensemble/desktop-ui build:export && node scripts/prep-sidecar.mjs",
+    "desktop:dev": "pnpm desktop:prep && pnpm dlx @tauri-apps/cli@latest dev",
+    "desktop:build": "node scripts/desktop-build.mjs",
+    "desktop:build:tauri": "pnpm desktop:prep && pnpm dlx @tauri-apps/cli@latest build",
+    "desktop:build:mac": "node scripts/desktop-build.mjs --mac"
+  },
+  "devDependencies": {
+    "javascript-obfuscator": "^5.4.2",
+    "sharp": "^0.34.5",
+    "typescript": "^5.6.0"
+  }
+}

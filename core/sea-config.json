@@ -1,0 +1,10 @@
+{
+  "main": "dist/loader.cjs",
+  "output": "dist/sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": false,
+  "assets": {
+    "payload": "dist/ensemble-core.enc"
+  }
+}

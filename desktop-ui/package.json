@@ -1,0 +1,36 @@
+{
+  "name": "@ensemble/desktop-ui",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "build:export": "cross-env NEXT_OUTPUT_EXPORT=1 next build && node scripts/obfuscate.mjs",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@agentorch/shared": "workspace:*",
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-shell": "^2.3.5",
+    "cmdk": "^1.1.1",
+    "next": "16.2.5",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "react-hotkeys-hook": "^5.3.2",
+    "react-markdown": "^10.1.0",
+    "react-resizable-panels": "^4.11.0",
+    "recharts": "^2.13.0",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "cross-env": "^7.0.3",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.5",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

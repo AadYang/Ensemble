@@ -1,0 +1,22 @@
+{
+  "version": "2026-05-11",
+  "note": "USD per 1M tokens. Source: provider official pricing pages, recalibrated quarterly.",
+  "models": {
+    "claude-opus-4-7":           { "input": 15.00, "output": 75.00, "cacheRead": 1.50,  "cacheWrite": 18.75, "_source": "anthropic.com/pricing" },
+    "claude-opus-4":             { "input": 15.00, "output": 75.00, "cacheRead": 1.50,  "cacheWrite": 18.75, "_source": "anthropic.com/pricing" },
+    "claude-sonnet-4-6":         { "input":  3.00, "output": 15.00, "cacheRead": 0.30,  "cacheWrite":  3.75, "_source": "anthropic.com/pricing" },
+    "claude-sonnet-4-5":         { "input":  3.00, "output": 15.00, "cacheRead": 0.30,  "cacheWrite":  3.75, "_source": "anthropic.com/pricing" },
+    "claude-sonnet-4":           { "input":  3.00, "output": 15.00, "cacheRead": 0.30,  "cacheWrite":  3.75, "_source": "anthropic.com/pricing" },
+    "claude-haiku-4-5-20251001": { "input":  1.00, "output":  5.00, "cacheRead": 0.08,  "cacheWrite":  1.25, "_source": "anthropic.com/pricing" },
+    "claude-haiku-4-5":          { "input":  1.00, "output":  5.00, "cacheRead": 0.08,  "cacheWrite":  1.25, "_source": "anthropic.com/pricing" },
+    "claude-haiku-4":            { "input":  1.00, "output":  5.00, "cacheRead": 0.08,  "cacheWrite":  1.25, "_source": "anthropic.com/pricing" },
+
+    "gpt-5.2":          { "input":  1.25, "output": 10.00, "cacheRead": 0.125, "_source": "openai.com/api/pricing" },
+    "gpt-5":            { "input":  1.25, "output": 10.00, "cacheRead": 0.125, "_source": "openai.com/api/pricing" },
+    "gpt-4o":           { "input":  2.50, "output": 10.00, "cacheRead": 1.25,  "_source": "openai.com/api/pricing" },
+    "gpt-4o-mini":      { "input":  0.15, "output":  0.60, "cacheRead": 0.075, "_source": "openai.com/api/pricing" },
+    "o1":               { "input": 15.00, "output": 60.00, "cacheRead": 7.50,  "_source": "openai.com/api/pricing" },
+    "o1-mini":          { "input":  1.10, "output":  4.40, "cacheRead": 0.55,  "_source": "openai.com/api/pricing" },
+    "o3-mini":          { "input":  1.10, "output":  4.40, "cacheRead": 0.55,  "_source": "openai.com/api/pricing" }
+  }
+}

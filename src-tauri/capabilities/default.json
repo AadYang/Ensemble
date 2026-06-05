@@ -1,0 +1,34 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default Ensemble permissions. The remote URL allowlist matches our sidecar's loopback HTTP origin (src-tauri/src/lib.rs:187) — Tauri otherwise refuses to inject __TAURI_INTERNALS__ into the webview, which breaks the custom-titlebar drag region and the WindowControls IPC (minimize/maximize/close). 127.0.0.1 is loopback-only and the page is served from our bundled sidecar.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-start-dragging",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/ensemble-core",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-open",
+      "allow": [
+        { "url": "https://(www\\.)?ensemble-ai\\.cn/.*" }
+      ]
+    },
+    "core:app:allow-version"
+  ]
+}
