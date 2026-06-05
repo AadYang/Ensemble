@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ensemble 新手教程</title>
+  <style>
+    body { margin: 0; color: #1f2933; font: 15px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #fff; }
+    main { max-width: 900px; margin: 0 auto; padding: 38px 22px 72px; }
+    h1 { font-size: 32px; margin: 0 0 8px; }
+    h2 { margin-top: 34px; padding-bottom: 6px; border-bottom: 1px solid #dfe6ee; }
+    code { padding: 1px 5px; border-radius: 4px; background: #f5f8fb; font-family: "SF Mono", Consolas, monospace; }
+    pre { padding: 12px; overflow: auto; border-radius: 6px; background: #f5f8fb; border: 1px solid #dfe6ee; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #dfe6ee; padding: 8px 10px; text-align: left; vertical-align: top; }
+    th { background: #f5f8fb; }
+    blockquote { margin: 12px 0; padding: 10px 14px; border-left: 4px solid #72b7f0; background: #e9f5ff; }
+    blockquote.warn { border-left-color: #f0b429; background: #fff7df; }
+    a { color: #0b5cad; text-decoration: none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Ensemble 新手教程</h1>
+  <p>Ensemble 是一个桌面多 Agent 工作台。你可以把 Claude、OpenAI、OpenAI Compat 和 Codex CLI agent 放在同一个 workspace 里，让它们通过 <code>peer_send</code> / <code>peer_query</code> 协作。</p>
+
+  <h2>快速开始</h2>
+  <ol>
+    <li>下载并安装 Windows 版 <code>Ensemble_0.0.14_x64-setup.exe</code>。</li>
+    <li>打开左侧 <b>Providers</b>，添加至少一个 provider。</li>
+    <li>点击 Agent 区域的 <b>+</b>，选择 provider 和 model。</li>
+    <li>在聊天框输入任务，按 Enter 发送。</li>
+  </ol>
+
+  <h2>Provider</h2>
+  <table>
+    <thead><tr><th>Provider</th><th>用途</th><th>凭据</th></tr></thead>
+    <tbody>
+      <tr><td>anthropic-local</td><td>使用本机 Claude Code 登录态</td><td><code>claude</code> CLI</td></tr>
+      <tr><td>openai-local</td><td>OpenAI 官方 API</td><td><code>sk-...</code></td></tr>
+      <tr><td>openai-compat</td><td>OpenAI 兼容服务</td><td><code>baseUrl</code> + <code>apiKey</code></td></tr>
+      <tr><td>openai-codex</td><td>使用本机 Codex CLI / ChatGPT 登录态</td><td><code>codex login</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Agent 互相通知</h2>
+  <p><code>peer_send</code> 用来向另一个 agent 发送新消息，<code>peer_query</code> 用来读取另一个 agent 的最近上下文。</p>
+  <pre><code>请通知 Reviewer：
+target: Reviewer
+mode: review
+message: 请检查这个实现是否有回归风险。</code></pre>
+
+  <h2>Codex CLI</h2>
+  <ol>
+    <li>先安装并登录 Codex CLI：<code>npm i -g @openai/codex</code>，然后运行 <code>codex login</code>。</li>
+    <li>在 Ensemble 的 Provider 面板添加 <b>OpenAI -> Codex CLI</b>。</li>
+    <li>为 Codex agent 设置 workspace 和 sandbox。</li>
+  </ol>
+  <blockquote class="warn">
+    Codex CLI 仍是本机 CLI 运行态，可能影响外部 Codex CLI 会话；外部会话被打断时可用 <code>codex resume</code> 恢复。当前版本已通过 stdio MCP bridge 支持 Codex agent 调用 <code>peer_send</code> / <code>peer_query</code>。
+  </blockquote>
+
+  <h2>MCP 和 Skills</h2>
+  <p>MCP 面板支持 <code>stdio</code>、<code>http</code>、<code>sse</code>。Skills 使用 <code>SKILL.md</code>，适合沉淀可复用工作流。</p>
+
+  <h2>常见问题</h2>
+  <p>如果目标 agent 收到消息但运行失败，说明 <code>peer_send</code> 已送达，失败点通常在目标 provider 的 key、baseUrl 或 model。</p>
+  <p><a href="/">返回官网首页</a></p>
+</main>
+</body>
+</html>

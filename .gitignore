@@ -1,0 +1,74 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# build output
+dist/
+build/
+.next/
+out/
+static-out/
+*.tsbuildinfo
+
+# Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Generated at build time by core/scripts/encrypt-blob.mjs — contains the AES
+# key used to decrypt the SEA payload. MUST NOT be committed.
+src-tauri/src/blob_key.rs
+core/dist/ensemble-core.enc
+core/dist/loader.cjs
+
+# Production secrets — Tencent SSH key, TLS cert/key, server-info notes.
+# Anyone with these files owns the production server / can impersonate
+# www.ensemble-ai.cn. MUST NOT be committed.
+ensemble_server/tencent_cloud_key.pem
+ensemble_server/ensemble-ai.cn_nginx/
+ensemble_server/服务器信息.txt
+ensemble_server/.env.production
+ensemble_server/**/*.pem
+ensemble_server/**/*.key
+ensemble_server/**/*.crt
+ensemble_server/**/*.p12
+ensemble_server/**/*.pfx
+ensemble_server/**/.env
+ensemble_server/**/.env.*
+ensemble_server/**/*服务器信息*
+ensemble_server/**/*server-info*
+ensemble_server/**/*secret*
+ensemble_server/**/*secrets*
+
+# Local probe scripts + scratch — not part of the project source.
+_data/
+codex-mcp-debug.md
+
+# Node SEA artifacts
+*.blob
+src-tauri/binaries/ensemble-core-*-pc-windows-msvc.exe
+src-tauri/binaries/ensemble-core-*-apple-darwin
+src-tauri/binaries/ensemble-core-*-unknown-linux-gnu
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# user data (should never be committed)
+_data/
+测试用供应商资料.txt

@@ -1,0 +1,5 @@
+packages:
+  - shared
+  - core
+  - desktop-ui
+  - ensemble_server

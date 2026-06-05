@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 940 140"
+     width="940" height="140"
+     preserveAspectRatio="xMidYMid meet"
+     fill="#00d9ff" stroke="none">
+  <!--
+    ENSEMBLE wordmark v2 — clean rectangular stencil. All letters built
+    purely from axis-aligned <rect>s plus one parallelogram for N's
+    diagonal and one stroked polyline for M's V. No chevron beaks, no
+    bg-color notches — single cyan fill throughout.
+
+    Each letter sits in its own 100-wide translated cell with a 20-unit
+    gap. Stroke / arm thickness fixed at 24.
+  -->
+
+  <!-- E -->
+  <g transform="translate(0,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="32" y="8" width="50" height="24"/>
+    <rect x="32" y="58" width="40" height="24"/>
+    <rect x="32" y="108" width="50" height="24"/>
+  </g>
+
+  <!-- N -->
+  <g transform="translate(120,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="76" y="8" width="24" height="124"/>
+    <polygon points="32,8 56,8 100,132 76,132"/>
+  </g>
+
+  <!-- S — top arm + left vertical (upper) + mid arm + right vertical (lower)
+       + bottom arm. The verticals are positioned LEFT-then-RIGHT (not
+       right-then-left) so the silhouette reads as S, not as a Z. -->
+  <g transform="translate(240,0)">
+    <rect x="8" y="8" width="82" height="24"/>
+    <rect x="8" y="32" width="24" height="26"/>
+    <rect x="8" y="58" width="82" height="24"/>
+    <rect x="66" y="82" width="24" height="26"/>
+    <rect x="8" y="108" width="82" height="24"/>
+  </g>
+
+  <!-- E -->
+  <g transform="translate(360,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="32" y="8" width="50" height="24"/>
+    <rect x="32" y="58" width="40" height="24"/>
+    <rect x="32" y="108" width="50" height="24"/>
+  </g>
+
+  <!-- M — two vertical spines + a stroked polyline forming the inner V.
+       The polyline starts/ends inside the spine rects, so its mitered end
+       caps are hidden under the spines and the top reads as a clean line. -->
+  <g transform="translate(480,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="86" y="8" width="24" height="124"/>
+    <polyline points="20,8 59,82 98,8"
+              stroke="#00d9ff" stroke-width="24" fill="none"
+              stroke-linejoin="miter" stroke-linecap="butt"
+              stroke-miterlimit="6"/>
+  </g>
+
+  <!-- B — spine + three arms + two right connectors that fuse them into
+       a blocky B silhouette. -->
+  <g transform="translate(610,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="32" y="8" width="50" height="24"/>
+    <rect x="32" y="58" width="50" height="24"/>
+    <rect x="32" y="108" width="50" height="24"/>
+    <rect x="58" y="32" width="24" height="26"/>
+    <rect x="58" y="82" width="24" height="26"/>
+  </g>
+
+  <!-- L -->
+  <g transform="translate(720,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="32" y="108" width="50" height="24"/>
+  </g>
+
+  <!-- E -->
+  <g transform="translate(840,0)">
+    <rect x="8" y="8" width="24" height="124"/>
+    <rect x="32" y="8" width="50" height="24"/>
+    <rect x="32" y="58" width="40" height="24"/>
+    <rect x="32" y="108" width="50" height="24"/>
+  </g>
+</svg>

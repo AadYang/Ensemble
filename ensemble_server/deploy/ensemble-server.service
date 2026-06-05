@@ -1,0 +1,29 @@
+[Unit]
+Description=Ensemble version-update server
+After=network.target
+
+[Service]
+Type=simple
+User=ensemble
+Group=ensemble
+WorkingDirectory=/opt/ensemble-server
+# Binds loopback only. nginx terminates TLS and proxies from :443.
+Environment=ENSEMBLE_SERVER_HOST=127.0.0.1
+Environment=ENSEMBLE_SERVER_PORT=8787
+Environment=ENSEMBLE_MANIFEST_PATH=/opt/ensemble-server/manifest.json
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/ensemble-server/dist/index.js
+Restart=on-failure
+RestartSec=2
+# Crash log goes to journalctl; rotate via journald's default policy.
+StandardOutput=journal
+StandardError=journal
+# Hardening: read-only root, writable working dir only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/ensemble-server
+
+[Install]
+WantedBy=multi-user.target

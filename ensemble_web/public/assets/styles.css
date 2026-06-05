@@ -1,0 +1,299 @@
+/* Ensemble official site — single-file stylesheet.
+   Palette mirrors the desktop app: deep navy bg + cyan accent. */
+:root {
+  --bg: #0a0e14;
+  --bg-soft: #0f1620;
+  --panel: #131c28;
+  --border: #1f2937;
+  --border-hover: #2d3a4d;
+  --accent: #00d9ff;
+  --accent-dim: #008fa8;
+  --text: #e6f0f7;
+  --text-dim: #93a3b3;
+  --text-faint: #5e6f7e;
+  --max-w: 1080px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  line-height: 1.6;
+  overflow-x: hidden;
+  min-height: 100vh;
+}
+a { color: var(--accent); text-decoration: none; transition: opacity .15s; }
+a:hover { opacity: .75; }
+
+/* ─── Matrix rain canvas behind everything ────────────────────────────── */
+#matrix-bg {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  pointer-events: none;
+}
+.fg { position: relative; z-index: 1; }
+
+/* ─── Top nav ─────────────────────────────────────────────────────────── */
+header.nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: rgba(10, 14, 20, 0.78);
+  border-bottom: 1px solid var(--border);
+}
+.nav-inner {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1.2rem;
+  padding: 0.9rem 1.5rem;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+.brand img {
+  width: 30px;
+  height: 30px;
+  display: block;
+}
+.nav-links {
+  margin-left: auto;
+  display: flex;
+  gap: 1.4rem;
+}
+.nav-links a {
+  color: var(--text-dim);
+  font-size: 0.92rem;
+}
+.nav-links a:hover { color: var(--accent); opacity: 1; }
+
+/* ─── Hero ────────────────────────────────────────────────────────────── */
+.hero {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 4rem 1.5rem 4rem;
+  text-align: center;
+}
+/* H1 wraps the generated wordmark; reset default heading margins/sizes and
+   let the image carry the visual weight. */
+.hero h1 {
+  margin: 0 0 1rem;
+  line-height: 1;
+  display: flex;
+  justify-content: center;
+}
+/* Transparent generated wordmark, sized to keep the hero compact across
+   desktop and mobile. */
+.wordmark {
+  width: clamp(300px, 84vw, 960px);
+  height: auto;
+  display: block;
+}
+.hero .slogan {
+  font-size: clamp(1rem, 1.6vw, 1.2rem);
+  color: var(--text-dim);
+  margin: 0.4rem 0 0.2rem;
+  letter-spacing: 0.06em;
+}
+.hero .tagline {
+  font-size: clamp(1.05rem, 1.8vw, 1.35rem);
+  color: var(--text);
+  margin: 1.5rem auto 0;
+  max-width: 640px;
+  font-weight: 500;
+}
+.hero .tagline strong { color: var(--accent); font-weight: 700; }
+
+/* ─── Download buttons ────────────────────────────────────────────────── */
+.downloads {
+  display: flex;
+  gap: 1.5rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 3rem 0 1rem;
+}
+.dl-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.7rem;
+  width: 200px;
+  height: 200px;
+  background: rgba(15, 22, 32, 0.6);
+  border: 2px solid var(--border);
+  color: var(--text);
+  padding: 1.2rem;
+  text-align: center;
+  transition: transform .2s, border-color .2s, box-shadow .2s, background .2s;
+  position: relative;
+  font-weight: 600;
+}
+.dl-btn:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 24px rgba(0, 217, 255, 0.25);
+  transform: translateY(-3px);
+  background: rgba(0, 217, 255, 0.06);
+  opacity: 1;
+}
+.dl-btn .dl-icon { font-size: 3rem; color: var(--accent); }
+.dl-btn .dl-platform { font-size: 1.2rem; letter-spacing: 0.04em; }
+.dl-btn .dl-detail { font-size: 0.78rem; color: var(--text-faint); }
+.dl-btn.coming-soon {
+  opacity: 0.55;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.dl-btn.coming-soon::after {
+  content: "敬请期待";
+  position: absolute;
+  bottom: 0.8rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+}
+
+/* ─── Features grid ───────────────────────────────────────────────────── */
+.features {
+  max-width: var(--max-w);
+  margin: 6rem auto 4rem;
+  padding: 0 1.5rem;
+}
+.section-title {
+  text-align: center;
+  font-size: 0.85rem;
+  letter-spacing: 0.4em;
+  color: var(--accent);
+  margin: 0 0 0.5rem;
+  text-transform: uppercase;
+}
+.section-sub {
+  text-align: center;
+  font-size: 1.6rem;
+  color: var(--text);
+  margin: 0 0 3rem;
+  font-weight: 600;
+}
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.2rem;
+}
+.feature {
+  background: rgba(15, 22, 32, 0.5);
+  border: 1px solid var(--border);
+  padding: 1.6rem 1.4rem 1.4rem;
+  transition: border-color .2s, background .2s;
+  position: relative;
+}
+.feature:hover {
+  border-color: var(--accent-dim);
+  background: rgba(0, 217, 255, 0.04);
+}
+.feature .num {
+  position: absolute;
+  top: 0.7rem;
+  right: 1rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  letter-spacing: 0.1em;
+}
+.feature .icon {
+  width: 32px;
+  height: 32px;
+  color: var(--accent);
+  margin-bottom: 0.8rem;
+}
+.feature h3 {
+  font-size: 1.1rem;
+  margin: 0 0 0.5rem;
+  color: var(--text);
+  font-weight: 700;
+}
+.feature p {
+  font-size: 0.92rem;
+  color: var(--text-dim);
+  margin: 0;
+  line-height: 1.65;
+}
+
+/* ─── Contact / QR section ────────────────────────────────────────────── */
+.contact {
+  max-width: var(--max-w);
+  margin: 5rem auto 2rem;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  border-top: 1px solid var(--border);
+}
+.qr-grid {
+  display: flex;
+  gap: 2rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 2rem;
+}
+.qr-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.7rem;
+}
+.qr-card img {
+  width: 180px;
+  height: 180px;
+  background: #fff;
+  padding: 8px;
+  border: 1px solid var(--border);
+  display: block;
+}
+.qr-card .qr-label {
+  font-size: 0.92rem;
+  color: var(--text-dim);
+  letter-spacing: 0.06em;
+}
+.qr-card .qr-handle {
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  font-family: ui-monospace, monospace;
+}
+
+/* ─── Footer ──────────────────────────────────────────────────────────── */
+footer.foot {
+  border-top: 1px solid var(--border);
+  padding: 2.5rem 1.5rem 3rem;
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--text-faint);
+}
+.foot-links {
+  display: flex;
+  gap: 1.5rem;
+  justify-content: center;
+  margin-bottom: 1.2rem;
+  flex-wrap: wrap;
+}
+.foot-links a {
+  color: var(--text-dim);
+}
+.foot-links a:hover { color: var(--accent); opacity: 1; }
+.foot-icp {
+  margin-top: 1.2rem;
+  letter-spacing: 0.05em;
+  font-size: 0.74rem;
+  opacity: 0.85;
+}
+.foot-icp a { color: inherit; }

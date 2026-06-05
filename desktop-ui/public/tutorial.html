@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ensemble 新手教程</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #1f2933;
+      --muted: #627386;
+      --line: #dfe6ee;
+      --soft: #f5f8fb;
+      --note: #e9f5ff;
+      --warn: #fff7df;
+      --link: #0b5cad;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--soft);
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: .92em;
+    }
+    pre {
+      padding: 12px;
+      overflow: auto;
+      border-radius: 6px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+    }
+    .layout { display: grid; grid-template-columns: 250px minmax(0, 880px); min-height: 100vh; }
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      padding: 22px 18px;
+      border-right: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+    aside h1 { margin: 0 0 4px; font-size: 18px; }
+    aside p { margin: 0 0 16px; color: var(--muted); font-size: 12px; }
+    aside a { display: block; padding: 5px 0; color: var(--fg); }
+    main { padding: 34px 48px 72px; }
+    h1.page { margin: 0 0 8px; font-size: 30px; }
+    h2 { margin: 34px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); font-size: 22px; }
+    h3 { margin: 22px 0 8px; font-size: 16px; }
+    ul, ol { padding-left: 22px; }
+    li { margin: 4px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    blockquote {
+      margin: 12px 0;
+      padding: 10px 14px;
+      border-left: 4px solid #72b7f0;
+      background: var(--note);
+    }
+    blockquote.warn { border-left-color: #f0b429; background: var(--warn); }
+    .kbd {
+      display: inline-block;
+      padding: 0 6px;
+      border: 1px solid #cbd5df;
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      background: #fff;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 12px;
+    }
+    footer { margin-top: 42px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); }
+    @media (max-width: 760px) {
+      .layout { display: block; }
+      aside { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      main { padding: 24px 18px 48px; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1>Ensemble</h1>
+    <p>Many minds. One workspace.</p>
+    <a href="#start">快速开始</a>
+    <a href="#providers">配置 Provider</a>
+    <a href="#agents">创建 Agent</a>
+    <a href="#peer">Agent 互相通知</a>
+    <a href="#codex">Codex CLI</a>
+    <a href="#mcp">MCP 和 Skills</a>
+    <a href="#commands">Slash 命令</a>
+    <a href="#troubleshoot">常见问题</a>
+  </aside>
+
+  <main>
+    <h1 class="page">Ensemble 新手教程</h1>
+    <p>Ensemble 是一个桌面多 Agent 工作台。你可以把 Claude、OpenAI、OpenAI Compat 和 Codex CLI agent 放在同一个 workspace 里，让它们通过 <code>peer_send</code> / <code>peer_query</code> 协作。</p>
+
+    <section id="start">
+      <h2>快速开始</h2>
+      <ol>
+        <li>安装 Windows 版 <code>Ensemble_0.0.14_x64-setup.exe</code>。</li>
+        <li>打开左侧 <b>Providers</b>，添加至少一个可用 provider。</li>
+        <li>点击左侧 Agent 区域的 <b>+</b>，选择 provider 和 model，创建第一个 agent。</li>
+        <li>在聊天框输入任务，按 <span class="kbd">Enter</span> 发送。</li>
+      </ol>
+      <blockquote>
+        如果你使用本地 Claude 或 Codex，需要先在系统终端完成对应 CLI 登录：<code>claude</code> / <code>codex login</code>。
+      </blockquote>
+    </section>
+
+    <section id="providers">
+      <h2>配置 Provider</h2>
+      <table>
+        <thead><tr><th>Provider</th><th>用途</th><th>凭据</th></tr></thead>
+        <tbody>
+          <tr><td>anthropic-local</td><td>使用本机 Claude Code 登录态</td><td>本机 <code>claude</code> CLI</td></tr>
+          <tr><td>anthropic-compat</td><td>Anthropic 兼容服务</td><td><code>baseUrl</code> + <code>apiKey</code></td></tr>
+          <tr><td>openai-local</td><td>OpenAI 官方 API</td><td><code>sk-...</code></td></tr>
+          <tr><td>openai-compat</td><td>OpenAI 兼容服务</td><td><code>baseUrl</code> + <code>apiKey</code></td></tr>
+          <tr><td>openai-codex</td><td>使用本机 Codex CLI / ChatGPT 登录态</td><td>本机 <code>codex login</code></td></tr>
+        </tbody>
+      </table>
+      <p>商业使用建议：稳定生产通知链路优先选 <code>openai-local</code> / <code>openai-compat</code> / <code>anthropic-local</code>。Codex CLI 已支持 peer tools，但仍依赖用户本机 Codex CLI 版本和登录状态。</p>
+    </section>
+
+    <section id="agents">
+      <h2>创建 Agent</h2>
+      <ul>
+        <li><b>Name</b>：给 agent 一个可被同伴识别的名字，例如 <code>Reviewer</code>。</li>
+        <li><b>Provider / Model</b>：决定它使用哪个 runtime。</li>
+        <li><b>System Prompt</b>：定义角色、职责和交付标准。</li>
+        <li><b>Codex Workspace</b>：仅 Codex provider 使用，建议指向实际项目目录。</li>
+      </ul>
+      <p>你可以创建多个 agent，并在同一个窗口内切换、并行运行、互相发送消息。</p>
+    </section>
+
+    <section id="peer">
+      <h2>Agent 互相通知</h2>
+      <p>Agent 间协作主要依赖两个工具：</p>
+      <ul>
+        <li><code>peer_send</code>：向另一个 agent 发送新消息，可触发对方继续工作。</li>
+        <li><code>peer_query</code>：只读取另一个 agent 最近对话，不触发对方运行。</li>
+      </ul>
+      <p>常用模式：</p>
+      <ul>
+        <li><code>raw</code>：普通通知或提问。</li>
+        <li><code>continue</code>：把当前工作交给对方继续。</li>
+        <li><code>review</code>：请对方审查你的输出。</li>
+        <li><code>fork</code>：请对方独立给出另一版方案。</li>
+      </ul>
+      <pre><code>请通知 Reviewer：
+target: Reviewer
+mode: review
+message: 请检查这个实现是否有回归风险。</code></pre>
+    </section>
+
+    <section id="codex">
+      <h2>Codex CLI 使用说明</h2>
+      <ol>
+        <li>先安装并登录 Codex CLI：<code>npm i -g @openai/codex</code>，然后运行 <code>codex login</code>。</li>
+        <li>在 Ensemble 的 Provider 面板添加 <b>OpenAI -> Codex CLI</b>。</li>
+        <li>为 Codex agent 设置合适的 workspace 和 sandbox。</li>
+      </ol>
+      <blockquote class="warn">
+        Codex CLI 仍是本机 CLI 运行态。它可能影响用户正在使用的外部 Codex CLI 会话；如果外部会话被打断，可以用 <code>codex resume</code> 恢复。Ensemble 已通过 stdio MCP bridge 支持 Codex agent 调用 <code>peer_send</code> / <code>peer_query</code>，但发布前仍应跑 smoke 测试确认当前 Codex CLI 版本没有改变 MCP 行为。
+      </blockquote>
+    </section>
+
+    <section id="mcp">
+      <h2>MCP 和 Skills</h2>
+      <p>MCP 面板可以添加外部工具服务，支持 <code>stdio</code>、<code>http</code>、<code>sse</code>。Skills 使用 <code>SKILL.md</code>，适合沉淀可复用工作流。</p>
+      <pre><code>{
+  "command": "npx",
+  "args": ["-y", "some-mcp-server"],
+  "env": { "TOKEN": "..." }
+}</code></pre>
+      <p>Agent 可通过 <code>skill_list</code> 查看技能，通过 <code>skill_invoke</code> 加载指定技能。</p>
+    </section>
+
+    <section id="commands">
+      <h2>Slash 命令</h2>
+      <table>
+        <thead><tr><th>命令</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>/help</code></td><td>显示帮助。</td></tr>
+          <tr><td><code>/model [name]</code></td><td>切换当前 agent 的模型。</td></tr>
+          <tr><td><code>/provider [name]</code></td><td>切换当前 agent 的 provider。</td></tr>
+          <tr><td><code>/clear</code></td><td>清空当前 agent 对话历史。</td></tr>
+          <tr><td><code>/compact</code></td><td>压缩历史，降低上下文压力。</td></tr>
+          <tr><td><code>/cost</code></td><td>查看 token 和成本统计。</td></tr>
+          <tr><td><code>/mcp</code></td><td>查看 MCP 状态。</td></tr>
+          <tr><td><code>/skills</code></td><td>查看 skills 状态。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="troubleshoot">
+      <h2>常见问题</h2>
+      <h3>Codex agent 不能互相通知？</h3>
+      <p>确认 Codex CLI 已登录、Provider 是 <code>openai-codex</code>、agent 名称拼写正确。当前版本通过 stdio MCP bridge 暴露 peer tools；如果失败，优先运行 Codex peer smoke 测试定位。</p>
+      <h3>目标 agent 收到消息但运行失败？</h3>
+      <p>这说明 <code>peer_send</code> 已送达，失败点在目标 agent 的 provider 或模型连接。检查目标 provider 的 key、baseUrl 和 model。</p>
+      <h3>安装新版后仍是旧行为？</h3>
+      <p>关闭所有 Ensemble 窗口后重新安装。安装器会替换桌面壳和 core sidecar，两者必须来自同一版本。</p>
+    </section>
+
+    <footer>Ensemble - Many minds. One workspace.</footer>
+  </main>
+</div>
+</body>
+</html>
