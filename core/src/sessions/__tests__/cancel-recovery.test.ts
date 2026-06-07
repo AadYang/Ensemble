@@ -111,4 +111,117 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(updatedIds).toEqual(expect.arrayContaining([a.id, b.id, c.id]));
     expect(updatedIds).not.toContain(d.id);
   });
+
+  it("runtime timeout force-stops only the matching run", async () => {
+    const stuck = await prisma.agent.create({ data: { name: "bad-provider-agent" } });
+    const other = await prisma.agent.create({ data: { name: "other-agent" } });
+    await prisma.agent.update({ where: { id: stuck.id }, data: { status: "RUNNING" } });
+    await prisma.agent.update({ where: { id: other.id }, data: { status: "RUNNING" } });
+
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(stuck.id, {
+      id: stuck.id,
+      runId: "run-a",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (sessions as any).forceStopRun(stuck.id, {
+      expectedRunId: "run-a",
+      dbStatus: "ERROR",
+      protoStatus: "error",
+      logPrefix: "test-timeout",
+      error: { code: "PROVIDER_TIMEOUT", message: "provider timed out" },
+    });
+
+    expect(abort.signal.aborted).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: stuck.id } }))?.status).toBe("ERROR");
+    expect((await prisma.agent.findUnique({ where: { id: other.id } }))?.status).toBe("RUNNING");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(stuck.id)).toBe(false);
+    expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.code === "PROVIDER_TIMEOUT")).toBe(true);
+  });
+
+  it("runtime idle completion force-stops only the matching run as DONE", async () => {
+    const stuck = await prisma.agent.create({ data: { name: "finished-but-open-stream" } });
+    const other = await prisma.agent.create({ data: { name: "other-running-agent" } });
+    await prisma.agent.update({ where: { id: stuck.id }, data: { status: "RUNNING" } });
+    await prisma.agent.update({ where: { id: other.id }, data: { status: "RUNNING" } });
+
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(stuck.id, {
+      id: stuck.id,
+      runId: "run-done",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (sessions as any).forceStopRun(stuck.id, {
+      expectedRunId: "run-done",
+      dbStatus: "DONE",
+      protoStatus: "done",
+      logPrefix: "test-idle-done",
+    });
+
+    expect(abort.signal.aborted).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: stuck.id } }))?.status).toBe("DONE");
+    expect((await prisma.agent.findUnique({ where: { id: other.id } }))?.status).toBe("RUNNING");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(stuck.id)).toBe(false);
+    expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.status === "done")).toBe(true);
+  });
+
+  it("sendMessage recovers from provider validation errors after entering RUNNING", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "missing-key-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: null,
+        models: ["example-model"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "bad-provider-agent",
+        providerId: provider.id,
+        model: "example-model",
+      },
+    });
+
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+
+    const result = await sessions.sendMessage(agent.id, "hello");
+
+    expect(result).toBeNull();
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("ERROR");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(agent.id)).toBe(false);
+    const statusBroadcasts = hub.broadcasts
+      .filter((b) => b.type === "agent_updated" && (b.agent as { id?: string })?.id === agent.id)
+      .map((b) => (b.agent as { status?: string })?.status);
+    expect(statusBroadcasts).toEqual(expect.arrayContaining(["running", "error"]));
+    expect(
+      hub.sessionMessages.some(
+        (m) =>
+          m.sessionId === agent.id &&
+          m.msg.code === "QUERY_FAILED" &&
+          String(m.msg.message).includes("missing an API key"),
+      ),
+    ).toBe(true);
+  });
 });

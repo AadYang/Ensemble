@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { PermissionMode, SandboxMode } from "@agentorch/shared";
+import type { PermissionMode, ReasoningEffort, SandboxMode } from "@agentorch/shared";
 import {
   closeAgent,
   deleteAgent,
@@ -30,6 +30,14 @@ const PERMISSION_MODES: PermissionMode[] = [
   "dontAsk",
 ];
 
+const REASONING_EFFORTS: ReasoningEffort[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
+
 export function AgentSettings({
   agentId,
   onClose,
@@ -46,12 +54,17 @@ export function AgentSettings({
   // "" = ungrouped; otherwise team id.
   const [teamId, setTeamId] = useState<string>(agent?.summary.teamId ?? "");
   const [providers, setProviders] = useState<ProviderDTO[]>([]);
+  const [providersError, setProvidersError] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(
     agent?.summary.permissionMode ?? "default",
   );
   // "" = inherit from provider.defaultSandbox; otherwise per-agent override.
   const [sandboxMode, setSandboxMode] = useState<SandboxMode | "">(
     agent?.summary.sandboxMode ?? "",
+  );
+  // "" = inherit from the runtime/provider default; otherwise per-agent override.
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
+    agent?.summary.reasoningEffort ?? "",
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,8 +85,14 @@ export function AgentSettings({
 
   useEffect(() => {
     void listProviders()
-      .then(setProviders)
-      .catch((err) => console.warn("listProviders failed", err));
+      .then((rows) => {
+        setProviders(rows);
+        setProvidersError(null);
+      })
+      .catch((err) => {
+        console.warn("listProviders failed", err);
+        setProvidersError((err as Error).message);
+      });
   }, []);
 
   // Reset model when the active provider changes to one that doesn't list the
@@ -151,7 +170,12 @@ export function AgentSettings({
 
   const summary = agent.summary;
   const selectedProvider = providers.find((p) => p.id === providerId);
+  const selectedProviderKind = selectedProvider?.kind ?? (providerId === null ? "anthropic-local" : null);
   const isCodexProvider = selectedProvider?.kind === "openai-codex";
+  const supportsThinkingMode =
+    selectedProviderKind === "anthropic-local" ||
+    selectedProviderKind === "anthropic" ||
+    selectedProviderKind === "openai-codex";
   // Only the local-OAuth Claude provider (anthropic-local) and the legacy
   // built-in default (kind=anthropic + no baseUrl) get the hardcoded model
   // fallback. For 3rd-party Anthropic-compat providers we MUST show only the
@@ -167,6 +191,9 @@ export function AgentSettings({
         ? FALLBACK_MODELS
         : [];
   const effectiveSandbox: SandboxMode | null = isCodexProvider ? (sandboxMode || null) : null;
+  const effectiveReasoningEffort: ReasoningEffort | null = supportsThinkingMode
+    ? (reasoningEffort || null)
+    : null;
   const effectiveSystemPrompt: string | null = systemPrompt.trim() ? systemPrompt : null;
   const effectiveTeamId: string | null = teamId || null;
   const dirty =
@@ -175,6 +202,7 @@ export function AgentSettings({
     (providerId ?? null) !== (summary.providerId ?? null) ||
     permissionMode !== summary.permissionMode ||
     effectiveSandbox !== (summary.sandboxMode ?? null) ||
+    effectiveReasoningEffort !== (summary.reasoningEffort ?? null) ||
     effectiveSystemPrompt !== (summary.systemPrompt ?? null) ||
     effectiveTeamId !== (summary.teamId ?? null);
 
@@ -201,6 +229,8 @@ export function AgentSettings({
         permissionMode: permissionMode !== summary.permissionMode ? permissionMode : undefined,
         sandboxMode:
           effectiveSandbox !== (summary.sandboxMode ?? null) ? effectiveSandbox : undefined,
+        reasoningEffort:
+          effectiveReasoningEffort !== (summary.reasoningEffort ?? null) ? effectiveReasoningEffort : undefined,
         systemPrompt:
           effectiveSystemPrompt !== (summary.systemPrompt ?? null) ? effectiveSystemPrompt : undefined,
         teamId: effectiveTeamId !== (summary.teamId ?? null) ? effectiveTeamId : undefined,
@@ -281,12 +311,22 @@ export function AgentSettings({
             onChange={(e) => setProviderId(e.target.value || null)}
             className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
           >
+            {providerId && !providers.some((p) => p.id === providerId) && (
+              <option value={providerId}>
+                Current provider ({providerId.slice(0, 8)})
+              </option>
+            )}
             {providers.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name} · {p.kind}
               </option>
             ))}
           </select>
+          {providersError && (
+            <span className="text-[10px] text-[var(--err)] leading-tight">
+              Provider list failed to load: {providersError}
+            </span>
+          )}
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.label.model")}</span>
@@ -369,27 +409,55 @@ export function AgentSettings({
             </span>
           </label>
         )}
+        {supportsThinkingMode && (
+          <>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+                {t("settings.label.reasoningEffort")}
+              </span>
+              <select
+                value={reasoningEffort}
+                onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort | "")}
+                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+              >
+                <option value="">{t("settings.reasoningEffort.inherit")}</option>
+                {REASONING_EFFORTS.map((effort) => (
+                  <option key={effort} value={effort}>
+                    {effort}
+                  </option>
+                ))}
+              </select>
+              <span className="text-[10px] text-[var(--text-faint)] leading-tight">
+                {reasoningEffort === ""
+                  ? t("settings.reasoningEffort.hint.inherit")
+                  : t(`settings.reasoningEffort.hint.${reasoningEffort}`)}
+              </span>
+            </label>
+          </>
+        )}
         {isCodexProvider && (
-          <label className="flex flex-col gap-1">
-            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
-              {t("settings.label.sandboxMode")}
-            </span>
-            <select
-              value={sandboxMode}
-              onChange={(e) => setSandboxMode(e.target.value as SandboxMode | "")}
-              className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
-            >
-              <option value="">{t("settings.sandboxMode.inherit")}</option>
-              <option value="read-only">read-only</option>
-              <option value="workspace-write">workspace-write</option>
-              <option value="danger-full-access">danger-full-access</option>
-            </select>
-            <span className="text-[10px] text-[var(--text-faint)] leading-tight">
-              {sandboxMode === ""
-                ? t("settings.sandboxMode.hint.inherit")
-                : t(`settings.sandboxMode.hint.${sandboxMode}`)}
-            </span>
-          </label>
+          <>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+                {t("settings.label.sandboxMode")}
+              </span>
+              <select
+                value={sandboxMode}
+                onChange={(e) => setSandboxMode(e.target.value as SandboxMode | "")}
+                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+              >
+                <option value="">{t("settings.sandboxMode.inherit")}</option>
+                <option value="read-only">read-only</option>
+                <option value="workspace-write">workspace-write</option>
+                <option value="danger-full-access">danger-full-access</option>
+              </select>
+              <span className="text-[10px] text-[var(--text-faint)] leading-tight">
+                {sandboxMode === ""
+                  ? t("settings.sandboxMode.hint.inherit")
+                  : t(`settings.sandboxMode.hint.${sandboxMode}`)}
+              </span>
+            </label>
+          </>
         )}
         {error && <div className="text-[var(--err)] text-[10px]">{error}</div>}
         <div className="flex gap-2">

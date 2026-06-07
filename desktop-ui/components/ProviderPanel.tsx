@@ -84,9 +84,11 @@ export function ProviderPanel() {
 
   const refresh = async () => {
     try {
+      setError(null);
       setProviders(await listProviders());
     } catch (err) {
       console.warn("listProviders failed", err);
+      setError((err as Error).message);
     }
   };
 

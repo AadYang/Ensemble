@@ -80,6 +80,30 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     ]);
   });
 
+  it("passes reasoning effort via -c on new and resume turns", () => {
+    expect(buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      model: "gpt-5.5",
+      promptFromStdin: true,
+      sandbox: "workspace-write",
+      reasoningEffort: "xhigh",
+    })).toEqual(expect.arrayContaining([
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
+    ]));
+
+    expect(buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      model: "gpt-5.5",
+      promptFromStdin: true,
+      resume: "018f0000-0000-7000-8000-000000000000",
+      reasoningEffort: "low",
+    })).toEqual(expect.arrayContaining([
+      "-c",
+      "model_reasoning_effort=\"low\"",
+    ]));
+  });
+
   it("builds codex mcp list args without the obsolete builtin_mcp flag", () => {
     expect(buildCodexMcpListArgs()).toEqual(["mcp", "--disable", "apps", "list"]);
   });
@@ -141,6 +165,20 @@ describe("Codex runtime isolated CODEX_HOME", () => {
       "danger-full-access",
     );
     expect(toml).toContain("sandbox_mode = \"danger-full-access\"");
+  });
+
+  it("writes model_reasoning_effort into config.toml when supplied", () => {
+    const toml = renderMcpConfigTomlForCodexRuntime(
+      {
+        "agentorch-internal-abcd1234": {
+          url: "http://127.0.0.1:1234/api/mcp/internal/agent",
+        },
+      },
+      [],
+      null,
+      "xhigh",
+    );
+    expect(toml).toContain("model_reasoning_effort = \"xhigh\"");
   });
 
   it("copies auth.json and connection settings without stale user MCP config", () => {

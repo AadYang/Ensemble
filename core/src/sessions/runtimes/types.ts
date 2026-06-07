@@ -18,7 +18,7 @@ import type {
   McpServerConfig,
   PermissionMode,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { SdkMessage } from "@agentorch/shared";
+import type { ReasoningEffort, SdkMessage } from "@agentorch/shared";
 
 import type { Provider } from "../../db.js";
 
@@ -76,6 +76,9 @@ export interface RuntimeOptions {
    *  per-agent settings (e.g. CodexCliRuntime reading sandboxMode override)
    *  read from here. Most runtimes ignore. */
   agentMetadata?: unknown;
+  /** Per-agent reasoning/thinking override. Claude Code maps this to a
+   *  thinking-token budget; Codex forwards the effort enum directly. */
+  reasoningEffort?: ReasoningEffort | null;
   /** Forward partial assistant token deltas. Default true. */
   includePartialMessages?: boolean;
 

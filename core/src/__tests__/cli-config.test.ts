@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { compareSemver, MIN_CODEX_VERSION } from "../cli-config.js";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable } from "../cli-config.js";
 
 describe("compareSemver", () => {
   it("returns 0 for identical versions", () => {
@@ -49,5 +52,20 @@ describe("MIN_CODEX_VERSION boundary", () => {
     expect(compareSemver("0.132.0", MIN_CODEX_VERSION)).toBe(0);
     expect(compareSemver("0.132.1", MIN_CODEX_VERSION)).toBe(1);
     expect(compareSemver("0.140.0", MIN_CODEX_VERSION)).toBe(1);
+  });
+});
+
+describe("resolveClaudeExecutable", () => {
+  it("resolves npm shim paths to the native Claude executable", () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-claude-shim-"));
+    const npmRoot = join(root, "npm");
+    const binRoot = join(npmRoot, "node_modules", "@anthropic-ai", "claude-code", "bin");
+    mkdirSync(binRoot, { recursive: true });
+    const shim = join(npmRoot, process.platform === "win32" ? "claude.cmd" : "claude");
+    const native = join(binRoot, process.platform === "win32" ? "claude.exe" : "claude");
+    writeFileSync(shim, "shim");
+    writeFileSync(native, "native");
+
+    expect(resolveClaudeExecutable(shim)).toBe(native);
   });
 });

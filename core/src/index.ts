@@ -39,6 +39,11 @@ import { getCliSettingsHealth, getCodexCliPath, setManualCliPath } from "./cli-c
 import { runCodexStdioMcp } from "./codex-stdio-mcp.js";
 import { currentPlatformKey } from "./platform-key.js";
 import type { PlatformKey } from "@agentorch/shared";
+import {
+  deepSeekOfficialModelsFallback,
+  probeModels,
+  type ProbeFlavor,
+} from "./providers/model-discovery.js";
 
 // When ENSEMBLE_AUTO_PORT=1 (set by Tauri shell), listen on a random free port
 // and announce it on stdout's first line as `ENSEMBLE_LISTENING <port>`. The
@@ -67,10 +72,15 @@ const fastify = Fastify({
 });
 
 fastify.register(websocket);
-mountMcpBridge(fastify);
 
 const hub = new WSHub();
 const sessions = new SessionManager(hub);
+mountMcpBridge(fastify, {
+  getFallbackHandlers: (agentId) => ({
+    peerSend: ({ target, message, mode }) => sessions.sendPeerMessage(agentId, target, message, mode),
+    peerQuery: ({ target, limit }) => sessions.fetchPeerHistory(agentId, target, limit),
+  }),
+});
 
 const PermissionDecisionSchema = z.discriminatedUnion("behavior", [
   z.object({
@@ -457,6 +467,7 @@ async function discoverCodexModels(): Promise<string[] | null> {
 }
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
+const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
 
 const ProviderInputSchema = z.object({
   name: z.string().min(1),
@@ -553,8 +564,6 @@ const migrateLocalAnthropic = async () => {
 
 const ensureDefaultProvider = async () => {
   await migrateLocalAnthropic();
-  await refreshClaudeLocalHealth();
-  await refreshCodexHealth();
   // W16 Slice 7: count *enabled* providers. A user upgrading from a DB where
   // every row was bedrock/vertex/autoManaged ends up with all rows disabled
   // at boot; without this filter they'd be stuck with no usable provider
@@ -573,6 +582,16 @@ const ensureDefaultProvider = async () => {
     },
   });
 };
+
+async function refreshProviderHealthBestEffort(): Promise<void> {
+  const timeoutMs = 2500;
+  const healthRefresh = Promise.allSettled([
+    refreshClaudeLocalHealth(),
+    refreshCodexHealth(),
+  ]).then(() => undefined);
+  const timeout = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+  await Promise.race([healthRefresh, timeout]);
+}
 
 async function refreshClaudeLocalHealth(): Promise<void> {
   const rows = await prisma.provider.findMany({ where: { kind: "anthropic-local" } });
@@ -662,124 +681,9 @@ async function refreshCodexHealth(): Promise<void> {
   }
 }
 
-/** Compute the candidate URLs to probe for model listing.
- *
- * Both Anthropic's `/v1/models` and OpenAI's `/v1/models` return the same
- * shape (`{data: [{id}, ...]}`), so the same parser handles either. We just
- * need to try a couple URL variants because users paste baseUrls in different
- * shapes — sometimes ending in `/v1`, sometimes not, sometimes with a custom
- * prefix like `/anthropic` for proxied compat endpoints.
- */
-const candidateModelsUrls = (base: string): string[] => {
-  const trimmed = base.replace(/\/+$/, "");
-  if (trimmed.endsWith("/v1")) return [`${trimmed}/models`];
-  if (trimmed.endsWith("/models")) return [trimmed];
-  return [`${trimmed}/v1/models`, `${trimmed}/models`];
-};
-
-interface ModelsProbeResult {
-  models: string[];
-  sourceUrl: string;
-}
-
-interface ModelsProbeFailure {
-  tried: Array<{ url: string; status: number; bodyHead: string }>;
-}
-
-type ProbeFlavor = "anthropic" | "openai";
-
-/** Try every candidate URL with auth headers tailored to the provider flavor.
- *  Anthropic-compat upstreams want `x-api-key` + `anthropic-version`; OpenAI-
- *  compat want `Authorization: Bearer`. v1 sent both unconditionally — that
- *  worked for most providers but masked errors on stricter ones (e.g. OpenAI
- *  rejects `x-api-key` as an unrecognized header in some cases). Flavor-aware
- *  probing also lets us emit a kind-appropriate hint when nothing comes back. */
-const probeModels = async (
-  baseUrl: string,
-  apiKey: string | null,
-  flavor: ProbeFlavor,
-): Promise<ModelsProbeResult | ModelsProbeFailure> => {
-  const tried: ModelsProbeFailure["tried"] = [];
-  const headers: Record<string, string> = {};
-  if (flavor === "anthropic") {
-    headers["anthropic-version"] = "2023-06-01";
-    if (apiKey) {
-      headers["x-api-key"] = apiKey;
-      // Some Anthropic-compat proxies (timicc-style) also accept Bearer;
-      // harmless when the upstream prefers x-api-key.
-      headers["Authorization"] = `Bearer ${apiKey}`;
-    }
-  } else {
-    // OpenAI flavor: bearer only. OpenAI's /v1/models 400/401s on
-    // unrecognized headers under some account configurations.
-    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-
-  for (const url of candidateModelsUrls(baseUrl)) {
-    try {
-      const res = await fetch(url, { headers });
-      const rawText = await res.text();
-      if (!res.ok) {
-        tried.push({ url, status: res.status, bodyHead: rawText.slice(0, 200) });
-        continue;
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(rawText);
-      } catch {
-        tried.push({ url, status: 200, bodyHead: `non-JSON: ${rawText.slice(0, 200)}` });
-        continue;
-      }
-      const models = extractModelIds(parsed);
-      if (models.length > 0) return { models, sourceUrl: url };
-      tried.push({
-        url,
-        status: 200,
-        bodyHead: `parsed 0 models from response: ${rawText.slice(0, 200)}`,
-      });
-    } catch (err) {
-      tried.push({ url, status: 0, bodyHead: err instanceof Error ? err.message : String(err) });
-    }
-  }
-  return { tried };
-};
-
-/** Extract model identifiers from the upstream response. Handles the common
- * shapes seen in the wild:
- *   - OpenAI / Anthropic standard: { data: [{id}, ...] }
- *   - bare array: [{id}, ...]
- *   - alt key: { models: [{id|name}, ...] } (some providers)
- *   - flat string array: ["m1", "m2"] or { data: ["m1", "m2"] }
- */
-function extractModelIds(body: unknown): string[] {
-  const pickArray = (obj: unknown): unknown[] | null => {
-    if (Array.isArray(obj)) return obj;
-    if (obj && typeof obj === "object") {
-      const r = obj as Record<string, unknown>;
-      if (Array.isArray(r.data)) return r.data;
-      if (Array.isArray(r.models)) return r.models;
-      if (Array.isArray(r.results)) return r.results;
-    }
-    return null;
-  };
-  const arr = pickArray(body);
-  if (!arr) return [];
-  return arr
-    .map((m): string | undefined => {
-      if (typeof m === "string") return m;
-      if (m && typeof m === "object") {
-        const r = m as Record<string, unknown>;
-        const candidates = [r.id, r.name, r.model, r.model_id, r.model_name];
-        for (const c of candidates) if (typeof c === "string" && c.length > 0) return c;
-      }
-      return undefined;
-    })
-    .filter((s): s is string => typeof s === "string" && s.length > 0)
-    .sort();
-}
-
 fastify.get("/providers", async () => {
   await ensureDefaultProvider();
+  await refreshProviderHealthBestEffort();
   const rows = await prisma.provider.findMany({ orderBy: { createdAt: "asc" } });
   return rows.map(sanitizeProvider);
 });
@@ -1049,6 +953,24 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
 
   const flavor: ProbeFlavor =
     provider.kind === "openai-local" || provider.kind === "openai-compat" ? "openai" : "anthropic";
+  const deepSeekFallback = deepSeekOfficialModelsFallback(provider.baseUrl, flavor);
+
+  if (deepSeekFallback) {
+    const updated = await prisma.provider.update({
+      where: { id: provider.id },
+      data: { models: deepSeekFallback.models },
+    });
+    return {
+      ...sanitizeProvider(updated),
+      discovered: {
+        count: deepSeekFallback.models.length,
+        source:
+          flavor === "openai" && !provider.apiKey
+            ? `${deepSeekFallback.sourceUrl}; API key required for requests`
+            : deepSeekFallback.sourceUrl,
+      },
+    };
+  }
 
   if (flavor === "openai" && !provider.apiKey) {
     // OpenAI's /v1/models requires `Authorization: Bearer sk-...`. There is
@@ -1296,6 +1218,10 @@ const AgentPatchSchema = z.object({
     .optional(),
   sandboxMode: z
     .enum(["read-only", "workspace-write", "danger-full-access"])
+    .nullable()
+    .optional(),
+  reasoningEffort: z
+    .enum(REASONING_EFFORTS)
     .nullable()
     .optional(),
   systemPrompt: z.string().nullable().optional(),

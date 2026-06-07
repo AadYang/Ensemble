@@ -83,6 +83,10 @@ export interface BridgeHandlers {
 
 const handlersByAgent = new Map<string, BridgeHandlers>();
 
+export interface McpBridgeOptions {
+  getFallbackHandlers?: (agentId: string) => BridgeHandlers | null | undefined;
+}
+
 export function registerHandlers(agentId: string, handlers: BridgeHandlers): void {
   handlersByAgent.set(agentId, handlers);
 }
@@ -215,7 +219,7 @@ function readBearer(headerVal: string | string[] | undefined): string | null {
  *   - Path + Bearer: /api/mcp/internal/<agentId>  Authorization: Bearer X
  *     (codex 0.130 path — its `bearer_token_env_var` config skips OAuth
  *      discovery entirely and signs requests with this header.) */
-export function mountMcpBridge(fastify: FastifyInstance): void {
+export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptions = {}): void {
   const handler = async (request: import("fastify").FastifyRequest<{ Params: { agentId?: string } }>, reply: import("fastify").FastifyReply) => {
     const url = new URL(request.url, "http://127.0.0.1");
     // agentId can come from URL query (legacy) or URL path param (bearer mode).
@@ -251,7 +255,7 @@ export function mountMcpBridge(fastify: FastifyInstance): void {
       reply.code(400);
       return { error: "agentId required" };
     }
-    const handlers = handlersByAgent.get(agentId);
+    const handlers = handlersByAgent.get(agentId) ?? options.getFallbackHandlers?.(agentId);
     if (!handlers) {
       reply.code(404);
       return { error: `no active handlers for agentId=${agentId}` };
@@ -397,7 +401,7 @@ export function mountMcpBridge(fastify: FastifyInstance): void {
       reply.code(400);
       return { error: "agentId and tool required" };
     }
-    const handlers = handlersByAgent.get(agentId);
+    const handlers = handlersByAgent.get(agentId) ?? options.getFallbackHandlers?.(agentId);
     if (!handlers) {
       reply.code(404);
       return { error: `no active handlers for agentId=${agentId}` };

@@ -12,15 +12,30 @@
 // SessionManager so OpenAIAgentRuntime (Slice 2+) doesn't need to duplicate it.
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { SdkMessage } from "@agentorch/shared";
+import type { ReasoningEffort, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeOptions } from "./types.js";
+
+const THINKING_TOKEN_BUDGETS: Record<ReasoningEffort, number> = {
+  minimal: 1024,
+  low: 4096,
+  medium: 8192,
+  high: 16384,
+  xhigh: 32768,
+};
+
+function maxThinkingTokensForEffort(effort?: ReasoningEffort | null): number | undefined {
+  if (!effort) return undefined;
+  return THINKING_TOKEN_BUDGETS[effort];
+}
 
 export class ClaudeAgentRuntime implements AgentRuntime {
   async *query(opts: RuntimeOptions): AsyncIterable<RuntimeEvent> {
+    const maxThinkingTokens = maxThinkingTokensForEffort(opts.reasoningEffort);
     const stream = query({
       prompt: opts.prompt,
       options: {
         model: opts.model,
+        ...(maxThinkingTokens !== undefined ? { maxThinkingTokens } : {}),
         permissionMode: opts.permissionMode,
         tools: opts.tools,
         allowedTools: opts.allowedTools,

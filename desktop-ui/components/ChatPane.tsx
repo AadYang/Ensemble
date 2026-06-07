@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getWS } from "@/lib/ws";
 import {
   clearAgentContext,
@@ -29,6 +29,7 @@ type PickerState =
 // fallback. Same pattern would apply to any other "default to empty array"
 // selector — always use a module-level constant.
 const EMPTY_HISTORY: readonly string[] = Object.freeze([]);
+const CHAT_INPUT_MAX_ROWS = 6;
 
 const PEER_INCOMING_RE = /^\[(?:from|来自) ([^\]]+)\]\s*([\s\S]*)$/;
 const PEER_OUTGOING_RE = /^→\s*(?:to|发往)\s+([^:]+):\s*([\s\S]*)$/;
@@ -108,8 +109,12 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const appendNotice = useStore((s) => s.appendNotice);
   const inputHistory = useStore((s) => s.inputHistory[agentId] ?? EMPTY_HISTORY);
   const pushInputHistory = useStore((s) => s.pushInputHistory);
+  const input = useStore((s) => s.inputDrafts[agentId] ?? "");
+  const inputSelection = useStore((s) => s.inputSelections[agentId] ?? null);
+  const setInputDraft = useStore((s) => s.setInputDraft);
+  const clearInputDraft = useStore((s) => s.clearInputDraft);
+  const setInputSelection = useStore((s) => s.setInputSelection);
   const setUsageOpen = useStore((s) => s.setUsageOpen);
-  const [input, setInput] = useState("");
   const [peerOpen, setPeerOpen] = useState(false);
   const [picker, setPicker] = useState<PickerState | null>(null);
   const [providers, setProviders] = useState<ProviderDTO[]>([]);
@@ -120,7 +125,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const draftRef = useRef<string>("");
   const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   // Next-step ghost hint: when a turn ends, scan the last assistant text for
   // a question / action-suggesting sentence. Show as ghost text in an empty
   // input box. Tab / RightArrow accepts. Cleared on send / type / dismiss /
@@ -128,6 +133,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const [nextStepHint, setNextStepHint] = useState<string | null>(null);
   const lastSeenResultSeqRef = useRef<number>(-Infinity);
   const t = useT();
+  const updateInput = useCallback((text: string) => setInputDraft(agentId, text), [agentId, setInputDraft]);
 
   // Reset history pointer + next-step hint when switching agents.
   useEffect(() => {
@@ -260,6 +266,41 @@ export function ChatPane({ agentId }: { agentId: string }) {
       .then(setProviders)
       .catch((err) => console.warn("listProviders failed", err));
   }, []);
+
+  const resizeInput = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 20;
+    const verticalChrome = el.offsetHeight - el.clientHeight;
+    const maxHeight = lineHeight * CHAT_INPUT_MAX_ROWS + verticalChrome;
+    const nextHeight = Math.min(el.scrollHeight, maxHeight);
+    el.style.height = `${nextHeight}px`;
+    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeInput();
+  }, [input, resizeInput]);
+
+  const recordInputSelection = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    setInputSelection(agentId, {
+      start: el.selectionStart ?? el.value.length,
+      end: el.selectionEnd ?? el.value.length,
+    });
+  }, [agentId, setInputSelection]);
+
+  const restoreInputSelection = useCallback(() => {
+    const el = inputRef.current;
+    if (!el || !inputSelection) return;
+    const start = Math.min(inputSelection.start, el.value.length);
+    const end = Math.min(inputSelection.end, el.value.length);
+    requestAnimationFrame(() => {
+      if (document.activeElement === el) el.setSelectionRange(start, end);
+    });
+  }, [inputSelection]);
 
   if (!agent) {
     return (
@@ -521,7 +562,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
       appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
     } finally {
       setPicker(null);
-      setInput("");
+      clearInputDraft(agentId);
     }
   };
 
@@ -537,9 +578,9 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const acceptGhost = () => {
     if (!ghostSuffix) return false;
     if (slashSuffix) {
-      setInput(input + slashSuffix);
+      updateInput(input + slashSuffix);
     } else if (showNextStep && nextStepHint) {
-      setInput(nextStepHint);
+      updateInput(nextStepHint);
       setNextStepHint(null);
     }
     // Defer focus + cursor-to-end so React's controlled-update commit lands first.
@@ -553,7 +594,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
     return true;
   };
 
-  const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const onInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Tab / RightArrow-at-end → accept ghost text (CLI-style).
     // Tab is unconditional (anywhere in the input). RightArrow only when the
     // cursor sits at the end of current input — otherwise users navigating
@@ -606,6 +647,18 @@ export function ChatPane({ agentId }: { agentId: string }) {
       // Other keys fall through (typing closes picker via onChange below).
     }
 
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (picker) return;
+      const text = input.trim();
+      if (!text) return;
+      if (summary.status === "running") return;
+      if (summary.closed && !text.startsWith("/")) return;
+      onSend(text);
+      clearInputDraft(agentId);
+      return;
+    }
+
     if (e.key === "ArrowUp") {
       if (inputHistory.length === 0) return;
       e.preventDefault();
@@ -613,11 +666,11 @@ export function ChatPane({ agentId }: { agentId: string }) {
         draftRef.current = input;
         const idx = inputHistory.length - 1;
         setHistoryIndex(idx);
-        setInput(inputHistory[idx]!);
+        updateInput(inputHistory[idx]!);
       } else if (historyIndex > 0) {
         const idx = historyIndex - 1;
         setHistoryIndex(idx);
-        setInput(inputHistory[idx]!);
+        updateInput(inputHistory[idx]!);
       }
     } else if (e.key === "ArrowDown") {
       if (historyIndex === null) return;
@@ -625,10 +678,10 @@ export function ChatPane({ agentId }: { agentId: string }) {
       if (historyIndex < inputHistory.length - 1) {
         const idx = historyIndex + 1;
         setHistoryIndex(idx);
-        setInput(inputHistory[idx]!);
+        updateInput(inputHistory[idx]!);
       } else {
         setHistoryIndex(null);
-        setInput(draftRef.current);
+        updateInput(draftRef.current);
       }
     }
   };
@@ -717,33 +770,33 @@ export function ChatPane({ agentId }: { agentId: string }) {
           const text = input.trim();
           if (!text) return;
           onSend(text);
-          setInput("");
+          clearInputDraft(agentId);
         }}
-        className="border-t border-[var(--border)] p-2 flex gap-2"
+        className="border-t border-[var(--border)] p-2 flex items-end gap-2"
       >
         <div className="relative flex-1">
-          {/* Ghost layer renders behind the input. Uses font-mono explicitly
+          {/* Ghost layer renders behind the textarea. Uses font-mono explicitly
               and matches input padding/border so the user-typed-text width
               measured by the invisible <span> aligns exactly with the visible
-              text inside the <input>. Without `font-mono` on both, glyph
+              text inside the textarea. Without `font-mono` on both, glyph
               widths drift slightly and the gray suffix appears misaligned. */}
           {ghostSuffix && (
             <div
               aria-hidden="true"
-              className="absolute inset-0 bg-[var(--bg-pane)] border border-[var(--border)] px-2 py-1 pointer-events-none whitespace-pre overflow-hidden text-sm font-mono leading-[1.25rem]"
+              className="absolute inset-0 bg-[var(--bg-pane)] border border-[var(--border)] px-2 py-1 pointer-events-none whitespace-pre-wrap break-words overflow-hidden text-sm font-mono leading-[1.25rem]"
             >
               <span style={{ visibility: "hidden" }}>{input}</span>
               <span className="text-[var(--text-faint)] opacity-60">{ghostSuffix}</span>
             </div>
           )}
-          <input
+          <textarea
             ref={inputRef}
             className={`relative w-full ${
               ghostSuffix ? "bg-transparent" : "bg-[var(--bg-pane)]"
-            } border border-[var(--border)] px-2 py-1 outline-none focus:border-[var(--accent)] text-sm font-mono leading-[1.25rem]`}
+            } border border-[var(--border)] px-2 py-1 outline-none focus:border-[var(--accent)] text-sm font-mono leading-[1.25rem] resize-none min-h-[2rem] overflow-hidden align-bottom`}
             value={input}
             onChange={(e) => {
-              setInput(e.target.value);
+              updateInput(e.target.value);
               // Typing dismisses any active next-step hint — it was a
               // one-time offer. Slash suffix recomputes naturally from input.
               if (nextStepHint !== null && e.target.value !== "") setNextStepHint(null);
@@ -755,13 +808,19 @@ export function ChatPane({ agentId }: { agentId: string }) {
               }
             }}
             onKeyDown={onInputKeyDown}
-            placeholder={picker ? t("slash.picker.placeholder") : t("chat.placeholder")}
+            onSelect={recordInputSelection}
+            onClick={recordInputSelection}
+            onKeyUp={recordInputSelection}
+            onBlur={recordInputSelection}
+            onFocus={restoreInputSelection}
+            placeholder={ghostSuffix ? "" : picker ? t("slash.picker.placeholder") : t("chat.placeholder")}
             disabled={summary.status === "running"}
+            rows={1}
           />
         </div>
         <button
           type="submit"
-          className="px-3 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+          className="shrink-0 px-3 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
           disabled={
             summary.status === "running" ||
             !input.trim() ||

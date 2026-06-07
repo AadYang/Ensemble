@@ -45,6 +45,7 @@ import type {
   PeerMode,
   PermissionDecision,
   PermissionMode,
+  ReasoningEffort,
   SandboxMode,
 } from "@agentorch/shared";
 import { formatPeerHandoff } from "./peerHandoff.js";
@@ -63,6 +64,34 @@ import { currentPlatformKey } from "../platform-key.js";
  * keeps sessions reachable for resume regardless of where the EXE lives. */
 const STABLE_CWD = homedir();
 const CODEX_DEFAULT_CWD = ensureDataDir();
+const FIRST_MODEL_RESPONSE_TIMEOUT_MS = 60_000;
+const TURN_COMPLETION_IDLE_TIMEOUT_MS = 60_000;
+
+function isInternalSystemMessage(msg: unknown): boolean {
+  return (
+    msg !== null &&
+    typeof msg === "object" &&
+    (msg as { type?: unknown }).type === "system" &&
+    (msg as { subtype?: unknown }).subtype === "thinking_tokens"
+  );
+}
+
+function isTextDeltaStreamEvent(msg: unknown): boolean {
+  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "stream_event") return false;
+  const event = (msg as { event?: { type?: unknown; delta?: { type?: unknown; text?: unknown } } }).event;
+  return (
+    event?.type === "content_block_delta" &&
+    event.delta?.type === "text_delta" &&
+    typeof event.delta.text === "string" &&
+    event.delta.text.length > 0
+  );
+}
+
+function assistantHasText(msg: unknown): boolean {
+  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "assistant") return false;
+  const blocks = (msg as { message?: { content?: Array<{ type?: unknown; text?: unknown }> } }).message?.content ?? [];
+  return blocks.some((b) => b.type === "text" && typeof b.text === "string" && b.text.length > 0);
+}
 
 function currentRuntimeFromProviderMeta(meta: unknown): { cliPath?: unknown; authPresent?: unknown } | null {
   if (!meta || typeof meta !== "object") return null;
@@ -101,6 +130,7 @@ interface RunningSession {
   runId: string;
   abort: AbortController;
   seq: number;
+  suspendCompletionIdleTimer?: () => void;
   /** Per-turn auto-allow cache, keyed by toolName. User clicking "Allow" on
    *  a permission dialog adds the tool name here; subsequent canUseTool calls
    *  with the same toolName during this turn skip the dialog. Cleared when
@@ -120,6 +150,14 @@ interface PendingUserQuestion {
   resolve: (choice: string) => void;
   question: string;
   options: string[];
+}
+
+interface ForceStopOptions {
+  expectedRunId?: string;
+  dbStatus: "IDLE" | "ERROR" | "DONE";
+  protoStatus: "idle" | "error" | "done";
+  error?: { code: string; message: string };
+  logPrefix: string;
 }
 
 const dbToProto = (s: string): ProtoStatus => {
@@ -167,6 +205,31 @@ export const readSandboxOverride = (metadata: unknown): SandboxMode | null => {
   }
   return null;
 };
+
+const VALID_REASONING_EFFORTS: ReadonlySet<ReasoningEffort> = new Set([
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+
+export const readReasoningEffortOverride = (metadata: unknown): ReasoningEffort | null => {
+  if (metadata && typeof metadata === "object" && "reasoningEffort" in metadata) {
+    const m = (metadata as { reasoningEffort: unknown }).reasoningEffort;
+    if (typeof m === "string" && VALID_REASONING_EFFORTS.has(m as ReasoningEffort)) {
+      return m as ReasoningEffort;
+    }
+  }
+  return null;
+};
+
+const providerSupportsReasoningEffort = (kind: string | null | undefined): boolean =>
+  kind === null ||
+  kind === undefined ||
+  kind === "anthropic-local" ||
+  kind === "anthropic" ||
+  kind === "openai-codex";
 
 const readMetaString = (metadata: unknown, key: string): string | null => {
   if (metadata && typeof metadata === "object" && key in (metadata as object)) {
@@ -229,6 +292,7 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
   codexWorkspace: row.codexWorkspace,
   permissionMode: readPermissionMode(row.metadata),
   sandboxMode: readSandboxOverride(row.metadata),
+  reasoningEffort: readReasoningEffortOverride(row.metadata),
   teamId: row.teamId,
   forcedSkills: Array.from(readSkillForcelist(row.metadata)),
   disabledSkills: Array.from(readSkillBlocklist(row.metadata)),
@@ -534,6 +598,7 @@ export class SessionManager {
       providerId?: string | null;
       codexWorkspace?: string | null;
       sandboxMode?: SandboxMode | null;
+      reasoningEffort?: ReasoningEffort | null;
       systemPrompt?: string | null;
       teamId?: string | null;
     },
@@ -611,6 +676,25 @@ export class SessionManager {
       }
     } else if (patch.providerId !== undefined && targetProvider?.kind !== "openai-codex" && readSandboxOverride(cur.metadata) !== null) {
       data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["sandboxMode"]);
+    }
+    if (patch.reasoningEffort !== undefined) {
+      if (patch.reasoningEffort !== null && !providerSupportsReasoningEffort(targetProvider?.kind)) {
+        throw new Error("reasoningEffort override is only valid for Claude Code or Codex agents");
+      }
+      const previousReasoningEffort = readReasoningEffortOverride(cur.metadata);
+      const baseMeta = data.metadata ?? cur.metadata;
+      data.metadata = patch.reasoningEffort === null
+        ? removeMetadataKeys(baseMeta, ["reasoningEffort"])
+        : mergeMetadata(baseMeta, { reasoningEffort: patch.reasoningEffort });
+      if (patch.reasoningEffort !== previousReasoningEffort) {
+        data.metadata = removeMetadataKeys(data.metadata, ["lastSessionId"]);
+      }
+    } else if (
+      patch.providerId !== undefined &&
+      !providerSupportsReasoningEffort(targetProvider?.kind) &&
+      readReasoningEffortOverride(cur.metadata) !== null
+    ) {
+      data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["reasoningEffort"]);
     }
     if (Object.keys(data).length === 0) return agentRowToSummary(cur);
     const updated = await prisma.agent.update({ where: { id }, data });
@@ -818,6 +902,7 @@ export class SessionManager {
     model: string;
     permissionMode: PermissionMode;
     sandboxMode: SandboxMode | null;
+    reasoningEffort: ReasoningEffort | null;
     codexWorkspace: string | null;
     hasResumeInfo: boolean;
     closed: boolean;
@@ -838,6 +923,7 @@ export class SessionManager {
       model: a.model,
       permissionMode: readPermissionMode(a.metadata),
       sandboxMode: readSandboxOverride(a.metadata),
+      reasoningEffort: readReasoningEffortOverride(a.metadata),
       codexWorkspace: a.codexWorkspace,
       hasResumeInfo: readMetaString(a.metadata, "lastSessionId") !== null,
       closed: readMetaBool(a.metadata, "closed"),
@@ -912,6 +998,7 @@ export class SessionManager {
         updatedAt: new Date(0),
       },
       history: [],
+      reasoningEffort: readReasoningEffortOverride(agent.metadata),
     };
 
     let accumulated = "";
@@ -1047,17 +1134,62 @@ export class SessionManager {
 
     const abort = new AbortController();
     const runId = randomUUID();
+    let staleResume = false;
+    let firstModelResponseTimer: NodeJS.Timeout | null = null;
+    let turnCompletionIdleTimer: NodeJS.Timeout | null = null;
+    const clearFirstModelResponseTimer = () => {
+      if (firstModelResponseTimer) {
+        clearTimeout(firstModelResponseTimer);
+        firstModelResponseTimer = null;
+      }
+    };
+    const clearTurnCompletionIdleTimer = () => {
+      if (turnCompletionIdleTimer) {
+        clearTimeout(turnCompletionIdleTimer);
+        turnCompletionIdleTimer = null;
+      }
+    };
+    const armFirstModelResponseTimer = () => {
+      clearFirstModelResponseTimer();
+      firstModelResponseTimer = setTimeout(() => {
+        void this.forceStopRun(sessionId, {
+          expectedRunId: runId,
+          dbStatus: "ERROR",
+          protoStatus: "error",
+          logPrefix: "runtime-timeout",
+          error: {
+            code: "PROVIDER_TIMEOUT",
+            message:
+              `provider request produced no model response within ${FIRST_MODEL_RESPONSE_TIMEOUT_MS / 1000}s. ` +
+              "Verify the provider baseUrl, API key, and network connection.",
+          },
+        });
+      }, FIRST_MODEL_RESPONSE_TIMEOUT_MS);
+    };
+    const armTurnCompletionIdleTimer = () => {
+      clearTurnCompletionIdleTimer();
+      turnCompletionIdleTimer = setTimeout(() => {
+        void this.forceStopRun(sessionId, {
+          expectedRunId: runId,
+          dbStatus: "DONE",
+          protoStatus: "done",
+          logPrefix: "runtime-idle-after-output",
+        });
+      }, TURN_COMPLETION_IDLE_TIMEOUT_MS);
+    };
+
     this.running.set(sessionId, {
       id: sessionId,
       runId,
       abort,
       seq,
+      suspendCompletionIdleTimer: clearTurnCompletionIdleTimer,
       autoAllowedTools: new Set<string>(),
     });
 
+    try {
     console.log(`[sendMessage] start agent=${sessionId.slice(0, 8)} run=${runId.slice(0, 8)} text="${userInput.slice(0, 40)}"`);
-    await prisma.agent.update({ where: { id: sessionId }, data: { status: "RUNNING" } });
-    this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "running" });
+    await this.updateAgentStatus(sessionId, "RUNNING", "running");
 
     // Persist + broadcast the user input itself. SDK doesn't echo user prompts back
     // through its stream, so without this step a peer-relayed message would never
@@ -1091,7 +1223,6 @@ export class SessionManager {
     const lastSessionId = readMetaString(agent.metadata, "lastSessionId");
     let capturedSessionId: string | null = lastSessionId;
     let finalText = "";
-
     // Resolve provider env. anthropic-local (no baseUrl/apiKey) inherits process.env.
     // W16: openai-compat is now handled by OpenAIAgentRuntime (Slice 2+); during
     // Slice 1 we still route everything through the Claude SDK path. The
@@ -1109,6 +1240,13 @@ export class SessionManager {
             `provider "${resolvedProvider.name}" is disabled (reason: ${reason}). ` +
               "use the migration button on the providers panel to convert it to a supported kind.",
           );
+        }
+        if (
+          resolvedProvider.kind !== "anthropic-local" &&
+          resolvedProvider.kind !== "openai-codex" &&
+          !resolvedProvider.apiKey
+        ) {
+          throw new Error(`provider "${resolvedProvider.name}" is missing an API key.`);
         }
         // W16 Slice 6: musistudio gateway path removed. Provider env now
         // always populates ANTHROPIC_BASE_URL/API_KEY directly from the
@@ -1169,10 +1307,8 @@ export class SessionManager {
         throw new Error(`Codex CLI is not logged in on ${currentPlatformKey()}. Run \`codex login\` for this OS.`);
       }
     }
-    // Set by the stderr watcher below if CLI complains the resume target
-    // session file is gone (e.g. user moved cwd, ~/.claude pruning, etc.).
-    let staleResume = false;
-    try {
+    // staleResume is set by the stderr watcher if the CLI reports a missing
+    // resume target; the catch path clears that cached session id.
       console.log(`[sendMessage] persisted user msg seq=${userPersisted.seq}, dispatching to runtime cli=${claudeCliPath ?? codexCliPath ?? "(sdk)"}`);
       // W16 Slice 1.6: dispatch via AgentRuntime abstraction instead of
       // directly calling the Claude SDK's query(). chooseRuntime falls back
@@ -1337,6 +1473,7 @@ export class SessionManager {
         // W20: codex runtime reads sandboxMode from this blob (per-agent
         // override). Other runtimes ignore it.
         agentMetadata: agent.metadata,
+        reasoningEffort: readReasoningEffortOverride(agent.metadata),
         // Slice 5.1: session-aware callbacks for OpenAIAgentRuntime to
         // register as NormalizedTools. Claude side ignores — same operations
         // already arrive via allMcpServers (peer + ask-user MCP). The closures
@@ -1365,13 +1502,23 @@ export class SessionManager {
         },
       };
       const stream = runtime.query(runtimeOpts);
+      armFirstModelResponseTimer();
 
       let firstMsg = true;
       for await (const event of stream) {
         if (event.type === "error") {
+          clearFirstModelResponseTimer();
           throw new Error(event.message);
         }
         const msg = event.payload;
+        if (msg.type === "assistant" || msg.type === "result") {
+          clearFirstModelResponseTimer();
+        }
+        if (msg.type === "result") {
+          clearTurnCompletionIdleTimer();
+        } else if (isTextDeltaStreamEvent(msg) || assistantHasText(msg)) {
+          armTurnCompletionIdleTimer();
+        }
         if (firstMsg) {
           console.log(`[sendMessage] first SDK msg type=${msg.type}`);
           firstMsg = false;
@@ -1383,6 +1530,10 @@ export class SessionManager {
         const incomingSid = (msg as { session_id?: string }).session_id;
         if (incomingSid && incomingSid !== capturedSessionId) {
           capturedSessionId = incomingSid;
+        }
+
+        if (isInternalSystemMessage(msg)) {
+          continue;
         }
 
         if (msg.type === "stream_event") {
@@ -1462,7 +1613,8 @@ export class SessionManager {
       // Guard: cancel() may have already force-cleared state and set status
       // back to IDLE. If our runId no longer owns this.running, defer to cancel.
       if (this.running.get(sessionId)?.runId === runId) {
-        await prisma.agent.update({ where: { id: sessionId }, data: persistData });
+        const updated = await prisma.agent.update({ where: { id: sessionId }, data: persistData });
+        this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
         this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "done" });
       } else {
         console.log(`[sendMessage] run=${runId.slice(0, 8)} finished post-cancel; skipping DB update`);
@@ -1489,7 +1641,8 @@ export class SessionManager {
       // Same guard as the success path. cancel() owns the canonical IDLE state
       // once it's removed this run from the map.
       if (this.running.get(sessionId)?.runId === runId) {
-        await prisma.agent.update({ where: { id: sessionId }, data: persistData });
+        const updated = await prisma.agent.update({ where: { id: sessionId }, data: persistData });
+        this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
         if (!aborted) {
           const friendly = staleResume
             ? "Previous conversation session was lost (the CLI's local session file is gone). " +
@@ -1508,6 +1661,8 @@ export class SessionManager {
       }
       return null;
     } finally {
+      clearFirstModelResponseTimer();
+      clearTurnCompletionIdleTimer();
       // Only clear state if we're still the owner. After cancel() the entry
       // is gone; a brand-new sendMessage could already have set its own entry.
       // Without this guard a wedged old run's finally would corrupt the new run.
@@ -1586,15 +1741,8 @@ export class SessionManager {
   /** Called by ask_user MCP tool. Suspends until the user clicks an option. */
   async askUser(sessionId: string, question: string, options: string[]): Promise<string> {
     const reqId = randomUUID();
-    await prisma.agent.update({
-      where: { id: sessionId },
-      data: { status: "AWAITING_USER_INPUT" },
-    });
-    this.hub.sendToSession(sessionId, {
-      type: "status",
-      sessionId,
-      status: "awaiting_user_input",
-    });
+    this.running.get(sessionId)?.suspendCompletionIdleTimer?.();
+    await this.updateAgentStatus(sessionId, "AWAITING_USER_INPUT", "awaiting_user_input");
     this.hub.sendToSession(sessionId, {
       type: "user_question",
       sessionId,
@@ -1613,8 +1761,7 @@ export class SessionManager {
     });
 
     if (this.running.has(sessionId)) {
-      await prisma.agent.update({ where: { id: sessionId }, data: { status: "RUNNING" } });
-      this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "running" });
+      await this.updateAgentStatus(sessionId, "RUNNING", "running");
     }
     return choice;
   }
@@ -1795,6 +1942,71 @@ export class SessionManager {
     return `delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode})`;
   }
 
+  private async forceStopRun(sessionId: string, opts: ForceStopOptions): Promise<boolean> {
+    const r = this.running.get(sessionId);
+    if (opts.expectedRunId && (!r || r.runId !== opts.expectedRunId)) {
+      return false;
+    }
+
+    if (r) {
+      console.log(`[${opts.logPrefix}] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
+      try { r.abort.abort(); } catch { /* signal already aborted */ }
+    } else {
+      console.log(`[${opts.logPrefix}] no live run for agent=${sessionId.slice(0, 8)}; cleaning stale state`);
+    }
+
+    this.running.delete(sessionId);
+    const sessionPending = this.pending.get(sessionId);
+    if (sessionPending) {
+      for (const [, p] of sessionPending) {
+        p.resolve({ behavior: "deny", message: opts.error?.message ?? "Cancelled by user." });
+      }
+      sessionPending.clear();
+      this.pending.delete(sessionId);
+    }
+    const sessionQuestions = this.pendingQuestions.get(sessionId);
+    if (sessionQuestions) {
+      for (const [, q] of sessionQuestions) {
+        q.resolve(opts.error ? `[${opts.error.message}]` : "[cancelled by user]");
+      }
+      sessionQuestions.clear();
+      this.pendingQuestions.delete(sessionId);
+    }
+
+    try {
+      const updated = await prisma.agent.update({
+        where: { id: sessionId },
+        data: { status: opts.dbStatus },
+      });
+      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+      if (opts.error) {
+        this.hub.sendToSession(sessionId, {
+          type: "error",
+          sessionId,
+          code: opts.error.code,
+          message: opts.error.message,
+        });
+      }
+      this.hub.sendToSession(sessionId, { type: "status", sessionId, status: opts.protoStatus });
+    } catch (err) {
+      console.warn(`[${opts.logPrefix}] DB reset for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`);
+    }
+    return true;
+  }
+
+  private async updateAgentStatus(
+    sessionId: string,
+    dbStatus: "IDLE" | "RUNNING" | "AWAITING_PERMISSION" | "AWAITING_USER_INPUT",
+    protoStatus: "idle" | "running" | "awaiting_permission" | "awaiting_user_input",
+  ): Promise<void> {
+    const updated = await prisma.agent.update({
+      where: { id: sessionId },
+      data: { status: dbStatus },
+    });
+    this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+    this.hub.sendToSession(sessionId, { type: "status", sessionId, status: protoStatus });
+  }
+
   /** Authoritatively cancel a run.
    *
    *  Previously cancel() only signalled the AbortController and left the
@@ -1845,12 +2057,7 @@ export class SessionManager {
     // Authoritative DB reset. We deliberately do NOT touch metadata — only the
     // status flips back to IDLE. lastSessionId / sandboxMode / etc. survive.
     try {
-      const updated = await prisma.agent.update({
-        where: { id: sessionId },
-        data: { status: "IDLE" },
-      });
-      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
-      this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "idle" });
+      await this.updateAgentStatus(sessionId, "IDLE", "idle");
     } catch (err) {
       // Agent might have been deleted concurrently — log and move on.
       console.warn(`[cancel] DB reset for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`);
@@ -1967,8 +2174,8 @@ export class SessionManager {
         },
       });
 
-      await prisma.agent.update({ where: { id: sessionId }, data: { status: "AWAITING_PERMISSION" } });
-      this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "awaiting_permission" });
+      this.running.get(sessionId)?.suspendCompletionIdleTimer?.();
+      await this.updateAgentStatus(sessionId, "AWAITING_PERMISSION", "awaiting_permission");
       this.hub.sendToSession(sessionId, { type: "permission_request", sessionId, reqId, toolName, input });
 
       const decision = await new Promise<PermissionDecision>((resolve) => {
@@ -1982,8 +2189,7 @@ export class SessionManager {
 
       // Only flip back to running if the session is still active. cancel() may have settled this.
       if (this.running.has(sessionId)) {
-        await prisma.agent.update({ where: { id: sessionId }, data: { status: "RUNNING" } });
-        this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "running" });
+        await this.updateAgentStatus(sessionId, "RUNNING", "running");
       }
 
       const result: PermissionResult =

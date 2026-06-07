@@ -112,6 +112,11 @@ interface Store {
    *  page reload. */
   inputHistory: Record<string, string[]>;
   pushInputHistory: (agentId: string, text: string) => void;
+  inputDrafts: Record<string, string>;
+  inputSelections: Record<string, { start: number; end: number }>;
+  setInputDraft: (agentId: string, text: string) => void;
+  clearInputDraft: (agentId: string) => void;
+  setInputSelection: (agentId: string, selection: { start: number; end: number }) => void;
 
   pendingPermissions: PendingPermission[];
   addPermissionRequest: (p: PendingPermission) => void;
@@ -198,6 +203,7 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
       return { seq, kind: "result", text: `result · ${subtype}` };
     }
     case "system":
+      if ((msg as { subtype?: string }).subtype === "thinking_tokens") return null;
       return { seq, kind: "system", text: `system · ${(msg as { subtype?: string }).subtype ?? ""}` };
     case "stream_event":
     case "rate_limit_event":
@@ -393,6 +399,10 @@ export const useStore = create<Store>((set) => ({
     set((s) => {
       if (!s.agents[id]) return s;
       const { [id]: _, ...rest } = s.agents;
+      const { [id]: _draft, ...inputDrafts } = s.inputDrafts;
+      const { [id]: _selection, ...inputSelections } = s.inputSelections;
+      void _draft;
+      void _selection;
       // Detach from every pane in every window.
       const windows = s.windows.map((w) => {
         const nextRoot = clearAgentFromTree(w.root, id);
@@ -400,6 +410,8 @@ export const useStore = create<Store>((set) => ({
       });
       return {
         agents: rest,
+        inputDrafts,
+        inputSelections,
         windows,
         activeId: s.activeId === id ? null : s.activeId,
       };
@@ -442,6 +454,28 @@ export const useStore = create<Store>((set) => ({
       const next = [...prev, text];
       const trimmed = next.length > HISTORY_CAP ? next.slice(-HISTORY_CAP) : next;
       return { inputHistory: { ...s.inputHistory, [agentId]: trimmed } };
+    }),
+  inputDrafts: {},
+  inputSelections: {},
+  setInputDraft: (agentId, text) =>
+    set((s) => {
+      if ((s.inputDrafts[agentId] ?? "") === text) return s;
+      return { inputDrafts: { ...s.inputDrafts, [agentId]: text } };
+    }),
+  clearInputDraft: (agentId) =>
+    set((s) => {
+      if (!(agentId in s.inputDrafts) && !(agentId in s.inputSelections)) return s;
+      const { [agentId]: _draft, ...inputDrafts } = s.inputDrafts;
+      const { [agentId]: _selection, ...inputSelections } = s.inputSelections;
+      void _draft;
+      void _selection;
+      return { inputDrafts, inputSelections };
+    }),
+  setInputSelection: (agentId, selection) =>
+    set((s) => {
+      const cur = s.inputSelections[agentId];
+      if (cur?.start === selection.start && cur.end === selection.end) return s;
+      return { inputSelections: { ...s.inputSelections, [agentId]: selection } };
     }),
 
   ingestSdkMessage: (id, seq, msg) =>
@@ -616,6 +650,8 @@ export const useStore = create<Store>((set) => ({
           },
         },
         inputHistory: { ...s.inputHistory, [id]: [] },
+        inputDrafts: { ...s.inputDrafts, [id]: "" },
+        inputSelections: { ...s.inputSelections, [id]: { start: 0, end: 0 } },
       };
     }),
 

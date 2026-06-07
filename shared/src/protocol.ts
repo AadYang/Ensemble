@@ -17,6 +17,9 @@ export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermiss
 /** Codex sandbox modes (mirrors `@openai/codex-sdk` SandboxMode). */
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
+/** Claude Code/Codex reasoning effort. null = inherit from the runtime default. */
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface TeamSummary {
   id: string;
   name: string;
@@ -42,6 +45,8 @@ export interface AgentSummary {
   permissionMode: PermissionMode;
   /** Codex per-agent override. null = inherit from provider.defaultSandbox. */
   sandboxMode: SandboxMode | null;
+  /** Claude Code/Codex per-agent reasoning effort override. null = inherit from runtime. */
+  reasoningEffort: ReasoningEffort | null;
   /** W21: which team this agent belongs to (null = ungrouped). */
   teamId: string | null;
   /** Skills this agent has flipped to force-on (always inject regardless of score). */

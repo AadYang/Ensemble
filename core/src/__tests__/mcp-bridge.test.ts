@@ -176,6 +176,34 @@ describe("mcpServersToCodexConfig", () => {
     }
   });
 
+  it("falls back to persistent peer handlers when turn handlers are not active", async () => {
+    const fastify = Fastify({ logger: false });
+    mountMcpBridge(fastify, {
+      getFallbackHandlers: (agentId) => ({
+        peerSend: async (args) => `fallback:${agentId}:${args.target}:${args.message}:${args.mode ?? "raw"}`,
+        peerQuery: async () => "fallback-history",
+      }),
+    });
+
+    try {
+      const res = await fastify.inject({
+        method: "POST",
+        url: "/mcp/internal-tool/agent-visible/peer_send",
+        headers: {
+          authorization: `Bearer ${BRIDGE_TOKEN}`,
+          "content-type": "application/json",
+        },
+        payload: JSON.stringify({ target: "Engineer", message: "fix bug", mode: "raw" }),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({
+        content: "fallback:agent-visible:Engineer:fix bug:raw",
+      });
+    } finally {
+      await fastify.close();
+    }
+  });
+
   it("rejects non-object input rows defensively", () => {
     const out = mcpServersToCodexConfig({
       nope: "string",

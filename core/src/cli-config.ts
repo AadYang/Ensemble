@@ -159,7 +159,7 @@ function detectCli(kind: CliKind, manualPath: string | null): CliHealth {
 
   if (manualPath) {
     if (existsSync(manualPath) && statSync(manualPath).isFile()) {
-      const resolved = kind === "codex" ? resolveCodexExecutable(manualPath) ?? manualPath : manualPath;
+      const resolved = resolveCliExecutable(kind, manualPath) ?? manualPath;
       return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === manualPath ? "manual" : "vendor", manualPath, ...auth });
     }
     return { platformKey, found: false, path: null, source: "missing", manualPath, error: `manual path not found: ${manualPath}`, ...auth };
@@ -167,19 +167,19 @@ function detectCli(kind: CliKind, manualPath: string | null): CliHealth {
 
   const envPath = kind === "codex" ? process.env.CODEX_PATH : process.env.CLAUDE_PATH;
   if (envPath && existsSync(envPath) && statSync(envPath).isFile()) {
-    const resolved = kind === "codex" ? resolveCodexExecutable(envPath) ?? envPath : envPath;
+    const resolved = resolveCliExecutable(kind, envPath) ?? envPath;
     return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === envPath ? "env" : "vendor", manualPath, ...auth });
   }
 
   const fromPath = findOnPath(kind);
   if (fromPath) {
-    const resolved = kind === "codex" ? resolveCodexExecutable(fromPath) ?? fromPath : fromPath;
+    const resolved = resolveCliExecutable(kind, fromPath) ?? fromPath;
     return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === fromPath ? "path" : "vendor", manualPath, ...auth });
   }
 
   const common = findCommonLocation(kind);
   if (common) {
-    const resolved = kind === "codex" ? resolveCodexExecutable(common) ?? common : common;
+    const resolved = resolveCliExecutable(kind, common) ?? common;
     return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === common ? "common-location" : "vendor", manualPath, ...auth });
   }
 
@@ -339,6 +339,36 @@ function platformCodexPackageName(): string | null {
   if (p === "darwin" && a === "arm64") return "codex-darwin-arm64";
   if (p === "linux" && a === "x64") return "codex-linux-x64";
   if (p === "linux" && a === "arm64") return "codex-linux-arm64";
+  return null;
+}
+
+function resolveCliExecutable(kind: CliKind, candidate: string): string | null {
+  return kind === "codex" ? resolveCodexExecutable(candidate) : resolveClaudeExecutable(candidate);
+}
+
+export function resolveClaudeExecutable(candidate: string): string | null {
+  const exeFileName = process.platform === "win32" ? "claude.exe" : "claude";
+  if (candidate.toLowerCase().endsWith(exeFileName) && existsSync(candidate)) return candidate;
+
+  let dir = dirname(candidate);
+  const seen = new Set<string>();
+  for (let i = 0; i < 10; i++) {
+    if (seen.has(dir)) break;
+    seen.add(dir);
+    const roots = [
+      join(dir, "node_modules", "@anthropic-ai", "claude-code", "bin"),
+      join(dir, "node_modules", "@anthropic-ai", "claude-code", "vendor"),
+      join(dir, "node_modules", "@anthropic-ai", "claude-code"),
+    ];
+    for (const root of roots) {
+      if (!existsSync(root)) continue;
+      const found = findFileUnder(root, exeFileName);
+      if (found) return found;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
   return null;
 }
 

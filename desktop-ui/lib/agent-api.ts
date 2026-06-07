@@ -1,4 +1,4 @@
-import type { AgentSummary, PermissionMode, SandboxMode } from "@agentorch/shared";
+import type { AgentSummary, PermissionMode, ReasoningEffort, SandboxMode } from "@agentorch/shared";
 
 export interface AgentPatch {
   name?: string;
@@ -8,6 +8,8 @@ export interface AgentPatch {
   permissionMode?: PermissionMode;
   /** Codex per-agent sandbox override. null = clear override (inherit provider). */
   sandboxMode?: SandboxMode | null;
+  /** Claude Code/Codex per-agent thinking override. null = clear override (inherit runtime). */
+  reasoningEffort?: ReasoningEffort | null;
   /** Role / persona prompt. Changing it clears the resume pointer server-side
    *  so the next turn picks up the new prompt instead of resuming the CLI
    *  session it locked in earlier. */
@@ -78,6 +80,7 @@ export interface AgentStatusReport {
   model: string;
   permissionMode: PermissionMode;
   sandboxMode: "read-only" | "workspace-write" | "danger-full-access" | null;
+  reasoningEffort: ReasoningEffort | null;
   codexWorkspace: string | null;
   hasResumeInfo: boolean;
   closed: boolean;

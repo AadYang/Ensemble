@@ -15,6 +15,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 import { ClaudeAgentRuntime } from "../claude.js";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Provider } from "../../../db.js";
 import type { RuntimeOptions } from "../types.js";
 
@@ -53,6 +54,7 @@ const baseOpts = (): RuntimeOptions => ({
 
 beforeEach(() => {
   queuedMessages.length = 0;
+  vi.mocked(query).mockClear();
 });
 
 describe("ClaudeAgentRuntime baseline", () => {
@@ -95,5 +97,33 @@ describe("ClaudeAgentRuntime baseline", () => {
     }
     expect(out).toHaveLength(1);
     expect(out[0]).toBe(msg); // referential — runtime is pass-through
+  });
+
+  it("passes explicit thinking mode as Claude Code max thinking tokens", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({ ...baseOpts(), reasoningEffort: "high" })) {
+      // consume stream
+    }
+
+    const call = vi.mocked(query).mock.calls.at(-1);
+    expect(call).toBeDefined();
+    const queryArgs = call![0]!;
+    const options = queryArgs.options!;
+    expect(options.maxThinkingTokens).toBe(16384);
+  });
+
+  it("omits max thinking tokens when thinking mode inherits runtime defaults", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query(baseOpts())) {
+      // consume stream
+    }
+
+    const call = vi.mocked(query).mock.calls.at(-1);
+    expect(call).toBeDefined();
+    const queryArgs = call![0]!;
+    const options = queryArgs.options!;
+    expect(options).not.toHaveProperty("maxThinkingTokens");
   });
 });

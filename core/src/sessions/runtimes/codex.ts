@@ -155,6 +155,7 @@ function locateCodexBinary(): string | null {
 }
 
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 const DEFAULT_CODEX_SANDBOX: SandboxMode = "danger-full-access";
 
 /** Hard kill a codex child process AND its grandchildren.
@@ -211,6 +212,14 @@ function readSandboxFromAgentMetadata(agentMeta: unknown): SandboxMode | null {
   if (agentMeta && typeof agentMeta === "object") {
     const m = (agentMeta as Record<string, unknown>).sandboxMode;
     if (m === "read-only" || m === "workspace-write" || m === "danger-full-access") return m;
+  }
+  return null;
+}
+
+function readReasoningEffortFromAgentMetadata(agentMeta: unknown): ReasoningEffort | null {
+  if (agentMeta && typeof agentMeta === "object") {
+    const m = (agentMeta as Record<string, unknown>).reasoningEffort;
+    if (m === "minimal" || m === "low" || m === "medium" || m === "high" || m === "xhigh") return m;
   }
   return null;
 }
@@ -291,6 +300,7 @@ export function renderMcpConfigTomlForCodexRuntime(
   mcpServers: Record<string, Record<string, unknown>>,
   trustedProjectPaths: readonly string[] = [],
   sandboxMode?: SandboxMode | null,
+  reasoningEffort?: ReasoningEffort | null,
   inheritedUserConfigToml = "",
 ): string {
   const lines: string[] = [
@@ -311,6 +321,9 @@ export function renderMcpConfigTomlForCodexRuntime(
   // pick up the agent's chosen sandbox, with no asymmetry between turns.
   if (sandboxMode) {
     lines.push(`sandbox_mode = "${sandboxMode}"`);
+  }
+  if (reasoningEffort) {
+    lines.push(`model_reasoning_effort = "${reasoningEffort}"`);
   }
   lines.push(
     "",
@@ -349,6 +362,7 @@ export function prepareCodexHomeForRuntime(
   sourceHomeOverride?: string,
   trustedProjectPath?: string,
   sandboxMode?: SandboxMode | null,
+  reasoningEffort?: ReasoningEffort | null,
 ): string {
   // Read login state from the user's normal Codex home by default, but never
   // inherit CODEX_HOME from Ensemble's parent process. Ensemble sets CODEX_HOME
@@ -373,6 +387,7 @@ export function prepareCodexHomeForRuntime(
       mcpServers,
       trustedProjectKeys(trustedProjectPath),
       sandboxMode ?? null,
+      reasoningEffort ?? null,
       inheritedUserConfig,
     ),
     "utf8",
@@ -386,6 +401,7 @@ export function buildCodexExecArgs(opts: {
   promptFromStdin: boolean;
   resume?: string;
   sandbox?: SandboxMode | null;
+  reasoningEffort?: ReasoningEffort | null;
 }): string[] {
   const promptArg = opts.promptFromStdin ? "-" : "";
   const approvalOverride = ["-c", "approval_policy=\"never\""];
@@ -400,12 +416,16 @@ export function buildCodexExecArgs(opts: {
   const sandboxOverride = opts.sandbox
     ? ["-c", `sandbox_mode="${opts.sandbox}"`]
     : [];
+  const reasoningOverride = opts.reasoningEffort
+    ? ["-c", `model_reasoning_effort="${opts.reasoningEffort}"`]
+    : [];
   const common = [
     "--json",
     "--skip-git-repo-check",
     ...modelArgs,
     ...approvalOverride,
     ...sandboxOverride,
+    ...reasoningOverride,
     "--disable",
     "apps",
     "--cd",
@@ -423,6 +443,7 @@ export function buildCodexExecArgs(opts: {
       ...modelArgs,
       ...approvalOverride,
       ...sandboxOverride,
+      ...reasoningOverride,
       "--disable",
       "apps",
       opts.resume,
@@ -517,6 +538,7 @@ export class CodexCliRuntime implements AgentRuntime {
     // Per-agent sandbox override > provider default > Codex CLI config/default.
     const sandbox =
       readSandboxFromAgentMetadata(opts.agentMetadata) ?? readSandboxFromProvider(opts.provider);
+    const reasoningEffort = opts.reasoningEffort ?? readReasoningEffortFromAgentMetadata(opts.agentMetadata);
 
     // W20 Slice 5.5: register peer/ask/Task callbacks with the HTTP MCP
     // bridge keyed on this agent id so codex's MCP client can call them via
@@ -616,6 +638,7 @@ export class CodexCliRuntime implements AgentRuntime {
         undefined,
         opts.cwd,
         sandbox,
+        reasoningEffort,
       );
       codexEnv.CODEX_HOME = codexHome;
     }
@@ -637,6 +660,7 @@ export class CodexCliRuntime implements AgentRuntime {
       promptFromStdin: true,
       resume: canResumeNative ? opts.resume : undefined,
       sandbox,
+      reasoningEffort,
     });
     let codexSessionId = canResumeNative ? opts.resume! : randomUUID();
 
