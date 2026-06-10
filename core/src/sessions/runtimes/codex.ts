@@ -22,7 +22,13 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFi
 import { homedir } from "node:os";
 import { dirname, join as joinPath } from "node:path";
 import type { SdkMessage } from "@agentorch/shared";
-import type { AgentRuntime, RuntimeEvent, RuntimeOptions } from "./types.js";
+import type { AgentRuntime, RuntimeErrorEvent, RuntimeEvent, RuntimeOptions } from "./types.js";
+import {
+  codexUsageSnapshotToDelta,
+  normalizeCodexUsageSnapshot,
+  readCodexUsageSnapshot,
+  type CodexUsageSnapshot,
+} from "./codex-usage.js";
 import {
   getBridgeBaseUrl,
   getBridgeUrl,
@@ -296,6 +302,29 @@ function extractUserCodexRuntimeConfigToml(sourceHome: string): string {
   return compact ? `${compact}\n\n` : "";
 }
 
+function stripRootConfigKeysFromToml(toml: string, keys: ReadonlySet<string>): string {
+  if (toml.trim() === "" || keys.size === 0) return toml;
+  const lines: string[] = [];
+  let currentTable: string | null = null;
+  for (const line of toml.split(/\r?\n/)) {
+    const tableMatch = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
+    const tableName = tableMatch?.[1];
+    if (tableName !== undefined) {
+      currentTable = tableName.trim();
+      lines.push(line);
+      continue;
+    }
+    if (currentTable === null) {
+      const keyMatch = line.match(/^\s*([A-Za-z0-9_.-]+)\s*=/);
+      const key = keyMatch?.[1];
+      if (key !== undefined && keys.has(key)) continue;
+    }
+    lines.push(line);
+  }
+  const compact = lines.join("\n").trim();
+  return compact ? `${compact}\n\n` : "";
+}
+
 export function renderMcpConfigTomlForCodexRuntime(
   mcpServers: Record<string, Record<string, unknown>>,
   trustedProjectPaths: readonly string[] = [],
@@ -303,8 +332,14 @@ export function renderMcpConfigTomlForCodexRuntime(
   reasoningEffort?: ReasoningEffort | null,
   inheritedUserConfigToml = "",
 ): string {
+  const overriddenRootKeys = new Set<string>();
+  if (reasoningEffort) overriddenRootKeys.add("model_reasoning_effort");
+  const safeInheritedUserConfigToml = stripRootConfigKeysFromToml(
+    inheritedUserConfigToml,
+    overriddenRootKeys,
+  );
   const lines: string[] = [
-    ...(inheritedUserConfigToml.trim() ? [inheritedUserConfigToml.trimEnd(), ""] : []),
+    ...(safeInheritedUserConfigToml.trim() ? [safeInheritedUserConfigToml.trimEnd(), ""] : []),
     "# Added by Ensemble for this Codex agent runtime.",
     // Ensemble drives `codex exec --json` as a non-interactive provider.
     // If Codex asks for human approval on MCP calls, the tool request is
@@ -663,6 +698,9 @@ export class CodexCliRuntime implements AgentRuntime {
       reasoningEffort,
     });
     let codexSessionId = canResumeNative ? opts.resume! : randomUUID();
+    const resumeSessionFile = canResumeNative
+      ? findCodexSessionFile(codexHome ?? joinPath(homedir(), ".codex"), opts.resume)
+      : null;
 
     // Diagnostic for the recurring "codex provider can't see peer_send" bug.
     // Logs the exact CLI invocation shape plus which URL we expect codex to
@@ -676,6 +714,13 @@ export class CodexCliRuntime implements AgentRuntime {
         sessionId: opts.sessionId,
         codexPath,
         cliArgs,
+        model: opts.model,
+        reasoningEffort,
+        sandbox,
+        cwd: opts.cwd,
+        resume: canResumeNative ? opts.resume : null,
+        resumeSessionFileExists: resumeSessionFile !== null,
+        resumeSessionFile,
         bridgeBaseUrl,
         codexHome,
         stdioProxyEnvSet: !!codexEnv.ENSEMBLE_MCP_BEARER,
@@ -685,10 +730,12 @@ export class CodexCliRuntime implements AgentRuntime {
     );
 
     let accumulatedText = "";
-    let lastUsage: { input_tokens: number; cached_input_tokens: number; output_tokens: number; reasoning_output_tokens: number } | null = null;
+    let lastUsage: CodexUsageSnapshot | null = null;
+    let turnStarted = false;
+    let turnCompleted = false;
 
     try {
-      const input = canResumeNative ? opts.prompt : buildPromptWithHistory(opts);
+      const input = canResumeNative ? buildCurrentTurnPrompt(opts.prompt) : buildPromptWithHistory(opts);
       const child = spawn(codexPath, cliArgs, {
         cwd: opts.cwd,
         env: codexEnv,
@@ -739,6 +786,8 @@ export class CodexCliRuntime implements AgentRuntime {
           codexSessionId = ev.thread_id;
           continue;
         }
+        if (isRecord(ev) && (ev.type === "turn.started" || ev.type === "turn.failed")) turnStarted = true;
+        if (isRecord(ev) && ev.type === "turn.completed") turnCompleted = true;
         const out = translateEvent(ev, codexSessionId, opts.model);
         if (out.streamEvent) {
           // Emit as stream_event for streaming UX (frontend already
@@ -751,7 +800,11 @@ export class CodexCliRuntime implements AgentRuntime {
         }
         if (out.usage) lastUsage = out.usage;
         if (out.errorMessage) {
-          yield { type: "error", message: out.errorMessage };
+          yield buildCodexRuntimeErrorEvent(out.errorMessage, {
+            usedNativeResume: canResumeNative,
+            turnStarted,
+            turnCompleted,
+          });
           return;
         }
       }
@@ -773,10 +826,22 @@ export class CodexCliRuntime implements AgentRuntime {
         );
       } else if (!opts.abortController.signal.aborted && close.code !== 0) {
         const stderr = stderrChunks.join("").trim();
-        yield {
-          type: "error",
-          message: `codex exec exited with code ${close.code}${close.signal ? ` (${close.signal})` : ""}${stderr ? `\n${stderr}` : ""}`,
-        };
+        yield buildCodexRuntimeErrorEvent(
+          `codex exec exited with code ${close.code}${close.signal ? ` (${close.signal})` : ""}${stderr ? `\n${stderr}` : ""}`,
+          {
+            usedNativeResume: canResumeNative,
+            turnStarted,
+            turnCompleted,
+          },
+        );
+        return;
+      }
+      if (!opts.abortController.signal.aborted && turnStarted && !turnCompleted) {
+        yield buildCodexRuntimeErrorEvent("codex turn ended before turn.completed", {
+          usedNativeResume: canResumeNative,
+          turnStarted,
+          turnCompleted,
+        });
         return;
       }
 
@@ -785,13 +850,16 @@ export class CodexCliRuntime implements AgentRuntime {
       // billingModel='subscription' + costUSD=0 logic lives at the
       // UsageEvent insertion site keyed on provider.kind === 'openai-codex'
       // (W20 Slice 5.6). Tokens here are populated from codex's Usage.
-      const modelUsage = lastUsage
+      const usageDelta = lastUsage
+        ? codexUsageSnapshotToDelta(lastUsage, readCodexUsageSnapshot(opts.agentMetadata))
+        : null;
+      const modelUsage = usageDelta
         ? {
             [opts.model || "codex"]: {
-              inputTokens: lastUsage.input_tokens,
-              outputTokens: lastUsage.output_tokens + lastUsage.reasoning_output_tokens,
-              cacheReadInputTokens: lastUsage.cached_input_tokens,
-              cacheCreationInputTokens: 0,
+              inputTokens: usageDelta.regularInputTokens,
+              outputTokens: usageDelta.outputTokens,
+              cacheReadInputTokens: usageDelta.cacheReadInputTokens,
+              cacheCreationInputTokens: usageDelta.cacheCreationInputTokens,
               costUSD: 0,
               webSearchRequests: 0,
               contextWindow: 0,
@@ -805,12 +873,17 @@ export class CodexCliRuntime implements AgentRuntime {
           subtype: "success",
           session_id: codexSessionId,
           modelUsage,
+          ...(lastUsage ? { _codexUsageSnapshot: lastUsage } : {}),
         },
       };
     } catch (err) {
       if (opts.abortController.signal.aborted) return;
       const msg = err instanceof Error ? err.message : String(err);
-      yield { type: "error", message: msg };
+      yield buildCodexRuntimeErrorEvent(msg, {
+        usedNativeResume: canResumeNative,
+        turnStarted,
+        turnCompleted,
+      });
     } finally {
       // Tear down bridge handler entry so a later turn for a different
       // agent can't accidentally inherit this agent's closures.
@@ -826,6 +899,42 @@ function isLikelyCodexThreadId(id: string | undefined): id is string {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 }
 
+function findCodexSessionFile(codexHome: string, threadId: string | undefined): string | null {
+  if (!threadId) return null;
+  const sessionsRoot = joinPath(codexHome, "sessions");
+  if (!existsSync(sessionsRoot)) return null;
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
+  while (stack.length > 0) {
+    const { dir, depth } = stack.pop()!;
+    if (depth > 5) continue;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }) as Dirent[];
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = joinPath(dir, entry.name);
+      if (entry.isFile() && entry.name.includes(threadId)) return full;
+      if (entry.isDirectory()) stack.push({ dir: full, depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+export function buildCurrentTurnPrompt(prompt: string): string {
+  return [
+    "Ensemble current-turn boundary:",
+    "The request inside <current-user-request> is the active task for this turn.",
+    "Use older thread context only as background. Do not resume, hand off, or continue older tasks unless this request explicitly asks for them.",
+    "If older context conflicts with this request, follow this request.",
+    "",
+    "<current-user-request>",
+    prompt,
+    "</current-user-request>",
+  ].join("\n");
+}
+
 function buildPromptWithHistory(opts: RuntimeOptions): string {
   const turns: string[] = [];
   if (opts.systemPrompt) turns.push(`System instructions:\n${opts.systemPrompt}`);
@@ -838,10 +947,12 @@ function buildPromptWithHistory(opts: RuntimeOptions): string {
       if (text) turns.push(`Assistant:\n${text}`);
     }
   }
-  if (turns.length === 0) return opts.prompt;
-  turns.push(`User:\n${opts.prompt}`);
+  if (turns.length === 0) return buildCurrentTurnPrompt(opts.prompt);
+  turns.push(buildCurrentTurnPrompt(opts.prompt));
   return [
-    "Continue this Ensemble pane conversation. The transcript below is reconstructed from the local pane history because no native Codex thread id was available.",
+    "This is an Ensemble pane transcript reconstructed from local history because no safe native Codex thread id was available.",
+    "The transcript is background only. The final <current-user-request> block is the active task for this turn.",
+    "Do not continue older tasks or peer handoffs from the transcript unless the current request explicitly asks for them.",
     "",
     turns.join("\n\n---\n\n"),
   ].join("\n");
@@ -868,19 +979,27 @@ interface TranslateOut {
   streamEvent?: Record<string, unknown>;
   deltaText?: string;
   assistantMessage?: Record<string, unknown>;
-  usage?: { input_tokens: number; cached_input_tokens: number; output_tokens: number; reasoning_output_tokens: number } | null;
+  usage?: CodexUsageSnapshot | null;
   errorMessage?: string;
 }
 
-function normalizeUsage(value: unknown): TranslateOut["usage"] {
-  if (!isRecord(value)) return null;
-  const n = (key: string) => (typeof value[key] === "number" ? value[key] : 0);
+export function buildCodexRuntimeErrorEvent(
+  message: string,
+  opts: { usedNativeResume: boolean; turnStarted: boolean; turnCompleted: boolean },
+): RuntimeErrorEvent {
+  const interruptedNativeResume = opts.usedNativeResume && opts.turnStarted && !opts.turnCompleted;
+  if (!interruptedNativeResume) return { type: "error", message };
   return {
-    input_tokens: n("input_tokens"),
-    cached_input_tokens: n("cached_input_tokens"),
-    output_tokens: n("output_tokens"),
-    reasoning_output_tokens: n("reasoning_output_tokens"),
+    type: "error",
+    message,
+    code: "RESUME_TURN_INTERRUPTED",
+    recoverable: true,
+    resumeScoped: true,
   };
+}
+
+function normalizeUsage(value: unknown): TranslateOut["usage"] {
+  return normalizeCodexUsageSnapshot(value);
 }
 
 function errorMessageFromUnknown(value: unknown): string {

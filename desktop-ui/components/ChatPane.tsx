@@ -538,7 +538,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
       void handleSlash(text);
       return;
     }
-    appendUserTurn(agentId, text);
+    if (summary.status !== "running") appendUserTurn(agentId, text);
     ws.send({ type: "send_message", sessionId: agentId, text });
   };
   const onCancel = () => ws.send({ type: "cancel", sessionId: agentId });
@@ -652,7 +652,6 @@ export function ChatPane({ agentId }: { agentId: string }) {
       if (picker) return;
       const text = input.trim();
       if (!text) return;
-      if (summary.status === "running") return;
       if (summary.closed && !text.startsWith("/")) return;
       onSend(text);
       clearInputDraft(agentId);
@@ -814,7 +813,6 @@ export function ChatPane({ agentId }: { agentId: string }) {
             onBlur={recordInputSelection}
             onFocus={restoreInputSelection}
             placeholder={ghostSuffix ? "" : picker ? t("slash.picker.placeholder") : t("chat.placeholder")}
-            disabled={summary.status === "running"}
             rows={1}
           />
         </div>
@@ -822,7 +820,6 @@ export function ChatPane({ agentId }: { agentId: string }) {
           type="submit"
           className="shrink-0 px-3 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
           disabled={
-            summary.status === "running" ||
             !input.trim() ||
             (summary.closed && !input.trim().startsWith("/"))
           }

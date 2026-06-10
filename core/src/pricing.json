@@ -1,8 +1,9 @@
 {
-  "version": "2026-05-11",
+  "version": "2026-05-28",
   "note": "USD per 1M tokens. Source: provider official pricing pages, recalibrated quarterly.",
   "models": {
-    "claude-opus-4-7":           { "input": 15.00, "output": 75.00, "cacheRead": 1.50,  "cacheWrite": 18.75, "_source": "anthropic.com/pricing" },
+    "claude-opus-4-8":           { "input":  5.00, "output": 25.00, "cacheRead": 0.50,  "cacheWrite":  6.25, "_source": "anthropic.com/news/claude-opus-4-8" },
+    "claude-opus-4-7":           { "input":  5.00, "output": 25.00, "cacheRead": 0.50,  "cacheWrite":  6.25, "_source": "anthropic.com/news/claude-opus-4-8" },
     "claude-opus-4":             { "input": 15.00, "output": 75.00, "cacheRead": 1.50,  "cacheWrite": 18.75, "_source": "anthropic.com/pricing" },
     "claude-sonnet-4-6":         { "input":  3.00, "output": 15.00, "cacheRead": 0.30,  "cacheWrite":  3.75, "_source": "anthropic.com/pricing" },
     "claude-sonnet-4-5":         { "input":  3.00, "output": 15.00, "cacheRead": 0.30,  "cacheWrite":  3.75, "_source": "anthropic.com/pricing" },

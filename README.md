@@ -94,6 +94,13 @@ Ensemble desktop app (Tauri 2.x)
 npm i -g @openai/codex
 ```
 
+支持的本地 CLI 版本：
+
+| Runtime | 支持版本 | 说明 |
+|---|---|---|
+| Codex CLI | `0.132.0` 或更新版本；当前按 `0.13x` 系列维护，已适配 `0.138.0` 的配置校验行为 | Ensemble 会解析真实平台二进制并使用隔离的 `CODEX_HOME`，不会直接写入 `~/.codex/config.toml`。 |
+| Claude Code CLI | 当前按 `2.1.x` 系列维护；已验证 `2.1.167` | Ensemble 通过 `@anthropic-ai/claude-agent-sdk` 调用本机 `claude`，建议保持 Claude Code CLI 为最新稳定版。 |
+
 Claude Code CLI 请按 Anthropic 官方方式安装并完成登录。
 
 ### 常用命令
@@ -237,6 +244,13 @@ Optional runtime CLI:
 ```bash
 npm i -g @openai/codex
 ```
+
+Supported local CLI versions:
+
+| Runtime | Supported versions | Notes |
+|---|---|---|
+| Codex CLI | `0.132.0` or newer; currently maintained against the `0.13x` series and adapted for the `0.138.0` config validation behavior | Ensemble resolves the real platform binary and uses an isolated `CODEX_HOME`; it does not write directly to `~/.codex/config.toml`. |
+| Claude Code CLI | Currently maintained against the `2.1.x` series; verified with `2.1.167` | Ensemble invokes the local `claude` through `@anthropic-ai/claude-agent-sdk`; keep Claude Code CLI on the latest stable release. |
 
 Install Claude Code CLI through Anthropic's official instructions and complete login before using Claude local providers.
 

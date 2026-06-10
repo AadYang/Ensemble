@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS Agent (
   systemPrompt TEXT,
   status TEXT NOT NULL DEFAULT 'IDLE'
     CHECK (status IN ('IDLE','RUNNING','AWAITING_PERMISSION','AWAITING_USER_INPUT','ERROR','DONE')),
-  model TEXT NOT NULL DEFAULT 'claude-opus-4-7',
+  model TEXT NOT NULL DEFAULT 'claude-opus-4-8',
   providerId TEXT REFERENCES Provider(id) ON DELETE RESTRICT,
   workspace TEXT,
   codexWorkspace TEXT,

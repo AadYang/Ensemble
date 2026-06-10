@@ -102,9 +102,19 @@ export interface RuntimeOptions {
   skillInvoke?: (args: { name: string }) => Promise<string>;
 }
 
+export type RuntimeErrorCode = "RESUME_TURN_INTERRUPTED";
+
+export interface RuntimeErrorEvent {
+  type: "error";
+  message: string;
+  code?: RuntimeErrorCode;
+  recoverable?: boolean;
+  resumeScoped?: boolean;
+}
+
 export type RuntimeEvent =
   | { type: "sdk_message"; payload: SdkMessage }
-  | { type: "error"; message: string };
+  | RuntimeErrorEvent;
 
 export interface AgentRuntime {
   /** Yields RuntimeEvents for one turn of conversation. Caller iterates via

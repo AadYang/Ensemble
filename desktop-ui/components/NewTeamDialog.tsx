@@ -13,6 +13,7 @@ import { useT } from "@/i18n/useT";
 // creation. AgentSettings hardcodes these three so users can pick something
 // sensible without an explicit refresh; NewTeamDialog should do the same.
 const FALLBACK_MODELS = [
+  "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001",

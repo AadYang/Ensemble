@@ -17,6 +17,7 @@ import { getDialog } from "@/lib/dialog";
 import { SuggestSubagentDialog } from "./SuggestSubagentDialog";
 
 const FALLBACK_MODELS = [
+  "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001",
@@ -97,7 +98,7 @@ export function AgentSettings({
 
   // Reset model when the active provider changes to one that doesn't list the
   // current value. Without this the dropdown's stale-model fallback option
-  // mixes claude-opus-4-7 (or whatever the agent had) into the codex/openai
+  // mixes claude-opus-4-8 (or whatever the agent had) into the codex/openai
   // model list — and "Apply" would PATCH that incompatible model upstream.
   useEffect(() => {
     const sp = providers.find((p) => p.id === providerId);

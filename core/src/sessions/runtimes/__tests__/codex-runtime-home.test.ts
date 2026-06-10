@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCodexExecArgs,
   buildCodexInternalStdioServerConfig,
+  buildCodexRuntimeErrorEvent,
   buildCodexMcpListArgs,
+  buildCurrentTurnPrompt,
   prepareCodexHomeForRuntime,
   renderMcpConfigTomlForCodexRuntime,
 } from "../codex.js";
@@ -108,6 +110,36 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     expect(buildCodexMcpListArgs()).toEqual(["mcp", "--disable", "apps", "list"]);
   });
 
+  it("wraps Codex prompts with a current-turn boundary", () => {
+    const prompt = buildCurrentTurnPrompt("fix B, not A");
+    expect(prompt).toContain("<current-user-request>");
+    expect(prompt).toContain("fix B, not A");
+    expect(prompt).toContain("Do not resume, hand off, or continue older tasks");
+  });
+
+  it("marks interrupted native resume turns with structured recovery metadata", () => {
+    expect(buildCodexRuntimeErrorEvent("closed before completion", {
+      usedNativeResume: true,
+      turnStarted: true,
+      turnCompleted: false,
+    })).toEqual({
+      type: "error",
+      message: "closed before completion",
+      code: "RESUME_TURN_INTERRUPTED",
+      recoverable: true,
+      resumeScoped: true,
+    });
+
+    expect(buildCodexRuntimeErrorEvent("provider failed", {
+      usedNativeResume: false,
+      turnStarted: true,
+      turnCompleted: false,
+    })).toEqual({
+      type: "error",
+      message: "provider failed",
+    });
+  });
+
   it("builds a stdio MCP config for the internal Codex bridge", () => {
     const cfg = buildCodexInternalStdioServerConfig({
       ENSEMBLE_MCP_BASE_URL: "http://127.0.0.1:12345",
@@ -179,6 +211,30 @@ describe("Codex runtime isolated CODEX_HOME", () => {
       "xhigh",
     );
     expect(toml).toContain("model_reasoning_effort = \"xhigh\"");
+  });
+
+  it("does not duplicate inherited model_reasoning_effort when an agent override is supplied", () => {
+    const toml = renderMcpConfigTomlForCodexRuntime(
+      {
+        "agentorch-internal-abcd1234": {
+          url: "http://127.0.0.1:1234/api/mcp/internal/agent",
+        },
+      },
+      [],
+      null,
+      "xhigh",
+      [
+        "model_provider = \"openai\"",
+        "model_reasoning_effort = \"low\"",
+        "",
+        "[model_providers.openai]",
+        "name = \"OpenAI\"",
+      ].join("\n"),
+    );
+    const matches = toml.match(/^model_reasoning_effort\s*=/gm) ?? [];
+    expect(matches).toHaveLength(1);
+    expect(toml).toContain("model_reasoning_effort = \"xhigh\"");
+    expect(toml).not.toContain("model_reasoning_effort = \"low\"");
   });
 
   it("copies auth.json and connection settings without stale user MCP config", () => {

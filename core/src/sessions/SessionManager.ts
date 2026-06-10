@@ -7,7 +7,11 @@ import type { CanUseTool, Options, PermissionResult } from "@anthropic-ai/claude
 import type { SdkMessage } from "@agentorch/shared";
 import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
 import { chooseRuntime } from "./runtimes/index.js";
-import type { RuntimeOptions } from "./runtimes/types.js";
+import type { RuntimeErrorCode, RuntimeErrorEvent, RuntimeOptions } from "./runtimes/types.js";
+import {
+  normalizeCodexUsageSnapshot,
+  type CodexUsageSnapshot,
+} from "./runtimes/codex-usage.js";
 import {
   makePeerMcpServer,
   makePeerSendHandler,
@@ -64,8 +68,11 @@ import { currentPlatformKey } from "../platform-key.js";
  * keeps sessions reachable for resume regardless of where the EXE lives. */
 const STABLE_CWD = homedir();
 const CODEX_DEFAULT_CWD = ensureDataDir();
-const FIRST_MODEL_RESPONSE_TIMEOUT_MS = 60_000;
-const TURN_COMPLETION_IDLE_TIMEOUT_MS = 60_000;
+const CODEX_DEFAULT_SANDBOX: SandboxMode = "danger-full-access";
+const FIRST_MODEL_RESPONSE_TIMEOUT_MS = 600_000;
+const CODEX_RESUME_SIGNATURE_KEY = "codexResumeSignature";
+const CODEX_RESUME_SIGNATURE_VERSION = 1;
+const RESUME_METADATA_KEYS = ["lastSessionId", "codexUsageSnapshot", CODEX_RESUME_SIGNATURE_KEY] as const;
 
 function isInternalSystemMessage(msg: unknown): boolean {
   return (
@@ -76,21 +83,25 @@ function isInternalSystemMessage(msg: unknown): boolean {
   );
 }
 
-function isTextDeltaStreamEvent(msg: unknown): boolean {
-  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "stream_event") return false;
+function textDeltaFromStreamEvent(msg: unknown): string | null {
+  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "stream_event") return null;
   const event = (msg as { event?: { type?: unknown; delta?: { type?: unknown; text?: unknown } } }).event;
-  return (
+  const isTextDelta =
     event?.type === "content_block_delta" &&
     event.delta?.type === "text_delta" &&
     typeof event.delta.text === "string" &&
-    event.delta.text.length > 0
-  );
+    event.delta.text.length > 0;
+  if (!isTextDelta) return null;
+  return event.delta!.text as string;
 }
 
-function assistantHasText(msg: unknown): boolean {
-  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "assistant") return false;
+function assistantTextFromMessage(msg: unknown): string {
+  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "assistant") return "";
   const blocks = (msg as { message?: { content?: Array<{ type?: unknown; text?: unknown }> } }).message?.content ?? [];
-  return blocks.some((b) => b.type === "text" && typeof b.text === "string" && b.text.length > 0);
+  return blocks
+    .filter((b) => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string)
+    .join("");
 }
 
 function currentRuntimeFromProviderMeta(meta: unknown): { cliPath?: unknown; authPresent?: unknown } | null {
@@ -130,7 +141,6 @@ interface RunningSession {
   runId: string;
   abort: AbortController;
   seq: number;
-  suspendCompletionIdleTimer?: () => void;
   /** Per-turn auto-allow cache, keyed by toolName. User clicking "Allow" on
    *  a permission dialog adds the tool name here; subsequent canUseTool calls
    *  with the same toolName during this turn skip the dialog. Cleared when
@@ -138,6 +148,20 @@ interface RunningSession {
    *  Deny is NOT cached — the model gets per-call rejection feedback and may
    *  reasonably retry with different input. */
   autoAllowedTools: Set<string>;
+  clearResumeOnAbort?: boolean;
+}
+
+interface QueuedTurn {
+  userInput: string;
+  opts?: {
+    peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
+  };
+  resolve: (result: { finalText: string } | null) => void;
+}
+
+interface LiveTranscript {
+  current: string;
+  finalized: string[];
 }
 
 interface PendingPermission {
@@ -224,6 +248,16 @@ export const readReasoningEffortOverride = (metadata: unknown): ReasoningEffort 
   return null;
 };
 
+const readProviderDefaultSandbox = (metadata: unknown): SandboxMode => {
+  if (metadata && typeof metadata === "object" && "defaultSandbox" in metadata) {
+    const m = (metadata as { defaultSandbox: unknown }).defaultSandbox;
+    if (typeof m === "string" && VALID_SANDBOX_MODES.has(m as SandboxMode)) {
+      return m as SandboxMode;
+    }
+  }
+  return CODEX_DEFAULT_SANDBOX;
+};
+
 const providerSupportsReasoningEffort = (kind: string | null | undefined): boolean =>
   kind === null ||
   kind === undefined ||
@@ -237,6 +271,27 @@ const readMetaString = (metadata: unknown, key: string): string | null => {
     return typeof v === "string" ? v : null;
   }
   return null;
+};
+
+export const buildCodexResumeSignature = (opts: {
+  providerId: string | null;
+  model: string;
+  reasoningEffort: ReasoningEffort | null;
+  sandboxMode: SandboxMode;
+  cwd: string;
+  systemPromptHash: string;
+}): string => {
+  const stable = {
+    version: CODEX_RESUME_SIGNATURE_VERSION,
+    providerId: opts.providerId ?? "",
+    model: opts.model,
+    reasoningEffort: opts.reasoningEffort ?? "",
+    sandboxMode: opts.sandboxMode,
+    cwd: opts.cwd,
+    systemPromptHash: opts.systemPromptHash,
+    mcpShape: "ensemble-codex-stdio-v1",
+  };
+  return createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 16);
 };
 
 const readMetaBool = (metadata: unknown, key: string): boolean => {
@@ -262,6 +317,64 @@ const removeMetadataKeys = (cur: unknown, keys: string[]): object => {
   for (const key of keys) delete next[key];
   return next;
 };
+
+type RuntimeErrorDetails = {
+  runtimeCode?: RuntimeErrorCode;
+  runtimeRecoverable?: boolean;
+  runtimeResumeScoped?: boolean;
+};
+
+const runtimeErrorFromEvent = (event: RuntimeErrorEvent): Error & RuntimeErrorDetails => {
+  const err = new Error(event.message) as Error & RuntimeErrorDetails;
+  if (event.code !== undefined) err.runtimeCode = event.code;
+  if (event.recoverable !== undefined) err.runtimeRecoverable = event.recoverable;
+  if (event.resumeScoped !== undefined) err.runtimeResumeScoped = event.resumeScoped;
+  return err;
+};
+
+export const isRuntimeResumeRecoverySignal = (
+  code: unknown,
+  recoverable: unknown,
+  resumeScoped: unknown,
+  usedResumeSessionId: string | null,
+): boolean =>
+  usedResumeSessionId !== null &&
+  code === "RESUME_TURN_INTERRUPTED" &&
+  recoverable === true &&
+  resumeScoped === true;
+
+// Legacy fallback for runtimes/CLI versions that still flatten transport
+// failures to text. New Codex recovery uses RuntimeErrorEvent.code instead.
+export const isResumeScopedStreamFailure = (rawMsg: string, usedResumeSessionId: string | null): boolean => {
+  if (!usedResumeSessionId) return false;
+  const msg = rawMsg.toLowerCase();
+  return (
+    msg.includes("stream disconnected before completion") ||
+    msg.includes("failed to send websocket request") ||
+    msg.includes("os error 10053") ||
+    msg.includes("connection reset") ||
+    msg.includes("connection aborted")
+  );
+};
+
+export const runtimeHistoryFromCompletedTurns = (
+  rows: Array<{ type: string; payload: unknown }>,
+): SdkMessage[] => {
+  const lastResultIndex = rows.map((row) => row.type).lastIndexOf("result");
+  const completedRows =
+    lastResultIndex >= 0
+      ? rows.slice(0, lastResultIndex + 1)
+      : rows.slice(0, trailingCompleteHistoryEnd(rows));
+  return completedRows
+    .filter((m) => m.type === "user" || m.type === "assistant")
+    .map((m) => m.payload as SdkMessage);
+};
+
+function trailingCompleteHistoryEnd(rows: Array<{ type: string }>): number {
+  let end = rows.length;
+  while (end > 0 && rows[end - 1]?.type === "user") end--;
+  return end;
+}
 
 const normalizeCodexWorkspace = (value: string | null | undefined): string | null | undefined => {
   if (value === undefined) return undefined;
@@ -303,6 +416,9 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
 
 export class SessionManager {
   private running = new Map<string, RunningSession>();
+  private queuedTurns = new Map<string, QueuedTurn[]>();
+  private drainingQueues = new Set<string>();
+  private liveTranscripts = new Map<string, LiveTranscript>();
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
 
@@ -341,7 +457,7 @@ export class SessionManager {
       data: {
         name: opts.name,
         systemPrompt: opts.systemPrompt,
-        model: opts.model ?? "claude-opus-4-7",
+        model: opts.model ?? "claude-opus-4-8",
         parentId: opts.parentId,
         providerId,
         ...(codexWorkspace !== undefined ? { codexWorkspace } : {}),
@@ -388,7 +504,7 @@ export class SessionManager {
         if (readMetaString(m.metadata, "lastSessionId") === null) continue;
         const updated = await prisma.agent.update({
           where: { id: m.id },
-          data: { metadata: removeMetadataKeys(m.metadata, ["lastSessionId"]) },
+          data: { metadata: removeMetadataKeys(m.metadata, [...RESUME_METADATA_KEYS]) },
         });
         this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
       }
@@ -614,7 +730,16 @@ export class SessionManager {
       systemPrompt?: string | null;
       teamId?: string | null;
     } = {};
-    if (patch.model !== undefined) data.model = patch.model;
+    if (patch.model !== undefined) {
+      data.model = patch.model;
+      // Native CLI resume threads are not model-agnostic. Reusing a cached
+      // thread after changing the agent model can make Codex resume an old
+      // backend/session shape while Ensemble believes it is running the new
+      // model.
+      if (patch.model !== cur.model) {
+        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
+      }
+    }
     if (patch.name !== undefined) data.name = patch.name;
     if (patch.providerId !== undefined) data.providerId = patch.providerId;
     if (patch.permissionMode !== undefined) {
@@ -627,7 +752,7 @@ export class SessionManager {
       // OLD systemPrompt at session start. Drop the resume pointer so the next
       // turn opens a fresh session and the new prompt actually takes effect.
       if (next !== cur.systemPrompt) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["lastSessionId"]);
+        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
       }
     }
     if (patch.teamId !== undefined) {
@@ -639,7 +764,7 @@ export class SessionManager {
       // Team membership affects the TEAM CONTEXT injected into systemPrompt
       // at runtime; drop lastSessionId so the next turn rebuilds context fresh.
       if (patch.teamId !== cur.teamId) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["lastSessionId"]);
+        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
       }
     }
     const targetProviderId = patch.providerId !== undefined ? patch.providerId : cur.providerId;
@@ -653,11 +778,11 @@ export class SessionManager {
       }
       data.codexWorkspace = codexWorkspace;
       if (codexWorkspace !== cur.codexWorkspace) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["lastSessionId"]);
+        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
       }
     } else if (patch.providerId !== undefined && targetProvider?.kind !== "openai-codex" && cur.codexWorkspace) {
       data.codexWorkspace = null;
-      data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["lastSessionId"]);
+      data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
     }
     if (patch.sandboxMode !== undefined) {
       if (patch.sandboxMode !== null && targetProvider?.kind !== "openai-codex") {
@@ -672,7 +797,7 @@ export class SessionManager {
         // Codex `exec resume` cannot accept a new --sandbox/--cd. Drop the
         // native resume pointer so the next user turn starts a fresh Codex
         // session with the newly selected sandbox.
-        data.metadata = removeMetadataKeys(data.metadata, ["lastSessionId"]);
+        data.metadata = removeMetadataKeys(data.metadata, [...RESUME_METADATA_KEYS]);
       }
     } else if (patch.providerId !== undefined && targetProvider?.kind !== "openai-codex" && readSandboxOverride(cur.metadata) !== null) {
       data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["sandboxMode"]);
@@ -687,7 +812,7 @@ export class SessionManager {
         ? removeMetadataKeys(baseMeta, ["reasoningEffort"])
         : mergeMetadata(baseMeta, { reasoningEffort: patch.reasoningEffort });
       if (patch.reasoningEffort !== previousReasoningEffort) {
-        data.metadata = removeMetadataKeys(data.metadata, ["lastSessionId"]);
+        data.metadata = removeMetadataKeys(data.metadata, [...RESUME_METADATA_KEYS]);
       }
     } else if (
       patch.providerId !== undefined &&
@@ -713,7 +838,7 @@ export class SessionManager {
       if (readMetaString(a.metadata, "lastSessionId") === null) continue;
       const updated = await prisma.agent.update({
         where: { id: a.id },
-        data: { metadata: removeMetadataKeys(a.metadata, ["lastSessionId"]) },
+        data: { metadata: removeMetadataKeys(a.metadata, [...RESUME_METADATA_KEYS]) },
       });
       this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
     }
@@ -806,7 +931,7 @@ export class SessionManager {
     if (readMetaString(cur.metadata, "lastSessionId") !== null) {
       await prisma.agent.update({
         where: { id },
-        data: { metadata: removeMetadataKeys(cur.metadata, ["lastSessionId"]) },
+        data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
       });
     }
     this.hub.broadcast({ type: "agent_history_reset", sessionId: id, reason: "clear" });
@@ -882,7 +1007,7 @@ export class SessionManager {
     if (readMetaString(cur.metadata, "lastSessionId") !== null) {
       await prisma.agent.update({
         where: { id },
-        data: { metadata: removeMetadataKeys(cur.metadata, ["lastSessionId"]) },
+        data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
       });
     }
     this.hub.broadcast({
@@ -1094,6 +1219,100 @@ export class SessionManager {
     return { finalText: result?.finalText ?? "", subagentId: child.id };
   }
 
+  private enqueueTurn(
+    sessionId: string,
+    userInput: string,
+    opts?: {
+      peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
+    },
+  ): Promise<{ finalText: string } | null> {
+    return new Promise((resolve) => {
+      const q = this.queuedTurns.get(sessionId) ?? [];
+      q.push({ userInput, opts, resolve });
+      this.queuedTurns.set(sessionId, q);
+      this.hub.sendToSession(sessionId, {
+        type: "status",
+        sessionId,
+        status: "running",
+      });
+    });
+  }
+
+  private drainQueuedTurns(sessionId: string): void {
+    if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
+    const next = this.queuedTurns.get(sessionId)?.shift();
+    if (!next) {
+      this.queuedTurns.delete(sessionId);
+      return;
+    }
+    if (this.queuedTurns.get(sessionId)?.length === 0) {
+      this.queuedTurns.delete(sessionId);
+    }
+    this.drainingQueues.add(sessionId);
+    void this.runMessageNow(sessionId, next.userInput, next.opts)
+      .then(next.resolve)
+      .catch((err) => {
+        console.error(`[queued-turn] sendMessage to ${sessionId} failed:`, err);
+        next.resolve(null);
+      })
+      .finally(() => {
+        this.drainingQueues.delete(sessionId);
+        this.drainQueuedTurns(sessionId);
+      });
+  }
+
+  private clearQueuedTurns(sessionId: string): void {
+    const q = this.queuedTurns.get(sessionId);
+    if (!q) return;
+    this.queuedTurns.delete(sessionId);
+    for (const turn of q) turn.resolve(null);
+  }
+
+  private recordLiveTranscript(sessionId: string, msg: unknown): void {
+    const delta = textDeltaFromStreamEvent(msg);
+    if (delta !== null) {
+      const live = this.liveTranscripts.get(sessionId) ?? { current: "", finalized: [] };
+      live.current += delta;
+      this.liveTranscripts.set(sessionId, live);
+      return;
+    }
+
+    const assistantText = assistantTextFromMessage(msg);
+    if (assistantText.length > 0) {
+      const live = this.liveTranscripts.get(sessionId) ?? { current: "", finalized: [] };
+      const finalized = assistantText.trim();
+      if (finalized && finalized !== live.current.trim()) live.finalized.push(finalized);
+      else if (finalized) live.finalized.push(live.current.trim());
+      live.current = "";
+      this.liveTranscripts.set(sessionId, live);
+      return;
+    }
+
+    if (msg && typeof msg === "object" && (msg as { type?: unknown }).type === "result") {
+      this.liveTranscripts.delete(sessionId);
+    }
+  }
+
+  private formatLiveTranscript(sessionId: string): string | null {
+    const live = this.liveTranscripts.get(sessionId);
+    if (!live) return null;
+    const parts = [...live.finalized];
+    if (live.current.trim()) parts.push(live.current.trim());
+    const text = parts.join("\n\n").trim();
+    if (!text) return null;
+    const MAX_LIVE_CHARS = 6000;
+    const clipped =
+      text.length <= MAX_LIVE_CHARS
+        ? text
+        : `${text.slice(0, 2800)}\n\n[... ${text.length - 5600} live chars truncated ...]\n\n${text.slice(-2800)}`;
+    return [
+      `target is currently running; live assistant output visible so far:`,
+      "",
+      "[assistant/live]",
+      clipped,
+    ].join("\n");
+  }
+
   async sendMessage(
     sessionId: string,
     userInput: string,
@@ -1101,16 +1320,25 @@ export class SessionManager {
       peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
     },
   ): Promise<{ finalText: string } | null> {
-    if (this.running.has(sessionId)) {
-      this.hub.sendToSession(sessionId, {
-        type: "error",
-        sessionId,
-        code: "BUSY",
-        message: "agent is already running, cancel before sending another message",
-      });
-      return null;
+    if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) {
+      return this.enqueueTurn(sessionId, userInput, opts);
     }
+    this.drainingQueues.add(sessionId);
+    try {
+      return await this.runMessageNow(sessionId, userInput, opts);
+    } finally {
+      this.drainingQueues.delete(sessionId);
+      this.drainQueuedTurns(sessionId);
+    }
+  }
 
+  private async runMessageNow(
+    sessionId: string,
+    userInput: string,
+    opts?: {
+      peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
+    },
+  ): Promise<{ finalText: string } | null> {
     const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
     if (!agent) {
       this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
@@ -1135,18 +1363,12 @@ export class SessionManager {
     const abort = new AbortController();
     const runId = randomUUID();
     let staleResume = false;
+    let usedResumeSessionId: string | null = null;
     let firstModelResponseTimer: NodeJS.Timeout | null = null;
-    let turnCompletionIdleTimer: NodeJS.Timeout | null = null;
     const clearFirstModelResponseTimer = () => {
       if (firstModelResponseTimer) {
         clearTimeout(firstModelResponseTimer);
         firstModelResponseTimer = null;
-      }
-    };
-    const clearTurnCompletionIdleTimer = () => {
-      if (turnCompletionIdleTimer) {
-        clearTimeout(turnCompletionIdleTimer);
-        turnCompletionIdleTimer = null;
       }
     };
     const armFirstModelResponseTimer = () => {
@@ -1166,24 +1388,12 @@ export class SessionManager {
         });
       }, FIRST_MODEL_RESPONSE_TIMEOUT_MS);
     };
-    const armTurnCompletionIdleTimer = () => {
-      clearTurnCompletionIdleTimer();
-      turnCompletionIdleTimer = setTimeout(() => {
-        void this.forceStopRun(sessionId, {
-          expectedRunId: runId,
-          dbStatus: "DONE",
-          protoStatus: "done",
-          logPrefix: "runtime-idle-after-output",
-        });
-      }, TURN_COMPLETION_IDLE_TIMEOUT_MS);
-    };
 
     this.running.set(sessionId, {
       id: sessionId,
       runId,
       abort,
       seq,
-      suspendCompletionIdleTimer: clearTurnCompletionIdleTimer,
       autoAllowedTools: new Set<string>(),
     });
 
@@ -1222,6 +1432,7 @@ export class SessionManager {
     const permissionMode = readPermissionMode(agent.metadata);
     const lastSessionId = readMetaString(agent.metadata, "lastSessionId");
     let capturedSessionId: string | null = lastSessionId;
+    let latestCodexUsageSnapshot: CodexUsageSnapshot | null = null;
     let finalText = "";
     // Resolve provider env. anthropic-local (no baseUrl/apiKey) inherits process.env.
     // W16: openai-compat is now handled by OpenAIAgentRuntime (Slice 2+); during
@@ -1319,23 +1530,30 @@ export class SessionManager {
       // db and hand them to the runtime — Claude side ignores `history`
       // (CLI session file is the source of truth there).
       const isCodexKind = resolvedProvider?.kind === "openai-codex";
+      const runningEntry = this.running.get(sessionId);
+      if (runningEntry?.runId === runId) {
+        runningEntry.clearResumeOnAbort = isCodexKind;
+      }
       const isOpenAIKind =
         resolvedProvider?.kind === "openai-compat" ||
         resolvedProvider?.kind === "openai-local" ||
         isCodexKind;
-      const priorMessages: SdkMessage[] =
-        isOpenAIKind
-          ? (await prisma.message.findMany({
-              where: { agentId: sessionId },
-              orderBy: { seq: "asc" },
-            }))
+      const priorRows = isOpenAIKind
+        ? (await prisma.message.findMany({
+            where: { agentId: sessionId },
+            orderBy: { seq: "asc" },
+          }))
               // Drop the user message we just persisted (it's opts.prompt) and
               // the system/init / stream_event / result rows — those don't
               // round-trip into the OpenAI Agents input items.
               .filter((m) => m.seq < userPersisted.seq)
-              .filter((m) => m.type === "user" || m.type === "assistant")
-              .map((m) => m.payload as SdkMessage)
           : [];
+      const priorMessages: SdkMessage[] =
+        isCodexKind
+          ? runtimeHistoryFromCompletedTurns(priorRows)
+          : priorRows
+              .filter((m) => m.type === "user" || m.type === "assistant")
+              .map((m) => m.payload as SdkMessage);
       const runtimeCwd = isCodexKind ? agent.codexWorkspace || CODEX_DEFAULT_CWD : STABLE_CWD;
       // W21: precompute team context (async DB read) so the systemPrompt IIFE
       // below stays synchronous. Empty string when agent isn't in a team.
@@ -1389,16 +1607,62 @@ export class SessionManager {
       const promptStableSig = [primer, planNotice, tailRole].join("\n\n---\n\n");
       const promptHash = createHash("sha1").update(promptStableSig).digest("hex").slice(0, 16);
       const storedPromptHash = readMetaString(agent.metadata, "systemPromptHash");
+      const codexReasoningEffort = readReasoningEffortOverride(agent.metadata);
+      const codexSandboxMode = isCodexKind
+        ? readSandboxOverride(agent.metadata) ?? readProviderDefaultSandbox(resolvedProvider?.metadata)
+        : null;
+      const codexResumeSignature = isCodexKind
+        ? buildCodexResumeSignature({
+            providerId: resolvedProvider?.id ?? null,
+            model: agent.model,
+            reasoningEffort: codexReasoningEffort,
+            sandboxMode: codexSandboxMode ?? CODEX_DEFAULT_SANDBOX,
+            cwd: runtimeCwd,
+            systemPromptHash: promptHash,
+          })
+        : null;
+      const storedCodexResumeSignature = readMetaString(agent.metadata, CODEX_RESUME_SIGNATURE_KEY);
       // If the assembled prompt's identity changed since we last persisted it,
       // the cached session is running with stale instructions. Drop the
       // resume pointer so the next turn opens a fresh CLI session and the
       // updated prompt actually reaches the model.
-      const effectiveLastSessionId =
-        storedPromptHash !== null && storedPromptHash !== promptHash ? null : lastSessionId;
+      let resumeInvalidReason: string | null = null;
+      if (storedPromptHash !== null && storedPromptHash !== promptHash) {
+        resumeInvalidReason = "systemPromptHash";
+      }
+      if (
+        resumeInvalidReason === null &&
+        isCodexKind &&
+        lastSessionId !== null &&
+        storedCodexResumeSignature !== codexResumeSignature
+      ) {
+        resumeInvalidReason =
+          storedCodexResumeSignature === null ? "missingCodexResumeSignature" : "codexResumeSignature";
+      }
+      const effectiveLastSessionId = resumeInvalidReason ? null : lastSessionId;
+      usedResumeSessionId = effectiveLastSessionId;
       if (effectiveLastSessionId === null && lastSessionId !== null) {
         console.log(
-          `[sendMessage] systemPrompt drift detected agent=${sessionId.slice(0, 8)} ` +
+          `[sendMessage] resume invalidated agent=${sessionId.slice(0, 8)} reason=${resumeInvalidReason} ` +
             `stored=${storedPromptHash} current=${promptHash} — clearing resume pointer`,
+        );
+      }
+      if (isCodexKind) {
+        console.error(
+          JSON.stringify({
+            codexDispatch: true,
+            agentId: sessionId,
+            runId,
+            model: agent.model,
+            reasoningEffort: codexReasoningEffort,
+            sandboxMode: codexSandboxMode,
+            cwd: runtimeCwd,
+            hasLastSessionId: lastSessionId !== null,
+            resumeSessionId: effectiveLastSessionId,
+            storedCodexResumeSignature,
+            codexResumeSignature,
+            resumeInvalidReason,
+          }),
         );
       }
       const runtimeOpts: RuntimeOptions = {
@@ -1473,7 +1737,7 @@ export class SessionManager {
         // W20: codex runtime reads sandboxMode from this blob (per-agent
         // override). Other runtimes ignore it.
         agentMetadata: agent.metadata,
-        reasoningEffort: readReasoningEffortOverride(agent.metadata),
+        reasoningEffort: codexReasoningEffort,
         // Slice 5.1: session-aware callbacks for OpenAIAgentRuntime to
         // register as NormalizedTools. Claude side ignores — same operations
         // already arrive via allMcpServers (peer + ask-user MCP). The closures
@@ -1508,16 +1772,11 @@ export class SessionManager {
       for await (const event of stream) {
         if (event.type === "error") {
           clearFirstModelResponseTimer();
-          throw new Error(event.message);
+          throw runtimeErrorFromEvent(event);
         }
         const msg = event.payload;
         if (msg.type === "assistant" || msg.type === "result") {
           clearFirstModelResponseTimer();
-        }
-        if (msg.type === "result") {
-          clearTurnCompletionIdleTimer();
-        } else if (isTextDeltaStreamEvent(msg) || assistantHasText(msg)) {
-          armTurnCompletionIdleTimer();
         }
         if (firstMsg) {
           console.log(`[sendMessage] first SDK msg type=${msg.type}`);
@@ -1535,6 +1794,8 @@ export class SessionManager {
         if (isInternalSystemMessage(msg)) {
           continue;
         }
+
+        this.recordLiveTranscript(sessionId, msg);
 
         if (msg.type === "stream_event") {
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
@@ -1565,6 +1826,9 @@ export class SessionManager {
         // Pricing is resolved against pricing.json (Claude SDK's costUSD
         // is intentionally ignored — wrong for third-party anthropic-compat).
         if (msg.type === "result") {
+          latestCodexUsageSnapshot = normalizeCodexUsageSnapshot(
+            (msg as { _codexUsageSnapshot?: unknown })._codexUsageSnapshot,
+          );
           const events = extractUsageEvents(
             {
               agentId: sessionId,
@@ -1607,6 +1871,12 @@ export class SessionManager {
       if (storedPromptHash !== promptHash) {
         metaPatch.systemPromptHash = promptHash;
       }
+      if (latestCodexUsageSnapshot) {
+        metaPatch.codexUsageSnapshot = latestCodexUsageSnapshot;
+      }
+      if (codexResumeSignature && storedCodexResumeSignature !== codexResumeSignature) {
+        metaPatch[CODEX_RESUME_SIGNATURE_KEY] = codexResumeSignature;
+      }
       if (Object.keys(metaPatch).length > 0) {
         persistData.metadata = mergeMetadata(agent.metadata, metaPatch);
       }
@@ -1623,20 +1893,40 @@ export class SessionManager {
     } catch (err) {
       const aborted = abort.signal.aborted;
       const rawMsg = err instanceof Error ? err.message : String(err);
-      console.log(`[sendMessage] caught err agent=${sessionId.slice(0, 8)} run=${runId.slice(0, 8)} aborted=${aborted} stale=${staleResume} err=${rawMsg}`);
+      const runtimeDetails = (err && typeof err === "object" ? err : {}) as Partial<RuntimeErrorDetails>;
+      console.log(
+        `[sendMessage] caught err agent=${sessionId.slice(0, 8)} run=${runId.slice(0, 8)} ` +
+          `aborted=${aborted} stale=${staleResume} runtimeCode=${runtimeDetails.runtimeCode ?? "(none)"} err=${rawMsg}`,
+      );
       // Self-heal stale resume: clear the bad lastSessionId so the next send
       // starts a fresh CLI session instead of re-failing on the same lookup.
       const persistData: { status: "ERROR" | "IDLE"; metadata?: object } = {
         status: aborted ? "IDLE" : "ERROR",
       };
-      if (staleResume) {
+      const structuredResumeFailure = isRuntimeResumeRecoverySignal(
+        runtimeDetails.runtimeCode,
+        runtimeDetails.runtimeRecoverable,
+        runtimeDetails.runtimeResumeScoped,
+        usedResumeSessionId,
+      );
+      const legacyResumeFailure =
+        !structuredResumeFailure &&
+        runtimeDetails.runtimeCode === undefined &&
+        isResumeScopedStreamFailure(rawMsg, usedResumeSessionId);
+      const recoverableResumeFailure = structuredResumeFailure || legacyResumeFailure;
+      if (staleResume || recoverableResumeFailure) {
         const cur = (agent.metadata && typeof agent.metadata === "object" ? agent.metadata : {}) as Record<
           string,
           unknown
         >;
         const next: Record<string, unknown> = { ...cur };
-        delete next.lastSessionId;
+        for (const key of RESUME_METADATA_KEYS) delete next[key];
         persistData.metadata = next;
+        console.warn(
+          `[sendMessage] clearing resume metadata agent=${sessionId.slice(0, 8)} ` +
+            `run=${runId.slice(0, 8)} stale=${staleResume} ` +
+            `structuredResumeFailure=${structuredResumeFailure} legacyResumeFailure=${legacyResumeFailure}`,
+        );
       }
       // Same guard as the success path. cancel() owns the canonical IDLE state
       // once it's removed this run from the map.
@@ -1646,7 +1936,9 @@ export class SessionManager {
         if (!aborted) {
           const friendly = staleResume
             ? "Previous conversation session was lost (the CLI's local session file is gone). " +
-              "Cleared cached session id — please send your message again to start fresh."
+              "Cleared cached session id; please send your message again to start fresh."
+            : recoverableResumeFailure
+              ? rawMsg + "\n\nCleared cached session state for this agent. Please send your message again; Ensemble will start a fresh runtime session while preserving the local chat history."
             : rawMsg;
           this.hub.sendToSession(sessionId, {
             type: "error",
@@ -1662,7 +1954,6 @@ export class SessionManager {
       return null;
     } finally {
       clearFirstModelResponseTimer();
-      clearTurnCompletionIdleTimer();
       // Only clear state if we're still the owner. After cancel() the entry
       // is gone; a brand-new sendMessage could already have set its own entry.
       // Without this guard a wedged old run's finally would corrupt the new run.
@@ -1674,6 +1965,7 @@ export class SessionManager {
           for (const [, q] of qb) q.resolve("[run ended before answer]");
           this.pendingQuestions.delete(sessionId);
         }
+        this.drainQueuedTurns(sessionId);
       }
     }
   }
@@ -1741,7 +2033,6 @@ export class SessionManager {
   /** Called by ask_user MCP tool. Suspends until the user clicks an option. */
   async askUser(sessionId: string, question: string, options: string[]): Promise<string> {
     const reqId = randomUUID();
-    this.running.get(sessionId)?.suspendCompletionIdleTimer?.();
     await this.updateAgentStatus(sessionId, "AWAITING_USER_INPUT", "awaiting_user_input");
     this.hub.sendToSession(sessionId, {
       type: "user_question",
@@ -1887,12 +2178,13 @@ export class SessionManager {
       }
     }
 
-    if (turns.length === 0) {
+    const live = this.formatLiveTranscript(targetId);
+    if (turns.length === 0 && !live) {
       return `peer "${targetAgent.name}" (id=${targetId.slice(0, 8)}) has no text history yet.`;
     }
-    const header = `peer agent: ${targetAgent.name} (id=${targetId.slice(0, 8)}) — last ${turns.length} text turns (oldest → newest):\n\n`;
+    const header = `peer agent: ${targetAgent.name} (id=${targetId.slice(0, 8)}) - last ${turns.length} text turns (oldest to newest):\n\n`;
     const body = turns.map((t) => `[${t.role}] ${t.text}`).join("\n\n");
-    const full = header + body;
+    const full = [turns.length > 0 ? header + body : "", live].filter((s) => s && s.trim()).join("\n\n---\n\n");
     if (full.length <= MAX_QUERY_CHARS) return full;
     const half = Math.floor(MAX_QUERY_CHARS / 2) - 60;
     return `${full.slice(0, half)}\n\n[... ${full.length - half * 2} chars truncated ...]\n\n${full.slice(-half)}`;
@@ -1917,9 +2209,6 @@ export class SessionManager {
     if (readMetaBool(targetAgent.metadata, "closed")) {
       return `error: peer agent "${targetAgent.name}" is closed; user must restart it before it can receive messages`;
     }
-    if (this.running.has(targetId)) {
-      return `error: peer agent "${targetAgent.name}" is busy (mid-run); try again after it finishes`;
-    }
 
     const sourceLastOutput = await this.fetchLastAssistantText(fromAgent.id);
     const formatted = formatPeerHandoff({
@@ -1930,6 +2219,7 @@ export class SessionManager {
       body,
       sourceLastOutput,
     });
+    const targetWasBusy = this.running.has(targetId) || this.drainingQueues.has(targetId);
     void this.sendMessage(targetId, formatted, {
       peerOrigin: {
         fromAgentId: fromAgent.id,
@@ -1939,7 +2229,8 @@ export class SessionManager {
     }).catch((err) => {
       console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
     });
-    return `delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode})`;
+    const delivery = targetWasBusy ? "queued for" : "delivered to";
+    return `${delivery} "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode})`;
   }
 
   private async forceStopRun(sessionId: string, opts: ForceStopOptions): Promise<boolean> {
@@ -1956,6 +2247,8 @@ export class SessionManager {
     }
 
     this.running.delete(sessionId);
+    this.clearQueuedTurns(sessionId);
+    this.liveTranscripts.delete(sessionId);
     const sessionPending = this.pending.get(sessionId);
     if (sessionPending) {
       for (const [, p] of sessionPending) {
@@ -1974,9 +2267,16 @@ export class SessionManager {
     }
 
     try {
+      let nextMetadata: object | undefined;
+      if (r?.clearResumeOnAbort) {
+        const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
+        if (agent) {
+          nextMetadata = removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]);
+        }
+      }
       const updated = await prisma.agent.update({
         where: { id: sessionId },
-        data: { status: opts.dbStatus },
+        data: { status: opts.dbStatus, ...(nextMetadata ? { metadata: nextMetadata } : {}) },
       });
       this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
       if (opts.error) {
@@ -2023,6 +2323,8 @@ export class SessionManager {
    *  updates so they can't undo the IDLE state. */
   async cancel(sessionId: string): Promise<void> {
     const r = this.running.get(sessionId);
+    this.clearQueuedTurns(sessionId);
+    this.liveTranscripts.delete(sessionId);
     if (r) {
       console.log(`[cancel] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
       try { r.abort.abort(); } catch { /* signal already aborted */ }
@@ -2057,7 +2359,15 @@ export class SessionManager {
     // Authoritative DB reset. We deliberately do NOT touch metadata — only the
     // status flips back to IDLE. lastSessionId / sandboxMode / etc. survive.
     try {
-      await this.updateAgentStatus(sessionId, "IDLE", "idle");
+      const metadata = r?.clearResumeOnAbort
+        ? removeMetadataKeys((await prisma.agent.findUnique({ where: { id: sessionId } }))?.metadata, [...RESUME_METADATA_KEYS])
+        : undefined;
+      const updated = await prisma.agent.update({
+        where: { id: sessionId },
+        data: { status: "IDLE", ...(metadata ? { metadata } : {}) },
+      });
+      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+      this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "idle" });
     } catch (err) {
       // Agent might have been deleted concurrently — log and move on.
       console.warn(`[cancel] DB reset for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`);
@@ -2174,7 +2484,6 @@ export class SessionManager {
         },
       });
 
-      this.running.get(sessionId)?.suspendCompletionIdleTimer?.();
       await this.updateAgentStatus(sessionId, "AWAITING_PERMISSION", "awaiting_permission");
       this.hub.sendToSession(sessionId, { type: "permission_request", sessionId, reqId, toolName, input });
 

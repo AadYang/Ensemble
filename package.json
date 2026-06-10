@@ -13,7 +13,7 @@
     "desktop:prep": "pnpm -F @ensemble/desktop-ui build:export && node scripts/prep-sidecar.mjs",
     "desktop:dev": "pnpm desktop:prep && pnpm dlx @tauri-apps/cli@latest dev",
     "desktop:build": "node scripts/desktop-build.mjs",
-    "desktop:build:tauri": "pnpm desktop:prep && pnpm dlx @tauri-apps/cli@latest build",
+    "desktop:build:tauri": "pnpm dlx @tauri-apps/cli@latest build",
     "desktop:build:mac": "node scripts/desktop-build.mjs --mac"
   },
   "devDependencies": {

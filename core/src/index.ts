@@ -403,10 +403,12 @@ const PROVIDER_KINDS = [
   "openai-compat",
 ] as const;
 const DEFAULT_ANTHROPIC_MODELS = [
+  "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001",
 ];
+const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 
 interface ProviderRuntimeMetadata {
   platformKey: PlatformKey;
@@ -940,7 +942,7 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   }
   // anthropic-local (or anthropic without baseUrl, the legacy default) — fall
   // back to hardcoded list. There's no remote endpoint to introspect.
-  if (provider.kind === "anthropic-local" || !provider.baseUrl) {
+  if (provider.kind === "anthropic-local" || (provider.kind === "anthropic" && !provider.baseUrl && !provider.apiKey)) {
     const updated = await prisma.provider.update({
       where: { id: provider.id },
       data: { models: DEFAULT_ANTHROPIC_MODELS },
@@ -953,7 +955,16 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
 
   const flavor: ProbeFlavor =
     provider.kind === "openai-local" || provider.kind === "openai-compat" ? "openai" : "anthropic";
-  const deepSeekFallback = deepSeekOfficialModelsFallback(provider.baseUrl, flavor);
+  const probeBaseUrl =
+    provider.baseUrl ?? (provider.kind === "anthropic" ? ANTHROPIC_DEFAULT_BASE_URL : null);
+  if (!probeBaseUrl) {
+    reply.code(400);
+    return {
+      error: "baseUrl_required",
+      message: "this provider type needs a baseUrl for model discovery.",
+    };
+  }
+  const deepSeekFallback = deepSeekOfficialModelsFallback(probeBaseUrl, flavor);
 
   if (deepSeekFallback) {
     const updated = await prisma.provider.update({
@@ -988,7 +999,7 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
     };
   }
 
-  const result = await probeModels(provider.baseUrl, provider.apiKey, flavor);
+  const result = await probeModels(probeBaseUrl, provider.apiKey, flavor);
   if ("models" in result) {
     const updated = await prisma.provider.update({
       where: { id: provider.id },

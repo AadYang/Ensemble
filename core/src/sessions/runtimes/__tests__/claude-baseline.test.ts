@@ -39,7 +39,7 @@ const stubProvider: Provider = {
 const baseOpts = (): RuntimeOptions => ({
   sessionId: "test-session",
   prompt: "hello",
-  model: "claude-opus-4-7",
+  model: "claude-opus-4-8",
   permissionMode: "default",
   tools: [],
   allowedTools: [],

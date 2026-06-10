@@ -26,6 +26,9 @@ process.env.AGENTORCH_DB_PATH = ":memory:";
 
 let prisma: typeof import("../../db.js").prisma;
 let SessionManager: typeof import("../SessionManager.js").SessionManager;
+let isResumeScopedStreamFailure: typeof import("../SessionManager.js").isResumeScopedStreamFailure;
+let isRuntimeResumeRecoverySignal: typeof import("../SessionManager.js").isRuntimeResumeRecoverySignal;
+let runtimeHistoryFromCompletedTurns: typeof import("../SessionManager.js").runtimeHistoryFromCompletedTurns;
 
 type Broadcast = Record<string, unknown>;
 
@@ -49,7 +52,7 @@ class StubHub {
 
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
-  ({ SessionManager } = await import("../SessionManager.js"));
+  ({ SessionManager, isResumeScopedStreamFailure, isRuntimeResumeRecoverySignal, runtimeHistoryFromCompletedTurns } = await import("../SessionManager.js"));
 });
 
 describe("SessionManager cancel + stale-session recovery", () => {
@@ -148,39 +151,182 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.code === "PROVIDER_TIMEOUT")).toBe(true);
   });
 
-  it("runtime idle completion force-stops only the matching run as DONE", async () => {
-    const stuck = await prisma.agent.create({ data: { name: "finished-but-open-stream" } });
-    const other = await prisma.agent.create({ data: { name: "other-running-agent" } });
-    await prisma.agent.update({ where: { id: stuck.id }, data: { status: "RUNNING" } });
-    await prisma.agent.update({ where: { id: other.id }, data: { status: "RUNNING" } });
-
+  it("sendMessage queues input while the agent is already running", async () => {
+    const agent = await prisma.agent.create({ data: { name: "queue-target" } });
     const hub = new StubHub();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sessions = new SessionManager(hub as any);
     const abort = new AbortController();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (sessions as any).running.set(stuck.id, {
-      id: stuck.id,
-      runId: "run-done",
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-active",
       abort,
       seq: 0,
       autoAllowedTools: new Set<string>(),
     });
 
+    const queued = sessions.sendMessage(agent.id, "queued while running");
+
+    await Promise.resolve();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (sessions as any).forceStopRun(stuck.id, {
-      expectedRunId: "run-done",
-      dbStatus: "DONE",
-      protoStatus: "done",
-      logPrefix: "test-idle-done",
+    expect((sessions as any).queuedTurns.get(agent.id)).toHaveLength(1);
+    expect(hub.sessionMessages.some((m) => m.sessionId === agent.id && m.msg.code === "BUSY")).toBe(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).clearQueuedTurns(agent.id);
+    await expect(queued).resolves.toBeNull();
+  });
+
+  it("peer_send queues for a running target instead of failing busy", async () => {
+    const source = await prisma.agent.create({ data: { name: "queue-source" } });
+    const target = await prisma.agent.create({ data: { name: "queue-peer" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "run-peer",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
     });
 
-    expect(abort.signal.aborted).toBe(true);
-    expect((await prisma.agent.findUnique({ where: { id: stuck.id } }))?.status).toBe("DONE");
-    expect((await prisma.agent.findUnique({ where: { id: other.id } }))?.status).toBe("RUNNING");
+    const result = await sessions.sendPeerMessage(source.id, target.name, "please continue", "raw");
+
+    expect(result).toContain("queued for");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((sessions as any).running.has(stuck.id)).toBe(false);
-    expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.status === "done")).toBe(true);
+    expect((sessions as any).queuedTurns.get(target.id)).toHaveLength(1);
+    expect(result).not.toContain("busy");
+  });
+
+  it("peer_query includes live assistant output from a running target", async () => {
+    const source = await prisma.agent.create({ data: { name: "observer" } });
+    const target = await prisma.agent.create({ data: { name: "visible-peer" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).recordLiveTranscript(target.id, {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "live progress" },
+      },
+    });
+
+    const history = await sessions.fetchPeerHistory(source.id, target.name, 5);
+
+    expect(history).toContain("target is currently running");
+    expect(history).toContain("live progress");
+  });
+
+  it("classifies websocket disconnects as resume-scoped recovery only when resume was used", () => {
+    const msg =
+      "Reconnecting... 2/5 (stream disconnected before completion: failed to send websocket request: " +
+      "IO error: software on your host aborted an established connection. (os error 10053))";
+
+    expect(isResumeScopedStreamFailure(msg, "codex-thread-id")).toBe(true);
+    expect(isResumeScopedStreamFailure(msg, null)).toBe(false);
+    expect(isResumeScopedStreamFailure("provider is missing an API key", "codex-thread-id")).toBe(false);
+  });
+
+  it("classifies structured runtime resume interruption without parsing provider text", () => {
+    expect(isRuntimeResumeRecoverySignal("RESUME_TURN_INTERRUPTED", true, true, "codex-thread-id")).toBe(true);
+    expect(isRuntimeResumeRecoverySignal("RESUME_TURN_INTERRUPTED", true, true, null)).toBe(false);
+    expect(isRuntimeResumeRecoverySignal("RESUME_TURN_INTERRUPTED", false, true, "codex-thread-id")).toBe(false);
+    expect(isRuntimeResumeRecoverySignal("QUERY_FAILED", true, true, "codex-thread-id")).toBe(false);
+  });
+
+  it("cancel() clears Codex native resume metadata for the aborted run", async () => {
+    const provider = await prisma.provider.create({
+      data: { name: "cancel-codex-provider", kind: "openai-codex", models: ["gpt-5.5"] },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cancel-codex-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "runtime-shape",
+        },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-codex",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+      clearResumeOnAbort: true,
+    });
+
+    await sessions.cancel(agent.id);
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.status).toBe("IDLE");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+  });
+
+  it("Codex history reconstruction drops an unfinished trailing user turn", () => {
+    const history = runtimeHistoryFromCompletedTurns([
+      { type: "user", payload: { type: "user", message: { content: "A" } } },
+      { type: "assistant", payload: { type: "assistant", message: { content: [{ type: "text", text: "done A" }] } } },
+      { type: "result", payload: { type: "result", subtype: "success" } },
+      { type: "user", payload: { type: "user", message: { content: "B cancelled" } } },
+    ]);
+
+    expect(history.map((m) => m.type)).toEqual(["user", "assistant"]);
+    expect(String((history[0] as { message?: { content?: unknown } }).message?.content)).toBe("A");
+    expect(JSON.stringify(history)).not.toContain("B cancelled");
+  });
+
+  it("patchAgent clears native resume metadata when the model changes", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "codex-model-change-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.4", "gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "codex-model-change-agent",
+        providerId: provider.id,
+        model: "gpt-5.4",
+        metadata: {
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+        },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+
+    await sessions.patchAgent(agent.id, { model: "gpt-5.5" });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.model).toBe("gpt-5.5");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
   });
 
   it("sendMessage recovers from provider validation errors after entering RUNNING", async () => {

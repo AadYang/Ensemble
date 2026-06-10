@@ -360,7 +360,7 @@ function extractUserText(msg: { message?: unknown }): string {
  *  for the top-level shape; `prompt_tokens_details.cached_tokens` snake when
  *  it falls through to the OpenAI SDK shape). Best-effort: if the SDK
  *  reshuffles names, we end up under-counting rather than crashing. */
-function accumulateUsage(
+export function _accumulateUsageForTest(
   accum: Record<string, {
     inputTokens: number;
     outputTokens: number;
@@ -384,13 +384,14 @@ function accumulateUsage(
   if (!r?.usage) return;
   const u = r.usage;
   const model = r.model || fallbackModel;
-  const inputTokens = u.inputTokens ?? u.input_tokens ?? 0;
+  const reportedInputTokens = u.inputTokens ?? u.input_tokens ?? 0;
   const outputTokens = u.outputTokens ?? u.output_tokens ?? 0;
   const cacheReadInputTokens =
     u.inputTokensDetails?.cached_tokens ??
     u.inputTokensDetails?.cachedTokens ??
     u.prompt_tokens_details?.cached_tokens ??
     0;
+  const inputTokens = Math.max(0, reportedInputTokens - cacheReadInputTokens);
   // OpenAI's prompt-caching only reports reads; creation is implicit in input
   // count (first send pays input price, subsequent reads pay cache_read).
   // We leave cacheCreationInputTokens=0 — there's no separate counter.
@@ -405,6 +406,8 @@ function accumulateUsage(
   slot.cacheReadInputTokens += cacheReadInputTokens;
   accum[model] = slot;
 }
+
+const accumulateUsage = _accumulateUsageForTest;
 
 function extractItemText(item: unknown): string {
   // RunItem shape: see runner/items. message_output_created carries a

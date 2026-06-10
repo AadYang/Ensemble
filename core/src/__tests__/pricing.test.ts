@@ -12,7 +12,7 @@ describe("loadPricingTable", () => {
     // The standard test env doesn't have a pricing-overrides.json next to the
     // built-in catalog, so we should see the built-in models intact.
     const t = loadPricingTable();
-    expect(t.models["claude-opus-4-7"]).toBeDefined();
+    expect(t.models["claude-opus-4-8"]).toBeDefined();
     expect(t.models["gpt-4o"]).toBeDefined();
     expect(t.version).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
@@ -56,13 +56,13 @@ describe("computeCost", () => {
   });
 
   it("applies cacheWrite price when set, falls back to input price otherwise", () => {
-    // claude-opus-4-7: input 15.00, cacheWrite 18.75.
-    const r1 = computeCost("claude-opus-4-7", {
+    // claude-opus-4-8: input 5.00, cacheWrite 6.25.
+    const r1 = computeCost("claude-opus-4-8", {
       inputTokens: 0,
       outputTokens: 0,
       cacheCreationInputTokens: 1_000_000,
     });
-    expect(r1.costUSD).toBeCloseTo(18.75, 6);
+    expect(r1.costUSD).toBeCloseTo(6.25, 6);
 
     // glm-4.5 (would be in overrides, not in built-in) → use a model without
     // cacheWrite for the fallback assertion. gpt-4o-mini has no cacheWrite,
