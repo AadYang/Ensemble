@@ -5,6 +5,7 @@ const CONTEXT_TEMPLATE = (vars: {
   fromId: string;
   mode: PeerMode;
   body: string;
+  sourceState?: "running" | "interrupted" | "completed" | "empty";
   sourceLastOutput?: string;
 }) => {
   const lines = [
@@ -14,6 +15,7 @@ const CONTEXT_TEMPLATE = (vars: {
   ];
   if (vars.sourceLastOutput) {
     lines.push(
+      `Source state: ${vars.sourceState ?? "completed"}`,
       `Source agent's most recent output (this is the artifact under review):`,
       `<<<source-output`,
       vars.sourceLastOutput,
@@ -96,11 +98,16 @@ export function formatPeerHandoff(args: {
    *  the actual artifact (review/continue/fork all need source context).
    *  Raw mode bypasses this and the rest of the template. */
   sourceLastOutput?: string;
+  /** Describes whether source-output is live, interrupted partial context, or
+   *  the last completed assistant answer. This prevents recipients from
+   *  treating a stale completed answer as the latest source state. */
+  sourceState?: "running" | "interrupted" | "completed" | "empty";
 }): string {
   if (args.mode === "raw") {
     if (args.sourceLastOutput) {
       return [
         `[from ${args.fromName} (id=${args.fromId.slice(0, 8)})]`,
+        `Source state: ${args.sourceState ?? "completed"}`,
         `<<<source-output`,
         args.sourceLastOutput,
         `source-output>>>`,
@@ -116,6 +123,7 @@ export function formatPeerHandoff(args: {
     mode: args.mode,
     body: args.body,
     sourceLastOutput: args.sourceLastOutput,
+    sourceState: args.sourceState,
   });
   const instruction = readPeerInstruction(args.receiverMetadata, args.mode);
   return `${context}\n\n${instruction}`;

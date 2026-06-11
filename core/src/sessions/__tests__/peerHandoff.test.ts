@@ -78,6 +78,30 @@ describe("formatPeerHandoff", () => {
     expect(out).not.toContain("你正在以");
   });
 
+  it("labels source state when source output is live or interrupted", () => {
+    const review = formatPeerHandoff({
+      fromName: "agent-3",
+      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
+      receiverMetadata: null,
+      mode: "review",
+      body: "review",
+      sourceState: "interrupted",
+      sourceLastOutput: "partial work",
+    });
+    expect(review).toContain("Source state: interrupted");
+
+    const raw = formatPeerHandoff({
+      fromName: "agent-3",
+      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
+      receiverMetadata: null,
+      mode: "raw",
+      body: "fyi",
+      sourceState: "running",
+      sourceLastOutput: "live work",
+    });
+    expect(raw).toContain("Source state: running");
+  });
+
   it("raw mode without sourceLastOutput keeps the legacy compact form", () => {
     const out = formatPeerHandoff({
       fromName: "agent-3",

@@ -165,4 +165,86 @@ describe("reasoning effort flow", () => {
     expect(meta.lastSessionId).not.toBe("stale-native-session");
     expect(meta.codexUsageSnapshot).toBeUndefined();
   });
+
+  it("keeps interrupted context in local history after model switch clears native resume", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "model-switch-history-codex",
+        kind: "openai-codex",
+        models: ["gpt-5.4", "gpt-5.5"],
+        metadata: { defaultSandbox: "workspace-write" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "model-switch-history-agent",
+        providerId: provider.id,
+        model: "gpt-5.4",
+        metadata: {
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+          reasoningEffort: "xhigh",
+          sandboxMode: "danger-full-access",
+        },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 0,
+        type: "system",
+        payload: { type: "system", subtype: "compact", text: "compact summary before model switch" },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 1,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "interrupted model switch task" } },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 2,
+        type: "system",
+        payload: {
+          type: "system",
+          subtype: "interrupted_turn",
+          reason: "cancelled",
+          runId: "run-model-switch",
+          userSeq: 1,
+          userRequest: "interrupted model switch task",
+          partialAssistantText: "partial model switch work",
+          interruptedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { model: "gpt-5.5" });
+    const patched = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (patched?.metadata && typeof patched.metadata === "object" ? patched.metadata : {}) as Record<string, unknown>;
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+    expect(meta.reasoningEffort).toBe("xhigh");
+    expect(meta.sandboxMode).toBe("danger-full-access");
+
+    await sessions.sendMessage(agent.id, "继续");
+
+    expect(capturedRuntimeOptions).toHaveLength(1);
+    const opts = capturedRuntimeOptions[0]!;
+    expect(opts.resume).toBeUndefined();
+    expect(opts.model).toBe("gpt-5.5");
+    expect(opts.reasoningEffort).toBe("xhigh");
+    expect((opts.agentMetadata as Record<string, unknown>).sandboxMode).toBe("danger-full-access");
+    const historyText = JSON.stringify(opts.history);
+    expect(historyText).toContain("compact summary before model switch");
+    expect(historyText).toContain("Previous Ensemble turn was interrupted");
+    expect(historyText).toContain("interrupted model switch task");
+    expect(historyText).toContain("partial model switch work");
+  });
 });

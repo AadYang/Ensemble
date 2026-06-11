@@ -131,6 +131,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "run-a",
       abort,
       seq: 0,
+      userInput: "run a request",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
 
@@ -154,6 +157,14 @@ describe("SessionManager cancel + stale-session recovery", () => {
   it("runtime idle timeout aborts the active run and reports ERROR", async () => {
     const agent = await prisma.agent.create({ data: { name: "idle-timeout-agent" } });
     await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 0,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "finish idle task" } },
+      },
+    });
 
     const hub = new StubHub();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -164,8 +175,17 @@ describe("SessionManager cancel + stale-session recovery", () => {
       id: agent.id,
       runId: "run-timeout",
       abort,
-      seq: 0,
+      seq: 1,
+      userInput: "finish idle task",
+      startedSeq: 0,
+      userMessageSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).recordLiveTranscript(agent.id, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial idle work" } },
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -185,6 +205,13 @@ describe("SessionManager cancel + stale-session recovery", () => {
           String(m.msg.message).includes("automatically stopped this turn"),
       ),
     ).toBe(true);
+    const interrupted = await prisma.message.findFirst({
+      where: { agentId: agent.id, type: "system" },
+      orderBy: { seq: "desc" },
+    });
+    expect(JSON.stringify(interrupted?.payload)).toContain("interrupted_turn");
+    expect(JSON.stringify(interrupted?.payload)).toContain("finish idle task");
+    expect(JSON.stringify(interrupted?.payload)).toContain("partial idle work");
     expect(
       hub.sessionMessages.some(
         (m) => m.sessionId === agent.id && m.msg.type === "status" && m.msg.status === "error",
@@ -206,6 +233,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "new-run",
       abort,
       seq: 0,
+      userInput: "new active request",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
 
@@ -220,6 +250,57 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(hub.sessionMessages.some((m) => m.sessionId === agent.id && m.msg.code === "RUNTIME_IDLE_TIMEOUT")).toBe(false);
   });
 
+  it("cancel persists interrupted_turn so continue can recover the active request", async () => {
+    const agent = await prisma.agent.create({ data: { name: "cancel-interrupted-agent" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 0,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "implement feature after disconnect" } },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-cancel-interrupt",
+      abort,
+      seq: 1,
+      userInput: "implement feature after disconnect",
+      startedSeq: 0,
+      userMessageSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).recordLiveTranscript(agent.id, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "I changed file A and was about to test" } },
+    });
+
+    await sessions.cancel(agent.id);
+
+    const systemRows = await prisma.message.findMany({ where: { agentId: agent.id, type: "system" } });
+    expect(systemRows).toHaveLength(1);
+    const payloadText = JSON.stringify(systemRows[0]!.payload);
+    expect(payloadText).toContain("interrupted_turn");
+    expect(payloadText).toContain("implement feature after disconnect");
+    expect(payloadText).toContain("I changed file A");
+
+    const history = runtimeHistoryFromCompletedTurns(
+      await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } }),
+    );
+    const historyText = JSON.stringify(history);
+    expect(historyText).toContain("Previous Ensemble turn was interrupted");
+    expect(historyText).toContain("implement feature after disconnect");
+    expect(historyText).toContain("continue that interrupted request");
+  });
+
   it("sendMessage queues input while the agent is already running", async () => {
     const agent = await prisma.agent.create({ data: { name: "queue-target" } });
     const hub = new StubHub();
@@ -232,6 +313,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "run-active",
       abort,
       seq: 0,
+      userInput: "active request",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
 
@@ -261,6 +345,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "run-active",
       abort,
       seq: 0,
+      userInput: "active request",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
 
@@ -298,6 +385,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "run-active",
       abort,
       seq: 0,
+      userInput: "active request",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
     // Simulate the outer sendMessage call still awaiting a wedged runtime.
@@ -344,6 +434,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "run-peer",
       abort,
       seq: 0,
+      userInput: "target is busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
 
@@ -354,6 +447,126 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect((sessions as any).queuedTurns.get(target.id).size).toBe(1);
     expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(1);
     expect(result).not.toContain("busy");
+  });
+
+  it("peer_send embeds running source live output instead of stale completed assistant text", async () => {
+    const source = await prisma.agent.create({ data: { name: "running-source" } });
+    const target = await prisma.agent.create({ data: { name: "snapshot-target-running" } });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 0,
+        type: "assistant",
+        payload: { type: "assistant", message: { content: [{ type: "text", text: "old completed answer" }] } },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "source-run",
+      abort,
+      seq: 1,
+      userInput: "current source request",
+      startedSeq: 1,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).recordLiveTranscript(source.id, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "live source output" } },
+    });
+
+    const result = await sessions.sendPeerMessage(source.id, target.name, "review latest", "review");
+    await Promise.resolve();
+
+    expect(result).toContain("queued for");
+    const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
+    const text = queued?.userInput ?? "";
+    expect(text).toContain("Source state: running");
+    expect(text).toContain("current source request");
+    expect(text).toContain("live source output");
+    expect(text).not.toContain("old completed answer");
+  });
+
+  it("peer_send embeds interrupted source context after timeout instead of older output", async () => {
+    const source = await prisma.agent.create({ data: { name: "interrupted-source" } });
+    const target = await prisma.agent.create({ data: { name: "snapshot-target-interrupted" } });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 0,
+        type: "assistant",
+        payload: { type: "assistant", message: { content: [{ type: "text", text: "older completed output" }] } },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 1,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "interrupted source request" } },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "source-timeout",
+      abort,
+      seq: 2,
+      userInput: "interrupted source request",
+      startedSeq: 1,
+      userMessageSeq: 1,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).recordLiveTranscript(source.id, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial interrupted output" } },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (sessions as any).handleRuntimeIdleTimeout(source.id, "source-timeout", 1_000);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(source.id, target.name, "continue latest", "continue");
+    await Promise.resolve();
+
+    const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
+    const text = queued?.userInput ?? "";
+    expect(text).toContain("Source state: interrupted");
+    expect(text).toContain("interrupted source request");
+    expect(text).toContain("partial interrupted output");
+    expect(text).not.toContain("older completed output");
   });
 
   it("peer_query includes live assistant output from a running target", async () => {
@@ -421,6 +634,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
       runId: "run-codex",
       abort,
       seq: 0,
+      userInput: "codex request",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
       clearResumeOnAbort: true,
     });
@@ -612,6 +828,54 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(JSON.stringify(history)).not.toContain("incomplete current prompt");
   });
 
+  it("keeps latest interrupted_turn alongside compact summary under long history budget", () => {
+    const rows: Array<{ type: string; payload: unknown; seq?: number }> = [
+      {
+        type: "system",
+        seq: 0,
+        payload: { type: "system", subtype: "compact", text: "critical compact summary" },
+      },
+    ];
+    for (let i = 1; i <= 70; i++) {
+      rows.push({
+        type: i % 2 === 0 ? "assistant" : "user",
+        seq: i,
+        payload:
+          i % 2 === 0
+            ? { type: "assistant", message: { content: [{ type: "text", text: `answer ${i} ${"a".repeat(900)}` }] } }
+            : { type: "user", message: { role: "user", content: `question ${i} ${"q".repeat(900)}` } },
+      });
+    }
+    rows.push({
+      type: "user",
+      seq: 71,
+      payload: { type: "user", message: { role: "user", content: "latest interrupted request" } },
+    });
+    rows.push({
+      type: "system",
+      seq: 72,
+      payload: {
+        type: "system",
+        subtype: "interrupted_turn",
+        reason: "RUNTIME_IDLE_TIMEOUT",
+        runId: "run-budget",
+        userSeq: 71,
+        userRequest: "latest interrupted request",
+        partialAssistantText: "important partial output",
+        interruptedAt: new Date().toISOString(),
+      },
+    });
+
+    const history = runtimeHistoryFromCompletedTurns(rows);
+    const text = JSON.stringify(history);
+
+    expect(text).toContain("critical compact summary");
+    expect(text).toContain("latest interrupted request");
+    expect(text).toContain("important partial output");
+    expect(text).not.toContain("question 1");
+    expect(text.length).toBeLessThan(25_000);
+  });
+
   it("caps runtime history to precise recent context instead of full transcript", () => {
     const rows: Array<{ type: string; payload: unknown }> = Array.from({ length: 80 }, (_, i) => ({
       type: i % 2 === 0 ? "user" : "assistant",
@@ -624,7 +888,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
 
     const history = runtimeHistoryFromCompletedTurns(rows);
 
-    expect(history.length).toBeLessThanOrEqual(40);
+    expect(history.length).toBeLessThanOrEqual(28);
     expect(JSON.stringify(history)).toContain("answer 79");
     expect(JSON.stringify(history)).not.toContain("question 0");
   });

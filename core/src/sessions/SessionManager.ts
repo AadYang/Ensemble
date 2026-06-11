@@ -72,12 +72,19 @@ const CODEX_DEFAULT_SANDBOX: SandboxMode = "danger-full-access";
 const CODEX_RESUME_SIGNATURE_KEY = "codexResumeSignature";
 const CODEX_RESUME_SIGNATURE_VERSION = 1;
 const RESUME_METADATA_KEYS = ["lastSessionId", "codexUsageSnapshot", CODEX_RESUME_SIGNATURE_KEY] as const;
-const RUNTIME_HISTORY_MAX_MESSAGES = 40;
-const RUNTIME_HISTORY_MAX_CHARS = 24_000;
-const AUTO_COMPACT_MIN_MESSAGES = 80;
-const AUTO_COMPACT_TRIGGER_CHARS = 48_000;
-const AUTO_COMPACT_KEEP_MESSAGES = 24;
-const AUTO_COMPACT_SUMMARY_MAX_CHARS = 60_000;
+const RUNTIME_HISTORY_MAX_MESSAGES = 28;
+const RUNTIME_HISTORY_MAX_CHARS = 18_000;
+const RUNTIME_HISTORY_SINGLE_MESSAGE_MAX_CHARS = 6_000;
+const RUNTIME_HISTORY_INTERRUPTED_MAX_CHARS = 12_000;
+const INTERRUPTED_USER_REQUEST_MAX_CHARS = 8_000;
+const INTERRUPTED_PARTIAL_MAX_CHARS = 6_000;
+const PEER_SOURCE_OUTPUT_MAX_CHARS = 5_000;
+const PEER_SOURCE_REQUEST_MAX_CHARS = 1_200;
+const PEER_SOURCE_PARTIAL_MAX_CHARS = 3_600;
+const AUTO_COMPACT_MIN_MESSAGES = 40;
+const AUTO_COMPACT_TRIGGER_CHARS = 28_000;
+const AUTO_COMPACT_KEEP_MESSAGES = 16;
+const AUTO_COMPACT_SUMMARY_MAX_CHARS = 40_000;
 const RUNTIME_IDLE_TIMEOUT_DEFAULT_MS = 20 * 60 * 1000;
 
 function readRuntimeIdleTimeoutMs(): number {
@@ -102,8 +109,15 @@ function runtimeIdleTimeoutMessage(timeoutMs: number): string {
   return (
     `No events have been received from the upstream runtime or network connection for ${formatRuntimeIdleTimeout(timeoutMs)}. ` +
     "Ensemble has automatically stopped this turn so the agent is not left running forever. " +
+    "This turn's interrupted context was saved; send \"continue\" to resume from the interruption. " +
     "The agent's model, thinking mode, sandbox, provider, and other settings were not modified."
   );
+}
+
+function truncateMiddle(text: string, maxChars: number, label = "chars"): string {
+  if (text.length <= maxChars) return text;
+  const half = Math.max(1, Math.floor(maxChars / 2) - 60);
+  return `${text.slice(0, half)}\n\n[... truncated ${text.length - half * 2} ${label} ...]\n\n${text.slice(-half)}`;
 }
 
 function isInternalSystemMessage(msg: unknown): boolean {
@@ -173,6 +187,13 @@ interface RunningSession {
   runId: string;
   abort: AbortController;
   seq: number;
+  userInput: string;
+  startedSeq: number;
+  userMessageSeq?: number;
+  peerOrigin?: SendMessageOptions["peerOrigin"];
+  startedAt: string;
+  sawResult?: boolean;
+  interruptedPersisted?: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
   idleWatchdogPaused?: boolean;
   /** Per-turn auto-allow cache, keyed by toolName. User clicking "Allow" on
@@ -188,6 +209,27 @@ interface RunningSession {
 interface LiveTranscript {
   current: string;
   finalized: string[];
+}
+
+interface InterruptedTurnPayload {
+  type: "system";
+  subtype: "interrupted_turn";
+  reason: string;
+  runId: string;
+  userSeq: number;
+  userRequest: string;
+  partialAssistantText?: string;
+  interruptedAt: string;
+  peerOrigin?: SendMessageOptions["peerOrigin"];
+}
+
+interface PeerSourceSnapshot {
+  sourceRunState: "running" | "interrupted" | "completed" | "empty";
+  lastCompletedAssistantText?: string;
+  latestInterruptedContext?: InterruptedTurnPayload;
+  liveText?: string;
+  sourceUserRequest?: string;
+  sourceOutput?: string;
 }
 
 interface PendingPermission {
@@ -411,13 +453,32 @@ export const isResumeScopedStreamFailure = (rawMsg: string, usedResumeSessionId:
 };
 
 export const runtimeHistoryFromCompletedTurns = (
-  rows: Array<{ type: string; payload: unknown }>,
+  rows: Array<{ type: string; payload: unknown; seq?: number }>,
 ): SdkMessage[] => {
   const lastResultIndex = rows.map((row) => row.type).lastIndexOf("result");
-  const completedRows =
+  let completedRows =
     lastResultIndex >= 0
       ? rows.slice(0, lastResultIndex + 1)
       : rows.slice(0, trailingCompleteHistoryEnd(rows));
+  const latestInterruptedIndex = findLatestInterruptedTurnIndex(rows);
+  if (latestInterruptedIndex >= 0) {
+    const latestInterrupted = rows[latestInterruptedIndex]!;
+    const interruptedPayload = parseInterruptedTurnPayload(latestInterrupted.payload);
+    const afterLastResult = lastResultIndex < 0 || latestInterruptedIndex > lastResultIndex;
+    if (interruptedPayload && afterLastResult) {
+      const matchingUserIndex = rows.findIndex((row) => {
+        if (row.type !== "user") return false;
+        const seqMatches = typeof row.seq === "number" && row.seq === interruptedPayload.userSeq;
+        const textMatches = messageRowText(row).trim() === interruptedPayload.userRequest.trim();
+        return seqMatches || textMatches;
+      });
+      const rowsBeforeInterruptedUser =
+        matchingUserIndex >= 0
+          ? rows.slice(0, matchingUserIndex).filter((row) => row.type !== "result")
+          : completedRows;
+      completedRows = [...rowsBeforeInterruptedUser, latestInterrupted];
+    }
+  }
   return trimRuntimeHistory(
     completedRows
       .map(rowToRuntimeHistoryMessage)
@@ -425,20 +486,57 @@ export const runtimeHistoryFromCompletedTurns = (
   );
 };
 
+export const buildRuntimeHistoryForTurn = (
+  rows: Array<{ type: string; payload: unknown; seq?: number }>,
+): SdkMessage[] => runtimeHistoryFromCompletedTurns(rows);
+
 function rowToRuntimeHistoryMessage(row: { type: string; payload: unknown }): SdkMessage | null {
   if (row.type === "user" || row.type === "assistant") return row.payload as SdkMessage;
   if (row.type !== "system") return null;
   const payload = row.payload as { type?: unknown; subtype?: unknown; text?: unknown } | null;
-  if (payload?.type !== "system" || payload.subtype !== "compact" || typeof payload.text !== "string") {
+  if (payload?.type !== "system") {
     return null;
   }
+  if (payload.subtype === "compact" && typeof payload.text === "string") {
+    return {
+      type: "user",
+      message: {
+        role: "user",
+        content: truncateMiddle(
+          `Conversation summary from Ensemble auto-compact:\n${payload.text}`,
+          RUNTIME_HISTORY_SINGLE_MESSAGE_MAX_CHARS,
+        ),
+      },
+      _compactSummary: true,
+    } as SdkMessage;
+  }
+  const interrupted = parseInterruptedTurnPayload(payload);
+  if (!interrupted) return null;
+  const parts = [
+    "Previous Ensemble turn was interrupted before completion.",
+    "",
+    "Original user request:",
+    truncateMiddle(interrupted.userRequest, INTERRUPTED_USER_REQUEST_MAX_CHARS),
+  ];
+  if (interrupted.partialAssistantText?.trim()) {
+    parts.push(
+      "",
+      "Partial assistant output before interruption:",
+      truncateMiddle(interrupted.partialAssistantText.trim(), INTERRUPTED_PARTIAL_MAX_CHARS),
+    );
+  }
+  parts.push(
+    "",
+    `Interruption reason: ${interrupted.reason}.`,
+    'If the current user asks to continue/resume, continue that interrupted request instead of starting unrelated work.',
+  );
   return {
     type: "user",
     message: {
       role: "user",
-      content: `Conversation summary from Ensemble auto-compact:\n${payload.text}`,
+      content: truncateMiddle(parts.join("\n"), RUNTIME_HISTORY_INTERRUPTED_MAX_CHARS),
     },
-    _compactSummary: true,
+    _interruptedTurn: true,
   } as SdkMessage;
 }
 
@@ -461,9 +559,14 @@ function messageRowText(row: { type: string; payload: unknown }): string {
   if (row.type === "assistant") return assistantTextFromMessage(row.payload);
   if (row.type === "system") {
     const payload = row.payload as { type?: unknown; subtype?: unknown; text?: unknown } | null;
-    return payload?.type === "system" && payload.subtype === "compact" && typeof payload.text === "string"
-      ? payload.text
-      : "";
+    if (payload?.type === "system" && payload.subtype === "compact" && typeof payload.text === "string") {
+      return payload.text;
+    }
+    const interrupted = parseInterruptedTurnPayload(payload);
+    if (interrupted) {
+      return [interrupted.userRequest, interrupted.partialAssistantText ?? ""].filter(Boolean).join("\n\n");
+    }
+    return "";
   }
   return "";
 }
@@ -475,7 +578,7 @@ function transcriptLinesFromRows(rows: Array<{ type: string; payload: unknown }>
     if (!text) continue;
     if (row.type === "user") lines.push(`User: ${text}`);
     else if (row.type === "assistant") lines.push(`Assistant: ${text}`);
-    else if (row.type === "system") lines.push(`Prior summary: ${text}`);
+    else if (row.type === "system") lines.push(`Prior context: ${text}`);
   }
   return lines;
 }
@@ -498,23 +601,114 @@ function compactPromptFromTranscript(transcript: string): string {
 }
 
 export function trimRuntimeHistory(messages: SdkMessage[]): SdkMessage[] {
-  if (messages.length <= RUNTIME_HISTORY_MAX_MESSAGES) {
-    const total = messages.reduce((sum, msg) => sum + runtimeHistoryMessageText(msg).length, 0);
-    if (total <= RUNTIME_HISTORY_MAX_CHARS) return messages;
+  const normalized = messages.map(clampRuntimeHistoryMessage);
+  if (normalized.length <= RUNTIME_HISTORY_MAX_MESSAGES) {
+    const total = normalized.reduce((sum, msg) => sum + runtimeHistoryMessageText(msg).length, 0);
+    if (total <= RUNTIME_HISTORY_MAX_CHARS) return normalized;
   }
-  const summaryMessages = messages.filter((msg) => (msg as { _compactSummary?: unknown })._compactSummary === true);
+  const summaryMessages = normalized.filter((msg) => (msg as { _compactSummary?: unknown })._compactSummary === true);
+  const interruptedMessages = normalized.filter((msg) => (msg as { _interruptedTurn?: unknown })._interruptedTurn === true);
+  const latestSummary = summaryMessages.at(-1);
+  const latestInterrupted = interruptedMessages.at(-1);
+  const preserved = [latestSummary, latestInterrupted].filter((m): m is SdkMessage => Boolean(m));
+  const preservedChars = preserved.reduce((sum, msg) => sum + runtimeHistoryMessageText(msg).length, 0);
+  const remainingChars = Math.max(0, RUNTIME_HISTORY_MAX_CHARS - preservedChars);
+  const remainingMessages = Math.max(0, RUNTIME_HISTORY_MAX_MESSAGES - preserved.length);
   const kept: SdkMessage[] = [];
   let chars = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]!;
+  for (let i = normalized.length - 1; i >= 0; i--) {
+    const msg = normalized[i]!;
     if ((msg as { _compactSummary?: unknown })._compactSummary === true) continue;
-    const textLen = runtimeHistoryMessageText(msg).length;
-    if (kept.length >= RUNTIME_HISTORY_MAX_MESSAGES || chars + textLen > RUNTIME_HISTORY_MAX_CHARS) break;
-    kept.unshift(msg);
+    if ((msg as { _interruptedTurn?: unknown })._interruptedTurn === true) continue;
+    const textLen = Math.min(
+      runtimeHistoryMessageText(msg).length,
+      RUNTIME_HISTORY_SINGLE_MESSAGE_MAX_CHARS,
+    );
+    if (kept.length >= remainingMessages || chars + textLen > remainingChars) break;
+    kept.unshift(clampRuntimeHistoryMessage(msg));
     chars += textLen;
   }
-  const latestSummary = summaryMessages.at(-1);
-  return latestSummary ? [latestSummary, ...kept] : kept;
+  return [...preserved, ...kept];
+}
+
+function clampRuntimeHistoryMessage(msg: SdkMessage): SdkMessage {
+  const maxChars = (msg as { _interruptedTurn?: unknown })._interruptedTurn === true
+    ? RUNTIME_HISTORY_INTERRUPTED_MAX_CHARS
+    : RUNTIME_HISTORY_SINGLE_MESSAGE_MAX_CHARS;
+  if (msg.type === "user") {
+    const original = (msg as { message?: { role?: string; content?: unknown } }).message?.content;
+    if (typeof original !== "string" || original.length <= maxChars) return msg;
+    return {
+      ...msg,
+      message: {
+        ...((msg as { message?: object }).message ?? {}),
+        role: (msg as { message?: { role?: string } }).message?.role ?? "user",
+        content: truncateMiddle(original, maxChars),
+      },
+    } as SdkMessage;
+  }
+  if (msg.type === "assistant") {
+    const blocks = (msg as { message?: { content?: Array<{ type?: unknown; text?: unknown }> } }).message?.content;
+    if (!Array.isArray(blocks)) return msg;
+    let remaining = maxChars;
+    let changed = false;
+    const nextBlocks = blocks.map((block) => {
+      if (block.type !== "text" || typeof block.text !== "string") return block;
+      if (remaining <= 0) {
+        changed = true;
+        return { ...block, text: "" };
+      }
+      if (block.text.length <= remaining) {
+        remaining -= block.text.length;
+        return block;
+      }
+      changed = true;
+      const text = truncateMiddle(block.text, remaining);
+      remaining = 0;
+      return { ...block, text };
+    });
+    if (!changed) return msg;
+    return {
+      ...msg,
+      message: {
+        ...((msg as { message?: object }).message ?? {}),
+        content: nextBlocks,
+      },
+    } as SdkMessage;
+  }
+  return msg;
+}
+
+function parseInterruptedTurnPayload(payload: unknown): InterruptedTurnPayload | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  if (p.type !== "system" || p.subtype !== "interrupted_turn") return null;
+  if (typeof p.reason !== "string" || typeof p.runId !== "string" || typeof p.userRequest !== "string") return null;
+  if (typeof p.userSeq !== "number" || typeof p.interruptedAt !== "string") return null;
+  const partialAssistantText = typeof p.partialAssistantText === "string" ? p.partialAssistantText : undefined;
+  const peerOrigin =
+    p.peerOrigin && typeof p.peerOrigin === "object"
+      ? normalizeQueuedTurnOpts({ peerOrigin: p.peerOrigin })?.peerOrigin
+      : undefined;
+  return {
+    type: "system",
+    subtype: "interrupted_turn",
+    reason: p.reason,
+    runId: p.runId,
+    userSeq: p.userSeq,
+    userRequest: p.userRequest,
+    ...(partialAssistantText ? { partialAssistantText } : {}),
+    interruptedAt: p.interruptedAt,
+    ...(peerOrigin ? { peerOrigin } : {}),
+  };
+}
+
+function findLatestInterruptedTurnIndex(rows: Array<{ type: string; payload: unknown }>): number {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (row.type === "system" && parseInterruptedTurnPayload(row.payload)) return i;
+  }
+  return -1;
 }
 
 function trailingCompleteHistoryEnd(rows: Array<{ type: string }>): number {
@@ -1595,6 +1789,89 @@ export class SessionManager {
     ].join("\n");
   }
 
+  private liveAssistantText(sessionId: string): string | null {
+    const live = this.liveTranscripts.get(sessionId);
+    if (!live) return null;
+    const text = [...live.finalized, live.current].filter((part) => part.trim()).join("\n\n").trim();
+    return text || null;
+  }
+
+  private latestInterruptedTurn(agentId: string): InterruptedTurnPayload | null {
+    const rows = prisma.message.findMany({
+      where: { agentId, type: "system" },
+      orderBy: { seq: "desc" },
+      take: 20,
+    });
+    for (const row of rows) {
+      const payload = parseInterruptedTurnPayload(row.payload);
+      if (payload) return payload;
+    }
+    return null;
+  }
+
+  private nextMessageSeq(agentId: string): number {
+    const last = prisma.message.findFirst({
+      where: { agentId },
+      orderBy: { seq: "desc" },
+    });
+    return (last?.seq ?? -1) + 1;
+  }
+
+  private interruptedTurnAlreadyPersisted(sessionId: string, run: RunningSession): boolean {
+    if (run.userMessageSeq === undefined) return false;
+    const rows = prisma.message.findMany({
+      where: { agentId: sessionId, type: "system" },
+      orderBy: { seq: "desc" },
+      take: 50,
+    });
+    return rows.some((row) => {
+      const payload = parseInterruptedTurnPayload(row.payload);
+      return payload?.runId === run.runId && payload.userSeq === run.userMessageSeq;
+    });
+  }
+
+  private async persistInterruptedTurn(
+    sessionId: string,
+    run: RunningSession,
+    reason: string,
+  ): Promise<InterruptedTurnPayload | null> {
+    if (run.interruptedPersisted || run.sawResult || run.userMessageSeq === undefined) return null;
+    if (this.interruptedTurnAlreadyPersisted(sessionId, run)) {
+      run.interruptedPersisted = true;
+      return null;
+    }
+    const userRequest = truncateMiddle(run.userInput.trim(), INTERRUPTED_USER_REQUEST_MAX_CHARS);
+    if (!userRequest) return null;
+    const liveText = this.liveAssistantText(sessionId);
+    const payload: InterruptedTurnPayload = {
+      type: "system",
+      subtype: "interrupted_turn",
+      reason,
+      runId: run.runId,
+      userSeq: run.userMessageSeq,
+      userRequest,
+      ...(liveText ? { partialAssistantText: truncateMiddle(liveText, INTERRUPTED_PARTIAL_MAX_CHARS) } : {}),
+      interruptedAt: new Date().toISOString(),
+      ...(run.peerOrigin ? { peerOrigin: run.peerOrigin } : {}),
+    };
+    const row = await prisma.message.create({
+      data: {
+        agentId: sessionId,
+        seq: this.nextMessageSeq(sessionId),
+        type: "system",
+        payload,
+      },
+    });
+    run.interruptedPersisted = true;
+    this.hub.sendToSession(sessionId, {
+      type: "message",
+      sessionId,
+      seq: row.seq,
+      msg: payload as never,
+    });
+    return payload;
+  }
+
   async sendMessage(
     sessionId: string,
     userInput: string,
@@ -1660,6 +1937,10 @@ export class SessionManager {
       runId,
       abort,
       seq,
+      userInput,
+      startedSeq: seq,
+      peerOrigin: opts?.peerOrigin,
+      startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
     });
 
@@ -1689,6 +1970,11 @@ export class SessionManager {
       seq: userPersisted.seq,
       msg: userMsgPayload as never,
     });
+    const activeRunAfterUser = this.running.get(sessionId);
+    if (activeRunAfterUser?.runId === runId) {
+      activeRunAfterUser.userMessageSeq = userPersisted.seq;
+      activeRunAfterUser.seq = seq + 1;
+    }
     seq++;
 
     const mcpServers = await this.loadEnabledMcpServers();
@@ -1815,13 +2101,7 @@ export class SessionManager {
               .filter((m) => m.seq < userPersisted.seq)
           : [];
       const priorMessages: SdkMessage[] =
-        isCodexKind
-          ? runtimeHistoryFromCompletedTurns(priorRows)
-          : trimRuntimeHistory(
-              priorRows
-                .map(rowToRuntimeHistoryMessage)
-                .filter((m): m is SdkMessage => m !== null),
-            );
+        isOpenAIKind ? buildRuntimeHistoryForTurn(priorRows) : [];
       const runtimeCwd = isCodexKind ? agent.codexWorkspace || CODEX_DEFAULT_CWD : STABLE_CWD;
       // W21: precompute team context (async DB read) so the systemPrompt IIFE
       // below stays synchronous. Empty string when agent isn't in a team.
@@ -2090,6 +2370,8 @@ export class SessionManager {
         // Pricing is resolved against pricing.json (Claude SDK's costUSD
         // is intentionally ignored — wrong for third-party anthropic-compat).
         if (msg.type === "result") {
+          const activeRun = this.running.get(sessionId);
+          if (activeRun?.runId === runId) activeRun.sawResult = true;
           latestCodexUsageSnapshot = normalizeCodexUsageSnapshot(
             (msg as { _codexUsageSnapshot?: unknown })._codexUsageSnapshot,
           );
@@ -2197,6 +2479,10 @@ export class SessionManager {
       // Same guard as the success path. cancel() owns the canonical IDLE state
       // once it's removed this run from the map.
       if (this.running.get(sessionId)?.runId === runId) {
+        const activeRun = this.running.get(sessionId);
+        if (aborted && activeRun?.runId === runId) {
+          await this.persistInterruptedTurn(sessionId, activeRun, "aborted");
+        }
         const updated = await prisma.agent.update({ where: { id: sessionId }, data: persistData });
         this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
         if (!aborted) {
@@ -2363,8 +2649,41 @@ export class SessionManager {
    * across the contiguous assistant run; drops tool_use noise. Caps at
    * MAX_REVIEW_CHARS to avoid blowing the recipient's context window.
    */
-  private async fetchLastAssistantText(agentId: string): Promise<string | undefined> {
+  private async fetchPeerSourceSnapshot(agentId: string): Promise<PeerSourceSnapshot> {
     const MAX_REVIEW_CHARS = 8000;
+    const running = this.running.get(agentId);
+    const liveText = this.liveAssistantText(agentId);
+    if (running && liveText) {
+      const output = [
+        `Source state: running`,
+        `Current user request: ${truncateMiddle(running.userInput, PEER_SOURCE_REQUEST_MAX_CHARS)}`,
+        "",
+        "Live assistant output so far:",
+        truncateMiddle(liveText, PEER_SOURCE_PARTIAL_MAX_CHARS),
+      ].join("\n");
+      return {
+        sourceRunState: "running",
+        liveText: truncateMiddle(liveText, PEER_SOURCE_PARTIAL_MAX_CHARS),
+        sourceUserRequest: truncateMiddle(running.userInput, PEER_SOURCE_REQUEST_MAX_CHARS),
+        sourceOutput: truncateMiddle(output, PEER_SOURCE_OUTPUT_MAX_CHARS),
+      };
+    }
+    const interrupted = this.latestInterruptedTurn(agentId);
+    if (interrupted) {
+      const output = [
+        `Source state: interrupted`,
+        `Interrupted user request: ${truncateMiddle(interrupted.userRequest, PEER_SOURCE_REQUEST_MAX_CHARS)}`,
+        "",
+        "Partial assistant output before interruption:",
+        truncateMiddle(interrupted.partialAssistantText ?? "(no assistant output before interruption)", PEER_SOURCE_PARTIAL_MAX_CHARS),
+      ].join("\n");
+      return {
+        sourceRunState: "interrupted",
+        latestInterruptedContext: interrupted,
+        sourceUserRequest: truncateMiddle(interrupted.userRequest, PEER_SOURCE_REQUEST_MAX_CHARS),
+        sourceOutput: truncateMiddle(output, PEER_SOURCE_OUTPUT_MAX_CHARS),
+      };
+    }
     // Pull last 80 rows newest-first; any sensible last-turn fits.
     const rows = await prisma.message.findMany({
       where: { agentId },
@@ -2383,11 +2702,15 @@ export class SessionManager {
         .join("");
       if (text.trim()) texts.unshift(text.trim());
     }
-    if (texts.length === 0) return undefined;
+    if (texts.length === 0) return { sourceRunState: "empty" };
     const joined = texts.join("\n\n");
-    if (joined.length <= MAX_REVIEW_CHARS) return joined;
-    const half = Math.floor(MAX_REVIEW_CHARS / 2) - 40;
-    return `${joined.slice(0, half)}\n\n[... ${joined.length - half * 2} chars truncated ...]\n\n${joined.slice(-half)}`;
+    const lastCompletedAssistantText =
+      joined.length <= MAX_REVIEW_CHARS ? joined : truncateMiddle(joined, MAX_REVIEW_CHARS);
+    return {
+      sourceRunState: "completed",
+      lastCompletedAssistantText,
+      sourceOutput: truncateMiddle(lastCompletedAssistantText, PEER_SOURCE_OUTPUT_MAX_CHARS),
+    };
   }
 
   /** Called by the peer_query MCP tool. Read-only fetch of another agent's
@@ -2476,14 +2799,15 @@ export class SessionManager {
       return `error: peer agent "${targetAgent.name}" is closed; user must restart it before it can receive messages`;
     }
 
-    const sourceLastOutput = await this.fetchLastAssistantText(fromAgent.id);
+    const sourceSnapshot = await this.fetchPeerSourceSnapshot(fromAgent.id);
     const formatted = formatPeerHandoff({
       fromName: fromAgent.name,
       fromId: fromAgent.id,
       receiverMetadata: targetAgent.metadata,
       mode,
       body,
-      sourceLastOutput,
+      sourceLastOutput: sourceSnapshot.sourceOutput,
+      sourceState: sourceSnapshot.sourceRunState,
     });
     const targetWasBusy = this.running.has(targetId) || this.drainingQueues.has(targetId);
     void this.sendMessage(targetId, formatted, {
@@ -2507,6 +2831,7 @@ export class SessionManager {
 
     if (r) {
       console.log(`[${opts.logPrefix}] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
+      await this.persistInterruptedTurn(sessionId, r, opts.error?.code ?? opts.logPrefix);
       try { r.abort.abort(); } catch { /* signal already aborted */ }
       this.clearRuntimeIdleWatchdog(sessionId, r.runId);
     } else {
@@ -2598,9 +2923,9 @@ export class SessionManager {
    *  updates so they can't undo the IDLE state. */
   async cancel(sessionId: string): Promise<void> {
     const r = this.running.get(sessionId);
-    this.liveTranscripts.delete(sessionId);
     if (r) {
       console.log(`[cancel] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
+      await this.persistInterruptedTurn(sessionId, r, "cancelled");
       try { r.abort.abort(); } catch { /* signal already aborted */ }
       this.clearRuntimeIdleWatchdog(sessionId, r.runId);
     } else {
@@ -2610,6 +2935,7 @@ export class SessionManager {
       // the agent IDLE than stuck.
       console.log(`[cancel] no live run for agent=${sessionId.slice(0, 8)}; cleaning stale state`);
     }
+    this.liveTranscripts.delete(sessionId);
 
     // Drop in-memory state synchronously so sendMessage's runId guard fires
     // and a fresh send_message can be accepted without races.
