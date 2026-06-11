@@ -6,6 +6,8 @@
 
 import { resolve } from "node:path";
 import Fastify from "fastify";
+import { CloudDb } from "./cloud/db.js";
+import { registerCloudRoutes } from "./cloud/routes.js";
 import { ManifestStore } from "./manifest.js";
 import { TelemetryDb, readDbConfig } from "./telemetry/db.js";
 import { registerTelemetryRoutes } from "./telemetry/routes.js";
@@ -69,6 +71,19 @@ if (telemetryDb) {
   }
 } else {
   app.log.warn("telemetry DB not configured — endpoints disabled");
+}
+
+if (telemetryDb) {
+  const cloudDb = new CloudDb(telemetryDb.pool);
+  try {
+    await cloudDb.migrate();
+    registerCloudRoutes(app, cloudDb);
+    app.log.info("cloud workspace routes enabled");
+  } catch (err) {
+    app.log.error({ err }, "cloud workspace migrate failed - routes NOT registered");
+  }
+} else {
+  app.log.warn("cloud workspace DB not configured - endpoints disabled");
 }
 
 // Always return JSON for unmatched paths, never an HTML 404 page.
