@@ -499,6 +499,7 @@
       reasoningEffort: summary.reasoningEffort,
       codexWorkspace: summary.codexWorkspace,
       metadata: {
+        ...(current.metadata || {}),
         forcedSkills: summary.forcedSkills || [],
         disabledSkills: summary.disabledSkills || [],
         closed: !!summary.closed,
