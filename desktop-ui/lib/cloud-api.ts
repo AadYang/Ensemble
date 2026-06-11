@@ -373,3 +373,48 @@ export function buildCloudSnapshotFromLocal(input: {
   }
   return { teams, agents, messages };
 }
+
+function stableConfigMetadata(value: unknown): unknown {
+  const scrubbed = scrubSecrets(value);
+  if (!isRecord(scrubbed)) return {};
+  return sortObject(scrubbed);
+}
+
+function sortObject(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortObject);
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    out[key] = sortObject(value[key]);
+  }
+  return out;
+}
+
+export function cloudConfigSignature(snapshot: { teams: CloudTeam[]; agents: CloudAgent[] }): string {
+  const teams = [...snapshot.teams]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((team) => ({
+      id: team.id,
+      name: team.name,
+      description: team.description,
+      sortOrder: team.sortOrder,
+    }));
+  const agents = [...snapshot.agents]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((agent) => ({
+      id: agent.id,
+      parentId: agent.parentId,
+      teamId: agent.teamId,
+      name: agent.name,
+      systemPrompt: agent.systemPrompt,
+      model: agent.model,
+      providerId: agent.providerId,
+      permissionMode: agent.permissionMode,
+      sandboxMode: agent.sandboxMode,
+      reasoningEffort: agent.reasoningEffort,
+      codexWorkspace: agent.codexWorkspace,
+      metadata: stableConfigMetadata(agent.metadata),
+      sortOrder: agent.sortOrder,
+    }));
+  return JSON.stringify({ teams, agents });
+}

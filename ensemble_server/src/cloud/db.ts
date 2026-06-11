@@ -376,6 +376,27 @@ export class CloudDb implements CloudStore {
       throw new CloudRevisionConflictError(workspace.revision);
     }
     const { teams, agents, messages } = sanitizeSnapshotInput(input);
+    const readMessageCursors = async (): Promise<CloudMessageCursor[]> => {
+      const [cursorRows] = await this.pool.query<Row[]>(
+        `SELECT agent_id AS agentId, MAX(seq) AS maxSeq
+         FROM cloud_message
+         WHERE account_id = ? AND workspace_id = ?
+         GROUP BY agent_id
+         ORDER BY agent_id ASC`,
+        [accountId, workspaceId],
+      );
+      return cursorRows.map((row) => ({
+        agentId: String(row.agentId),
+        maxSeq: Number(row.maxSeq ?? -1),
+      }));
+    };
+    if (teams.length === 0 && agents.length === 0 && messages.length === 0) {
+      return {
+        workspace,
+        applied: { teams: 0, agents: 0, messages: 0 },
+        messageCursors: await readMessageCursors(),
+      };
+    }
     const conn = await this.pool.getConnection();
     const now = new Date();
     const nextRevision = workspace.revision + 1;
@@ -467,18 +488,6 @@ export class CloudDb implements CloudStore {
     }
     const nextWorkspace = await this.getWorkspace(accountId, workspaceId);
     if (!nextWorkspace) throw new Error("workspace_not_found");
-    const [cursorRows] = await this.pool.query<Row[]>(
-      `SELECT agent_id AS agentId, MAX(seq) AS maxSeq
-       FROM cloud_message
-       WHERE account_id = ? AND workspace_id = ?
-       GROUP BY agent_id
-       ORDER BY agent_id ASC`,
-      [accountId, workspaceId],
-    );
-    const messageCursors: CloudMessageCursor[] = cursorRows.map((row) => ({
-      agentId: String(row.agentId),
-      maxSeq: Number(row.maxSeq ?? -1),
-    }));
     return {
       workspace: nextWorkspace,
       applied: {
@@ -486,7 +495,7 @@ export class CloudDb implements CloudStore {
         agents: agents.length,
         messages: messages.length,
       },
-      messageCursors,
+      messageCursors: await readMessageCursors(),
     };
   }
 }

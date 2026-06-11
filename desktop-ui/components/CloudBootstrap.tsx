@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import {
+  cloudConfigSignature,
   fetchCloudMe,
   fetchCloudSnapshot,
   listCloudWorkspaces,
@@ -44,7 +45,7 @@ export function CloudBootstrap() {
         setCloudSnapshot(snapshot);
         setCloudRevision(target.id, snapshot.workspace.revision);
         setCloudMessageCursors(target.id, cursorsFromSnapshot(snapshot));
-        setCloudConfigSignature(target.id, configSignature(snapshot));
+        setCloudConfigSignature(target.id, cloudConfigSignature(snapshot));
       } catch (err) {
         console.warn("cloud bootstrap failed", err);
       }
@@ -74,8 +75,4 @@ function cursorsFromSnapshot(snapshot: {
     cursors[message.agentId] = Math.max(cursors[message.agentId] ?? -1, message.seq);
   }
   return cursors;
-}
-
-function configSignature(snapshot: { teams: unknown[]; agents: unknown[] }): string {
-  return JSON.stringify({ teams: snapshot.teams, agents: snapshot.agents });
 }

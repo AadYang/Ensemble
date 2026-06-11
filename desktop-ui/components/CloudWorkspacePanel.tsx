@@ -5,6 +5,7 @@ import type { AgentState } from "@/store/agents";
 import { useStore } from "@/store/agents";
 import {
   buildCloudSnapshotFromLocal,
+  cloudConfigSignature,
   createCloudWorkspace,
   fetchCloudMe,
   fetchCloudSnapshot,
@@ -79,7 +80,7 @@ export function CloudWorkspacePanel({
         setCloudSnapshot(snapshot);
         setCloudRevision(target.id, snapshot.workspace.revision);
         setCloudMessageCursors(target.id, cursorsFromSnapshot(snapshot));
-        setCloudConfigSignature(target.id, configSignature(snapshot));
+        setCloudConfigSignature(target.id, cloudConfigSignature(snapshot));
       } else {
         setCloudSnapshot(null);
       }
@@ -101,7 +102,7 @@ export function CloudWorkspacePanel({
       setCloudSnapshot(snapshot);
       setCloudRevision(id, snapshot.workspace.revision);
       setCloudMessageCursors(id, cursorsFromSnapshot(snapshot));
-      setCloudConfigSignature(id, configSignature(snapshot));
+      setCloudConfigSignature(id, cloudConfigSignature(snapshot));
       setStatus("cloud workspace loaded");
     } catch (err) {
       setError((err as Error).message);
@@ -128,7 +129,7 @@ export function CloudWorkspacePanel({
       setCloudSnapshot(snapshot);
       setCloudRevision(created.id, snapshot.workspace.revision);
       setCloudMessageCursors(created.id, cursorsFromSnapshot(snapshot));
-      setCloudConfigSignature(created.id, configSignature(snapshot));
+      setCloudConfigSignature(created.id, cloudConfigSignature(snapshot));
       setStatus("cloud workspace created");
     } catch (err) {
       setError((err as Error).message);
@@ -154,7 +155,7 @@ export function CloudWorkspacePanel({
       setCloudSnapshot(uploaded.snapshot);
       setCloudRevision(cloudCurrentWorkspaceId, uploaded.snapshot.workspace.revision);
       setCloudMessageCursors(cloudCurrentWorkspaceId, cursorsFromList(uploaded.messageCursors));
-      setCloudConfigSignature(cloudCurrentWorkspaceId, configSignature(snapshot));
+      setCloudConfigSignature(cloudCurrentWorkspaceId, cloudConfigSignature(snapshot));
       const list = await listCloudWorkspaces(cloudSession);
       setCloudWorkspaces(list);
       setStatus(`uploaded ${snapshot.agents.length} agents and ${snapshot.messages.length} messages`);
@@ -371,7 +372,7 @@ async function buildIncrementalBatch(
     teams: teamList,
     messagesByAgent,
   });
-  const signature = configSignature(snapshot);
+  const signature = cloudConfigSignature(snapshot);
   const messages = snapshot.messages;
   const configChanged = signature !== previousSignature;
   return {
@@ -379,10 +380,6 @@ async function buildIncrementalBatch(
     messages,
     configSignature: signature,
   };
-}
-
-function configSignature(snapshot: { teams: unknown[]; agents: unknown[] }): string {
-  return JSON.stringify({ teams: snapshot.teams, agents: snapshot.agents });
 }
 
 function cursorsFromSnapshot(snapshot: { messages: Array<{ agentId: string; seq: number }> }): Record<string, number> {

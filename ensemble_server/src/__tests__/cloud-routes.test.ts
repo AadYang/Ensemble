@@ -310,6 +310,21 @@ describe("cloud account workspace routes", () => {
         applied: { messages: 1 },
         messageCursors: [{ agentId: "agent-1", maxSeq: 3 }],
       });
+
+      const noop = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/workspaces/batch/sync-batch",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          expectedRevision: 2,
+        },
+      });
+      expect(noop.statusCode).toBe(200);
+      expect(noop.json()).toMatchObject({
+        workspace: { revision: 2 },
+        applied: { teams: 0, agents: 0, messages: 0 },
+        messageCursors: [{ agentId: "agent-1", maxSeq: 3 }],
+      });
     } finally {
       await app.close();
     }

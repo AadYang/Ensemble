@@ -418,6 +418,24 @@ export class MemoryCloudStore implements CloudStore {
       throw new CloudRevisionConflictError(workspace.revision);
     }
     const sanitized = sanitizeSnapshotInput(input);
+    const messageCursors = (): CloudMessageCursor[] => {
+      const cursors = new Map<string, number>();
+      const prefix = `${accountId}\u0000${workspaceId}\u0000`;
+      for (const [messageKey, message] of this.messages.entries()) {
+        if (!messageKey.startsWith(prefix)) continue;
+        cursors.set(message.agentId, Math.max(cursors.get(message.agentId) ?? -1, message.seq));
+      }
+      return [...cursors.entries()]
+        .map(([agentId, maxSeq]) => ({ agentId, maxSeq }))
+        .sort((a, b) => a.agentId.localeCompare(b.agentId));
+    };
+    if (sanitized.teams.length === 0 && sanitized.agents.length === 0 && sanitized.messages.length === 0) {
+      return {
+        workspace,
+        applied: { teams: 0, agents: 0, messages: 0 },
+        messageCursors: messageCursors(),
+      };
+    }
     const at = nowIso();
     const nextRevision = workspace.revision + 1;
     workspace.revision = nextRevision;
@@ -435,12 +453,6 @@ export class MemoryCloudStore implements CloudStore {
       this.messages.set(messageKey, { ...message, id: existing?.id ?? this.nextMessageId++ });
     }
 
-    const cursors = new Map<string, number>();
-    const prefix = `${accountId}\u0000${workspaceId}\u0000`;
-    for (const [messageKey, message] of this.messages.entries()) {
-      if (!messageKey.startsWith(prefix)) continue;
-      cursors.set(message.agentId, Math.max(cursors.get(message.agentId) ?? -1, message.seq));
-    }
     return {
       workspace,
       applied: {
@@ -448,9 +460,7 @@ export class MemoryCloudStore implements CloudStore {
         agents: sanitized.agents.length,
         messages: sanitized.messages.length,
       },
-      messageCursors: [...cursors.entries()]
-        .map(([agentId, maxSeq]) => ({ agentId, maxSeq }))
-        .sort((a, b) => a.agentId.localeCompare(b.agentId)),
+      messageCursors: messageCursors(),
     };
   }
 }
