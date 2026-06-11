@@ -18,6 +18,8 @@ const EMAIL_MAX = 255;
 const PASSWORD_MAX = 1024;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CLOUD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 8;
 
 const loginBodySchema = z.object({
   email: z.string().email().max(EMAIL_MAX),
@@ -49,11 +51,18 @@ export interface CloudRoutesOptions {
   fixedAccounts?: FixedAccountConfig[];
   inviteCode?: string;
   sessionTtlMs?: number;
+  loginWindowMs?: number;
+  loginMaxFailures?: number;
 }
 
 interface AuthContext {
   tokenHash: string;
   account: CloudAccountRecord;
+}
+
+interface LoginFailureBucket {
+  count: number;
+  resetAt: number;
 }
 
 function bearerToken(req: FastifyRequest): string | null {
@@ -66,6 +75,38 @@ function bearerToken(req: FastifyRequest): string | null {
 function userAgent(req: FastifyRequest): string | null {
   const value = req.headers["user-agent"];
   return typeof value === "string" ? value.slice(0, 512) : null;
+}
+
+function loginFailureKey(req: FastifyRequest, email: string): string {
+  return `${req.ip || "unknown"}:${normalizeEmail(email)}`;
+}
+
+function getLoginBucket(
+  failures: Map<string, LoginFailureBucket>,
+  key: string,
+  now: number,
+): LoginFailureBucket | null {
+  const bucket = failures.get(key);
+  if (!bucket) return null;
+  if (bucket.resetAt <= now) {
+    failures.delete(key);
+    return null;
+  }
+  return bucket;
+}
+
+function recordLoginFailure(
+  failures: Map<string, LoginFailureBucket>,
+  key: string,
+  now: number,
+  windowMs: number,
+): LoginFailureBucket {
+  const existing = getLoginBucket(failures, key, now);
+  const next = existing
+    ? { count: existing.count + 1, resetAt: existing.resetAt }
+    : { count: 1, resetAt: now + windowMs };
+  failures.set(key, next);
+  return next;
 }
 
 async function authenticate(req: FastifyRequest, store: CloudStore): Promise<AuthContext | null> {
@@ -131,7 +172,21 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
     fixedAccounts: routeOptions.fixedAccounts ?? parseFixedAccounts(),
     inviteCode: routeOptions.inviteCode ?? process.env.ENSEMBLE_BETA_INVITE_CODE ?? "",
     sessionTtlMs: routeOptions.sessionTtlMs ?? SESSION_TTL_MS,
+    loginWindowMs: routeOptions.loginWindowMs ?? LOGIN_WINDOW_MS,
+    loginMaxFailures: routeOptions.loginMaxFailures ?? LOGIN_MAX_FAILURES,
   };
+  const loginFailures = new Map<string, LoginFailureBucket>();
+
+  app.addHook("onRequest", async (req, reply) => {
+    if (!req.url.startsWith("/v1/cloud/")) return;
+    reply.header("Access-Control-Allow-Origin", "*");
+    reply.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    reply.header("Access-Control-Allow-Headers", "authorization,content-type");
+    reply.header("Access-Control-Max-Age", "600");
+    if (req.method === "OPTIONS") {
+      reply.code(204).send();
+    }
+  });
 
   app.post("/v1/cloud/auth/login", async (req, reply) => {
     const parsed = loginBodySchema.safeParse(req.body);
@@ -139,11 +194,26 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       reply.code(400);
       return { error: "bad_request", detail: parsed.error.issues };
     }
+    const failureKey = loginFailureKey(req, parsed.data.email);
+    const now = Date.now();
+    const bucket = getLoginBucket(loginFailures, failureKey, now);
+    if (bucket && bucket.count >= options.loginMaxFailures) {
+      reply.code(429);
+      return {
+        error: "rate_limited",
+        retryAfterMs: Math.max(0, bucket.resetAt - now),
+      };
+    }
     const account = await loginAccount(store, parsed.data, options);
     if (!account) {
+      const failed = recordLoginFailure(loginFailures, failureKey, now, options.loginWindowMs);
       reply.code(401);
-      return { error: "invalid_credentials" };
+      return {
+        error: "invalid_credentials",
+        remainingAttempts: Math.max(0, options.loginMaxFailures - failed.count),
+      };
     }
+    loginFailures.delete(failureKey);
     const token = newSessionToken();
     const expiresAt = new Date(Date.now() + options.sessionTtlMs);
     await store.createSession({
@@ -238,7 +308,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
         return { error: "not_found" };
       }
       const snapshot = await store.upsertSnapshot(auth.account.id, params.data.workspaceId, body.data);
-      return { snapshot };
+      return { mode: "upsert", snapshot };
     } catch (err) {
       if (err instanceof Error && err.message === "workspace_not_found") {
         reply.code(404);

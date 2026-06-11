@@ -7,6 +7,15 @@ import { useT } from "@/i18n/useT";
 import { useStore } from "@/store/agents";
 import { getCliSettings, patchCliSettings, type CliSettingsHealth } from "@/lib/settings-api";
 import {
+  defaultCloudOrigin,
+  fetchCloudMe,
+  listCloudWorkspaces,
+  loadCloudSession,
+  loginCloud,
+  logoutCloud,
+  saveCloudSession,
+} from "@/lib/cloud-api";
+import {
   checkForUpdates,
   getCurrentVersion,
   type UpdateState,
@@ -24,6 +33,12 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
   const t = useT();
   const locale = useStore((s) => s.locale);
   const setLocale = useStore((s) => s.setLocale);
+  const cloudSession = useStore((s) => s.cloudSession);
+  const setCloudSession = useStore((s) => s.setCloudSession);
+  const setCloudAccount = useStore((s) => s.setCloudAccount);
+  const setCloudWorkspaces = useStore((s) => s.setCloudWorkspaces);
+  const setCloudCurrentWorkspace = useStore((s) => s.setCloudCurrentWorkspace);
+  const setCloudSnapshot = useStore((s) => s.setCloudSnapshot);
 
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const [mounted, setMounted] = useState(false);
@@ -41,6 +56,13 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
     | { kind: "up-to-date"; latest: string }
     | { kind: "failed"; message: string }
   >({ kind: "idle" });
+  const [cloudOrigin, setCloudOrigin] = useState(defaultCloudOrigin());
+  const [cloudEmail, setCloudEmail] = useState("");
+  const [cloudPassword, setCloudPassword] = useState("");
+  const [cloudInviteCode, setCloudInviteCode] = useState("");
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [cloudStatus, setCloudStatus] = useState<string | null>(null);
   const dragOffsetRef = useRef<{ dx: number; dy: number } | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -67,6 +89,15 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
     if (mounted) void refreshCli();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mounted]);
+
+  useEffect(() => {
+    if (!mounted) return;
+    const session = loadCloudSession();
+    if (!session) return;
+    setCloudOrigin(session.origin);
+    setCloudEmail(session.account.email);
+    setCloudSession(session);
+  }, [mounted, setCloudSession]);
 
   // Read the app version once when the dialog mounts. Fast (sync IPC call
   // through @tauri-apps/api/app) so no separate loading state.
@@ -160,6 +191,72 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
       setError((err as Error).message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const onCloudLogin = async () => {
+    setCloudBusy(true);
+    setCloudError(null);
+    setCloudStatus(null);
+    try {
+      const session = await loginCloud({
+        origin: cloudOrigin,
+        email: cloudEmail.trim(),
+        password: cloudPassword,
+        inviteCode: cloudInviteCode,
+      });
+      setCloudSession(session);
+      const workspaces = await listCloudWorkspaces(session);
+      setCloudWorkspaces(workspaces);
+      setCloudPassword("");
+      setCloudInviteCode("");
+      setCloudStatus("signed in");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const onCloudRefresh = async () => {
+    if (!cloudSession) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    setCloudStatus(null);
+    try {
+      const [account, workspaces] = await Promise.all([
+        fetchCloudMe(cloudSession),
+        listCloudWorkspaces(cloudSession),
+      ]);
+      const next = { ...cloudSession, account };
+      saveCloudSession(next);
+      setCloudSession(next);
+      setCloudAccount(account);
+      setCloudWorkspaces(workspaces);
+      setCloudStatus("account refreshed");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const onCloudLogout = async () => {
+    if (!cloudSession) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    setCloudStatus(null);
+    try {
+      await logoutCloud(cloudSession);
+      setCloudSession(null);
+      setCloudWorkspaces([]);
+      setCloudCurrentWorkspace(null);
+      setCloudSnapshot(null);
+      setCloudStatus("signed out");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
     }
   };
 
@@ -314,6 +411,83 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
               {versionStatus.message}
             </div>
           )}
+        </div>
+
+        <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">Account workspace beta</span>
+            <span className="flex-1" />
+            {cloudSession && (
+              <div className="flex gap-1">
+                <button
+                  onClick={() => void onCloudRefresh()}
+                  disabled={cloudBusy}
+                  className="px-2 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] disabled:opacity-30"
+                >
+                  refresh
+                </button>
+                <button
+                  onClick={() => void onCloudLogout()}
+                  disabled={cloudBusy}
+                  className="px-2 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)] disabled:opacity-30"
+                >
+                  sign out
+                </button>
+              </div>
+            )}
+          </div>
+          {cloudSession ? (
+            <div className="flex flex-col gap-1">
+              <div className="text-[var(--text)] break-all">
+                signed in as {cloudSession.account.displayName || cloudSession.account.email}
+              </div>
+              <div className="text-[10px] text-[var(--text-faint)] break-all">
+                server: {cloudSession.origin}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <input
+                value={cloudOrigin}
+                onChange={(e) => setCloudOrigin(e.target.value)}
+                placeholder={defaultCloudOrigin()}
+                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)] font-mono text-[11px]"
+              />
+              <input
+                value={cloudEmail}
+                onChange={(e) => setCloudEmail(e.target.value)}
+                placeholder="email"
+                autoComplete="username"
+                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+              />
+              <input
+                value={cloudPassword}
+                onChange={(e) => setCloudPassword(e.target.value)}
+                placeholder="password"
+                type="password"
+                autoComplete="current-password"
+                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+              />
+              <input
+                value={cloudInviteCode}
+                onChange={(e) => setCloudInviteCode(e.target.value)}
+                placeholder="invite code (only needed for first login)"
+                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+              />
+              <button
+                onClick={() => void onCloudLogin()}
+                disabled={cloudBusy || !cloudEmail.trim() || !cloudPassword}
+                className="px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+              >
+                sign in
+              </button>
+            </div>
+          )}
+          <div className="text-[10px] text-[var(--text-faint)] leading-tight">
+            Local workspaces are never uploaded automatically. Use the cloud panel in the sidebar to copy a sanitized snapshot.
+          </div>
+          {cloudStatus && <div className="text-[10px] text-[var(--ok)]">{cloudStatus}</div>}
+          {cloudError && <div className="text-[10px] text-[var(--err)] break-words">{cloudError}</div>}
         </div>
       </div>
     </div>

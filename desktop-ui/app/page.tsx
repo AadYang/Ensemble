@@ -21,6 +21,7 @@ import { PermissionDialog } from "@/components/PermissionDialog";
 import { AskUserDialog } from "@/components/AskUserDialog";
 import { DialogHost } from "@/components/DialogHost";
 import { AgentTree } from "@/components/AgentTree";
+import { CloudWorkspacePanel } from "@/components/CloudWorkspacePanel";
 import { McpServerPanel } from "@/components/McpServerPanel";
 import { SkillPanel } from "@/components/SkillPanel";
 import { ProviderPanel } from "@/components/ProviderPanel";
@@ -485,6 +486,10 @@ export default function Page() {
             onSelect={selectWorkspace}
             onCreate={onCreateWorkspace}
             onRename={onRenameWorkspace}
+          />
+          <CloudWorkspacePanel
+            localWorkspaces={workspaces}
+            currentLocalWorkspaceId={currentWorkspaceId}
           />
           <div className="p-3 border-b border-[var(--border)] flex flex-col gap-2">
             <div className="flex gap-1">

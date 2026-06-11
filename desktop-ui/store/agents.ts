@@ -21,6 +21,7 @@ import {
   type TeamSummary,
 } from "@agentorch/shared";
 import type { Locale } from "@/i18n/dict";
+import type { CloudAccount, CloudSession, CloudSnapshot, CloudWorkspace } from "@/lib/cloud-api";
 
 const LOCALE_KEY = "ensemble:locale";
 
@@ -79,6 +80,16 @@ interface Store {
   currentWorkspaceId: string | null;
   setWorkspaces: (list: WorkspaceSummary[]) => void;
   setCurrentWorkspace: (id: string | null) => void;
+
+  cloudSession: CloudSession | null;
+  cloudWorkspaces: CloudWorkspace[];
+  cloudCurrentWorkspaceId: string | null;
+  cloudSnapshot: CloudSnapshot | null;
+  setCloudSession: (session: CloudSession | null) => void;
+  setCloudAccount: (account: CloudAccount) => void;
+  setCloudWorkspaces: (list: CloudWorkspace[]) => void;
+  setCloudCurrentWorkspace: (id: string | null) => void;
+  setCloudSnapshot: (snapshot: CloudSnapshot | null) => void;
 
   windows: LayoutWindow[];
   activeWindowId: string;
@@ -240,6 +251,21 @@ export const useStore = create<Store>((set) => ({
   currentWorkspaceId: null,
   setWorkspaces: (list) => set({ workspaces: list }),
   setCurrentWorkspace: (id) => set({ currentWorkspaceId: id }),
+
+  cloudSession: null,
+  cloudWorkspaces: [],
+  cloudCurrentWorkspaceId: null,
+  cloudSnapshot: null,
+  setCloudSession: (session) => set({ cloudSession: session }),
+  setCloudAccount: (account) =>
+    set((s) =>
+      s.cloudSession
+        ? { cloudSession: { ...s.cloudSession, account } }
+        : s,
+    ),
+  setCloudWorkspaces: (list) => set({ cloudWorkspaces: list }),
+  setCloudCurrentWorkspace: (id) => set({ cloudCurrentWorkspaceId: id }),
+  setCloudSnapshot: (snapshot) => set({ cloudSnapshot: snapshot }),
 
   windows: [initialWindow],
   activeWindowId: initialWindow.id,

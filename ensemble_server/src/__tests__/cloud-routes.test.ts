@@ -10,6 +10,8 @@ function makeApp() {
     fixedAccounts: [{ email: "fixed@example.com", password: "fixed-pass", displayName: "Fixed User" }],
     inviteCode: "invite-123",
     sessionTtlMs: 60 * 60 * 1000,
+    loginWindowMs: 60 * 1000,
+    loginMaxFailures: 2,
   });
   return { app, store };
 }
@@ -63,6 +65,68 @@ describe("cloud account workspace routes", () => {
       const res = await app.inject({ method: "GET", url: "/v1/cloud/workspaces" });
       expect(res.statusCode).toBe(401);
       expect(res.json()).toMatchObject({ error: "unauthorized" });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("answers cloud CORS preflight requests", async () => {
+    const { app } = makeApp();
+    try {
+      const res = await app.inject({
+        method: "OPTIONS",
+        url: "/v1/cloud/workspaces",
+        headers: {
+          origin: "tauri://localhost",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "authorization,content-type",
+        },
+      });
+      expect(res.statusCode).toBe(204);
+      expect(res.headers["access-control-allow-origin"]).toBe("*");
+      expect(String(res.headers["access-control-allow-headers"])).toContain("authorization");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rate limits repeated login failures and resets after a successful login", async () => {
+    const { app } = makeApp();
+    try {
+      for (let i = 0; i < 2; i++) {
+        const res = await app.inject({
+          method: "POST",
+          url: "/v1/cloud/auth/login",
+          payload: { email: "fixed@example.com", password: "wrong" },
+        });
+        expect(res.statusCode).toBe(401);
+        expect(res.json()).toMatchObject({ error: "invalid_credentials" });
+      }
+
+      const limited = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/auth/login",
+        payload: { email: "fixed@example.com", password: "wrong" },
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(limited.json()).toMatchObject({ error: "rate_limited" });
+
+      const otherIp = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/auth/login",
+        remoteAddress: "203.0.113.10",
+        payload: { email: "fixed@example.com", password: "fixed-pass" },
+      });
+      expect(otherIp.statusCode).toBe(200);
+
+      const afterSuccess = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/auth/login",
+        remoteAddress: "203.0.113.10",
+        payload: { email: "fixed@example.com", password: "wrong" },
+      });
+      expect(afterSuccess.statusCode).toBe(401);
+      expect(afterSuccess.json()).toMatchObject({ remainingAttempts: 1 });
     } finally {
       await app.close();
     }
@@ -164,6 +228,7 @@ describe("cloud account workspace routes", () => {
         },
       });
       expect(put.statusCode).toBe(200);
+      expect(put.json()).toMatchObject({ mode: "upsert" });
 
       const get = await app.inject({
         method: "GET",
