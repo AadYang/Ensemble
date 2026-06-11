@@ -251,4 +251,67 @@ describe("cloud account workspace routes", () => {
       await app.close();
     }
   });
+
+  it("applies revision-guarded sync batches and returns message cursors", async () => {
+    const { app } = makeApp();
+    try {
+      const token = await login(app, {
+        email: "batch@example.com",
+        password: "batch-pass",
+        inviteCode: "invite-123",
+      });
+      await createWorkspace(app, token, { id: "batch", name: "Batch" });
+
+      const first = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/workspaces/batch/sync-batch",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          expectedRevision: 0,
+          agents: [{ id: "agent-1", name: "Agent", model: "gpt-5" }],
+          messages: [
+            { agentId: "agent-1", seq: 1, type: "user", payload: { text: "one" } },
+            { agentId: "agent-1", seq: 2, type: "assistant", payload: { text: "two" } },
+          ],
+        },
+      });
+      expect(first.statusCode).toBe(200);
+      expect(first.json()).toMatchObject({
+        mode: "sync-batch",
+        workspace: { id: "batch", revision: 1 },
+        applied: { agents: 1, messages: 2 },
+        messageCursors: [{ agentId: "agent-1", maxSeq: 2 }],
+      });
+
+      const conflict = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/workspaces/batch/sync-batch",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          expectedRevision: 0,
+          messages: [{ agentId: "agent-1", seq: 3, type: "user", payload: { text: "stale" } }],
+        },
+      });
+      expect(conflict.statusCode).toBe(409);
+      expect(conflict.json()).toMatchObject({ error: "revision_conflict", currentRevision: 1 });
+
+      const second = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/workspaces/batch/sync-batch",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          expectedRevision: 1,
+          messages: [{ agentId: "agent-1", seq: 3, type: "user", payload: { text: "three" } }],
+        },
+      });
+      expect(second.statusCode).toBe(200);
+      expect(second.json()).toMatchObject({
+        workspace: { revision: 2 },
+        applied: { messages: 1 },
+        messageCursors: [{ agentId: "agent-1", maxSeq: 3 }],
+      });
+    } finally {
+      await app.close();
+    }
+  });
 });

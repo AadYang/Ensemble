@@ -12,7 +12,7 @@ import type {
 } from "@agentorch/shared";
 import { WSHub } from "./ws/hub.js";
 import { agentRowToSummary, SessionManager } from "./sessions/SessionManager.js";
-import { prisma, closeDb } from "./db.js";
+import { prisma, closeDb, sqliteDb } from "./db.js";
 import { createHash } from "node:crypto";
 import {
   SUBAGENT_CATALOG,
@@ -1151,10 +1151,31 @@ fastify.get("/agents", async () => {
   return rows.map(agentRowToSummary);
 });
 
-fastify.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
+fastify.get<{ Params: { id: string }; Querystring: { limit?: string; afterSeq?: string } }>(
   "/agents/:id/messages",
   async (req) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 200) || 200));
+    const afterSeq = Number(req.query.afterSeq);
+    if (Number.isFinite(afterSeq)) {
+      const rows = sqliteDb
+        .prepare(
+          `SELECT seq, payload
+           FROM Message
+           WHERE agentId = ? AND seq > ?
+           ORDER BY seq ASC
+           LIMIT ?`,
+        )
+        .all(req.params.id, afterSeq, limit) as Array<{ seq: number; payload: string }>;
+      return rows.map((r) => {
+        let msg: unknown = null;
+        try {
+          msg = JSON.parse(r.payload);
+        } catch {
+          msg = null;
+        }
+        return { seq: r.seq, msg };
+      });
+    }
     const rows = await prisma.message.findMany({
       where: { agentId: req.params.id },
       orderBy: { seq: "desc" },

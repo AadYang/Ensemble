@@ -12,7 +12,7 @@ import {
   type FixedAccountConfig,
 } from "./auth.js";
 import type { CloudAccountRecord, CloudStore } from "./store.js";
-import { publicAccount } from "./store.js";
+import { CloudRevisionConflictError, publicAccount } from "./store.js";
 
 const EMAIL_MAX = 255;
 const PASSWORD_MAX = 1024;
@@ -41,6 +41,10 @@ const snapshotBodySchema = z.object({
   messages: z.array(z.unknown()).max(20_000).optional(),
   // Intentionally ignored for anti-confused-deputy behavior.
   accountId: z.string().optional(),
+});
+
+const syncBatchBodySchema = snapshotBodySchema.extend({
+  expectedRevision: z.number().int().min(0).optional(),
 });
 
 const paramsSchema = z.object({
@@ -308,8 +312,54 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
         return { error: "not_found" };
       }
       const snapshot = await store.upsertSnapshot(auth.account.id, params.data.workspaceId, body.data);
-      return { mode: "upsert", snapshot };
+      const cursors = new Map<string, number>();
+      for (const message of snapshot.messages) {
+        cursors.set(message.agentId, Math.max(cursors.get(message.agentId) ?? -1, message.seq));
+      }
+      return {
+        mode: "upsert",
+        snapshot,
+        revision: snapshot.workspace.revision,
+        messageCursors: [...cursors.entries()].map(([agentId, maxSeq]) => ({ agentId, maxSeq })),
+      };
     } catch (err) {
+      if (err instanceof Error && err.message === "workspace_not_found") {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      reply.code(401);
+      return { error: "unauthorized" };
+    }
+  });
+
+  app.post("/v1/cloud/workspaces/:workspaceId/sync-batch", async (req, reply) => {
+    const params = paramsSchema.safeParse(req.params);
+    if (!params.success) {
+      reply.code(400);
+      return { error: "bad_request", detail: params.error.issues };
+    }
+    const body = syncBatchBodySchema.safeParse(req.body);
+    if (!body.success) {
+      reply.code(400);
+      return { error: "bad_request", detail: body.error.issues };
+    }
+    try {
+      const auth = await requireAuth(req, store);
+      const workspace = await store.getWorkspace(auth.account.id, params.data.workspaceId);
+      if (!workspace) {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      const result = await store.syncBatch(auth.account.id, params.data.workspaceId, body.data);
+      return { mode: "sync-batch", ...result };
+    } catch (err) {
+      if (err instanceof CloudRevisionConflictError) {
+        reply.code(409);
+        return {
+          error: "revision_conflict",
+          currentRevision: err.currentRevision,
+        };
+      }
       if (err instanceof Error && err.message === "workspace_not_found") {
         reply.code(404);
         return { error: "not_found" };

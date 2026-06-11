@@ -29,8 +29,10 @@ export interface PersistedMessage {
   msg: unknown;
 }
 
-export async function listMessages(id: string, limit = 200): Promise<PersistedMessage[]> {
-  const res = await fetch(`/api/agents/${id}/messages?limit=${limit}`);
+export async function listMessages(id: string, limit = 200, afterSeq?: number): Promise<PersistedMessage[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (afterSeq !== undefined) params.set("afterSeq", String(afterSeq));
+  const res = await fetch(`/api/agents/${id}/messages?${params.toString()}`);
   if (!res.ok) throw new Error(`listMessages: ${res.status}`);
   return (await res.json()) as PersistedMessage[];
 }

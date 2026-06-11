@@ -105,6 +105,31 @@ export interface CloudSnapshotInput {
   messages?: unknown[];
 }
 
+export interface CloudSyncBatchInput extends CloudSnapshotInput {
+  expectedRevision?: number;
+}
+
+export interface CloudMessageCursor {
+  agentId: string;
+  maxSeq: number;
+}
+
+export interface CloudSyncBatchResult {
+  workspace: CloudWorkspace;
+  applied: {
+    teams: number;
+    agents: number;
+    messages: number;
+  };
+  messageCursors: CloudMessageCursor[];
+}
+
+export class CloudRevisionConflictError extends Error {
+  constructor(readonly currentRevision: number) {
+    super("workspace_revision_conflict");
+  }
+}
+
 export interface CloudStore {
   migrate(): Promise<void>;
   findAccountByEmail(email: string): Promise<CloudAccountRecord | null>;
@@ -119,6 +144,7 @@ export interface CloudStore {
   getWorkspace(accountId: string, workspaceId: string): Promise<CloudWorkspace | null>;
   getSnapshot(accountId: string, workspaceId: string): Promise<CloudSnapshot | null>;
   upsertSnapshot(accountId: string, workspaceId: string, input: CloudSnapshotInput): Promise<CloudSnapshot>;
+  syncBatch(accountId: string, workspaceId: string, input: CloudSyncBatchInput): Promise<CloudSyncBatchResult>;
 }
 
 function nowIso(): string {
@@ -379,23 +405,52 @@ export class MemoryCloudStore implements CloudStore {
   }
 
   async upsertSnapshot(accountId: string, workspaceId: string, input: CloudSnapshotInput): Promise<CloudSnapshot> {
+    await this.syncBatch(accountId, workspaceId, input);
+    const snapshot = await this.getSnapshot(accountId, workspaceId);
+    if (!snapshot) throw new Error("workspace_not_found");
+    return snapshot;
+  }
+
+  async syncBatch(accountId: string, workspaceId: string, input: CloudSyncBatchInput): Promise<CloudSyncBatchResult> {
     const workspace = await this.getWorkspace(accountId, workspaceId);
     if (!workspace) throw new Error("workspace_not_found");
+    if (input.expectedRevision !== undefined && input.expectedRevision !== workspace.revision) {
+      throw new CloudRevisionConflictError(workspace.revision);
+    }
     const sanitized = sanitizeSnapshotInput(input);
     const at = nowIso();
-    workspace.revision += 1;
+    const nextRevision = workspace.revision + 1;
+    workspace.revision = nextRevision;
     workspace.updatedAt = at;
 
-    for (const team of sanitized.teams) this.teams.set(key(accountId, workspaceId, team.id), team);
-    for (const agent of sanitized.agents) this.agents.set(key(accountId, workspaceId, agent.id), agent);
+    for (const team of sanitized.teams) {
+      this.teams.set(key(accountId, workspaceId, team.id), { ...team, revision: nextRevision, updatedAt: at });
+    }
+    for (const agent of sanitized.agents) {
+      this.agents.set(key(accountId, workspaceId, agent.id), { ...agent, revision: nextRevision, updatedAt: at });
+    }
     for (const message of sanitized.messages) {
       const messageKey = key(accountId, workspaceId, message.agentId, String(message.seq));
       const existing = this.messages.get(messageKey);
       this.messages.set(messageKey, { ...message, id: existing?.id ?? this.nextMessageId++ });
     }
 
-    const snapshot = await this.getSnapshot(accountId, workspaceId);
-    if (!snapshot) throw new Error("workspace_not_found");
-    return snapshot;
+    const cursors = new Map<string, number>();
+    const prefix = `${accountId}\u0000${workspaceId}\u0000`;
+    for (const [messageKey, message] of this.messages.entries()) {
+      if (!messageKey.startsWith(prefix)) continue;
+      cursors.set(message.agentId, Math.max(cursors.get(message.agentId) ?? -1, message.seq));
+    }
+    return {
+      workspace,
+      applied: {
+        teams: sanitized.teams.length,
+        agents: sanitized.agents.length,
+        messages: sanitized.messages.length,
+      },
+      messageCursors: [...cursors.entries()]
+        .map(([agentId, maxSeq]) => ({ agentId, maxSeq }))
+        .sort((a, b) => a.agentId.localeCompare(b.agentId)),
+    };
   }
 }

@@ -5,8 +5,11 @@ import type {
   CloudAccountRecord,
   CloudAgent,
   CloudMessage,
+  CloudMessageCursor,
   CloudSessionRecord,
   CloudSnapshot,
+  CloudSyncBatchInput,
+  CloudSyncBatchResult,
   CloudSnapshotInput,
   CloudStore,
   CloudTeam,
@@ -14,7 +17,7 @@ import type {
   JsonObject,
   JsonValue,
 } from "./store.js";
-import { sanitizeSnapshotInput } from "./store.js";
+import { CloudRevisionConflictError, sanitizeSnapshotInput } from "./store.js";
 
 const SCHEMA_STATEMENTS: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS cloud_account (
@@ -360,16 +363,27 @@ export class CloudDb implements CloudStore {
   }
 
   async upsertSnapshot(accountId: string, workspaceId: string, input: CloudSnapshotInput): Promise<CloudSnapshot> {
+    await this.syncBatch(accountId, workspaceId, input);
+    const snapshot = await this.getSnapshot(accountId, workspaceId);
+    if (!snapshot) throw new Error("workspace_not_found");
+    return snapshot;
+  }
+
+  async syncBatch(accountId: string, workspaceId: string, input: CloudSyncBatchInput): Promise<CloudSyncBatchResult> {
     const workspace = await this.getWorkspace(accountId, workspaceId);
     if (!workspace) throw new Error("workspace_not_found");
+    if (input.expectedRevision !== undefined && input.expectedRevision !== workspace.revision) {
+      throw new CloudRevisionConflictError(workspace.revision);
+    }
     const { teams, agents, messages } = sanitizeSnapshotInput(input);
     const conn = await this.pool.getConnection();
     const now = new Date();
+    const nextRevision = workspace.revision + 1;
     try {
       await conn.beginTransaction();
       await conn.query(
-        "UPDATE cloud_workspace SET revision = revision + 1, updated_at = ? WHERE account_id = ? AND id = ?",
-        [now, accountId, workspaceId],
+        "UPDATE cloud_workspace SET revision = ?, updated_at = ? WHERE account_id = ? AND id = ?",
+        [nextRevision, now, accountId, workspaceId],
       );
       for (const team of teams) {
         await conn.query(
@@ -382,7 +396,7 @@ export class CloudDb implements CloudStore {
              sort_order = VALUES(sort_order),
              revision = VALUES(revision),
              updated_at = VALUES(updated_at)`,
-          [team.id, accountId, workspaceId, team.name, team.description, team.sortOrder, team.revision, team.updatedAt],
+          [team.id, accountId, workspaceId, team.name, team.description, team.sortOrder, nextRevision, now],
         );
       }
       for (const agent of agents) {
@@ -427,8 +441,8 @@ export class CloudDb implements CloudStore {
             agent.codexWorkspace,
             jsonString(agent.metadata),
             agent.sortOrder,
-            agent.revision,
-            agent.updatedAt,
+            nextRevision,
+            now,
           ],
         );
       }
@@ -451,8 +465,28 @@ export class CloudDb implements CloudStore {
     } finally {
       conn.release();
     }
-    const snapshot = await this.getSnapshot(accountId, workspaceId);
-    if (!snapshot) throw new Error("workspace_not_found");
-    return snapshot;
+    const nextWorkspace = await this.getWorkspace(accountId, workspaceId);
+    if (!nextWorkspace) throw new Error("workspace_not_found");
+    const [cursorRows] = await this.pool.query<Row[]>(
+      `SELECT agent_id AS agentId, MAX(seq) AS maxSeq
+       FROM cloud_message
+       WHERE account_id = ? AND workspace_id = ?
+       GROUP BY agent_id
+       ORDER BY agent_id ASC`,
+      [accountId, workspaceId],
+    );
+    const messageCursors: CloudMessageCursor[] = cursorRows.map((row) => ({
+      agentId: String(row.agentId),
+      maxSeq: Number(row.maxSeq ?? -1),
+    }));
+    return {
+      workspace: nextWorkspace,
+      applied: {
+        teams: teams.length,
+        agents: agents.length,
+        messages: messages.length,
+      },
+      messageCursors,
+    };
   }
 }

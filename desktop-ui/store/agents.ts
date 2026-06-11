@@ -85,11 +85,17 @@ interface Store {
   cloudWorkspaces: CloudWorkspace[];
   cloudCurrentWorkspaceId: string | null;
   cloudSnapshot: CloudSnapshot | null;
+  cloudRevisions: Record<string, number>;
+  cloudMessageCursors: Record<string, Record<string, number>>;
+  cloudConfigSignatures: Record<string, string>;
   setCloudSession: (session: CloudSession | null) => void;
   setCloudAccount: (account: CloudAccount) => void;
   setCloudWorkspaces: (list: CloudWorkspace[]) => void;
   setCloudCurrentWorkspace: (id: string | null) => void;
   setCloudSnapshot: (snapshot: CloudSnapshot | null) => void;
+  setCloudRevision: (workspaceId: string, revision: number) => void;
+  setCloudMessageCursors: (workspaceId: string, cursors: Record<string, number>) => void;
+  setCloudConfigSignature: (workspaceId: string, signature: string) => void;
 
   windows: LayoutWindow[];
   activeWindowId: string;
@@ -256,6 +262,9 @@ export const useStore = create<Store>((set) => ({
   cloudWorkspaces: [],
   cloudCurrentWorkspaceId: null,
   cloudSnapshot: null,
+  cloudRevisions: {},
+  cloudMessageCursors: {},
+  cloudConfigSignatures: {},
   setCloudSession: (session) => set({ cloudSession: session }),
   setCloudAccount: (account) =>
     set((s) =>
@@ -266,6 +275,20 @@ export const useStore = create<Store>((set) => ({
   setCloudWorkspaces: (list) => set({ cloudWorkspaces: list }),
   setCloudCurrentWorkspace: (id) => set({ cloudCurrentWorkspaceId: id }),
   setCloudSnapshot: (snapshot) => set({ cloudSnapshot: snapshot }),
+  setCloudRevision: (workspaceId, revision) =>
+    set((s) => ({ cloudRevisions: { ...s.cloudRevisions, [workspaceId]: revision } })),
+  setCloudMessageCursors: (workspaceId, cursors) =>
+    set((s) => ({
+      cloudMessageCursors: {
+        ...s.cloudMessageCursors,
+        [workspaceId]: {
+          ...(s.cloudMessageCursors[workspaceId] ?? {}),
+          ...cursors,
+        },
+      },
+    })),
+  setCloudConfigSignature: (workspaceId, signature) =>
+    set((s) => ({ cloudConfigSignatures: { ...s.cloudConfigSignatures, [workspaceId]: signature } })),
 
   windows: [initialWindow],
   activeWindowId: initialWindow.id,

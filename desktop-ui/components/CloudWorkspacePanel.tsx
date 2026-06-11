@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { AgentState } from "@/store/agents";
 import { useStore } from "@/store/agents";
 import {
@@ -9,8 +9,8 @@ import {
   fetchCloudMe,
   fetchCloudSnapshot,
   listCloudWorkspaces,
-  loadCloudSession,
   logoutCloud,
+  syncCloudBatch,
   upsertCloudSnapshot,
 } from "@/lib/cloud-api";
 import { listMessages, type PersistedMessage } from "@/lib/agent-api";
@@ -35,6 +35,12 @@ export function CloudWorkspacePanel({
   const setCloudWorkspaces = useStore((s) => s.setCloudWorkspaces);
   const setCloudCurrentWorkspace = useStore((s) => s.setCloudCurrentWorkspace);
   const setCloudSnapshot = useStore((s) => s.setCloudSnapshot);
+  const cloudRevisions = useStore((s) => s.cloudRevisions);
+  const cloudMessageCursors = useStore((s) => s.cloudMessageCursors);
+  const cloudConfigSignatures = useStore((s) => s.cloudConfigSignatures);
+  const setCloudRevision = useStore((s) => s.setCloudRevision);
+  const setCloudMessageCursors = useStore((s) => s.setCloudMessageCursors);
+  const setCloudConfigSignature = useStore((s) => s.setCloudConfigSignature);
   const agents = useStore((s) => s.agents);
   const teams = useStore((s) => s.teams);
 
@@ -46,14 +52,6 @@ export function CloudWorkspacePanel({
     () => localWorkspaces.find((w) => w.id === currentLocalWorkspaceId)?.name ?? "local",
     [localWorkspaces, currentLocalWorkspaceId],
   );
-
-  useEffect(() => {
-    const session = loadCloudSession();
-    if (!session) return;
-    setCloudSession(session);
-    void refreshCloud(session, { silent: true });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const refreshCloud = async (
     session = cloudSession,
@@ -79,6 +77,9 @@ export function CloudWorkspacePanel({
       if (target) {
         const snapshot = await fetchCloudSnapshot(session, target.id);
         setCloudSnapshot(snapshot);
+        setCloudRevision(target.id, snapshot.workspace.revision);
+        setCloudMessageCursors(target.id, cursorsFromSnapshot(snapshot));
+        setCloudConfigSignature(target.id, configSignature(snapshot));
       } else {
         setCloudSnapshot(null);
       }
@@ -98,6 +99,9 @@ export function CloudWorkspacePanel({
       const snapshot = await fetchCloudSnapshot(cloudSession, id);
       setCloudCurrentWorkspace(id);
       setCloudSnapshot(snapshot);
+      setCloudRevision(id, snapshot.workspace.revision);
+      setCloudMessageCursors(id, cursorsFromSnapshot(snapshot));
+      setCloudConfigSignature(id, configSignature(snapshot));
       setStatus("cloud workspace loaded");
     } catch (err) {
       setError((err as Error).message);
@@ -122,6 +126,9 @@ export function CloudWorkspacePanel({
       setCloudCurrentWorkspace(created.id);
       const snapshot = await fetchCloudSnapshot(cloudSession, created.id);
       setCloudSnapshot(snapshot);
+      setCloudRevision(created.id, snapshot.workspace.revision);
+      setCloudMessageCursors(created.id, cursorsFromSnapshot(snapshot));
+      setCloudConfigSignature(created.id, configSignature(snapshot));
       setStatus("cloud workspace created");
     } catch (err) {
       setError((err as Error).message);
@@ -144,12 +151,55 @@ export function CloudWorkspacePanel({
     try {
       const snapshot = await buildLocalSnapshot(agents, teams);
       const uploaded = await upsertCloudSnapshot(cloudSession, cloudCurrentWorkspaceId, snapshot);
-      setCloudSnapshot(uploaded);
+      setCloudSnapshot(uploaded.snapshot);
+      setCloudRevision(cloudCurrentWorkspaceId, uploaded.snapshot.workspace.revision);
+      setCloudMessageCursors(cloudCurrentWorkspaceId, cursorsFromList(uploaded.messageCursors));
+      setCloudConfigSignature(cloudCurrentWorkspaceId, configSignature(snapshot));
       const list = await listCloudWorkspaces(cloudSession);
       setCloudWorkspaces(list);
       setStatus(`uploaded ${snapshot.agents.length} agents and ${snapshot.messages.length} messages`);
     } catch (err) {
       setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onSyncChanges = async () => {
+    if (!cloudSession || !cloudCurrentWorkspaceId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const cursor = cloudMessageCursors[cloudCurrentWorkspaceId] ?? {};
+      const batch = await buildIncrementalBatch(
+        agents,
+        teams,
+        cursor,
+        cloudConfigSignatures[cloudCurrentWorkspaceId] ?? null,
+      );
+      if (batch.messages.length === 0 && !batch.teams && !batch.agents) {
+        setStatus("no new cloud changes to sync");
+        return;
+      }
+      const expectedRevision = cloudRevisions[cloudCurrentWorkspaceId] ?? cloudSnapshot?.workspace.revision;
+      const result = await syncCloudBatch(cloudSession, cloudCurrentWorkspaceId, {
+        expectedRevision,
+        ...batch,
+      });
+      setCloudRevision(cloudCurrentWorkspaceId, result.workspace.revision);
+      setCloudMessageCursors(cloudCurrentWorkspaceId, cursorsFromList(result.messageCursors));
+      if (batch.configSignature) setCloudConfigSignature(cloudCurrentWorkspaceId, batch.configSignature);
+      const snapshot = await fetchCloudSnapshot(cloudSession, cloudCurrentWorkspaceId);
+      setCloudSnapshot(snapshot);
+      const list = await listCloudWorkspaces(cloudSession);
+      setCloudWorkspaces(list);
+      setStatus(`synced ${result.applied.messages} new messages`);
+    } catch (err) {
+      if ((err as Error).message.includes("revision_conflict")) {
+        setError("cloud workspace changed elsewhere; refresh and retry");
+      } else {
+        setError((err as Error).message);
+      }
     } finally {
       setBusy(false);
     }
@@ -242,6 +292,14 @@ export function CloudWorkspacePanel({
           copy local
         </button>
         <button
+          onClick={() => void onSyncChanges()}
+          disabled={busy || !selected}
+          className="flex-1 px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30"
+          title="Upload only messages after the stored per-agent cursor"
+        >
+          sync changes
+        </button>
+        <button
           onClick={() => void onLogout()}
           disabled={busy}
           className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)] disabled:opacity-30"
@@ -254,6 +312,7 @@ export function CloudWorkspacePanel({
         {cloudSnapshot
           ? `${cloudSnapshot.agents.length} agents / ${cloudSnapshot.messages.length} messages synced`
           : "Create a cloud workspace, then copy local data manually."}
+        {" "}Initial copy uploads at most the latest 500 messages per agent in this beta; sync changes sends changed config plus the next 500 messages after each stored seq cursor.
       </div>
       {status && <div className="text-[10px] text-[var(--ok)] leading-tight">{status}</div>}
       {error && <div className="text-[10px] text-[var(--err)] leading-tight break-words">{error}</div>}
@@ -291,4 +350,51 @@ async function buildLocalSnapshot(
     teams: teamList,
     messagesByAgent,
   });
+}
+
+async function buildIncrementalBatch(
+  agents: Record<string, AgentState>,
+  teams: ReturnType<typeof useStore.getState>["teams"],
+  cursor: Record<string, number>,
+  previousSignature: string | null,
+) {
+  const agentList = Object.values(agents).map((a) => a.summary);
+  const teamList = Object.values(teams);
+  const messagesByAgent: Record<string, PersistedMessage[]> = {};
+  await Promise.all(
+    agentList.map(async (agent) => {
+      messagesByAgent[agent.id] = await listMessages(agent.id, 500, cursor[agent.id] ?? -1);
+    }),
+  );
+  const snapshot = buildCloudSnapshotFromLocal({
+    agents: agentList,
+    teams: teamList,
+    messagesByAgent,
+  });
+  const signature = configSignature(snapshot);
+  const messages = snapshot.messages;
+  const configChanged = signature !== previousSignature;
+  return {
+    ...(configChanged ? { teams: snapshot.teams, agents: snapshot.agents } : {}),
+    messages,
+    configSignature: signature,
+  };
+}
+
+function configSignature(snapshot: { teams: unknown[]; agents: unknown[] }): string {
+  return JSON.stringify({ teams: snapshot.teams, agents: snapshot.agents });
+}
+
+function cursorsFromSnapshot(snapshot: { messages: Array<{ agentId: string; seq: number }> }): Record<string, number> {
+  const cursors: Record<string, number> = {};
+  for (const message of snapshot.messages) {
+    cursors[message.agentId] = Math.max(cursors[message.agentId] ?? -1, message.seq);
+  }
+  return cursors;
+}
+
+function cursorsFromList(list: Array<{ agentId: string; maxSeq: number }>): Record<string, number> {
+  const cursors: Record<string, number> = {};
+  for (const cursor of list) cursors[cursor.agentId] = cursor.maxSeq;
+  return cursors;
 }

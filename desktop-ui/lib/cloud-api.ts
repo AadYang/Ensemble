@@ -88,6 +88,25 @@ export interface CloudSnapshotInput {
   messages: CloudMessage[];
 }
 
+export interface CloudMessageCursor {
+  agentId: string;
+  maxSeq: number;
+}
+
+export interface CloudSyncBatchInput extends Partial<CloudSnapshotInput> {
+  expectedRevision?: number;
+}
+
+export interface CloudSyncBatchResult {
+  workspace: CloudWorkspace;
+  applied: {
+    teams: number;
+    agents: number;
+    messages: number;
+  };
+  messageCursors: CloudMessageCursor[];
+}
+
 interface StoredCloudSession {
   origin: string;
   token: string;
@@ -250,14 +269,32 @@ export async function upsertCloudSnapshot(
   session: CloudSession,
   workspaceId: string,
   snapshot: CloudSnapshotInput,
-): Promise<CloudSnapshot> {
-  const body = await cloudFetch<{ mode: "upsert"; snapshot: CloudSnapshot }>(
+): Promise<{ snapshot: CloudSnapshot; messageCursors: CloudMessageCursor[] }> {
+  const body = await cloudFetch<{ mode: "upsert"; snapshot: CloudSnapshot; messageCursors?: CloudMessageCursor[] }>(
     session.origin,
     `/v1/cloud/workspaces/${encodeURIComponent(workspaceId)}/snapshot`,
     { method: "PUT", body: JSON.stringify(snapshot) },
     session.token,
   );
-  return body.snapshot;
+  return { snapshot: body.snapshot, messageCursors: body.messageCursors ?? [] };
+}
+
+export async function syncCloudBatch(
+  session: CloudSession,
+  workspaceId: string,
+  batch: CloudSyncBatchInput,
+): Promise<CloudSyncBatchResult> {
+  const body = await cloudFetch<{ mode: "sync-batch" } & CloudSyncBatchResult>(
+    session.origin,
+    `/v1/cloud/workspaces/${encodeURIComponent(workspaceId)}/sync-batch`,
+    { method: "POST", body: JSON.stringify(batch) },
+    session.token,
+  );
+  return {
+    workspace: body.workspace,
+    applied: body.applied,
+    messageCursors: body.messageCursors,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
