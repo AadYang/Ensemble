@@ -76,6 +76,74 @@
       </header>
 
       <section id="notice" class="notice hidden"></section>
+      <section id="settingsPanel" class="settings-panel hidden">
+        <div class="settings-head">
+          <span>Remote settings</span>
+          <span id="settingsState" class="muted"></span>
+        </div>
+        <div class="settings-grid">
+          <label>
+            Name
+            <input id="agentNameInput" maxlength="160" />
+          </label>
+          <label>
+            Model
+            <input id="modelInput" maxlength="160" />
+          </label>
+          <label>
+            Provider ID
+            <input id="providerIdInput" maxlength="128" />
+          </label>
+          <label>
+            Permission
+            <select id="permissionModeSelect">
+              <option value="default">default</option>
+              <option value="plan">plan</option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="bypassPermissions">bypassPermissions</option>
+              <option value="dontAsk">dontAsk</option>
+            </select>
+          </label>
+          <label>
+            Sandbox
+            <select id="sandboxModeSelect">
+              <option value="">inherit</option>
+              <option value="read-only">read-only</option>
+              <option value="workspace-write">workspace-write</option>
+              <option value="danger-full-access">danger-full-access</option>
+            </select>
+          </label>
+          <label>
+            Reasoning
+            <select id="reasoningEffortSelect">
+              <option value="">inherit</option>
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
+            </select>
+          </label>
+          <label>
+            Codex workspace
+            <input id="codexWorkspaceInput" maxlength="512" />
+          </label>
+          <label>
+            Team ID
+            <input id="teamIdInput" maxlength="128" />
+          </label>
+          <label class="toggle-row">
+            <input id="closedInput" type="checkbox" />
+            <span>Disabled</span>
+          </label>
+        </div>
+        <label>
+          System prompt
+          <textarea id="systemPromptInput" rows="4" maxlength="32000"></textarea>
+        </label>
+        <button id="saveSettingsButton" class="ghost">Apply settings</button>
+      </section>
       <section id="messages" class="messages"></section>
 
       <footer class="composer">

@@ -184,6 +184,44 @@ textarea { resize: vertical; min-height: 72px; max-height: 220px; }
 .notice.error { border-color: rgba(255, 107, 122, .5); color: var(--err); }
 .notice.ok { border-color: rgba(124, 221, 124, .5); color: var(--ok); }
 
+.settings-panel {
+  margin: 12px 16px 0;
+  border: 1px solid var(--border);
+  background: rgba(15, 22, 32, .9);
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+  font-weight: 650;
+}
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: end;
+  min-height: 36px;
+}
+.toggle-row input {
+  width: auto;
+}
+.settings-panel textarea {
+  min-height: 94px;
+}
+.settings-panel .ghost {
+  justify-self: end;
+  min-width: 140px;
+}
+
 .messages {
   min-height: 0;
   overflow: auto;
@@ -236,6 +274,7 @@ textarea { resize: vertical; min-height: 72px; max-height: 220px; }
   .sidebar { min-height: auto; border-right: 0; border-bottom: 1px solid var(--border); }
   .agent-list { max-height: 220px; }
   .topbar { align-items: flex-start; flex-direction: column; }
+  .settings-grid { grid-template-columns: 1fr; }
   .composer { grid-template-columns: 1fr; }
   .composer .primary { min-height: 42px; }
 }

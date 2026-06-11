@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useRef } from "react";
-import type { ServerMsg } from "@agentorch/shared";
+import type { AgentSummary, CloudAgentConfigPatch, ServerMsg } from "@agentorch/shared";
+import { closeAgent, patchAgent, restartAgent } from "@/lib/agent-api";
 import { CloudRealtimeClient } from "@/lib/cloud-realtime";
+import { cloudConfigSignature, type CloudAgent, type CloudSnapshot } from "@/lib/cloud-api";
 import { getWS } from "@/lib/ws";
 import { useStore } from "@/store/agents";
 
@@ -28,12 +30,58 @@ export function CloudRemoteBridge() {
     if (!cloudSession) return;
     const client = new CloudRealtimeClient(cloudSession, "desktop");
     const unsubscribeCloud = client.subscribe((msg) => {
+      if (msg.type === "config_request") {
+        void (async () => {
+          const state = useStore.getState();
+          if (!cloudAgentLoaded(state, msg.workspaceId, msg.agentId)) {
+            client.send({
+              type: "remote_error",
+              requestId: msg.requestId,
+              workspaceId: msg.workspaceId,
+              agentId: msg.agentId,
+              code: "AGENT_NOT_AVAILABLE",
+              message: "This desktop does not have the requested cloud workspace agent loaded.",
+            });
+            return;
+          }
+          if (!state.agents[msg.agentId]) {
+            client.send({
+              type: "remote_error",
+              requestId: msg.requestId,
+              workspaceId: msg.workspaceId,
+              agentId: msg.agentId,
+              code: "LOCAL_AGENT_NOT_FOUND",
+              message: "The corresponding local agent is not available on this desktop.",
+            });
+            return;
+          }
+          try {
+            const updated = await applyRemoteConfig(msg.agentId, msg.patch);
+            applyCloudAgentSummary(msg.workspaceId, updated);
+            client.send({
+              type: "config_ack",
+              requestId: msg.requestId,
+              workspaceId: msg.workspaceId,
+              agentId: msg.agentId,
+              agent: updated,
+            });
+          } catch (err) {
+            client.send({
+              type: "remote_error",
+              requestId: msg.requestId,
+              workspaceId: msg.workspaceId,
+              agentId: msg.agentId,
+              code: "CONFIG_APPLY_FAILED",
+              message: err instanceof Error ? err.message : "Remote settings change failed.",
+            });
+          }
+        })();
+        return;
+      }
       if (msg.type !== "remote_send") return;
       void (async () => {
         const state = useStore.getState();
-        const workspaceId = state.cloudCurrentWorkspaceId;
-        const snapshot = state.cloudSnapshot;
-        if (!workspaceId || workspaceId !== msg.workspaceId || !snapshot?.agents.some((agent) => agent.id === msg.agentId)) {
+        if (!cloudAgentLoaded(state, msg.workspaceId, msg.agentId)) {
           client.send({
             type: "remote_error",
             requestId: msg.requestId,
@@ -138,6 +186,76 @@ export function CloudRemoteBridge() {
   }, [cloudAgentIds, cloudCurrentWorkspaceId, localAgents, localWs]);
 
   return null;
+}
+
+type StoreState = ReturnType<typeof useStore.getState>;
+
+function cloudAgentLoaded(state: StoreState, workspaceId: string, agentId: string): boolean {
+  return !!(
+    state.cloudCurrentWorkspaceId &&
+    state.cloudCurrentWorkspaceId === workspaceId &&
+    state.cloudSnapshot?.agents.some((agent) => agent.id === agentId)
+  );
+}
+
+async function applyRemoteConfig(agentId: string, patch: CloudAgentConfigPatch): Promise<AgentSummary> {
+  const { closed, agentPatch } = splitRemoteConfigPatch(patch);
+  let updated: AgentSummary | null = null;
+  if (Object.keys(agentPatch).length > 0) updated = await patchAgent(agentId, agentPatch);
+  if (closed === true) updated = await closeAgent(agentId);
+  if (closed === false) updated = await restartAgent(agentId);
+  if (!updated) {
+    const current = useStore.getState().agents[agentId]?.summary;
+    if (!current) throw new Error("The corresponding local agent is not available on this desktop.");
+    updated = current;
+  }
+  return updated;
+}
+
+function splitRemoteConfigPatch(patch: CloudAgentConfigPatch): {
+  closed: boolean | undefined;
+  agentPatch: CloudAgentConfigPatch;
+} {
+  const { closed, ...agentPatch } = patch;
+  return { closed, agentPatch };
+}
+
+function applyCloudAgentSummary(workspaceId: string, summary: AgentSummary): void {
+  const state = useStore.getState();
+  const snapshot = state.cloudSnapshot;
+  if (!snapshot || state.cloudCurrentWorkspaceId !== workspaceId) return;
+  const next = replaceCloudAgent(snapshot, summary);
+  state.setCloudSnapshot(next);
+  state.setCloudConfigSignature(workspaceId, cloudConfigSignature(next));
+}
+
+function replaceCloudAgent(snapshot: CloudSnapshot, summary: AgentSummary): CloudSnapshot {
+  return {
+    ...snapshot,
+    agents: snapshot.agents.map((agent) => (agent.id === summary.id ? cloudAgentFromSummary(agent, summary) : agent)),
+  };
+}
+
+function cloudAgentFromSummary(existing: CloudAgent, summary: AgentSummary): CloudAgent {
+  return {
+    ...existing,
+    parentId: summary.parentId,
+    teamId: summary.teamId,
+    name: summary.name,
+    systemPrompt: summary.systemPrompt,
+    model: summary.model,
+    providerId: summary.providerId,
+    permissionMode: summary.permissionMode,
+    sandboxMode: summary.sandboxMode,
+    reasoningEffort: summary.reasoningEffort,
+    codexWorkspace: summary.codexWorkspace,
+    metadata: {
+      ...existing.metadata,
+      forcedSkills: summary.forcedSkills,
+      disabledSkills: summary.disabledSkills,
+      closed: summary.closed,
+    },
+  };
 }
 
 async function ensureLocalWsOpen(localWs: ReturnType<typeof getWS>, timeoutMs = 3000): Promise<boolean> {

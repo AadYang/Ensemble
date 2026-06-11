@@ -12,7 +12,9 @@
     desktopOnline: false,
     socket: null,
     busyAgents: new Set(),
+    configBusyAgents: new Set(),
     agentStatuses: new Map(),
+    renderedSettingsAgentId: null,
   };
 
   const el = {
@@ -35,6 +37,19 @@
     desktopStatus: byId("desktopStatus"),
     agentStatus: byId("agentStatus"),
     notice: byId("notice"),
+    settingsPanel: byId("settingsPanel"),
+    settingsState: byId("settingsState"),
+    agentNameInput: byId("agentNameInput"),
+    modelInput: byId("modelInput"),
+    providerIdInput: byId("providerIdInput"),
+    permissionModeSelect: byId("permissionModeSelect"),
+    sandboxModeSelect: byId("sandboxModeSelect"),
+    reasoningEffortSelect: byId("reasoningEffortSelect"),
+    codexWorkspaceInput: byId("codexWorkspaceInput"),
+    teamIdInput: byId("teamIdInput"),
+    closedInput: byId("closedInput"),
+    systemPromptInput: byId("systemPromptInput"),
+    saveSettingsButton: byId("saveSettingsButton"),
     messages: byId("messages"),
     composerInput: byId("composerInput"),
     sendButton: byId("sendButton"),
@@ -47,6 +62,10 @@
   function normalizeOrigin(origin) {
     const raw = (origin || DEFAULT_ORIGIN).trim();
     const url = new URL(raw);
+    const localHost = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+    if (url.protocol !== "https:" && !(localHost && url.protocol === "http:")) {
+      throw new Error("Cloud server must use HTTPS. http is allowed only for localhost.");
+    }
     url.pathname = "";
     url.search = "";
     url.hash = "";
@@ -172,7 +191,11 @@
       if (state.socket === socket) {
         state.socket = null;
         state.desktopOnline = false;
+        state.busyAgents.clear();
+        state.configBusyAgents.clear();
         renderStatus();
+        renderAgents();
+        renderSettings();
         if (state.session) window.setTimeout(connectRealtime, 1500);
       }
     });
@@ -194,8 +217,17 @@
       case "remote_error":
         if (msg.workspaceId && msg.agentId) state.busyAgents.delete(remoteAgentKey(msg.workspaceId, msg.agentId));
         else if (msg.agentId) state.busyAgents.delete(remoteAgentKey(state.workspaceId, msg.agentId));
+        if (msg.workspaceId && msg.agentId) state.configBusyAgents.delete(remoteAgentKey(msg.workspaceId, msg.agentId));
+        else if (msg.agentId) state.configBusyAgents.delete(remoteAgentKey(state.workspaceId, msg.agentId));
         setNotice(`${msg.code}: ${msg.message}`, "error");
         renderStatus();
+        renderSettings();
+        break;
+      case "config_updated":
+        applyConfigUpdated(msg);
+        state.configBusyAgents.delete(remoteAgentKey(msg.workspaceId, msg.agentId));
+        setNotice("Settings applied by desktop.", "ok");
+        renderShell();
         break;
       case "agent_status":
         state.agentStatuses.set(msg.agentId, msg.status);
@@ -248,6 +280,29 @@
     renderAgents();
   }
 
+  function sendSettings() {
+    if (!state.session || !state.workspaceId || !state.agentId || !state.socket || state.socket.readyState !== WebSocket.OPEN) return;
+    if (!canSaveSettings()) return;
+    const agent = currentAgent();
+    if (!agent) return;
+    const patch = buildSettingsPatch(agent);
+    if (!Object.keys(patch).length) {
+      setNotice("No settings changes to apply.");
+      return;
+    }
+    const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    state.configBusyAgents.add(remoteAgentKey(state.workspaceId, state.agentId));
+    state.socket.send(JSON.stringify({
+      type: "config_request",
+      requestId,
+      workspaceId: state.workspaceId,
+      agentId: state.agentId,
+      patch,
+    }));
+    setNotice("Settings sent to the online desktop for approval.", "ok");
+    renderSettings();
+  }
+
   function canSend() {
     return !!(
       state.session &&
@@ -257,6 +312,18 @@
       state.socket &&
       state.socket.readyState === WebSocket.OPEN &&
       !state.busyAgents.has(remoteAgentKey(state.workspaceId, state.agentId))
+    );
+  }
+
+  function canSaveSettings() {
+    return !!(
+      state.session &&
+      state.workspaceId &&
+      state.agentId &&
+      state.desktopOnline &&
+      state.socket &&
+      state.socket.readyState === WebSocket.OPEN &&
+      !state.configBusyAgents.has(remoteAgentKey(state.workspaceId, state.agentId))
     );
   }
 
@@ -280,6 +347,7 @@
     el.workspaceTitle.textContent = workspace ? workspace.name : "Cloud Workspace";
     renderAgents();
     renderMessages();
+    renderSettings();
     renderStatus();
   }
 
@@ -305,7 +373,7 @@
       `;
       btn.querySelector(".agent-name").textContent = agent.name || agent.id;
       btn.querySelector(".agent-meta").textContent =
-        `${agent.model || "model unset"} - ${status}${state.busyAgents.has(remoteAgentKey(state.workspaceId, agent.id)) ? " - remote busy" : ""}`;
+        `${agent.model || "model unset"} - ${status}${state.busyAgents.has(remoteAgentKey(state.workspaceId, agent.id)) ? " - remote busy" : ""}${state.configBusyAgents.has(remoteAgentKey(state.workspaceId, agent.id)) ? " - settings busy" : ""}`;
       btn.addEventListener("click", () => {
         state.agentId = agent.id;
         renderShell();
@@ -339,6 +407,32 @@
     el.messages.scrollTop = el.messages.scrollHeight;
   }
 
+  function renderSettings() {
+    const agent = currentAgent();
+    el.settingsPanel.classList.toggle("hidden", !agent);
+    if (!agent) {
+      state.renderedSettingsAgentId = null;
+      return;
+    }
+    const editing = el.settingsPanel.contains(document.activeElement) && state.renderedSettingsAgentId === agent.id;
+    if (!editing) {
+      state.renderedSettingsAgentId = agent.id;
+      el.agentNameInput.value = agent.name || "";
+      el.modelInput.value = agent.model || "";
+      el.providerIdInput.value = agent.providerId || "";
+      el.permissionModeSelect.value = agent.permissionMode || "default";
+      el.sandboxModeSelect.value = agent.sandboxMode || "";
+      el.reasoningEffortSelect.value = agent.reasoningEffort || "";
+      el.codexWorkspaceInput.value = agent.codexWorkspace || "";
+      el.teamIdInput.value = agent.teamId || "";
+      el.closedInput.checked = !!agent.metadata?.closed;
+      el.systemPromptInput.value = agent.systemPrompt || "";
+    }
+    const saveable = canSaveSettings();
+    el.saveSettingsButton.disabled = !saveable;
+    el.settingsState.textContent = saveable ? "desktop online" : settingsDisabledReason();
+  }
+
   function renderMessage(row) {
     const node = document.createElement("article");
     const kind = row.type === "assistant" ? "assistant" : row.type === "user" ? "user" : row.type === "result" ? "result" : "system";
@@ -365,6 +459,7 @@
     el.composerInput.placeholder = sendable
       ? "Send a remote message through the online desktop."
       : sendDisabledReason();
+    el.saveSettingsButton.disabled = !canSaveSettings();
   }
 
   function sendDisabledReason() {
@@ -378,6 +473,76 @@
 
   function currentAgent() {
     return (state.snapshot?.agents || []).find((agent) => agent.id === state.agentId) || null;
+  }
+
+  function applyConfigUpdated(msg) {
+    if (!state.snapshot || msg.workspaceId !== state.workspaceId) return;
+    const index = state.snapshot.agents.findIndex((agent) => agent.id === msg.agentId);
+    if (index < 0) return;
+    const current = state.snapshot.agents[index];
+    state.snapshot.agents[index] = cloudAgentFromSummary(current, msg.agent);
+    state.snapshot.workspace.revision = msg.revision;
+    state.snapshot.workspace.updatedAt = new Date().toISOString();
+  }
+
+  function cloudAgentFromSummary(current, summary) {
+    return {
+      ...current,
+      parentId: summary.parentId,
+      teamId: summary.teamId,
+      name: summary.name,
+      systemPrompt: summary.systemPrompt,
+      model: summary.model,
+      providerId: summary.providerId,
+      permissionMode: summary.permissionMode,
+      sandboxMode: summary.sandboxMode,
+      reasoningEffort: summary.reasoningEffort,
+      codexWorkspace: summary.codexWorkspace,
+      metadata: {
+        forcedSkills: summary.forcedSkills || [],
+        disabledSkills: summary.disabledSkills || [],
+        closed: !!summary.closed,
+      },
+    };
+  }
+
+  function buildSettingsPatch(agent) {
+    const patch = {};
+    const name = el.agentNameInput.value.trim();
+    if (name && name !== agent.name) patch.name = name;
+    const model = el.modelInput.value.trim();
+    if (model && model !== agent.model) patch.model = model;
+    const providerId = nullableInput(el.providerIdInput.value);
+    if (providerId !== (agent.providerId || null)) patch.providerId = providerId;
+    const permissionMode = el.permissionModeSelect.value;
+    if (permissionMode !== (agent.permissionMode || "default")) patch.permissionMode = permissionMode;
+    const sandboxMode = nullableInput(el.sandboxModeSelect.value);
+    if (sandboxMode !== (agent.sandboxMode || null)) patch.sandboxMode = sandboxMode;
+    const reasoningEffort = nullableInput(el.reasoningEffortSelect.value);
+    if (reasoningEffort !== (agent.reasoningEffort || null)) patch.reasoningEffort = reasoningEffort;
+    const codexWorkspace = nullableInput(el.codexWorkspaceInput.value);
+    if (codexWorkspace !== (agent.codexWorkspace || null)) patch.codexWorkspace = codexWorkspace;
+    const teamId = nullableInput(el.teamIdInput.value);
+    if (teamId !== (agent.teamId || null)) patch.teamId = teamId;
+    const systemPrompt = nullableInput(el.systemPromptInput.value);
+    if (systemPrompt !== (agent.systemPrompt || null)) patch.systemPrompt = systemPrompt;
+    const closed = !!el.closedInput.checked;
+    if (closed !== !!agent.metadata?.closed) patch.closed = closed;
+    return patch;
+  }
+
+  function nullableInput(value) {
+    const trimmed = String(value || "").trim();
+    return trimmed ? trimmed : null;
+  }
+
+  function settingsDisabledReason() {
+    if (!state.session) return "sign in required";
+    if (!state.agentId) return "select an agent";
+    if (!state.desktopOnline) return "desktop offline";
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return "realtime offline";
+    if (state.configBusyAgents.has(remoteAgentKey(state.workspaceId, state.agentId))) return "settings pending";
+    return "unavailable";
   }
 
   function remoteAgentKey(workspaceId, agentId) {
@@ -444,6 +609,7 @@
     state.agentId = null;
     state.desktopOnline = false;
     state.busyAgents.clear();
+    state.configBusyAgents.clear();
     state.agentStatuses.clear();
     if (state.socket) state.socket.close();
     state.socket = null;
@@ -457,6 +623,7 @@
   el.refreshButton.addEventListener("click", () => void refresh());
   el.workspaceSelect.addEventListener("change", () => void loadWorkspace(el.workspaceSelect.value));
   el.sendButton.addEventListener("click", sendRemote);
+  el.saveSettingsButton.addEventListener("click", sendSettings);
   el.composerInput.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") sendRemote();
   });

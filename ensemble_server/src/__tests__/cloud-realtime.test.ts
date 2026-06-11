@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { AgentSummary } from "@agentorch/shared";
 import Fastify from "fastify";
 import { CloudRealtimeHub, registerCloudRealtimeRoutes, type CloudSocket } from "../cloud/realtime.js";
 import { registerCloudRoutes } from "../cloud/routes.js";
@@ -152,6 +153,55 @@ describe("CloudRealtimeHub", () => {
       expect.objectContaining({ type: "remote_send", requestId: "req-3", text: "third" }),
     );
   });
+
+  it("serializes remote config requests per agent until desktop ack or error", () => {
+    const hub = new CloudRealtimeHub();
+    const web = new FakeSocket();
+    const desktop = new FakeSocket();
+    hub.connect("acct", "web", web);
+    hub.connect("acct", "desktop", desktop);
+
+    hub.handle("acct", "web", web, {
+      type: "config_request",
+      requestId: "cfg-1",
+      workspaceId: "workspace",
+      agentId: "agent",
+      patch: { name: "First" },
+    });
+    hub.handle("acct", "web", web, {
+      type: "config_request",
+      requestId: "cfg-2",
+      workspaceId: "workspace",
+      agentId: "agent",
+      patch: { name: "Second" },
+    });
+
+    expect(desktop.sent).toContainEqual(
+      expect.objectContaining({ type: "config_request", requestId: "cfg-1", patch: { name: "First" } }),
+    );
+    expect(desktop.sent).not.toContainEqual(expect.objectContaining({ type: "config_request", requestId: "cfg-2" }));
+    expect(web.sent).toContainEqual(expect.objectContaining({ type: "remote_error", requestId: "cfg-2", code: "CONFIG_BUSY" }));
+
+    hub.handle("acct", "desktop", desktop, {
+      type: "remote_error",
+      requestId: "cfg-1",
+      workspaceId: "workspace",
+      agentId: "agent",
+      code: "LOCAL_AGENT_NOT_FOUND",
+      message: "missing",
+    });
+    hub.handle("acct", "web", web, {
+      type: "config_request",
+      requestId: "cfg-3",
+      workspaceId: "workspace",
+      agentId: "agent",
+      patch: { name: "Third" },
+    });
+
+    expect(desktop.sent).toContainEqual(
+      expect.objectContaining({ type: "config_request", requestId: "cfg-3", patch: { name: "Third" } }),
+    );
+  });
 });
 
 async function makeRealtimeApp() {
@@ -189,6 +239,26 @@ async function setupCloudAgent(app: Awaited<ReturnType<typeof makeRealtimeApp>>[
     url: "/v1/cloud/workspaces/workspace/sync-batch",
     headers: { authorization: `Bearer ${token}` },
     payload: { expectedRevision: 0, agents: [{ id: "agent", name: "Agent" }] },
+  });
+  expect(sync.statusCode).toBe(200);
+}
+
+async function setupCloudAgentWithMetadata(app: Awaited<ReturnType<typeof makeRealtimeApp>>["app"], token: string): Promise<void> {
+  const create = await app.inject({
+    method: "POST",
+    url: "/v1/cloud/workspaces",
+    headers: { authorization: `Bearer ${token}` },
+    payload: { id: "workspace", name: "Workspace" },
+  });
+  expect(create.statusCode).toBe(200);
+  const sync = await app.inject({
+    method: "POST",
+    url: "/v1/cloud/workspaces/workspace/sync-batch",
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      expectedRevision: 0,
+      agents: [{ id: "agent", name: "Agent", metadata: { displayGroup: "beta", closed: false } }],
+    },
   });
   expect(sync.statusCode).toBe(200);
 }
@@ -284,4 +354,225 @@ describe("cloud realtime websocket routes", () => {
       await app.close();
     }
   });
+
+  it("rejects web config changes while desktop is offline", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-offline@example.com");
+      await setupCloudAgent(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+
+      const next = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "remote_error");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg-offline",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { name: "Remote name" },
+      }));
+      expect(await next).toMatchObject({ type: "remote_error", code: "DESKTOP_OFFLINE", requestId: "cfg-offline" });
+      web.close();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("forwards web config changes and stores desktop acked agent config", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-online@example.com");
+      await setupCloudAgent(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+      const desktop = await app.injectWS(`/v1/cloud/realtime?role=desktop&token=${encodeURIComponent(token)}`);
+
+      const forwarded = waitForWsJson(desktop, (msg) => (msg as { type?: string }).type === "config_request");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { name: "Remote name", model: "gpt-5.5", reasoningEffort: "high" },
+      }));
+      expect(await forwarded).toMatchObject({
+        type: "config_request",
+        requestId: "cfg",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { name: "Remote name", model: "gpt-5.5", reasoningEffort: "high" },
+      });
+
+      const updated = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "config_updated");
+      const sync = waitForWsJson(desktop, (msg) => (msg as { type?: string }).type === "sync_result");
+      desktop.send(JSON.stringify({
+        type: "config_ack",
+        requestId: "cfg",
+        workspaceId: "workspace",
+        agentId: "agent",
+        agent: agentSummary({ name: "Remote name", model: "gpt-5.5", reasoningEffort: "high" }),
+      }));
+      expect(await updated).toMatchObject({
+        type: "config_updated",
+        requestId: "cfg",
+        workspaceId: "workspace",
+        agentId: "agent",
+        revision: 2,
+        agent: { id: "agent", name: "Remote name", model: "gpt-5.5", reasoningEffort: "high" },
+      });
+      expect(await sync).toMatchObject({ type: "sync_result", workspaceId: "workspace", revision: 2 });
+
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(snapshot.statusCode).toBe(200);
+      expect(snapshot.json()).toMatchObject({
+        snapshot: {
+          agents: [{ id: "agent", name: "Remote name", model: "gpt-5.5", reasoningEffort: "high" }],
+        },
+      });
+      web.close();
+      desktop.close();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("preserves existing safe cloud metadata when storing desktop acked config", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-metadata@example.com");
+      await setupCloudAgentWithMetadata(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+      const desktop = await app.injectWS(`/v1/cloud/realtime?role=desktop&token=${encodeURIComponent(token)}`);
+
+      const forwarded = waitForWsJson(desktop, (msg) => (msg as { type?: string }).type === "config_request");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg-meta",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { closed: true },
+      }));
+      await forwarded;
+
+      const updated = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "config_updated");
+      desktop.send(JSON.stringify({
+        type: "config_ack",
+        requestId: "cfg-meta",
+        workspaceId: "workspace",
+        agentId: "agent",
+        agent: agentSummary({ closed: true }),
+      }));
+      await updated;
+
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(snapshot.json()).toMatchObject({
+        snapshot: {
+          agents: [{ id: "agent", metadata: { displayGroup: "beta", closed: true } }],
+        },
+      });
+      web.close();
+      desktop.close();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("does not store config when desktop returns a remote error", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-error@example.com");
+      await setupCloudAgent(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+      const desktop = await app.injectWS(`/v1/cloud/realtime?role=desktop&token=${encodeURIComponent(token)}`);
+
+      const forwarded = waitForWsJson(desktop, (msg) => (msg as { type?: string }).type === "config_request");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg-error",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { name: "Should not persist" },
+      }));
+      await forwarded;
+
+      const webError = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "remote_error");
+      desktop.send(JSON.stringify({
+        type: "remote_error",
+        requestId: "cfg-error",
+        workspaceId: "workspace",
+        agentId: "agent",
+        code: "AGENT_NOT_AVAILABLE",
+        message: "not loaded",
+      }));
+      expect(await webError).toMatchObject({ type: "remote_error", requestId: "cfg-error", code: "AGENT_NOT_AVAILABLE" });
+
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(snapshot.json()).toMatchObject({ snapshot: { agents: [{ id: "agent", name: "Agent" }] } });
+      web.close();
+      desktop.close();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects sensitive or unknown config fields before forwarding", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-secret@example.com");
+      await setupCloudAgent(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+      const desktop = await app.injectWS(`/v1/cloud/realtime?role=desktop&token=${encodeURIComponent(token)}`);
+
+      const error = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "remote_error");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg-secret",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { name: "ok", apiKey: "secret" },
+      }));
+      expect(await error).toMatchObject({ type: "remote_error", code: "BAD_REQUEST" });
+      expect(desktop).toBeDefined();
+      web.close();
+      desktop.close();
+    } finally {
+      await app.close();
+    }
+  });
 });
+
+function agentSummary(overrides: Partial<AgentSummary> = {}): AgentSummary {
+  return { ...agentSummaryBase(), ...overrides };
+}
+
+function agentSummaryBase(): AgentSummary {
+  return {
+    id: "agent",
+    name: "Agent",
+    parentId: null,
+    status: "idle",
+    model: "model",
+    systemPrompt: null,
+    providerId: null,
+    codexWorkspace: null,
+    permissionMode: "default",
+    sandboxMode: null,
+    reasoningEffort: null,
+    teamId: null,
+    forcedSkills: [],
+    disabledSkills: [],
+    closed: false,
+    hasResumeInfo: false,
+    createdAt: new Date(0).toISOString(),
+  };
+}
