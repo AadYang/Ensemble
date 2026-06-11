@@ -101,6 +101,57 @@ describe("CloudRealtimeHub", () => {
     hub.disconnect("acct", "desktop", desktop);
     expect(web.sent).toContainEqual({ type: "online_status", desktopOnline: false });
   });
+
+  it("serializes remote sends per agent until a terminal desktop event", () => {
+    const hub = new CloudRealtimeHub();
+    const web = new FakeSocket();
+    const desktop = new FakeSocket();
+    hub.connect("acct", "web", web);
+    hub.connect("acct", "desktop", desktop);
+
+    hub.handle("acct", "web", web, {
+      type: "remote_send",
+      requestId: "req-1",
+      workspaceId: "workspace",
+      agentId: "agent",
+      text: "first",
+    });
+    hub.handle("acct", "web", web, {
+      type: "remote_send",
+      requestId: "req-2",
+      workspaceId: "workspace",
+      agentId: "agent",
+      text: "second",
+    });
+
+    expect(desktop.sent).toContainEqual(
+      expect.objectContaining({ type: "remote_send", requestId: "req-1", text: "first" }),
+    );
+    expect(desktop.sent).not.toContainEqual(
+      expect.objectContaining({ type: "remote_send", requestId: "req-2" }),
+    );
+    expect(web.sent).toContainEqual(
+      expect.objectContaining({ type: "remote_error", requestId: "req-2", code: "AGENT_BUSY" }),
+    );
+
+    hub.handle("acct", "desktop", desktop, {
+      type: "agent_status",
+      workspaceId: "workspace",
+      agentId: "agent",
+      status: "done",
+    });
+    hub.handle("acct", "web", web, {
+      type: "remote_send",
+      requestId: "req-3",
+      workspaceId: "workspace",
+      agentId: "agent",
+      text: "third",
+    });
+
+    expect(desktop.sent).toContainEqual(
+      expect.objectContaining({ type: "remote_send", requestId: "req-3", text: "third" }),
+    );
+  });
 });
 
 async function makeRealtimeApp() {

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ensemble Cloud Workspace</title>
+  <meta name="description" content="Remote Ensemble account workspace beta." />
+  <link rel="icon" href="/favicon.ico?v=2" sizes="any" />
+  <link rel="stylesheet" href="/assets/workspace.css?v=1" />
+</head>
+<body>
+  <main class="shell">
+    <aside class="sidebar">
+      <header class="brandbar">
+        <a class="brand" href="/">
+          <img src="/assets/icon.png?v=2" alt="Ensemble" />
+          <span>ENSEMBLE</span>
+        </a>
+        <span class="beta">cloud beta</span>
+      </header>
+
+      <section id="loginPanel" class="panel login-panel">
+        <label>
+          Server
+          <input id="originInput" autocomplete="url" spellcheck="false" />
+        </label>
+        <label>
+          Email
+          <input id="emailInput" autocomplete="email" />
+        </label>
+        <label>
+          Password
+          <input id="passwordInput" type="password" autocomplete="current-password" />
+        </label>
+        <label>
+          Invite
+          <input id="inviteInput" autocomplete="one-time-code" />
+        </label>
+        <button id="loginButton" class="primary">Sign in</button>
+      </section>
+
+      <section id="accountPanel" class="panel account-panel hidden">
+        <div class="account-row">
+          <div>
+            <div id="accountName" class="account-name"></div>
+            <div id="accountEmail" class="muted"></div>
+          </div>
+          <button id="logoutButton" class="ghost">Sign out</button>
+        </div>
+        <label>
+          Workspace
+          <select id="workspaceSelect"></select>
+        </label>
+        <button id="refreshButton" class="ghost">Refresh</button>
+      </section>
+
+      <section class="agents-section">
+        <div class="section-head">
+          <span>Agents</span>
+          <span id="agentCount" class="muted">0</span>
+        </div>
+        <div id="agentList" class="agent-list"></div>
+      </section>
+    </aside>
+
+    <section class="main">
+      <header class="topbar">
+        <div>
+          <div id="workspaceTitle" class="workspace-title">Cloud Workspace</div>
+          <div id="agentTitle" class="agent-title">Sign in to view account agents.</div>
+        </div>
+        <div class="status-cluster">
+          <span id="desktopStatus" class="pill offline">desktop offline</span>
+          <span id="agentStatus" class="pill idle">idle</span>
+        </div>
+      </header>
+
+      <section id="notice" class="notice hidden"></section>
+      <section id="messages" class="messages"></section>
+
+      <footer class="composer">
+        <textarea id="composerInput" rows="3" placeholder="Select an online desktop agent to send a remote message."></textarea>
+        <button id="sendButton" class="primary">Send</button>
+      </footer>
+    </section>
+  </main>
+
+  <script src="/assets/workspace.js?v=1"></script>
+</body>
+</html>

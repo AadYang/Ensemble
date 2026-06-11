@@ -15,6 +15,7 @@ export type CloudSocket = {
 interface AccountSockets {
   desktop: CloudSocket | null;
   webs: Set<CloudSocket>;
+  inFlightAgents: Set<string>;
 }
 
 const cloudIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
@@ -95,6 +96,7 @@ export class CloudRealtimeHub {
     if (role === "desktop") {
       if (entry.desktop === socket) {
         entry.desktop = null;
+        entry.inFlightAgents.clear();
         this.broadcastOnline(accountId, false);
       }
     } else {
@@ -139,14 +141,15 @@ export class CloudRealtimeHub {
   private account(accountId: string): AccountSockets {
     let entry = this.accounts.get(accountId);
     if (!entry) {
-      entry = { desktop: null, webs: new Set() };
+      entry = { desktop: null, webs: new Set(), inFlightAgents: new Set() };
       this.accounts.set(accountId, entry);
     }
     return entry;
   }
 
   private forwardRemoteSend(accountId: string, source: CloudSocket, msg: Extract<CloudRealtimeClientMsg, { type: "remote_send" }>): void {
-    const desktop = this.accounts.get(accountId)?.desktop;
+    const entry = this.accounts.get(accountId);
+    const desktop = entry?.desktop;
     if (!desktop || desktop.readyState !== desktop.OPEN) {
       send(source, {
         type: "remote_error",
@@ -158,6 +161,19 @@ export class CloudRealtimeHub {
       });
       return;
     }
+    const busyKey = remoteAgentKey(msg.workspaceId, msg.agentId);
+    if (entry.inFlightAgents.has(busyKey)) {
+      send(source, {
+        type: "remote_error",
+        requestId: msg.requestId,
+        code: "AGENT_BUSY",
+        message: "This agent is already running a remote request.",
+        workspaceId: msg.workspaceId,
+        agentId: msg.agentId,
+      });
+      return;
+    }
+    entry.inFlightAgents.add(busyKey);
     send(desktop, msg);
   }
 
@@ -170,9 +186,18 @@ export class CloudRealtimeHub {
     ) {
       return;
     }
+    if (msg.type === "remote_error") {
+      if (msg.workspaceId && msg.agentId) this.releaseInFlight(accountId, msg.workspaceId, msg.agentId);
+    } else if (msg.type === "agent_status" && (msg.status === "done" || msg.status === "error" || msg.status === "idle")) {
+      this.releaseInFlight(accountId, msg.workspaceId, msg.agentId);
+    }
     const webs = this.accounts.get(accountId)?.webs;
     if (!webs) return;
     for (const web of webs) send(web, msg);
+  }
+
+  private releaseInFlight(accountId: string, workspaceId: string, agentId: string): void {
+    this.accounts.get(accountId)?.inFlightAgents.delete(remoteAgentKey(workspaceId, agentId));
   }
 
   private broadcastOnline(accountId: string, desktopOnline: boolean): void {
@@ -180,6 +205,10 @@ export class CloudRealtimeHub {
     if (!webs) return;
     for (const web of webs) send(web, { type: "online_status", desktopOnline });
   }
+}
+
+function remoteAgentKey(workspaceId: string, agentId: string): string {
+  return `${workspaceId}\u0000${agentId}`;
 }
 
 export function registerCloudRealtimeRoutes(app: FastifyInstance, store: CloudStore, hub = new CloudRealtimeHub()): CloudRealtimeHub {
