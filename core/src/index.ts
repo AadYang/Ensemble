@@ -44,6 +44,7 @@ import {
   probeModels,
   type ProbeFlavor,
 } from "./providers/model-discovery.js";
+import { DEFAULT_ANTHROPIC_MODELS } from "./providers/default-models.js";
 
 // When ENSEMBLE_AUTO_PORT=1 (set by Tauri shell), listen on a random free port
 // and announce it on stdout's first line as `ENSEMBLE_LISTENING <port>`. The
@@ -402,12 +403,6 @@ const PROVIDER_KINDS = [
   "openai-codex",
   "openai-compat",
 ] as const;
-const DEFAULT_ANTHROPIC_MODELS = [
-  "claude-opus-4-8",
-  "claude-opus-4-7",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001",
-];
 const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 
 interface ProviderRuntimeMetadata {
@@ -469,7 +464,7 @@ async function discoverCodexModels(): Promise<string[] | null> {
 }
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
-const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 const ProviderInputSchema = z.object({
   name: z.string().min(1),
@@ -604,6 +599,7 @@ async function refreshClaudeLocalHealth(): Promise<void> {
   for (const p of rows) {
     const meta = (p.metadata && typeof p.metadata === "object" ? p.metadata : {}) as Record<string, unknown>;
     const runtimes = { ...providerRuntimes(meta) };
+    const models = Array.from(new Set([...DEFAULT_ANTHROPIC_MODELS, ...p.models]));
     runtimes[platformKey] = {
       platformKey,
       cliPath: health.claude.path,
@@ -611,11 +607,11 @@ async function refreshClaudeLocalHealth(): Promise<void> {
       cliMinSupportedVersion: null,
       authPath: null,
       authPresent,
-      models: p.models,
+      models,
       lastHealthAt: new Date().toISOString(),
       lastError: health.claude.error ?? null,
     };
-    await prisma.provider.update({ where: { id: p.id }, data: { metadata: { ...meta, runtimes } } });
+    await prisma.provider.update({ where: { id: p.id }, data: { models, metadata: { ...meta, runtimes } } });
   }
 }
 

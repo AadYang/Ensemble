@@ -115,7 +115,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(updatedIds).not.toContain(d.id);
   });
 
-  it("runtime timeout force-stops only the matching run", async () => {
+  it("runtime force-stop only affects the matching run", async () => {
     const stuck = await prisma.agent.create({ data: { name: "bad-provider-agent" } });
     const other = await prisma.agent.create({ data: { name: "other-agent" } });
     await prisma.agent.update({ where: { id: stuck.id }, data: { status: "RUNNING" } });
@@ -139,8 +139,8 @@ describe("SessionManager cancel + stale-session recovery", () => {
       expectedRunId: "run-a",
       dbStatus: "ERROR",
       protoStatus: "error",
-      logPrefix: "test-timeout",
-      error: { code: "PROVIDER_TIMEOUT", message: "provider timed out" },
+      logPrefix: "test-force-stop",
+      error: { code: "RUNTIME_STOPPED", message: "runtime stopped" },
     });
 
     expect(abort.signal.aborted).toBe(true);
@@ -148,7 +148,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect((await prisma.agent.findUnique({ where: { id: other.id } }))?.status).toBe("RUNNING");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((sessions as any).running.has(stuck.id)).toBe(false);
-    expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.code === "PROVIDER_TIMEOUT")).toBe(true);
+    expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.code === "RUNTIME_STOPPED")).toBe(true);
   });
 
   it("sendMessage queues input while the agent is already running", async () => {
@@ -170,12 +170,96 @@ describe("SessionManager cancel + stale-session recovery", () => {
 
     await Promise.resolve();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((sessions as any).queuedTurns.get(agent.id)).toHaveLength(1);
+    expect((sessions as any).queuedTurns.get(agent.id).size).toBe(1);
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(1);
     expect(hub.sessionMessages.some((m) => m.sessionId === agent.id && m.msg.code === "BUSY")).toBe(false);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (sessions as any).clearQueuedTurns(agent.id);
     await expect(queued).resolves.toBeNull();
+  });
+
+  it("cancel() aborts the active run but keeps queued input for the next turn", async () => {
+    const agent = await prisma.agent.create({ data: { name: "cancel-queue-target" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-active",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+
+    const queued = sessions.sendMessage(agent.id, "queued after cancel");
+    await Promise.resolve();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).queuedTurns.get(agent.id).size).toBe(1);
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(1);
+    let drained: { sessionId: string; text: string } | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (sessionId: string, text: string) => {
+      drained = { sessionId, text };
+      return null;
+    };
+
+    await sessions.cancel(agent.id);
+
+    expect(abort.signal.aborted).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("IDLE");
+    await expect(queued).resolves.toBeNull();
+    expect(drained).toEqual({ sessionId: agent.id, text: "queued after cancel" });
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(0);
+  });
+
+  it("runtime force-stop releases the execution slot and drains queued input", async () => {
+    const agent = await prisma.agent.create({ data: { name: "force-stop-queue-target" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-active",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+    // Simulate the outer sendMessage call still awaiting a wedged runtime.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).drainingQueues.set(agent.id, "outer-run");
+
+    const queued = sessions.sendMessage(agent.id, "queued after timeout");
+    await Promise.resolve();
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(1);
+    let drained: { sessionId: string; text: string } | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (sessionId: string, text: string) => {
+      drained = { sessionId, text };
+      return null;
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (sessions as any).forceStopRun(agent.id, {
+      expectedRunId: "run-active",
+      dbStatus: "ERROR",
+      protoStatus: "error",
+      logPrefix: "test-force-stop",
+      error: { code: "RUNTIME_STOPPED", message: "runtime stopped" },
+    });
+
+    expect(abort.signal.aborted).toBe(true);
+    expect(drained).toEqual({ sessionId: agent.id, text: "queued after timeout" });
+    await expect(queued).resolves.toBeNull();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).drainingQueues.has(agent.id)).toBe(false);
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(0);
   });
 
   it("peer_send queues for a running target instead of failing busy", async () => {
@@ -198,7 +282,8 @@ describe("SessionManager cancel + stale-session recovery", () => {
 
     expect(result).toContain("queued for");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((sessions as any).queuedTurns.get(target.id)).toHaveLength(1);
+    expect((sessions as any).queuedTurns.get(target.id).size).toBe(1);
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(1);
     expect(result).not.toContain("busy");
   });
 
@@ -329,6 +414,64 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(meta.codexResumeSignature).toBeUndefined();
   });
 
+  it("patchAgent provider switch preserves explicit model and supported reasoning effort", async () => {
+    const sourceProvider = await prisma.provider.create({
+      data: {
+        name: "codex-provider-preserve-source",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const targetProvider = await prisma.provider.create({
+      data: {
+        name: "codex-provider-preserve-target",
+        kind: "openai-codex",
+        models: ["gpt-5.6"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "provider-switch-preserve-agent",
+        providerId: sourceProvider.id,
+        model: "user-explicit-model",
+        metadata: { reasoningEffort: "max" },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { providerId: targetProvider.id });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.providerId).toBe(targetProvider.id);
+    expect(after?.model).toBe("user-explicit-model");
+    expect(meta.reasoningEffort).toBe("max");
+  });
+
+  it("recoverStaleSessions drains persisted pending turns after resetting stale state", async () => {
+    const agent = await prisma.agent.create({ data: { name: "persisted-queue-agent" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    await prisma.pendingTurn.create({
+      data: { agentId: agent.id, userInput: "persisted queued input", opts: {} },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+    let drained: { sessionId: string; text: string } | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (sessionId: string, text: string) => {
+      drained = { sessionId, text };
+      return null;
+    };
+
+    await sessions.recoverStaleSessions();
+    await Promise.resolve();
+
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("IDLE");
+    expect(drained).toEqual({ sessionId: agent.id, text: "persisted queued input" });
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(0);
+  });
+
   it("sendMessage recovers from provider validation errors after entering RUNNING", async () => {
     const provider = await prisma.provider.create({
       data: {
@@ -369,5 +512,51 @@ describe("SessionManager cancel + stale-session recovery", () => {
           String(m.msg.message).includes("missing an API key"),
       ),
     ).toBe(true);
+  });
+
+  it("keeps compact summaries in runtime history and drops incomplete trailing user turns", () => {
+    const history = runtimeHistoryFromCompletedTurns([
+      {
+        type: "system",
+        payload: { type: "system", subtype: "compact", text: "important compact summary" },
+      },
+      {
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "old question" } },
+      },
+      {
+        type: "assistant",
+        payload: { type: "assistant", message: { content: [{ type: "text", text: "old answer" }] } },
+      },
+      {
+        type: "result",
+        payload: { type: "result", subtype: "success" },
+      },
+      {
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "incomplete current prompt" } },
+      },
+    ]);
+
+    expect(JSON.stringify(history)).toContain("important compact summary");
+    expect(JSON.stringify(history)).toContain("old answer");
+    expect(JSON.stringify(history)).not.toContain("incomplete current prompt");
+  });
+
+  it("caps runtime history to precise recent context instead of full transcript", () => {
+    const rows: Array<{ type: string; payload: unknown }> = Array.from({ length: 80 }, (_, i) => ({
+      type: i % 2 === 0 ? "user" : "assistant",
+      payload:
+        i % 2 === 0
+          ? { type: "user", message: { role: "user", content: `question ${i}` } }
+          : { type: "assistant", message: { content: [{ type: "text", text: `answer ${i}` }] } },
+    }));
+    rows.push({ type: "result", payload: { type: "result", subtype: "success" } });
+
+    const history = runtimeHistoryFromCompletedTurns(rows);
+
+    expect(history.length).toBeLessThanOrEqual(40);
+    expect(JSON.stringify(history)).toContain("answer 79");
+    expect(JSON.stringify(history)).not.toContain("question 0");
   });
 });

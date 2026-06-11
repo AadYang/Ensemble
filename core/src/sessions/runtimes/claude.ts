@@ -21,6 +21,7 @@ const THINKING_TOKEN_BUDGETS: Record<ReasoningEffort, number> = {
   medium: 8192,
   high: 16384,
   xhigh: 32768,
+  max: 64000,
 };
 
 function maxThinkingTokensForEffort(effort?: ReasoningEffort | null): number | undefined {

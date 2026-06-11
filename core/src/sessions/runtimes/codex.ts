@@ -161,7 +161,7 @@ function locateCodexBinary(): string | null {
 }
 
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
-type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 const DEFAULT_CODEX_SANDBOX: SandboxMode = "danger-full-access";
 
 /** Hard kill a codex child process AND its grandchildren.
@@ -225,7 +225,9 @@ function readSandboxFromAgentMetadata(agentMeta: unknown): SandboxMode | null {
 function readReasoningEffortFromAgentMetadata(agentMeta: unknown): ReasoningEffort | null {
   if (agentMeta && typeof agentMeta === "object") {
     const m = (agentMeta as Record<string, unknown>).reasoningEffort;
-    if (m === "minimal" || m === "low" || m === "medium" || m === "high" || m === "xhigh") return m;
+    if (m === "minimal" || m === "low" || m === "medium" || m === "high" || m === "xhigh" || m === "max") {
+      return m;
+    }
   }
   return null;
 }

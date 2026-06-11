@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS Message (
 CREATE UNIQUE INDEX IF NOT EXISTS msg_agent_seq_uq ON Message(agentId, seq);
 CREATE INDEX IF NOT EXISTS msg_agent_time_idx ON Message(agentId, createdAt);
 
+CREATE TABLE IF NOT EXISTS PendingTurn (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agentId TEXT NOT NULL REFERENCES Agent(id) ON DELETE CASCADE,
+  userInput TEXT NOT NULL,
+  opts TEXT NOT NULL DEFAULT '{}',
+  createdAt INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS pending_turn_agent_order_idx ON PendingTurn(agentId, id);
+
 CREATE TABLE IF NOT EXISTS Permission (
   id TEXT PRIMARY KEY,
   agentId TEXT NOT NULL REFERENCES Agent(id) ON DELETE CASCADE,
@@ -267,6 +276,14 @@ export interface Message {
   createdAt: Date;
 }
 
+export interface PendingTurn {
+  id: number;
+  agentId: string;
+  userInput: string;
+  opts: unknown;
+  createdAt: Date;
+}
+
 export interface Permission {
   id: string;
   agentId: string;
@@ -391,6 +408,14 @@ const mapMessage = (r: Record<string, unknown>): Message => ({
   seq: r.seq as number,
   type: r.type as string,
   payload: parseJson(r.payload as string),
+  createdAt: dateOf(r.createdAt as number),
+});
+
+const mapPendingTurn = (r: Record<string, unknown>): PendingTurn => ({
+  id: Number(r.id),
+  agentId: r.agentId as string,
+  userInput: r.userInput as string,
+  opts: parseJson(r.opts as string) ?? {},
   createdAt: dateOf(r.createdAt as number),
 });
 
@@ -661,6 +686,12 @@ const messageRepo = makeRepo(
   { payload: jsonEncoder },
   { autoUuid: false }, // INTEGER PK AUTOINCREMENT — rowid handles id assignment
 );
+const pendingTurnRepo = makeRepo(
+  "PendingTurn",
+  mapPendingTurn,
+  { opts: jsonEncoder },
+  { autoUuid: false },
+);
 const permissionRepo = makeRepo("Permission", mapPermission, {
   input: jsonEncoder,
   updatedInput: jsonEncoder,
@@ -709,6 +740,7 @@ export const db = {
   agent: agentRepo,
   provider: providerRepo,
   message: messageRepo,
+  pendingTurn: pendingTurnRepo,
   permission: permissionRepo,
   mcpServer: mcpServerRepo,
   workspace: workspaceRepo,

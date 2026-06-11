@@ -54,7 +54,7 @@ import type {
 } from "@agentorch/shared";
 import { formatPeerHandoff } from "./peerHandoff.js";
 import type { Agent as DbAgent } from "../db.js";
-import { prisma } from "../db.js";
+import { prisma, sqliteDb } from "../db.js";
 import type { WebSocket } from "@fastify/websocket";
 import type { WSHub } from "../ws/hub.js";
 import { getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
@@ -69,10 +69,15 @@ import { currentPlatformKey } from "../platform-key.js";
 const STABLE_CWD = homedir();
 const CODEX_DEFAULT_CWD = ensureDataDir();
 const CODEX_DEFAULT_SANDBOX: SandboxMode = "danger-full-access";
-const FIRST_MODEL_RESPONSE_TIMEOUT_MS = 600_000;
 const CODEX_RESUME_SIGNATURE_KEY = "codexResumeSignature";
 const CODEX_RESUME_SIGNATURE_VERSION = 1;
 const RESUME_METADATA_KEYS = ["lastSessionId", "codexUsageSnapshot", CODEX_RESUME_SIGNATURE_KEY] as const;
+const RUNTIME_HISTORY_MAX_MESSAGES = 40;
+const RUNTIME_HISTORY_MAX_CHARS = 24_000;
+const AUTO_COMPACT_MIN_MESSAGES = 80;
+const AUTO_COMPACT_TRIGGER_CHARS = 48_000;
+const AUTO_COMPACT_KEEP_MESSAGES = 24;
+const AUTO_COMPACT_SUMMARY_MAX_CHARS = 60_000;
 
 function isInternalSystemMessage(msg: unknown): boolean {
   return (
@@ -151,14 +156,6 @@ interface RunningSession {
   clearResumeOnAbort?: boolean;
 }
 
-interface QueuedTurn {
-  userInput: string;
-  opts?: {
-    peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
-  };
-  resolve: (result: { finalText: string } | null) => void;
-}
-
 interface LiveTranscript {
   current: string;
   finalized: string[];
@@ -182,6 +179,32 @@ interface ForceStopOptions {
   protoStatus: "idle" | "error" | "done";
   error?: { code: string; message: string };
   logPrefix: string;
+}
+
+type SendMessageOptions = {
+  peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
+};
+
+function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const peerOrigin = (raw as { peerOrigin?: unknown }).peerOrigin;
+  if (!peerOrigin || typeof peerOrigin !== "object") return undefined;
+  const p = peerOrigin as Record<string, unknown>;
+  const mode = p.mode;
+  if (
+    typeof p.fromAgentId !== "string" ||
+    typeof p.fromAgentName !== "string" ||
+    (mode !== "continue" && mode !== "review" && mode !== "fork" && mode !== "raw")
+  ) {
+    return undefined;
+  }
+  return {
+    peerOrigin: {
+      fromAgentId: p.fromAgentId,
+      fromAgentName: p.fromAgentName,
+      mode,
+    },
+  };
 }
 
 const dbToProto = (s: string): ProtoStatus => {
@@ -236,6 +259,7 @@ const VALID_REASONING_EFFORTS: ReadonlySet<ReasoningEffort> = new Set([
   "medium",
   "high",
   "xhigh",
+  "max",
 ]);
 
 export const readReasoningEffortOverride = (metadata: unknown): ReasoningEffort | null => {
@@ -365,10 +389,104 @@ export const runtimeHistoryFromCompletedTurns = (
     lastResultIndex >= 0
       ? rows.slice(0, lastResultIndex + 1)
       : rows.slice(0, trailingCompleteHistoryEnd(rows));
-  return completedRows
-    .filter((m) => m.type === "user" || m.type === "assistant")
-    .map((m) => m.payload as SdkMessage);
+  return trimRuntimeHistory(
+    completedRows
+      .map(rowToRuntimeHistoryMessage)
+      .filter((m): m is SdkMessage => m !== null),
+  );
 };
+
+function rowToRuntimeHistoryMessage(row: { type: string; payload: unknown }): SdkMessage | null {
+  if (row.type === "user" || row.type === "assistant") return row.payload as SdkMessage;
+  if (row.type !== "system") return null;
+  const payload = row.payload as { type?: unknown; subtype?: unknown; text?: unknown } | null;
+  if (payload?.type !== "system" || payload.subtype !== "compact" || typeof payload.text !== "string") {
+    return null;
+  }
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: `Conversation summary from Ensemble auto-compact:\n${payload.text}`,
+    },
+    _compactSummary: true,
+  } as SdkMessage;
+}
+
+function runtimeHistoryMessageText(msg: SdkMessage): string {
+  if (msg.type === "user") {
+    const content = (msg as { message?: { content?: unknown } }).message?.content;
+    return typeof content === "string" ? content : "";
+  }
+  if (msg.type === "assistant") {
+    return assistantTextFromMessage(msg);
+  }
+  return "";
+}
+
+function messageRowText(row: { type: string; payload: unknown }): string {
+  if (row.type === "user") {
+    const content = (row.payload as { message?: { content?: unknown } })?.message?.content;
+    return typeof content === "string" ? content : "";
+  }
+  if (row.type === "assistant") return assistantTextFromMessage(row.payload);
+  if (row.type === "system") {
+    const payload = row.payload as { type?: unknown; subtype?: unknown; text?: unknown } | null;
+    return payload?.type === "system" && payload.subtype === "compact" && typeof payload.text === "string"
+      ? payload.text
+      : "";
+  }
+  return "";
+}
+
+function transcriptLinesFromRows(rows: Array<{ type: string; payload: unknown }>): string[] {
+  const lines: string[] = [];
+  for (const row of rows) {
+    const text = messageRowText(row).trim();
+    if (!text) continue;
+    if (row.type === "user") lines.push(`User: ${text}`);
+    else if (row.type === "assistant") lines.push(`Assistant: ${text}`);
+    else if (row.type === "system") lines.push(`Prior summary: ${text}`);
+  }
+  return lines;
+}
+
+function truncateTranscript(transcript: string, maxChars: number): string {
+  if (transcript.length <= maxChars) return transcript;
+  const half = Math.floor(maxChars / 2) - 80;
+  return `${transcript.slice(0, half)}\n\n[... truncated ${transcript.length - half * 2} chars ...]\n\n${transcript.slice(-half)}`;
+}
+
+function compactPromptFromTranscript(transcript: string): string {
+  return [
+    "Summarize the following conversation transcript in 5-12 sentences.",
+    "Focus on: what the user asked for, key decisions, what's been done, what's still pending.",
+    "Output plain text only - no markdown headers, no bullet markup.",
+    "",
+    "Transcript:",
+    transcript,
+  ].join("\n");
+}
+
+export function trimRuntimeHistory(messages: SdkMessage[]): SdkMessage[] {
+  if (messages.length <= RUNTIME_HISTORY_MAX_MESSAGES) {
+    const total = messages.reduce((sum, msg) => sum + runtimeHistoryMessageText(msg).length, 0);
+    if (total <= RUNTIME_HISTORY_MAX_CHARS) return messages;
+  }
+  const summaryMessages = messages.filter((msg) => (msg as { _compactSummary?: unknown })._compactSummary === true);
+  const kept: SdkMessage[] = [];
+  let chars = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!;
+    if ((msg as { _compactSummary?: unknown })._compactSummary === true) continue;
+    const textLen = runtimeHistoryMessageText(msg).length;
+    if (kept.length >= RUNTIME_HISTORY_MAX_MESSAGES || chars + textLen > RUNTIME_HISTORY_MAX_CHARS) break;
+    kept.unshift(msg);
+    chars += textLen;
+  }
+  const latestSummary = summaryMessages.at(-1);
+  return latestSummary ? [latestSummary, ...kept] : kept;
+}
 
 function trailingCompleteHistoryEnd(rows: Array<{ type: string }>): number {
   let end = rows.length;
@@ -416,13 +534,26 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
 
 export class SessionManager {
   private running = new Map<string, RunningSession>();
-  private queuedTurns = new Map<string, QueuedTurn[]>();
-  private drainingQueues = new Set<string>();
+  private queuedTurns = new Map<string, Map<number, (result: { finalText: string } | null) => void>>();
+  private drainingQueues = new Map<string, string>();
   private liveTranscripts = new Map<string, LiveTranscript>();
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
 
   constructor(private hub: WSHub) {}
+
+  private beginDrain(sessionId: string): string {
+    const token = randomUUID();
+    this.drainingQueues.set(sessionId, token);
+    return token;
+  }
+
+  private finishDrain(sessionId: string, token: string): void {
+    if (this.drainingQueues.get(sessionId) === token) {
+      this.drainingQueues.delete(sessionId);
+      this.drainQueuedTurns(sessionId);
+    }
+  }
 
   async createAgent(opts: {
     name: string;
@@ -848,6 +979,7 @@ export class SessionManager {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
     // Abort running stream if any. resolvePermission will deny outstanding via cancel().
+    this.clearQueuedTurns(id);
     this.cancel(id);
     const updated = await prisma.agent.update({
       where: { id },
@@ -877,6 +1009,7 @@ export class SessionManager {
   async deleteAgent(id: string): Promise<boolean> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
+    this.clearQueuedTurns(id);
     this.cancel(id);
     // Cascading FKs on Message / Permission / McpServer / PaneState will clean rows.
     await prisma.agent.delete({ where: { id } });
@@ -926,6 +1059,7 @@ export class SessionManager {
   async clearAgentContext(id: string): Promise<boolean> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
+    this.clearQueuedTurns(id);
     this.cancel(id);
     await prisma.message.delete({ where: { agentId: id } });
     if (readMetaString(cur.metadata, "lastSessionId") !== null) {
@@ -946,29 +1080,14 @@ export class SessionManager {
   async compactAgent(id: string): Promise<{ summary: string } | null> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
+    this.clearQueuedTurns(id);
     this.cancel(id);
 
     const messages = await prisma.message.findMany({
       where: { agentId: id },
       orderBy: { seq: "asc" },
     });
-    const lines: string[] = [];
-    for (const m of messages) {
-      if (m.type === "user") {
-        const c = (m.payload as { message?: { content?: unknown } })?.message?.content;
-        const text = typeof c === "string" ? c : "";
-        if (text.trim()) lines.push(`User: ${text.trim()}`);
-      } else if (m.type === "assistant") {
-        const blocks =
-          (m.payload as { message?: { content?: Array<{ type: string; text?: string }> } })
-            ?.message?.content ?? [];
-        const text = blocks
-          .filter((b) => b.type === "text" && typeof b.text === "string")
-          .map((b) => b.text!)
-          .join("");
-        if (text.trim()) lines.push(`Assistant: ${text.trim()}`);
-      }
-    }
+    const lines = transcriptLinesFromRows(messages);
     if (lines.length === 0) {
       return { summary: "(empty conversation — nothing to compact)" };
     }
@@ -1020,6 +1139,61 @@ export class SessionManager {
   }
 
   /** /status — runtime-agnostic snapshot of an agent's current state. */
+  private async maybeAutoCompactBeforeTurn(agent: DbAgent): Promise<void> {
+    const rows = await prisma.message.findMany({
+      where: { agentId: agent.id },
+      orderBy: { seq: "asc" },
+    });
+    if (rows.length < AUTO_COMPACT_MIN_MESSAGES) return;
+
+    const totalChars = rows.reduce((sum, row) => sum + messageRowText(row).length, 0);
+    if (totalChars < AUTO_COMPACT_TRIGGER_CHARS) return;
+
+    const keepStart = Math.max(0, rows.length - AUTO_COMPACT_KEEP_MESSAGES);
+    const rowsToSummarize = rows.slice(0, keepStart);
+    const rowsToKeep = rows.slice(keepStart);
+    const lines = transcriptLinesFromRows(rowsToSummarize);
+    if (lines.length === 0) return;
+
+    const transcript = truncateTranscript(lines.join("\n\n"), AUTO_COMPACT_SUMMARY_MAX_CHARS);
+    const summary = (await this.quickQuery(agent.id, compactPromptFromTranscript(transcript), 45_000)).trim();
+    if (!summary) return;
+
+    this.replaceMessageHistory(agent.id, summary, rowsToKeep);
+    await prisma.agent.update({
+      where: { id: agent.id },
+      data: { metadata: removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]) },
+    });
+    this.hub.sendToSession(agent.id, {
+      type: "message",
+      sessionId: agent.id,
+      seq: 0,
+      msg: { type: "system", subtype: "compact", text: summary } as never,
+    });
+  }
+
+  private replaceMessageHistory(
+    agentId: string,
+    summary: string,
+    rowsToKeep: Array<{ type: string; payload: unknown }>,
+  ): void {
+    sqliteDb.exec("BEGIN IMMEDIATE");
+    try {
+      sqliteDb.prepare("DELETE FROM Message WHERE agentId = ?").run(agentId);
+      const insert = sqliteDb.prepare("INSERT INTO Message (agentId, seq, type, payload) VALUES (?, ?, ?, ?)");
+      insert.run(agentId, 0, "system", JSON.stringify({ type: "system", subtype: "compact", text: summary }));
+      let seq = 1;
+      for (const row of rowsToKeep) {
+        insert.run(agentId, seq, row.type, JSON.stringify(row.payload));
+        seq++;
+      }
+      sqliteDb.exec("COMMIT");
+    } catch (err) {
+      try { sqliteDb.exec("ROLLBACK"); } catch { /* ignore rollback failure */ }
+      throw err;
+    }
+  }
+
   async getStatusReport(id: string): Promise<{
     name: string;
     providerName: string | null;
@@ -1222,14 +1396,18 @@ export class SessionManager {
   private enqueueTurn(
     sessionId: string,
     userInput: string,
-    opts?: {
-      peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
-    },
+    opts?: SendMessageOptions,
   ): Promise<{ finalText: string } | null> {
     return new Promise((resolve) => {
-      const q = this.queuedTurns.get(sessionId) ?? [];
-      q.push({ userInput, opts, resolve });
-      this.queuedTurns.set(sessionId, q);
+      const row = prisma.pendingTurn.create({
+        data: { agentId: sessionId, userInput, opts: opts ?? {} },
+      });
+      let bucket = this.queuedTurns.get(sessionId);
+      if (!bucket) {
+        bucket = new Map();
+        this.queuedTurns.set(sessionId, bucket);
+      }
+      bucket.set(row.id, resolve);
       this.hub.sendToSession(sessionId, {
         type: "status",
         sessionId,
@@ -1240,32 +1418,40 @@ export class SessionManager {
 
   private drainQueuedTurns(sessionId: string): void {
     if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
-    const next = this.queuedTurns.get(sessionId)?.shift();
+    const next = prisma.pendingTurn.findFirst({
+      where: { agentId: sessionId },
+      orderBy: { id: "asc" },
+    });
     if (!next) {
       this.queuedTurns.delete(sessionId);
       return;
     }
-    if (this.queuedTurns.get(sessionId)?.length === 0) {
-      this.queuedTurns.delete(sessionId);
-    }
-    this.drainingQueues.add(sessionId);
-    void this.runMessageNow(sessionId, next.userInput, next.opts)
-      .then(next.resolve)
+    prisma.pendingTurn.delete({ where: { id: next.id } });
+    const resolver = this.queuedTurns.get(sessionId)?.get(next.id);
+    this.queuedTurns.get(sessionId)?.delete(next.id);
+    if (this.queuedTurns.get(sessionId)?.size === 0) this.queuedTurns.delete(sessionId);
+    const opts = normalizeQueuedTurnOpts(next.opts);
+    const drainToken = this.beginDrain(sessionId);
+    void this.runMessageNow(sessionId, next.userInput, opts)
+      .then((result) => resolver?.(result))
       .catch((err) => {
         console.error(`[queued-turn] sendMessage to ${sessionId} failed:`, err);
-        next.resolve(null);
+        resolver?.(null);
       })
       .finally(() => {
-        this.drainingQueues.delete(sessionId);
-        this.drainQueuedTurns(sessionId);
+        this.finishDrain(sessionId, drainToken);
       });
   }
 
   private clearQueuedTurns(sessionId: string): void {
+    const rows = prisma.pendingTurn.findMany({ where: { agentId: sessionId } });
+    for (const row of rows) {
+      prisma.pendingTurn.delete({ where: { id: row.id } });
+    }
     const q = this.queuedTurns.get(sessionId);
-    if (!q) return;
     this.queuedTurns.delete(sessionId);
-    for (const turn of q) turn.resolve(null);
+    if (!q) return;
+    for (const resolve of q.values()) resolve(null);
   }
 
   private recordLiveTranscript(sessionId: string, msg: unknown): void {
@@ -1316,30 +1502,25 @@ export class SessionManager {
   async sendMessage(
     sessionId: string,
     userInput: string,
-    opts?: {
-      peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
-    },
+    opts?: SendMessageOptions,
   ): Promise<{ finalText: string } | null> {
     if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) {
       return this.enqueueTurn(sessionId, userInput, opts);
     }
-    this.drainingQueues.add(sessionId);
+    const drainToken = this.beginDrain(sessionId);
     try {
       return await this.runMessageNow(sessionId, userInput, opts);
     } finally {
-      this.drainingQueues.delete(sessionId);
-      this.drainQueuedTurns(sessionId);
+      this.finishDrain(sessionId, drainToken);
     }
   }
 
   private async runMessageNow(
     sessionId: string,
     userInput: string,
-    opts?: {
-      peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
-    },
+    opts?: SendMessageOptions,
   ): Promise<{ finalText: string } | null> {
-    const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
+    let agent = await prisma.agent.findUnique({ where: { id: sessionId } });
     if (!agent) {
       this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
       return null;
@@ -1354,6 +1535,20 @@ export class SessionManager {
       return null;
     }
 
+    let activeAgent = agent;
+    try {
+      await this.maybeAutoCompactBeforeTurn(activeAgent);
+      const refreshedAgent = await prisma.agent.findUnique({ where: { id: sessionId } });
+      if (!refreshedAgent) {
+        this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
+        return null;
+      }
+      activeAgent = refreshedAgent;
+    } catch (err) {
+      console.warn(`[auto-compact] skipped agent=${sessionId.slice(0, 8)}: ${(err as Error).message}`);
+    }
+    agent = activeAgent;
+
     const lastMsg = await prisma.message.findFirst({
       where: { agentId: sessionId },
       orderBy: { seq: "desc" },
@@ -1364,31 +1559,6 @@ export class SessionManager {
     const runId = randomUUID();
     let staleResume = false;
     let usedResumeSessionId: string | null = null;
-    let firstModelResponseTimer: NodeJS.Timeout | null = null;
-    const clearFirstModelResponseTimer = () => {
-      if (firstModelResponseTimer) {
-        clearTimeout(firstModelResponseTimer);
-        firstModelResponseTimer = null;
-      }
-    };
-    const armFirstModelResponseTimer = () => {
-      clearFirstModelResponseTimer();
-      firstModelResponseTimer = setTimeout(() => {
-        void this.forceStopRun(sessionId, {
-          expectedRunId: runId,
-          dbStatus: "ERROR",
-          protoStatus: "error",
-          logPrefix: "runtime-timeout",
-          error: {
-            code: "PROVIDER_TIMEOUT",
-            message:
-              `provider request produced no model response within ${FIRST_MODEL_RESPONSE_TIMEOUT_MS / 1000}s. ` +
-              "Verify the provider baseUrl, API key, and network connection.",
-          },
-        });
-      }, FIRST_MODEL_RESPONSE_TIMEOUT_MS);
-    };
-
     this.running.set(sessionId, {
       id: sessionId,
       runId,
@@ -1551,9 +1721,11 @@ export class SessionManager {
       const priorMessages: SdkMessage[] =
         isCodexKind
           ? runtimeHistoryFromCompletedTurns(priorRows)
-          : priorRows
-              .filter((m) => m.type === "user" || m.type === "assistant")
-              .map((m) => m.payload as SdkMessage);
+          : trimRuntimeHistory(
+              priorRows
+                .map(rowToRuntimeHistoryMessage)
+                .filter((m): m is SdkMessage => m !== null),
+            );
       const runtimeCwd = isCodexKind ? agent.codexWorkspace || CODEX_DEFAULT_CWD : STABLE_CWD;
       // W21: precompute team context (async DB read) so the systemPrompt IIFE
       // below stays synchronous. Empty string when agent isn't in a team.
@@ -1766,18 +1938,13 @@ export class SessionManager {
         },
       };
       const stream = runtime.query(runtimeOpts);
-      armFirstModelResponseTimer();
 
       let firstMsg = true;
       for await (const event of stream) {
         if (event.type === "error") {
-          clearFirstModelResponseTimer();
           throw runtimeErrorFromEvent(event);
         }
         const msg = event.payload;
-        if (msg.type === "assistant" || msg.type === "result") {
-          clearFirstModelResponseTimer();
-        }
         if (firstMsg) {
           console.log(`[sendMessage] first SDK msg type=${msg.type}`);
           firstMsg = false;
@@ -1953,7 +2120,6 @@ export class SessionManager {
       }
       return null;
     } finally {
-      clearFirstModelResponseTimer();
       // Only clear state if we're still the owner. After cancel() the entry
       // is gone; a brand-new sendMessage could already have set its own entry.
       // Without this guard a wedged old run's finally would corrupt the new run.
@@ -2247,7 +2413,7 @@ export class SessionManager {
     }
 
     this.running.delete(sessionId);
-    this.clearQueuedTurns(sessionId);
+    this.drainingQueues.delete(sessionId);
     this.liveTranscripts.delete(sessionId);
     const sessionPending = this.pending.get(sessionId);
     if (sessionPending) {
@@ -2288,6 +2454,7 @@ export class SessionManager {
         });
       }
       this.hub.sendToSession(sessionId, { type: "status", sessionId, status: opts.protoStatus });
+      this.drainQueuedTurns(sessionId);
     } catch (err) {
       console.warn(`[${opts.logPrefix}] DB reset for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`);
     }
@@ -2323,7 +2490,6 @@ export class SessionManager {
    *  updates so they can't undo the IDLE state. */
   async cancel(sessionId: string): Promise<void> {
     const r = this.running.get(sessionId);
-    this.clearQueuedTurns(sessionId);
     this.liveTranscripts.delete(sessionId);
     if (r) {
       console.log(`[cancel] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
@@ -2339,6 +2505,7 @@ export class SessionManager {
     // Drop in-memory state synchronously so sendMessage's runId guard fires
     // and a fresh send_message can be accepted without races.
     this.running.delete(sessionId);
+    this.drainingQueues.delete(sessionId);
     const sessionPending = this.pending.get(sessionId);
     if (sessionPending) {
       for (const [, p] of sessionPending) {
@@ -2368,6 +2535,7 @@ export class SessionManager {
       });
       this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
       this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "idle" });
+      this.drainQueuedTurns(sessionId);
     } catch (err) {
       // Agent might have been deleted concurrently — log and move on.
       console.warn(`[cancel] DB reset for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`);
@@ -2395,22 +2563,30 @@ export class SessionManager {
           ],
         },
       });
-      if (stuck.length === 0) return;
-      console.warn(
-        `[recover] resetting ${stuck.length} stale agent(s) to IDLE: ${stuck
-          .map((a) => `${a.name}(${a.id.slice(0, 8)}/${a.status})`)
-          .join(", ")}`,
-      );
-      for (const a of stuck) {
-        const updated = await prisma.agent.update({
-          where: { id: a.id },
-          data: { status: "IDLE" },
-        });
-        this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+      if (stuck.length > 0) {
+        console.warn(
+          `[recover] resetting ${stuck.length} stale agent(s) to IDLE: ${stuck
+            .map((a) => `${a.name}(${a.id.slice(0, 8)}/${a.status})`)
+            .join(", ")}`,
+        );
+        for (const a of stuck) {
+          const updated = await prisma.agent.update({
+            where: { id: a.id },
+            data: { status: "IDLE" },
+          });
+          this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+        }
       }
+      this.drainPersistedQueues();
     } catch (err) {
       console.error(`[recover] failed: ${(err as Error).message}`);
     }
+  }
+
+  private drainPersistedQueues(): void {
+    const rows = prisma.pendingTurn.findMany({ orderBy: { id: "asc" } });
+    const sessionIds = new Set(rows.map((row) => row.agentId));
+    for (const sessionId of sessionIds) this.drainQueuedTurns(sessionId);
   }
 
   async resolvePermission(sessionId: string, reqId: string, decision: PermissionDecision) {

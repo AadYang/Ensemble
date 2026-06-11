@@ -18,7 +18,7 @@ export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermiss
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
 /** Claude Code/Codex reasoning effort. null = inherit from the runtime default. */
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface TeamSummary {
   id: string;

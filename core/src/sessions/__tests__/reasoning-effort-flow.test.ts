@@ -48,6 +48,7 @@ describe("reasoning effort flow", () => {
   it.each([
     ["anthropic-local", "high"],
     ["openai-codex", "xhigh"],
+    ["openai-codex", "max"],
   ] as const)("passes patched reasoning effort to %s runtime", async (kind, effort) => {
     const provider = await prisma.provider.create({
       data: {
@@ -109,5 +110,59 @@ describe("reasoning effort flow", () => {
     const opts = capturedRuntimeOptions[0]!;
     expect(opts.reasoningEffort).toBeNull();
     expect(opts.resume).toBeUndefined();
+  });
+
+  it("auto-compacts oversized local history before building runtime context", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "auto-compact-openai-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "sk-test",
+        models: ["test-model"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "auto-compact-agent",
+        providerId: provider.id,
+        model: "test-model",
+        metadata: {
+          lastSessionId: "stale-native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+        },
+      },
+    });
+    for (let i = 0; i < 82; i++) {
+      await prisma.message.create({
+        data: {
+          agentId: agent.id,
+          seq: i,
+          type: i % 2 === 0 ? "user" : "assistant",
+          payload:
+            i % 2 === 0
+              ? { type: "user", message: { role: "user", content: `old question ${i} ${"x".repeat(650)}` } }
+              : { type: "assistant", message: { content: [{ type: "text", text: `old answer ${i} ${"y".repeat(650)}` }] } },
+        },
+      });
+    }
+    const sessions = new SessionManager(new StubHub() as never);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).quickQuery = async () => "compact summary for old turns";
+
+    await sessions.sendMessage(agent.id, "new prompt after compact");
+
+    expect(capturedRuntimeOptions).toHaveLength(1);
+    const historyText = JSON.stringify(capturedRuntimeOptions[0]!.history);
+    expect(historyText).toContain("compact summary for old turns");
+    expect(historyText).toContain("old answer 81");
+    expect(historyText).not.toContain("old question 0");
+    const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
+    expect(rows[0]?.type).toBe("system");
+    expect(JSON.stringify(rows[0]?.payload)).toContain("compact summary for old turns");
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(meta.lastSessionId).not.toBe("stale-native-session");
+    expect(meta.codexUsageSnapshot).toBeUndefined();
   });
 });

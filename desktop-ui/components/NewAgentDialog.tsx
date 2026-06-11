@@ -4,13 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useT } from "@/i18n/useT";
-
-const FALLBACK_MODELS = [
-  "claude-opus-4-8",
-  "claude-opus-4-7",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001",
-];
+import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 
 export function NewAgentDialog({
   defaultName,
@@ -63,7 +57,7 @@ export function NewAgentDialog({
   const availableModels: string[] = selectedProvider?.models.length
     ? selectedProvider.models
     : isDefaultAnth
-      ? FALLBACK_MODELS
+      ? DEFAULT_ANTHROPIC_MODELS
       : [];
 
   // Reset model to first option whenever provider changes.

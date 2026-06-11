@@ -6,19 +6,13 @@ import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { createTeam } from "@/lib/team-api";
 import { getWS } from "@/lib/ws";
 import { useT } from "@/i18n/useT";
+import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 
 // Same fallback that AgentSettings uses. anthropic-local provider rows live
 // in the DB with empty `models[]` because the actual model id list comes from
 // the local claude CLI's own catalog, which we don't enumerate at provider
 // creation. AgentSettings hardcodes these three so users can pick something
 // sensible without an explicit refresh; NewTeamDialog should do the same.
-const FALLBACK_MODELS = [
-  "claude-opus-4-8",
-  "claude-opus-4-7",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001",
-];
-
 function isDefaultAnthropic(p: ProviderDTO | undefined): boolean {
   if (!p) return false;
   return p.kind === "anthropic-local" || (p.kind === "anthropic" && !p.baseUrl);
@@ -27,7 +21,7 @@ function isDefaultAnthropic(p: ProviderDTO | undefined): boolean {
 function availableModelsFor(p: ProviderDTO | undefined): string[] {
   if (!p) return [];
   if (p.models.length > 0) return p.models;
-  return isDefaultAnthropic(p) ? FALLBACK_MODELS : [];
+  return isDefaultAnthropic(p) ? DEFAULT_ANTHROPIC_MODELS : [];
 }
 
 interface MemberDraft {

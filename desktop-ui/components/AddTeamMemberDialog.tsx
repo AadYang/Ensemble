@@ -5,17 +5,11 @@ import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { getWS } from "@/lib/ws";
 import { useT } from "@/i18n/useT";
+import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 
 // Same FALLBACK_MODELS treatment NewTeamDialog uses — anthropic-local rows
 // have empty `models[]` in the DB; without this fallback the model dropdown
 // shows nothing.
-const FALLBACK_MODELS = [
-  "claude-opus-4-8",
-  "claude-opus-4-7",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001",
-];
-
 function isDefaultAnthropic(p: ProviderDTO | undefined): boolean {
   if (!p) return false;
   return p.kind === "anthropic-local" || (p.kind === "anthropic" && !p.baseUrl);
@@ -24,7 +18,7 @@ function isDefaultAnthropic(p: ProviderDTO | undefined): boolean {
 function availableModelsFor(p: ProviderDTO | undefined): string[] {
   if (!p) return [];
   if (p.models.length > 0) return p.models;
-  return isDefaultAnthropic(p) ? FALLBACK_MODELS : [];
+  return isDefaultAnthropic(p) ? DEFAULT_ANTHROPIC_MODELS : [];
 }
 
 export function AddTeamMemberDialog({

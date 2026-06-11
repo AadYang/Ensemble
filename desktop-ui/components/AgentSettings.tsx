@@ -15,13 +15,7 @@ import { useStore } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { getDialog } from "@/lib/dialog";
 import { SuggestSubagentDialog } from "./SuggestSubagentDialog";
-
-const FALLBACK_MODELS = [
-  "claude-opus-4-8",
-  "claude-opus-4-7",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001",
-];
+import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 
 const PERMISSION_MODES: PermissionMode[] = [
   "default",
@@ -37,6 +31,7 @@ const REASONING_EFFORTS: ReasoningEffort[] = [
   "medium",
   "high",
   "xhigh",
+  "max",
 ];
 
 export function AgentSettings({
@@ -49,7 +44,7 @@ export function AgentSettings({
   const agent = useStore((s) => s.agents[agentId]);
   const teams = useStore((s) => s.teams);
   const [name, setName] = useState(agent?.summary.name ?? "");
-  const [model, setModel] = useState(agent?.summary.model ?? FALLBACK_MODELS[0]!);
+  const [model, setModel] = useState(agent?.summary.model ?? DEFAULT_ANTHROPIC_MODELS[0]!);
   const [providerId, setProviderId] = useState<string | null>(agent?.summary.providerId ?? null);
   const [systemPrompt, setSystemPrompt] = useState(agent?.summary.systemPrompt ?? "");
   // "" = ungrouped; otherwise team id.
@@ -107,7 +102,7 @@ export function AgentSettings({
       sp.kind === "anthropic-local" || (sp.kind === "anthropic" && !sp.baseUrl);
     const avail = sp.models.length
       ? sp.models
-      : isDefaultAnth ? FALLBACK_MODELS : [];
+      : isDefaultAnth ? DEFAULT_ANTHROPIC_MODELS : [];
     if (!avail.includes(model)) {
       setModel(avail[0] ?? "");
     }
@@ -171,6 +166,7 @@ export function AgentSettings({
 
   const summary = agent.summary;
   const selectedProvider = providers.find((p) => p.id === providerId);
+  const providerCapabilityKnown = providerId === null || selectedProvider !== undefined;
   const selectedProviderKind = selectedProvider?.kind ?? (providerId === null ? "anthropic-local" : null);
   const isCodexProvider = selectedProvider?.kind === "openai-codex";
   const supportsThinkingMode =
@@ -189,12 +185,14 @@ export function AgentSettings({
     selectedProvider?.models.length
       ? selectedProvider.models
       : isDefaultAnthropic
-        ? FALLBACK_MODELS
+        ? DEFAULT_ANTHROPIC_MODELS
         : [];
   const effectiveSandbox: SandboxMode | null = isCodexProvider ? (sandboxMode || null) : null;
-  const effectiveReasoningEffort: ReasoningEffort | null = supportsThinkingMode
-    ? (reasoningEffort || null)
-    : null;
+  const effectiveReasoningEffort: ReasoningEffort | null | undefined = providerCapabilityKnown
+    ? supportsThinkingMode
+      ? (reasoningEffort || null)
+      : null
+    : undefined;
   const effectiveSystemPrompt: string | null = systemPrompt.trim() ? systemPrompt : null;
   const effectiveTeamId: string | null = teamId || null;
   const dirty =
@@ -203,7 +201,7 @@ export function AgentSettings({
     (providerId ?? null) !== (summary.providerId ?? null) ||
     permissionMode !== summary.permissionMode ||
     effectiveSandbox !== (summary.sandboxMode ?? null) ||
-    effectiveReasoningEffort !== (summary.reasoningEffort ?? null) ||
+    (effectiveReasoningEffort !== undefined && effectiveReasoningEffort !== (summary.reasoningEffort ?? null)) ||
     effectiveSystemPrompt !== (summary.systemPrompt ?? null) ||
     effectiveTeamId !== (summary.teamId ?? null);
 
@@ -231,7 +229,9 @@ export function AgentSettings({
         sandboxMode:
           effectiveSandbox !== (summary.sandboxMode ?? null) ? effectiveSandbox : undefined,
         reasoningEffort:
-          effectiveReasoningEffort !== (summary.reasoningEffort ?? null) ? effectiveReasoningEffort : undefined,
+          effectiveReasoningEffort !== undefined && effectiveReasoningEffort !== (summary.reasoningEffort ?? null)
+            ? effectiveReasoningEffort
+            : undefined,
         systemPrompt:
           effectiveSystemPrompt !== (summary.systemPrompt ?? null) ? effectiveSystemPrompt : undefined,
         teamId: effectiveTeamId !== (summary.teamId ?? null) ? effectiveTeamId : undefined,
