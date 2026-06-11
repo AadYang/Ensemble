@@ -13,6 +13,7 @@ import {
 } from "./auth.js";
 import type { CloudAccountRecord, CloudStore } from "./store.js";
 import { CloudRevisionConflictError, publicAccount } from "./store.js";
+import { bearerToken, authenticateCloudRequest, requireCloudAuth } from "./session-auth.js";
 
 const EMAIL_MAX = 255;
 const PASSWORD_MAX = 1024;
@@ -59,21 +60,9 @@ export interface CloudRoutesOptions {
   loginMaxFailures?: number;
 }
 
-interface AuthContext {
-  tokenHash: string;
-  account: CloudAccountRecord;
-}
-
 interface LoginFailureBucket {
   count: number;
   resetAt: number;
-}
-
-function bearerToken(req: FastifyRequest): string | null {
-  const header = req.headers.authorization;
-  if (!header) return null;
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  return match?.[1]?.trim() || null;
 }
 
 function userAgent(req: FastifyRequest): string | null {
@@ -111,28 +100,6 @@ function recordLoginFailure(
     : { count: 1, resetAt: now + windowMs };
   failures.set(key, next);
   return next;
-}
-
-async function authenticate(req: FastifyRequest, store: CloudStore): Promise<AuthContext | null> {
-  const token = bearerToken(req);
-  if (!token) return null;
-  const tokenHash = hashToken(token);
-  const session = await store.getSessionByTokenHash(tokenHash);
-  if (!session) return null;
-  if (new Date(session.expiresAt).getTime() <= Date.now()) {
-    await store.deleteSession(tokenHash);
-    return null;
-  }
-  const account = await store.getAccountById(session.accountId);
-  if (!account) return null;
-  await store.touchSession(tokenHash, new Date());
-  return { tokenHash, account };
-}
-
-async function requireAuth(req: FastifyRequest, store: CloudStore): Promise<AuthContext> {
-  const auth = await authenticate(req, store);
-  if (!auth) throw new Error("unauthorized");
-  return auth;
 }
 
 async function ensureFixedAccount(
@@ -236,7 +203,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
   });
 
   app.get("/v1/cloud/me", async (req, reply) => {
-    const auth = await authenticate(req, store);
+    const auth = await authenticateCloudRequest(req, store);
     if (!auth) {
       reply.code(401);
       return { error: "unauthorized" };
@@ -246,7 +213,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
 
   app.get("/v1/cloud/workspaces", async (req, reply) => {
     try {
-      const auth = await requireAuth(req, store);
+      const auth = await requireCloudAuth(req, store);
       return { workspaces: await store.listWorkspaces(auth.account.id) };
     } catch {
       reply.code(401);
@@ -261,7 +228,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       return { error: "bad_request", detail: parsed.error.issues };
     }
     try {
-      const auth = await requireAuth(req, store);
+      const auth = await requireCloudAuth(req, store);
       const workspace = await store.createWorkspace(auth.account.id, {
         id: parsed.data.id,
         name: parsed.data.name,
@@ -280,7 +247,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       return { error: "bad_request", detail: params.error.issues };
     }
     try {
-      const auth = await requireAuth(req, store);
+      const auth = await requireCloudAuth(req, store);
       const snapshot = await store.getSnapshot(auth.account.id, params.data.workspaceId);
       if (!snapshot) {
         reply.code(404);
@@ -305,7 +272,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       return { error: "bad_request", detail: body.error.issues };
     }
     try {
-      const auth = await requireAuth(req, store);
+      const auth = await requireCloudAuth(req, store);
       const workspace = await store.getWorkspace(auth.account.id, params.data.workspaceId);
       if (!workspace) {
         reply.code(404);
@@ -344,7 +311,7 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       return { error: "bad_request", detail: body.error.issues };
     }
     try {
-      const auth = await requireAuth(req, store);
+      const auth = await requireCloudAuth(req, store);
       const workspace = await store.getWorkspace(auth.account.id, params.data.workspaceId);
       if (!workspace) {
         reply.code(404);

@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@agentorch/shared": "workspace:*",
+    "@fastify/websocket": "^11.0.2",
     "fastify": "^5.1.0",
     "mysql2": "^3.22.3",
     "zod": "^4.4.3"

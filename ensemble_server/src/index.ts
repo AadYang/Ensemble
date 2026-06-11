@@ -7,6 +7,7 @@
 import { resolve } from "node:path";
 import Fastify from "fastify";
 import { CloudDb } from "./cloud/db.js";
+import { registerCloudRealtimeRoutes } from "./cloud/realtime.js";
 import { registerCloudRoutes } from "./cloud/routes.js";
 import { ManifestStore } from "./manifest.js";
 import { TelemetryDb, readDbConfig } from "./telemetry/db.js";
@@ -78,6 +79,7 @@ if (telemetryDb) {
   try {
     await cloudDb.migrate();
     registerCloudRoutes(app, cloudDb);
+    registerCloudRealtimeRoutes(app, cloudDb);
     app.log.info("cloud workspace routes enabled");
   } catch (err) {
     app.log.error({ err }, "cloud workspace migrate failed - routes NOT registered");
