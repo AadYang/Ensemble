@@ -9,6 +9,9 @@ vi.mock("../runtimes/index.js", () => ({
   chooseRuntime: () => ({
     async *query(opts: RuntimeOptions) {
       capturedRuntimeOptions.push(opts);
+      if (opts.prompt === "simulate non-aborted runtime error") {
+        throw new Error("network stream failed after dispatch");
+      }
       yield {
         type: "sdk_message" as const,
         payload: {
@@ -29,6 +32,7 @@ vi.mock("../../cli-config.js", () => ({
 
 let prisma: typeof import("../../db.js").prisma;
 let SessionManager: typeof import("../SessionManager.js").SessionManager;
+let runtimeHistoryFromCompletedTurns: typeof import("../SessionManager.js").runtimeHistoryFromCompletedTurns;
 
 class StubHub {
   sendToSession(): void {}
@@ -37,7 +41,7 @@ class StubHub {
 
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
-  ({ SessionManager } = await import("../SessionManager.js"));
+  ({ SessionManager, runtimeHistoryFromCompletedTurns } = await import("../SessionManager.js"));
 });
 
 beforeEach(() => {
@@ -246,5 +250,35 @@ describe("reasoning effort flow", () => {
     expect(historyText).toContain("Previous Ensemble turn was interrupted");
     expect(historyText).toContain("interrupted model switch task");
     expect(historyText).toContain("partial model switch work");
+  });
+
+  it("persists interrupted_turn for non-aborted runtime errors after dispatch", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "runtime-error-interrupted-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "sk-test",
+        models: ["test-model"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "runtime-error-interrupted-agent",
+        providerId: provider.id,
+        model: "test-model",
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    const result = await sessions.sendMessage(agent.id, "simulate non-aborted runtime error");
+
+    expect(result).toBeNull();
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("ERROR");
+    const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
+    expect(JSON.stringify(rows)).toContain("interrupted_turn");
+    const historyText = JSON.stringify(runtimeHistoryFromCompletedTurns(rows));
+    expect(historyText).toContain("Previous Ensemble turn was interrupted");
+    expect(historyText).toContain("simulate non-aborted runtime error");
   });
 });

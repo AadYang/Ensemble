@@ -456,16 +456,18 @@ export const runtimeHistoryFromCompletedTurns = (
   rows: Array<{ type: string; payload: unknown; seq?: number }>,
 ): SdkMessage[] => {
   const lastResultIndex = rows.map((row) => row.type).lastIndexOf("result");
+  const latestUnresolvedInterruptedIndex = findLatestInterruptedTurnIndex(rows, lastResultIndex + 1);
   let completedRows =
     lastResultIndex >= 0
-      ? rows.slice(0, lastResultIndex + 1)
+      ? rows.slice(0, lastResultIndex + 1).filter((row) => {
+          if (row.type !== "system") return true;
+          return parseInterruptedTurnPayload(row.payload) === null;
+        })
       : rows.slice(0, trailingCompleteHistoryEnd(rows));
-  const latestInterruptedIndex = findLatestInterruptedTurnIndex(rows);
-  if (latestInterruptedIndex >= 0) {
-    const latestInterrupted = rows[latestInterruptedIndex]!;
+  if (latestUnresolvedInterruptedIndex >= 0) {
+    const latestInterrupted = rows[latestUnresolvedInterruptedIndex]!;
     const interruptedPayload = parseInterruptedTurnPayload(latestInterrupted.payload);
-    const afterLastResult = lastResultIndex < 0 || latestInterruptedIndex > lastResultIndex;
-    if (interruptedPayload && afterLastResult) {
+    if (interruptedPayload) {
       const matchingUserIndex = rows.findIndex((row) => {
         if (row.type !== "user") return false;
         const seqMatches = typeof row.seq === "number" && row.seq === interruptedPayload.userSeq;
@@ -703,8 +705,9 @@ function parseInterruptedTurnPayload(payload: unknown): InterruptedTurnPayload |
   };
 }
 
-function findLatestInterruptedTurnIndex(rows: Array<{ type: string; payload: unknown }>): number {
+function findLatestInterruptedTurnIndex(rows: Array<{ type: string; payload: unknown }>, startIndex = 0): number {
   for (let i = rows.length - 1; i >= 0; i--) {
+    if (i < startIndex) break;
     const row = rows[i]!;
     if (row.type === "system" && parseInterruptedTurnPayload(row.payload)) return i;
   }
@@ -2480,8 +2483,11 @@ export class SessionManager {
       // once it's removed this run from the map.
       if (this.running.get(sessionId)?.runId === runId) {
         const activeRun = this.running.get(sessionId);
-        if (aborted && activeRun?.runId === runId) {
-          await this.persistInterruptedTurn(sessionId, activeRun, "aborted");
+        if (activeRun?.runId === runId && !activeRun.sawResult) {
+          const reason = aborted
+            ? "aborted"
+            : String(runtimeDetails.runtimeCode ?? (staleResume ? "SESSION_LOST" : "QUERY_FAILED"));
+          await this.persistInterruptedTurn(sessionId, activeRun, reason);
         }
         const updated = await prisma.agent.update({ where: { id: sessionId }, data: persistData });
         this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
@@ -2653,22 +2659,31 @@ export class SessionManager {
     const MAX_REVIEW_CHARS = 8000;
     const running = this.running.get(agentId);
     const liveText = this.liveAssistantText(agentId);
-    if (running && liveText) {
+    if (running) {
       const output = [
         `Source state: running`,
         `Current user request: ${truncateMiddle(running.userInput, PEER_SOURCE_REQUEST_MAX_CHARS)}`,
         "",
-        "Live assistant output so far:",
-        truncateMiddle(liveText, PEER_SOURCE_PARTIAL_MAX_CHARS),
+        liveText ? "Live assistant output so far:" : "Live assistant output so far: (none yet)",
+        liveText ? truncateMiddle(liveText, PEER_SOURCE_PARTIAL_MAX_CHARS) : "",
       ].join("\n");
       return {
         sourceRunState: "running",
-        liveText: truncateMiddle(liveText, PEER_SOURCE_PARTIAL_MAX_CHARS),
+        ...(liveText ? { liveText: truncateMiddle(liveText, PEER_SOURCE_PARTIAL_MAX_CHARS) } : {}),
         sourceUserRequest: truncateMiddle(running.userInput, PEER_SOURCE_REQUEST_MAX_CHARS),
         sourceOutput: truncateMiddle(output, PEER_SOURCE_OUTPUT_MAX_CHARS),
       };
     }
-    const interrupted = this.latestInterruptedTurn(agentId);
+    const sourceRows = await prisma.message.findMany({
+      where: { agentId },
+      orderBy: { seq: "asc" },
+      take: 400,
+    });
+    const latestResultIndex = sourceRows.map((row) => row.type).lastIndexOf("result");
+    const latestUnresolvedInterruptedIndex = findLatestInterruptedTurnIndex(sourceRows, latestResultIndex + 1);
+    const interrupted = latestUnresolvedInterruptedIndex >= 0
+      ? parseInterruptedTurnPayload(sourceRows[latestUnresolvedInterruptedIndex]!.payload)
+      : null;
     if (interrupted) {
       const output = [
         `Source state: interrupted`,
@@ -2684,12 +2699,9 @@ export class SessionManager {
         sourceOutput: truncateMiddle(output, PEER_SOURCE_OUTPUT_MAX_CHARS),
       };
     }
-    // Pull last 80 rows newest-first; any sensible last-turn fits.
-    const rows = await prisma.message.findMany({
-      where: { agentId },
-      orderBy: { seq: "desc" },
-      take: 80,
-    });
+    // Pull newest rows from the already-loaded source snapshot; any sensible
+    // last turn fits in the last 80 rows.
+    const rows = sourceRows.slice(-80).reverse();
     const texts: string[] = [];
     for (const row of rows) {
       if (row.type === "user") break;

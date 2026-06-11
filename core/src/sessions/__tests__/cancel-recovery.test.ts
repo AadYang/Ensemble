@@ -569,6 +569,131 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(text).not.toContain("older completed output");
   });
 
+  it("peer_send uses newer completed output instead of older interrupted context", async () => {
+    const source = await prisma.agent.create({ data: { name: "resolved-source" } });
+    const target = await prisma.agent.create({ data: { name: "resolved-target" } });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 0,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "old interrupted request" } },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 1,
+        type: "system",
+        payload: {
+          type: "system",
+          subtype: "interrupted_turn",
+          reason: "cancelled",
+          runId: "old-run",
+          userSeq: 0,
+          userRequest: "old interrupted request",
+          partialAssistantText: "old interrupted partial",
+          interruptedAt: new Date().toISOString(),
+        },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 2,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "new completed request" } },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 3,
+        type: "assistant",
+        payload: { type: "assistant", message: { content: [{ type: "text", text: "new completed output" }] } },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 4,
+        type: "result",
+        payload: { type: "result", subtype: "success" },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(source.id, target.name, "review latest", "review");
+    await Promise.resolve();
+
+    const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
+    const text = queued?.userInput ?? "";
+    expect(text).toContain("Source state: completed");
+    expect(text).toContain("new completed output");
+    expect(text).not.toContain("old interrupted partial");
+  });
+
+  it("peer_send reports running source with no live output instead of falling back to old context", async () => {
+    const source = await prisma.agent.create({ data: { name: "running-no-live-source" } });
+    const target = await prisma.agent.create({ data: { name: "running-no-live-target" } });
+    await prisma.message.create({
+      data: {
+        agentId: source.id,
+        seq: 0,
+        type: "assistant",
+        payload: { type: "assistant", message: { content: [{ type: "text", text: "stale completed output" }] } },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "source-running-no-live",
+      abort: new AbortController(),
+      seq: 1,
+      userInput: "brand new request before first token",
+      startedSeq: 1,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(source.id, target.name, "review latest", "review");
+    await Promise.resolve();
+
+    const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
+    const text = queued?.userInput ?? "";
+    expect(text).toContain("Source state: running");
+    expect(text).toContain("brand new request before first token");
+    expect(text).toContain("(none yet)");
+    expect(text).not.toContain("stale completed output");
+  });
+
   it("peer_query includes live assistant output from a running target", async () => {
     const source = await prisma.agent.create({ data: { name: "observer" } });
     const target = await prisma.agent.create({ data: { name: "visible-peer" } });
@@ -874,6 +999,50 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(text).toContain("important partial output");
     expect(text).not.toContain("question 1");
     expect(text.length).toBeLessThan(25_000);
+  });
+
+  it("does not keep interrupted_turn as current resume target after a later result resolves it", () => {
+    const history = runtimeHistoryFromCompletedTurns([
+      {
+        type: "user",
+        seq: 0,
+        payload: { type: "user", message: { role: "user", content: "interrupted request" } },
+      },
+      {
+        type: "system",
+        seq: 1,
+        payload: {
+          type: "system",
+          subtype: "interrupted_turn",
+          reason: "cancelled",
+          runId: "resolved-run",
+          userSeq: 0,
+          userRequest: "interrupted request",
+          partialAssistantText: "old partial",
+          interruptedAt: new Date().toISOString(),
+        },
+      },
+      {
+        type: "user",
+        seq: 2,
+        payload: { type: "user", message: { role: "user", content: "continue resolved request" } },
+      },
+      {
+        type: "assistant",
+        seq: 3,
+        payload: { type: "assistant", message: { content: [{ type: "text", text: "resolved answer" }] } },
+      },
+      {
+        type: "result",
+        seq: 4,
+        payload: { type: "result", subtype: "success" },
+      },
+    ]);
+
+    const text = JSON.stringify(history);
+    expect(text).toContain("resolved answer");
+    expect(text).not.toContain("Previous Ensemble turn was interrupted");
+    expect(text).not.toContain("old partial");
   });
 
   it("caps runtime history to precise recent context instead of full transcript", () => {
