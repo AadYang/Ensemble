@@ -151,6 +151,75 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.code === "RUNTIME_STOPPED")).toBe(true);
   });
 
+  it("runtime idle timeout aborts the active run and reports ERROR", async () => {
+    const agent = await prisma.agent.create({ data: { name: "idle-timeout-agent" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-timeout",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stopped = await (sessions as any).handleRuntimeIdleTimeout(agent.id, "run-timeout", 1_000);
+
+    expect(stopped).toBe(true);
+    expect(abort.signal.aborted).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("ERROR");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(agent.id)).toBe(false);
+    expect(
+      hub.sessionMessages.some(
+        (m) =>
+          m.sessionId === agent.id &&
+          m.msg.type === "error" &&
+          m.msg.code === "RUNTIME_IDLE_TIMEOUT" &&
+          String(m.msg.message).includes("automatically stopped this turn"),
+      ),
+    ).toBe(true);
+    expect(
+      hub.sessionMessages.some(
+        (m) => m.sessionId === agent.id && m.msg.type === "status" && m.msg.status === "error",
+      ),
+    ).toBe(true);
+  });
+
+  it("runtime idle timeout ignores a stale run id after a new run owns the session", async () => {
+    const agent = await prisma.agent.create({ data: { name: "idle-timeout-stale-run" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "new-run",
+      abort,
+      seq: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stopped = await (sessions as any).handleRuntimeIdleTimeout(agent.id, "old-run", 1_000);
+
+    expect(stopped).toBe(false);
+    expect(abort.signal.aborted).toBe(false);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("RUNNING");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.get(agent.id)?.runId).toBe("new-run");
+    expect(hub.sessionMessages.some((m) => m.sessionId === agent.id && m.msg.code === "RUNTIME_IDLE_TIMEOUT")).toBe(false);
+  });
+
   it("sendMessage queues input while the agent is already running", async () => {
     const agent = await prisma.agent.create({ data: { name: "queue-target" } });
     const hub = new StubHub();

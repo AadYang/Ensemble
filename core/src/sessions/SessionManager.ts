@@ -78,6 +78,33 @@ const AUTO_COMPACT_MIN_MESSAGES = 80;
 const AUTO_COMPACT_TRIGGER_CHARS = 48_000;
 const AUTO_COMPACT_KEEP_MESSAGES = 24;
 const AUTO_COMPACT_SUMMARY_MAX_CHARS = 60_000;
+const RUNTIME_IDLE_TIMEOUT_DEFAULT_MS = 20 * 60 * 1000;
+
+function readRuntimeIdleTimeoutMs(): number {
+  const raw = process.env.ENSEMBLE_RUNTIME_IDLE_TIMEOUT_MS;
+  if (!raw) return RUNTIME_IDLE_TIMEOUT_DEFAULT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : RUNTIME_IDLE_TIMEOUT_DEFAULT_MS;
+}
+
+function formatRuntimeIdleTimeout(timeoutMs: number): string {
+  if (timeoutMs >= 60_000) {
+    const minutes = Math.round(timeoutMs / 60_000);
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+function runtimeIdleTimeoutMessage(timeoutMs: number): string {
+  return (
+    `No events have been received from the upstream runtime or network connection for ${formatRuntimeIdleTimeout(timeoutMs)}. ` +
+    "Ensemble has automatically stopped this turn so the agent is not left running forever. " +
+    "The agent's model, thinking mode, sandbox, provider, and other settings were not modified."
+  );
+}
 
 function isInternalSystemMessage(msg: unknown): boolean {
   return (
@@ -146,6 +173,8 @@ interface RunningSession {
   runId: string;
   abort: AbortController;
   seq: number;
+  idleTimer?: ReturnType<typeof setTimeout>;
+  idleWatchdogPaused?: boolean;
   /** Per-turn auto-allow cache, keyed by toolName. User clicking "Allow" on
    *  a permission dialog adds the tool name here; subsequent canUseTool calls
    *  with the same toolName during this turn skip the dialog. Cleared when
@@ -541,6 +570,73 @@ export class SessionManager {
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
 
   constructor(private hub: WSHub) {}
+
+  private getRuntimeIdleTimeoutMs(): number {
+    return readRuntimeIdleTimeoutMs();
+  }
+
+  private clearRuntimeIdleWatchdog(sessionId: string, expectedRunId?: string): void {
+    const running = this.running.get(sessionId);
+    if (!running || (expectedRunId && running.runId !== expectedRunId)) return;
+    if (running.idleTimer) {
+      clearTimeout(running.idleTimer);
+      running.idleTimer = undefined;
+    }
+  }
+
+  private armRuntimeIdleWatchdog(sessionId: string, expectedRunId: string): void {
+    const running = this.running.get(sessionId);
+    if (!running || running.runId !== expectedRunId || running.idleWatchdogPaused) return;
+    this.clearRuntimeIdleWatchdog(sessionId, expectedRunId);
+    const timeoutMs = this.getRuntimeIdleTimeoutMs();
+    const timer = setTimeout(() => {
+      void this.handleRuntimeIdleTimeout(sessionId, expectedRunId, timeoutMs);
+    }, timeoutMs);
+    const maybeNodeTimer = timer as { unref?: () => void };
+    if (typeof maybeNodeTimer.unref === "function") maybeNodeTimer.unref();
+    running.idleTimer = timer;
+  }
+
+  private resetRuntimeIdleWatchdog(sessionId: string, expectedRunId: string): void {
+    const running = this.running.get(sessionId);
+    if (!running || running.runId !== expectedRunId) return;
+    running.idleWatchdogPaused = false;
+    this.armRuntimeIdleWatchdog(sessionId, expectedRunId);
+  }
+
+  private pauseRuntimeIdleWatchdog(sessionId: string, expectedRunId?: string): void {
+    const running = this.running.get(sessionId);
+    if (!running || (expectedRunId && running.runId !== expectedRunId)) return;
+    running.idleWatchdogPaused = true;
+    this.clearRuntimeIdleWatchdog(sessionId, expectedRunId);
+  }
+
+  private resumeRuntimeIdleWatchdog(sessionId: string, expectedRunId?: string): void {
+    const running = this.running.get(sessionId);
+    if (!running || (expectedRunId && running.runId !== expectedRunId)) return;
+    running.idleWatchdogPaused = false;
+    this.armRuntimeIdleWatchdog(sessionId, running.runId);
+  }
+
+  private async handleRuntimeIdleTimeout(
+    sessionId: string,
+    expectedRunId: string,
+    timeoutMs = this.getRuntimeIdleTimeoutMs(),
+  ): Promise<boolean> {
+    const running = this.running.get(sessionId);
+    if (!running || running.runId !== expectedRunId || running.idleWatchdogPaused) return false;
+    this.clearRuntimeIdleWatchdog(sessionId, expectedRunId);
+    return this.forceStopRun(sessionId, {
+      expectedRunId,
+      dbStatus: "ERROR",
+      protoStatus: "error",
+      logPrefix: "runtime-idle-timeout",
+      error: {
+        code: "RUNTIME_IDLE_TIMEOUT",
+        message: runtimeIdleTimeoutMessage(timeoutMs),
+      },
+    });
+  }
 
   private beginDrain(sessionId: string): string {
     const token = randomUUID();
@@ -1941,6 +2037,7 @@ export class SessionManager {
 
       let firstMsg = true;
       for await (const event of stream) {
+        this.resetRuntimeIdleWatchdog(sessionId, runId);
         if (event.type === "error") {
           throw runtimeErrorFromEvent(event);
         }
@@ -2027,6 +2124,7 @@ export class SessionManager {
 
         seq++;
       }
+      this.clearRuntimeIdleWatchdog(sessionId, runId);
 
       const persistData: { status: "DONE"; metadata?: object } = { status: "DONE" };
       const metaPatch: Record<string, unknown> = {};
@@ -2058,6 +2156,7 @@ export class SessionManager {
       }
       return { finalText };
     } catch (err) {
+      this.clearRuntimeIdleWatchdog(sessionId, runId);
       const aborted = abort.signal.aborted;
       const rawMsg = err instanceof Error ? err.message : String(err);
       const runtimeDetails = (err && typeof err === "object" ? err : {}) as Partial<RuntimeErrorDetails>;
@@ -2124,6 +2223,7 @@ export class SessionManager {
       // is gone; a brand-new sendMessage could already have set its own entry.
       // Without this guard a wedged old run's finally would corrupt the new run.
       if (this.running.get(sessionId)?.runId === runId) {
+        this.clearRuntimeIdleWatchdog(sessionId, runId);
         this.running.delete(sessionId);
         this.pending.delete(sessionId);
         const qb = this.pendingQuestions.get(sessionId);
@@ -2408,6 +2508,7 @@ export class SessionManager {
     if (r) {
       console.log(`[${opts.logPrefix}] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
       try { r.abort.abort(); } catch { /* signal already aborted */ }
+      this.clearRuntimeIdleWatchdog(sessionId, r.runId);
     } else {
       console.log(`[${opts.logPrefix}] no live run for agent=${sessionId.slice(0, 8)}; cleaning stale state`);
     }
@@ -2472,6 +2573,13 @@ export class SessionManager {
     });
     this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
     this.hub.sendToSession(sessionId, { type: "status", sessionId, status: protoStatus });
+    if (dbStatus === "RUNNING") {
+      this.resumeRuntimeIdleWatchdog(sessionId);
+    } else if (dbStatus === "AWAITING_PERMISSION" || dbStatus === "AWAITING_USER_INPUT") {
+      this.pauseRuntimeIdleWatchdog(sessionId);
+    } else {
+      this.clearRuntimeIdleWatchdog(sessionId);
+    }
   }
 
   /** Authoritatively cancel a run.
@@ -2494,6 +2602,7 @@ export class SessionManager {
     if (r) {
       console.log(`[cancel] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
       try { r.abort.abort(); } catch { /* signal already aborted */ }
+      this.clearRuntimeIdleWatchdog(sessionId, r.runId);
     } else {
       // No in-memory run — but the DB might still say RUNNING because a
       // previous core process crashed mid-turn or a runtime hang outlived its
