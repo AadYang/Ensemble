@@ -824,6 +824,185 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(meta.codexResumeSignature).toBeUndefined();
   });
 
+  it("patchAgent preserves permissionMode while clearing resume metadata for model+permission changes", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "codex-model-permission-change-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.4", "gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "codex-model-permission-change-agent",
+        providerId: provider.id,
+        model: "gpt-5.4",
+        metadata: {
+          permissionMode: "default",
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { model: "gpt-5.5", permissionMode: "plan" });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.model).toBe("gpt-5.5");
+    expect(meta.permissionMode).toBe("plan");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+  });
+
+  it("patchAgent clears resume metadata for provider-only changes", async () => {
+    const sourceProvider = await prisma.provider.create({
+      data: {
+        name: "provider-only-source",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const targetProvider = await prisma.provider.create({
+      data: {
+        name: "provider-only-target",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "provider-only-change-agent",
+        providerId: sourceProvider.id,
+        model: "gpt-5.5",
+        metadata: {
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { providerId: targetProvider.id });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.providerId).toBe(targetProvider.id);
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+  });
+
+  it("patchAgent preserves permissionMode while clearing resume metadata for provider+permission changes", async () => {
+    const sourceProvider = await prisma.provider.create({
+      data: {
+        name: "provider-permission-source",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const targetProvider = await prisma.provider.create({
+      data: {
+        name: "provider-permission-target",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "provider-permission-change-agent",
+        providerId: sourceProvider.id,
+        model: "gpt-5.5",
+        metadata: {
+          permissionMode: "default",
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { providerId: targetProvider.id, permissionMode: "bypassPermissions" });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.providerId).toBe(targetProvider.id);
+    expect(meta.permissionMode).toBe("bypassPermissions");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+  });
+
+  it("patchAgent clears resume metadata for permissionMode-only changes", async () => {
+    const agent = await prisma.agent.create({
+      data: {
+        name: "permission-only-change-agent",
+        metadata: {
+          permissionMode: "default",
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { permissionMode: "dontAsk" });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(meta.permissionMode).toBe("dontAsk");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+  });
+
+  it("patchAgent preserves reasoning effort while clearing resume metadata for systemPrompt+reasoning changes", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "system-reasoning-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "system-reasoning-change-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        systemPrompt: "old role",
+        metadata: {
+          reasoningEffort: "low",
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { systemPrompt: "new role", reasoningEffort: "max" });
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.systemPrompt).toBe("new role");
+    expect(meta.reasoningEffort).toBe("max");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+  });
+
   it("patchAgent provider switch preserves explicit model and supported reasoning effort", async () => {
     const sourceProvider = await prisma.provider.create({
       data: {

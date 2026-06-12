@@ -1154,6 +1154,16 @@ export class SessionManager {
       systemPrompt?: string | null;
       teamId?: string | null;
     } = {};
+    let nextMetadata: object | undefined;
+    const mergeNextMetadata = (patchMeta: Record<string, unknown>): void => {
+      nextMetadata = mergeMetadata(nextMetadata ?? cur.metadata, patchMeta);
+    };
+    const removeNextMetadataKeys = (keys: string[]): void => {
+      nextMetadata = removeMetadataKeys(nextMetadata ?? cur.metadata, keys);
+    };
+    const clearResumeMetadata = (): void => {
+      removeNextMetadataKeys([...RESUME_METADATA_KEYS]);
+    };
     if (patch.model !== undefined) {
       data.model = patch.model;
       // Native CLI resume threads are not model-agnostic. Reusing a cached
@@ -1161,13 +1171,25 @@ export class SessionManager {
       // backend/session shape while Ensemble believes it is running the new
       // model.
       if (patch.model !== cur.model) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
+        clearResumeMetadata();
       }
     }
     if (patch.name !== undefined) data.name = patch.name;
-    if (patch.providerId !== undefined) data.providerId = patch.providerId;
+    if (patch.providerId !== undefined) {
+      data.providerId = patch.providerId;
+      if (patch.providerId !== cur.providerId) {
+        // Native runtime session ids are provider-scoped. Even if the model
+        // string happens to match, the prior Claude/Codex/compat session must
+        // not be resumed under a different provider implementation.
+        clearResumeMetadata();
+      }
+    }
     if (patch.permissionMode !== undefined) {
-      data.metadata = mergeMetadata(cur.metadata, { permissionMode: patch.permissionMode });
+      const previousPermissionMode = readPermissionMode(cur.metadata);
+      mergeNextMetadata({ permissionMode: patch.permissionMode });
+      if (patch.permissionMode !== previousPermissionMode) {
+        clearResumeMetadata();
+      }
     }
     if (patch.systemPrompt !== undefined) {
       const next = patch.systemPrompt === null ? null : patch.systemPrompt;
@@ -1176,7 +1198,7 @@ export class SessionManager {
       // OLD systemPrompt at session start. Drop the resume pointer so the next
       // turn opens a fresh session and the new prompt actually takes effect.
       if (next !== cur.systemPrompt) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
+        clearResumeMetadata();
       }
     }
     if (patch.teamId !== undefined) {
@@ -1188,7 +1210,7 @@ export class SessionManager {
       // Team membership affects the TEAM CONTEXT injected into systemPrompt
       // at runtime; drop lastSessionId so the next turn rebuilds context fresh.
       if (patch.teamId !== cur.teamId) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
+        clearResumeMetadata();
       }
     }
     const targetProviderId = patch.providerId !== undefined ? patch.providerId : cur.providerId;
@@ -1202,49 +1224,52 @@ export class SessionManager {
       }
       data.codexWorkspace = codexWorkspace;
       if (codexWorkspace !== cur.codexWorkspace) {
-        data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
+        clearResumeMetadata();
       }
     } else if (patch.providerId !== undefined && targetProvider?.kind !== "openai-codex" && cur.codexWorkspace) {
       data.codexWorkspace = null;
-      data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, [...RESUME_METADATA_KEYS]);
+      clearResumeMetadata();
     }
     if (patch.sandboxMode !== undefined) {
       if (patch.sandboxMode !== null && targetProvider?.kind !== "openai-codex") {
         throw new Error("sandboxMode override is only valid for openai-codex agents");
       }
       const previousSandbox = readSandboxOverride(cur.metadata);
-      const baseMeta = data.metadata ?? cur.metadata;
-      data.metadata = patch.sandboxMode === null
-        ? removeMetadataKeys(baseMeta, ["sandboxMode"])
-        : mergeMetadata(baseMeta, { sandboxMode: patch.sandboxMode });
+      if (patch.sandboxMode === null) {
+        removeNextMetadataKeys(["sandboxMode"]);
+      } else {
+        mergeNextMetadata({ sandboxMode: patch.sandboxMode });
+      }
       if (patch.sandboxMode !== previousSandbox) {
         // Codex `exec resume` cannot accept a new --sandbox/--cd. Drop the
         // native resume pointer so the next user turn starts a fresh Codex
         // session with the newly selected sandbox.
-        data.metadata = removeMetadataKeys(data.metadata, [...RESUME_METADATA_KEYS]);
+        clearResumeMetadata();
       }
     } else if (patch.providerId !== undefined && targetProvider?.kind !== "openai-codex" && readSandboxOverride(cur.metadata) !== null) {
-      data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["sandboxMode"]);
+      removeNextMetadataKeys(["sandboxMode"]);
     }
     if (patch.reasoningEffort !== undefined) {
       if (patch.reasoningEffort !== null && !providerSupportsReasoningEffort(targetProvider?.kind)) {
         throw new Error("reasoningEffort override is only valid for Claude Code or Codex agents");
       }
       const previousReasoningEffort = readReasoningEffortOverride(cur.metadata);
-      const baseMeta = data.metadata ?? cur.metadata;
-      data.metadata = patch.reasoningEffort === null
-        ? removeMetadataKeys(baseMeta, ["reasoningEffort"])
-        : mergeMetadata(baseMeta, { reasoningEffort: patch.reasoningEffort });
+      if (patch.reasoningEffort === null) {
+        removeNextMetadataKeys(["reasoningEffort"]);
+      } else {
+        mergeNextMetadata({ reasoningEffort: patch.reasoningEffort });
+      }
       if (patch.reasoningEffort !== previousReasoningEffort) {
-        data.metadata = removeMetadataKeys(data.metadata, [...RESUME_METADATA_KEYS]);
+        clearResumeMetadata();
       }
     } else if (
       patch.providerId !== undefined &&
       !providerSupportsReasoningEffort(targetProvider?.kind) &&
       readReasoningEffortOverride(cur.metadata) !== null
     ) {
-      data.metadata = removeMetadataKeys(data.metadata ?? cur.metadata, ["reasoningEffort"]);
+      removeNextMetadataKeys(["reasoningEffort"]);
     }
+    if (nextMetadata !== undefined) data.metadata = nextMetadata;
     if (Object.keys(data).length === 0) return agentRowToSummary(cur);
     const updated = await prisma.agent.update({ where: { id }, data });
     const summary = agentRowToSummary(updated);
@@ -1273,7 +1298,7 @@ export class SessionManager {
     if (!cur) return null;
     // Abort running stream if any. resolvePermission will deny outstanding via cancel().
     this.clearQueuedTurns(id);
-    this.cancel(id);
+    await this.cancel(id);
     const updated = await prisma.agent.update({
       where: { id },
       data: {
@@ -1303,7 +1328,7 @@ export class SessionManager {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
     this.clearQueuedTurns(id);
-    this.cancel(id);
+    await this.cancel(id);
     // Cascading FKs on Message / Permission / McpServer / PaneState will clean rows.
     await prisma.agent.delete({ where: { id } });
     this.hub.broadcast({ type: "agent_deleted", sessionId: id });
@@ -1353,14 +1378,12 @@ export class SessionManager {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
     this.clearQueuedTurns(id);
-    this.cancel(id);
+    await this.cancel(id);
     await prisma.message.delete({ where: { agentId: id } });
-    if (readMetaString(cur.metadata, "lastSessionId") !== null) {
-      await prisma.agent.update({
-        where: { id },
-        data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
-      });
-    }
+    await prisma.agent.update({
+      where: { id },
+      data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
+    });
     this.hub.broadcast({ type: "agent_history_reset", sessionId: id, reason: "clear" });
     return true;
   }
@@ -1374,7 +1397,7 @@ export class SessionManager {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
     this.clearQueuedTurns(id);
-    this.cancel(id);
+    await this.cancel(id);
 
     const messages = await prisma.message.findMany({
       where: { agentId: id },
@@ -1416,12 +1439,10 @@ export class SessionManager {
         },
       },
     });
-    if (readMetaString(cur.metadata, "lastSessionId") !== null) {
-      await prisma.agent.update({
-        where: { id },
-        data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
-      });
-    }
+    await prisma.agent.update({
+      where: { id },
+      data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
+    });
     this.hub.broadcast({
       type: "agent_history_reset",
       sessionId: id,
@@ -1935,6 +1956,7 @@ export class SessionManager {
     const runId = randomUUID();
     let staleResume = false;
     let usedResumeSessionId: string | null = null;
+    let resumeInvalidReasonForRun: string | null = null;
     this.running.set(sessionId, {
       id: sessionId,
       runId,
@@ -2178,8 +2200,12 @@ export class SessionManager {
       // resume pointer so the next turn opens a fresh CLI session and the
       // updated prompt actually reaches the model.
       let resumeInvalidReason: string | null = null;
-      if (storedPromptHash !== null && storedPromptHash !== promptHash) {
-        resumeInvalidReason = "systemPromptHash";
+      if (lastSessionId !== null) {
+        if (storedPromptHash === null) {
+          resumeInvalidReason = "missingSystemPromptHash";
+        } else if (storedPromptHash !== promptHash) {
+          resumeInvalidReason = "systemPromptHash";
+        }
       }
       if (
         resumeInvalidReason === null &&
@@ -2190,7 +2216,9 @@ export class SessionManager {
         resumeInvalidReason =
           storedCodexResumeSignature === null ? "missingCodexResumeSignature" : "codexResumeSignature";
       }
+      resumeInvalidReasonForRun = resumeInvalidReason;
       const effectiveLastSessionId = resumeInvalidReason ? null : lastSessionId;
+      capturedSessionId = effectiveLastSessionId;
       usedResumeSessionId = effectiveLastSessionId;
       if (effectiveLastSessionId === null && lastSessionId !== null) {
         console.log(
@@ -2198,6 +2226,10 @@ export class SessionManager {
             `stored=${storedPromptHash} current=${promptHash} — clearing resume pointer`,
         );
       }
+      const promptForRuntime =
+        effectiveLastSessionId && skillsSection
+          ? `${skillsSection}\n\n---\n\n${userInput}`
+          : userInput;
       if (isCodexKind) {
         console.error(
           JSON.stringify({
@@ -2218,7 +2250,7 @@ export class SessionManager {
       }
       const runtimeOpts: RuntimeOptions = {
         sessionId,
-        prompt: userInput,
+        prompt: promptForRuntime,
         model: agent.model,
         permissionMode,
         // `tools` restricts what the model can request. `allowedTools` is auto-approval
@@ -2427,8 +2459,12 @@ export class SessionManager {
       if (codexResumeSignature && storedCodexResumeSignature !== codexResumeSignature) {
         metaPatch[CODEX_RESUME_SIGNATURE_KEY] = codexResumeSignature;
       }
-      if (Object.keys(metaPatch).length > 0) {
-        persistData.metadata = mergeMetadata(agent.metadata, metaPatch);
+      if (resumeInvalidReasonForRun !== null || Object.keys(metaPatch).length > 0) {
+        const baseMetadata =
+          resumeInvalidReasonForRun !== null
+            ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
+            : agent.metadata;
+        persistData.metadata = mergeMetadata(baseMetadata, metaPatch);
       }
       // Guard: cancel() may have already force-cleared state and set status
       // back to IDLE. If our runId no longer owns this.running, defer to cancel.
@@ -2465,17 +2501,12 @@ export class SessionManager {
         runtimeDetails.runtimeCode === undefined &&
         isResumeScopedStreamFailure(rawMsg, usedResumeSessionId);
       const recoverableResumeFailure = structuredResumeFailure || legacyResumeFailure;
-      if (staleResume || recoverableResumeFailure) {
-        const cur = (agent.metadata && typeof agent.metadata === "object" ? agent.metadata : {}) as Record<
-          string,
-          unknown
-        >;
-        const next: Record<string, unknown> = { ...cur };
-        for (const key of RESUME_METADATA_KEYS) delete next[key];
-        persistData.metadata = next;
+      if (resumeInvalidReasonForRun !== null || staleResume || recoverableResumeFailure) {
+        persistData.metadata = removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]);
         console.warn(
           `[sendMessage] clearing resume metadata agent=${sessionId.slice(0, 8)} ` +
             `run=${runId.slice(0, 8)} stale=${staleResume} ` +
+            `resumeInvalidReason=${resumeInvalidReasonForRun ?? "(none)"} ` +
             `structuredResumeFailure=${structuredResumeFailure} legacyResumeFailure=${legacyResumeFailure}`,
         );
       }
