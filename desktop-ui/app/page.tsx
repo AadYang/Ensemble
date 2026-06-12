@@ -40,6 +40,7 @@ import {
   formatWorkspaceSelectionKey,
   parseStoredWorkspaceSelection,
   parseWorkspaceSelectionKey,
+  resolveCloudRefreshSelection,
 } from "@agentorch/shared";
 import { hydrateLocaleFromStorage, selectActiveWindow, useStore } from "@/store/agents";
 import { LayoutRenderer } from "@/components/LayoutRenderer";
@@ -444,21 +445,26 @@ export default function Page() {
     }
   };
 
+  const loadCloudWorkspaceSnapshot = useCallback(async (session: CloudSession, id: string) => {
+    const snapshot = await fetchCloudSnapshot(session, id);
+    setCloudCurrentWorkspace(id);
+    setCloudSnapshot(snapshot);
+    setCloudRevision(id, snapshot.workspace.revision);
+    setCloudMessageCursors(id, cursorsFromSnapshot(snapshot));
+    setCloudConfigSignature(id, cloudConfigSignature(snapshot));
+    setCloudActiveAgentId((cur) => (snapshot.agents.some((agent) => agent.id === cur) ? cur : snapshot.agents[0]?.id ?? null));
+    return snapshot;
+  }, [setCloudConfigSignature, setCloudCurrentWorkspace, setCloudMessageCursors, setCloudRevision, setCloudSnapshot]);
+
   const selectCloudWorkspace = useCallback(async (id: string) => {
     const session = useStore.getState().cloudSession;
     if (!session) return;
     setCloudBusy(true);
     setCloudError(null);
     try {
-      const snapshot = await fetchCloudSnapshot(session, id);
+      await loadCloudWorkspaceSnapshot(session, id);
       const selection: WorkspaceSelection = { kind: "cloud", id };
       setActiveWorkspace(selection);
-      setCloudCurrentWorkspace(id);
-      setCloudSnapshot(snapshot);
-      setCloudRevision(id, snapshot.workspace.revision);
-      setCloudMessageCursors(id, cursorsFromSnapshot(snapshot));
-      setCloudConfigSignature(id, cloudConfigSignature(snapshot));
-      setCloudActiveAgentId((cur) => (snapshot.agents.some((agent) => agent.id === cur) ? cur : snapshot.agents[0]?.id ?? null));
       if (typeof window !== "undefined") {
         window.localStorage.setItem(LAST_WORKSPACE_KEY, formatWorkspaceSelectionKey(selection));
       }
@@ -468,7 +474,7 @@ export default function Page() {
     } finally {
       setCloudBusy(false);
     }
-  }, [setCloudConfigSignature, setCloudCurrentWorkspace, setCloudMessageCursors, setCloudRevision, setCloudSnapshot]);
+  }, [loadCloudWorkspaceSnapshot]);
 
   const onSelectWorkspace = async (key: string) => {
     const parsed = parseWorkspaceSelectionKey(key);
@@ -517,15 +523,25 @@ export default function Page() {
       ]);
       setCloudAccount(account);
       setCloudWorkspaces(list);
-      const target =
-        list.find((workspace) => workspace.id === cloudCurrentWorkspaceId) ??
-        list.find((workspace) => activeWorkspace?.kind === "cloud" && workspace.id === activeWorkspace.id) ??
-        list[0] ??
-        null;
-      if (target) await selectCloudWorkspace(target.id);
-      else {
+      const selection = resolveCloudRefreshSelection({
+        active: activeWorkspace,
+        currentCloudWorkspaceId: cloudCurrentWorkspaceId,
+        cloudWorkspaceIds: list.map((workspace) => workspace.id),
+      });
+      if (selection) {
+        await loadCloudWorkspaceSnapshot(session, selection.id);
+        setActiveWorkspace(selection);
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(LAST_WORKSPACE_KEY, formatWorkspaceSelectionKey(selection));
+        }
+      } else if (activeWorkspace?.kind === "cloud") {
         setCloudCurrentWorkspace(null);
         setCloudSnapshot(null);
+        setCloudActiveAgentId(null);
+      } else if (cloudCurrentWorkspaceId && !list.some((workspace) => workspace.id === cloudCurrentWorkspaceId)) {
+        setCloudCurrentWorkspace(null);
+        setCloudSnapshot(null);
+        setCloudActiveAgentId(null);
       }
       setCloudStatus("cloud workspace list refreshed");
     } catch (err) {

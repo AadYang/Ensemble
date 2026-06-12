@@ -6,6 +6,7 @@ import {
   formatWorkspaceSelectionKey,
   parseStoredWorkspaceSelection,
   parseWorkspaceSelectionKey,
+  resolveCloudRefreshSelection,
 } from "./workspace-selection";
 
 describe("workspace selection keys", () => {
@@ -47,6 +48,55 @@ describe("workspace entity scope", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       },
     ]);
+  });
+});
+
+describe("cloud refresh selection", () => {
+  it("does not activate cloud workspace while local workspace is active", () => {
+    expect(
+      resolveCloudRefreshSelection({
+        active: { kind: "local", id: "local-a" },
+        currentCloudWorkspaceId: "cloud-a",
+        cloudWorkspaceIds: ["cloud-a"],
+      }),
+    ).toBeNull();
+  });
+
+  it("does not write a new selection when no active workspace exists", () => {
+    expect(
+      resolveCloudRefreshSelection({
+        active: null,
+        currentCloudWorkspaceId: "cloud-a",
+        cloudWorkspaceIds: ["cloud-a"],
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps the selected cloud workspace active after refresh", () => {
+    expect(
+      resolveCloudRefreshSelection({
+        active: { kind: "cloud", id: "cloud-b" },
+        currentCloudWorkspaceId: "cloud-b",
+        cloudWorkspaceIds: ["cloud-a", "cloud-b"],
+      }),
+    ).toEqual({ kind: "cloud", id: "cloud-b" });
+  });
+
+  it("falls back to the active cloud id or first refreshed cloud id", () => {
+    expect(
+      resolveCloudRefreshSelection({
+        active: { kind: "cloud", id: "cloud-b" },
+        currentCloudWorkspaceId: "deleted-cloud",
+        cloudWorkspaceIds: ["cloud-a", "cloud-b"],
+      }),
+    ).toEqual({ kind: "cloud", id: "cloud-b" });
+    expect(
+      resolveCloudRefreshSelection({
+        active: { kind: "cloud", id: "deleted-cloud" },
+        currentCloudWorkspaceId: "also-deleted",
+        cloudWorkspaceIds: ["cloud-a"],
+      }),
+    ).toEqual({ kind: "cloud", id: "cloud-a" });
   });
 });
 

@@ -68,6 +68,20 @@ export function filterWorkspaceEntitiesForLayout(input: {
   return { agents, teams };
 }
 
+export function resolveCloudRefreshSelection(input: {
+  active: WorkspaceSelection | null;
+  currentCloudWorkspaceId: string | null;
+  cloudWorkspaceIds: string[];
+}): WorkspaceSelection | null {
+  if (input.active?.kind !== "cloud") return null;
+  const target =
+    input.cloudWorkspaceIds.find((id) => id === input.currentCloudWorkspaceId) ??
+    input.cloudWorkspaceIds.find((id) => id === input.active?.id) ??
+    input.cloudWorkspaceIds[0] ??
+    null;
+  return target ? { kind: "cloud", id: target } : null;
+}
+
 function parseSelection(kind: WorkspaceSelectionKind, id: string): WorkspaceSelection | null {
   return id ? { kind, id } : null;
 }
