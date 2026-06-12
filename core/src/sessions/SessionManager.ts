@@ -253,7 +253,7 @@ interface ForceStopOptions {
 }
 
 type SendMessageOptions = {
-  peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
+  peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode; sourceRunId?: string };
   autoRecoveryAttempt?: "codex-event-stream-lagged";
   suppressUserMessage?: boolean;
 };
@@ -281,6 +281,7 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
         fromAgentId: p.fromAgentId,
         fromAgentName: p.fromAgentName,
         mode,
+        ...(typeof p.sourceRunId === "string" ? { sourceRunId: p.sourceRunId } : {}),
       };
     }
   }
@@ -1758,9 +1759,27 @@ export class SessionManager {
     opts?: SendMessageOptions,
   ): Promise<{ finalText: string } | null> {
     return new Promise((resolve) => {
-      const row = prisma.pendingTurn.create({
-        data: { agentId: sessionId, userInput, opts: opts ?? {} },
-      });
+      const peerOrigin = opts?.peerOrigin;
+      let row: { id: number };
+      if (peerOrigin) {
+        const existing = this.findQueuedPeerHandoff(sessionId, peerOrigin);
+        if (existing) {
+          prisma.pendingTurn.update({
+            where: { id: existing.id },
+            data: { userInput, opts: opts ?? {} },
+          });
+          this.queuedTurns.get(sessionId)?.get(existing.id)?.(null);
+          row = existing;
+        } else {
+          row = prisma.pendingTurn.create({
+            data: { agentId: sessionId, userInput, opts: opts ?? {} },
+          });
+        }
+      } else {
+        row = prisma.pendingTurn.create({
+          data: { agentId: sessionId, userInput, opts: opts ?? {} },
+        });
+      }
       let bucket = this.queuedTurns.get(sessionId);
       if (!bucket) {
         bucket = new Map();
@@ -1773,6 +1792,31 @@ export class SessionManager {
         status: "running",
       });
     });
+  }
+
+  private findQueuedPeerHandoff(
+    sessionId: string,
+    peerOrigin: NonNullable<SendMessageOptions["peerOrigin"]>,
+  ): { id: number } | null {
+    // Only live in-flight handoffs are superseded. Completed-source peer_send
+    // calls can be distinct operator messages and must remain FIFO.
+    if (!peerOrigin.sourceRunId) return null;
+    const rows = prisma.pendingTurn.findMany({
+      where: { agentId: sessionId },
+      orderBy: { id: "asc" },
+    });
+    for (const row of rows) {
+      const existing = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      if (!existing) continue;
+      if (
+        existing.fromAgentId === peerOrigin.fromAgentId &&
+        existing.mode === peerOrigin.mode &&
+        (existing.sourceRunId ?? null) === (peerOrigin.sourceRunId ?? null)
+      ) {
+        return { id: row.id };
+      }
+    }
+    return null;
   }
 
   private drainQueuedTurns(sessionId: string): void {
@@ -2938,6 +2982,7 @@ export class SessionManager {
       return `error: peer agent "${targetAgent.name}" is closed; user must restart it before it can receive messages`;
     }
 
+    const sourceRunId = this.running.get(fromAgent.id)?.runId;
     const sourceSnapshot = await this.fetchPeerSourceSnapshot(fromAgent.id);
     const formatted = formatPeerHandoff({
       fromName: fromAgent.name,
@@ -2949,16 +2994,19 @@ export class SessionManager {
       sourceState: sourceSnapshot.sourceRunState,
     });
     const targetWasBusy = this.running.has(targetId) || this.drainingQueues.has(targetId);
+    const peerOrigin = {
+      fromAgentId: fromAgent.id,
+      fromAgentName: fromAgent.name,
+      mode,
+      ...(sourceRunId ? { sourceRunId } : {}),
+    };
+    const willReplaceQueuedPeerHandoff = targetWasBusy && this.findQueuedPeerHandoff(targetId, peerOrigin) !== null;
     void this.sendMessage(targetId, formatted, {
-      peerOrigin: {
-        fromAgentId: fromAgent.id,
-        fromAgentName: fromAgent.name,
-        mode,
-      },
+      peerOrigin,
     }).catch((err) => {
       console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
     });
-    const delivery = targetWasBusy ? "queued for" : "delivered to";
+    const delivery = willReplaceQueuedPeerHandoff ? "replaced stale queued peer handoff for" : targetWasBusy ? "queued for" : "delivered to";
     return `${delivery} "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode})`;
   }
 

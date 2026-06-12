@@ -460,6 +460,197 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(result).not.toContain("busy");
   });
 
+  it("coalesces superseded peer_send handoffs from the same running source and mode", async () => {
+    const source = await prisma.agent.create({ data: { name: "coalesce-source" } });
+    const target = await prisma.agent.create({ data: { name: "coalesce-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "source-run",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "source is still working",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live snapshot 1" });
+    const first = await sessions.sendPeerMessage(source.id, target.name, "note one", "review");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live snapshot 2" });
+    const second = await sessions.sendPeerMessage(source.id, target.name, "note two", "review");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live snapshot 3" });
+    const third = await sessions.sendPeerMessage(source.id, target.name, "note three", "review");
+    await Promise.resolve();
+
+    expect(first).toContain("queued for");
+    expect(second).toContain("replaced stale queued peer handoff for");
+    expect(third).toContain("replaced stale queued peer handoff for");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).queuedTurns.get(target.id).size).toBe(1);
+    const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
+    expect(queued?.userInput).toContain("live snapshot 3");
+    expect(queued?.userInput).toContain("note three");
+    expect(queued?.userInput).not.toContain("live snapshot 1");
+    expect(queued?.userInput).not.toContain("note one");
+
+    const drained: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (_sessionId: string, text: string) => {
+      drained.push(text);
+      return { finalText: "drained" };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.delete(target.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).drainQueuedTurns(target.id);
+    await Promise.resolve();
+
+    expect(drained).toHaveLength(1);
+    expect(drained[0]).toContain("live snapshot 3");
+    expect(drained[0]).toContain("note three");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+  });
+
+  it("does not coalesce peer_send handoffs from different sources or modes", async () => {
+    const sourceA = await prisma.agent.create({ data: { name: "source-a" } });
+    const sourceB = await prisma.agent.create({ data: { name: "source-b" } });
+    const target = await prisma.agent.create({ data: { name: "coalesce-boundary-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    for (const [source, runId, live] of [
+      [sourceA, "source-a-run", "source A live"] as const,
+      [sourceB, "source-b-run", "source B live"] as const,
+    ]) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (sessions as any).running.set(source.id, {
+        id: source.id,
+        runId,
+        abort: new AbortController(),
+        seq: 0,
+        userInput: `${source.name} request`,
+        startedSeq: 0,
+        startedAt: new Date().toISOString(),
+        autoAllowedTools: new Set<string>(),
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: live });
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(sourceA.id, target.name, "review from A", "review");
+    await sessions.sendPeerMessage(sourceB.id, target.name, "review from B", "review");
+    await sessions.sendPeerMessage(sourceA.id, target.name, "raw from A", "raw");
+    await Promise.resolve();
+
+    const rows = await prisma.pendingTurn.findMany({ where: { agentId: target.id }, orderBy: { id: "asc" } });
+    expect(rows).toHaveLength(3);
+    const text = rows.map((row) => row.userInput).join("\n---\n");
+    expect(text).toContain("review from A");
+    expect(text).toContain("review from B");
+    expect(text).toContain("raw from A");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).clearQueuedTurns(target.id);
+  });
+
+  it("does not coalesce completed-source peer_send handoffs without a live run id", async () => {
+    const source = await prisma.agent.create({ data: { name: "completed-source-coalesce-boundary" } });
+    const target = await prisma.agent.create({ data: { name: "completed-source-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(source.id, target.name, "first completed-source note", "raw");
+    await sessions.sendPeerMessage(source.id, target.name, "second completed-source note", "raw");
+    await Promise.resolve();
+
+    const rows = await prisma.pendingTurn.findMany({ where: { agentId: target.id }, orderBy: { id: "asc" } });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.userInput).toContain("first completed-source note");
+    expect(rows[1]?.userInput).toContain("second completed-source note");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).clearQueuedTurns(target.id);
+  });
+
+  it("keeps ordinary queued sendMessage turns FIFO instead of coalescing them", async () => {
+    const target = await prisma.agent.create({ data: { name: "ordinary-queue-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    const first = sessions.sendMessage(target.id, "first ordinary queued turn");
+    const second = sessions.sendMessage(target.id, "second ordinary queued turn");
+    await Promise.resolve();
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(2);
+
+    const drained: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (_sessionId: string, text: string) => {
+      drained.push(text);
+      return { finalText: text };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.delete(target.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).drainQueuedTurns(target.id);
+
+    await expect(first).resolves.toEqual({ finalText: "first ordinary queued turn" });
+    await expect(second).resolves.toEqual({ finalText: "second ordinary queued turn" });
+    expect(drained).toEqual(["first ordinary queued turn", "second ordinary queued turn"]);
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+  });
+
   it("peer_send embeds running source live output instead of stale completed assistant text", async () => {
     const source = await prisma.agent.create({ data: { name: "running-source" } });
     const target = await prisma.agent.create({ data: { name: "snapshot-target-running" } });
