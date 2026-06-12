@@ -56,6 +56,16 @@ beforeAll(async () => {
   ({ SessionManager, isResumeScopedStreamFailure, isRuntimeResumeRecoverySignal, runtimeHistoryFromCompletedTurns } = await import("../SessionManager.js"));
 });
 
+async function ensureCodexCliPath(): Promise<void> {
+  const key = "cli.codexPath";
+  const existing = await prisma.appSetting.findUnique({ where: { key } });
+  if (existing) {
+    await prisma.appSetting.update({ where: { key }, data: { value: process.execPath } });
+  } else {
+    await prisma.appSetting.create({ data: { key, value: process.execPath } });
+  }
+}
+
 describe("SessionManager cancel + stale-session recovery", () => {
   it("cancel() force-resets DB status to IDLE even when no in-memory run exists", async () => {
     // Simulate the wedge: an agent row is in RUNNING state but the in-memory
@@ -1461,7 +1471,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
   });
 
   it("auto-continues once when Codex app-server event stream drops events", async () => {
-    await prisma.appSetting.create({ data: { key: "cli.codexPath", value: process.execPath } });
+    await ensureCodexCliPath();
     const provider = await prisma.provider.create({
       data: {
         name: "codex-lagged-provider",
@@ -1525,7 +1535,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
     const result = await sessions.sendMessage(agent.id, "finish the current implementation");
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(result).toBeNull();
+    expect(result).toEqual({ finalText: "continued from recovered history" });
     expect(calls).toHaveLength(2);
     expect(calls[0]?.prompt).toBe("finish the current implementation");
     expect(calls[1]?.resume).toBeUndefined();
@@ -1557,6 +1567,160 @@ describe("SessionManager cancel + stale-session recovery", () => {
           m.msg.code === "CODEX_EVENT_STREAM_RECOVERING",
       ),
     ).toBe(true);
+  });
+
+  it("runs suppressed Codex event-stream recovery before queued user input", async () => {
+    await ensureCodexCliPath();
+    const provider = await prisma.provider.create({
+      data: {
+        name: "codex-lagged-queue-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "codex-lagged-queue-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexResumeSignature: "old-runtime-shape",
+          systemPromptHash: "stale-hash",
+        },
+      },
+    });
+
+    let releaseLag!: () => void;
+    const lagReleased = new Promise<void>((resolve) => {
+      releaseLag = resolve;
+    });
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const calls: RuntimeOptions[] = [];
+    const runtime: AgentRuntime = {
+      async *query(opts: RuntimeOptions) {
+        calls.push(opts);
+        if (calls.length === 1) {
+          firstStarted();
+          await lagReleased;
+          yield {
+            type: "error",
+            message: "QUERY_FAILED · in-process app-server event stream lagged; dropped events",
+            code: "CODEX_EVENT_STREAM_LAGGED",
+            recoverable: true,
+            resumeScoped: false,
+          };
+          return;
+        }
+        const text = opts.prompt === "continue" ? "recovered current turn" : "queued turn done";
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "assistant",
+            session_id:
+              opts.prompt === "continue"
+                ? "019ea530-56b8-7333-8b3c-5bd5ae5c2c79"
+                : "019ea530-56b8-7444-8b3c-5bd5ae5c2c79",
+            message: { content: [{ type: "text", text }] },
+          },
+        };
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "result",
+            subtype: "success",
+            session_id:
+              opts.prompt === "continue"
+                ? "019ea530-56b8-7333-8b3c-5bd5ae5c2c79"
+                : "019ea530-56b8-7444-8b3c-5bd5ae5c2c79",
+          },
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const first = sessions.sendMessage(agent.id, "finish interrupted work");
+    await firstStartedPromise;
+    const queued = sessions.sendMessage(agent.id, "queued after lag");
+    await Promise.resolve();
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(1);
+
+    releaseLag();
+
+    await expect(first).resolves.toEqual({ finalText: "recovered current turn" });
+    await expect(queued).resolves.toEqual({ finalText: "queued turn done" });
+    expect(calls.map((call) => call.prompt)).toEqual([
+      "finish interrupted work",
+      "continue",
+      "queued after lag",
+    ]);
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(0);
+
+    const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
+    const userPayloadText = JSON.stringify(rows.filter((row) => row.type === "user"));
+    expect(userPayloadText).toContain("finish interrupted work");
+    expect(userPayloadText).toContain("queued after lag");
+    expect(userPayloadText).not.toContain("continue");
+  });
+
+  it("does not retry Codex event-stream lag recovery more than once", async () => {
+    await ensureCodexCliPath();
+    const provider = await prisma.provider.create({
+      data: {
+        name: "codex-lagged-once-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "codex-lagged-once-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexResumeSignature: "old-runtime-shape",
+          systemPromptHash: "stale-hash",
+        },
+      },
+    });
+    const calls: RuntimeOptions[] = [];
+    const runtime: AgentRuntime = {
+      async *query(opts: RuntimeOptions) {
+        calls.push(opts);
+        yield {
+          type: "error",
+          message: "QUERY_FAILED · in-process app-server event stream lagged; dropped events",
+          code: "CODEX_EVENT_STREAM_LAGGED",
+          recoverable: true,
+          resumeScoped: false,
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const result = await sessions.sendMessage(agent.id, "finish current work");
+
+    expect(result).toBeNull();
+    expect(calls.map((call) => call.prompt)).toEqual(["finish current work", "continue"]);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("ERROR");
+    expect(
+      hub.sessionMessages.filter(
+        (m) =>
+          m.sessionId === agent.id &&
+          m.msg.type === "error" &&
+          m.msg.code === "CODEX_EVENT_STREAM_RECOVERING",
+      ),
+    ).toHaveLength(1);
   });
 
   it("keeps compact summaries in runtime history and drops incomplete trailing user turns", () => {

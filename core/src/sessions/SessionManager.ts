@@ -2003,6 +2003,7 @@ export class SessionManager {
     let usedResumeSessionId: string | null = null;
     let resumeInvalidReasonForRun: string | null = null;
     let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
+    let autoRecoveryPromise: Promise<{ finalText: string } | null> | null = null;
     this.running.set(sessionId, {
       id: sessionId,
       runId,
@@ -2623,7 +2624,6 @@ export class SessionManager {
       } else {
         console.log(`[sendMessage] run=${runId.slice(0, 8)} error post-cancel; skipping DB update`);
       }
-      return null;
     } finally {
       // Only clear state if we're still the owner. After cancel() the entry
       // is gone; a brand-new sendMessage could already have set its own entry.
@@ -2639,7 +2639,7 @@ export class SessionManager {
         }
         if (autoRecoverAfterRun) {
           const recoveryDrainToken = this.beginDrain(sessionId);
-          void this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)
+          autoRecoveryPromise = this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)
             .catch((err) => {
               console.error(`[codex-event-stream-recovery] retry for ${sessionId} failed:`, err);
               return null;
@@ -2652,6 +2652,7 @@ export class SessionManager {
         }
       }
     }
+    return autoRecoveryPromise ? await autoRecoveryPromise : null;
   }
 
   private async loadEnabledMcpServers(): Promise<NonNullable<Options["mcpServers"]>> {

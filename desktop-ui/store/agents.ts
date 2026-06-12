@@ -622,7 +622,11 @@ export const useStore = create<Store>((set) => ({
       const ag = s.agents[id];
       if (!ag) return s;
       const seq = ag.turns.length > 0 ? ag.turns[ag.turns.length - 1]!.seq + 0.5 : -1;
-      const turn: ChatTurn = { seq, kind: "raw", text: `error · ${code} · ${message}` };
+      const text =
+        code === "CODEX_EVENT_STREAM_RECOVERING"
+          ? `recovering · ${message}`
+          : `error · ${code} · ${message}`;
+      const turn: ChatTurn = { seq, kind: "raw", text };
       return { agents: { ...s.agents, [id]: { ...ag, turns: [...ag.turns, turn] } } };
     }),
 
