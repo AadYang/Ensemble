@@ -62,6 +62,9 @@
   function normalizeOrigin(origin) {
     const raw = (origin || DEFAULT_ORIGIN).trim();
     const url = new URL(raw);
+    if (url.hostname === "www.ensemble-ai.cn") {
+      url.hostname = "ensemble-ai.cn";
+    }
     const localHost = url.hostname === "localhost" || url.hostname === "127.0.0.1";
     if (url.protocol !== "https:" && !(localHost && url.protocol === "http:")) {
       throw new Error("Cloud server must use HTTPS. http is allowed only for localhost.");
