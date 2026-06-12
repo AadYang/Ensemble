@@ -1003,6 +1003,157 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(meta.codexResumeSignature).toBeUndefined();
   });
 
+  it("deleteTeam clears resume metadata for all former members while preserving local settings", async () => {
+    const team = await prisma.team.create({
+      data: { name: "delete-team-resume", description: "mission before delete" },
+    });
+    const teamId = team.id;
+    const provider = await prisma.provider.create({
+      data: {
+        name: "delete-team-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const first = await prisma.agent.create({
+      data: {
+        name: "delete-team-first",
+        teamId,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          permissionMode: "plan",
+          reasoningEffort: "max",
+          sandboxMode: "workspace-write",
+          lastSessionId: "first-native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "first-runtime-shape",
+        },
+      },
+    });
+    const second = await prisma.agent.create({
+      data: {
+        name: "delete-team-second",
+        teamId,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          permissionMode: "dontAsk",
+          reasoningEffort: "xhigh",
+          sandboxMode: "danger-full-access",
+          lastSessionId: "second-native-session",
+          codexUsageSnapshot: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 },
+          codexResumeSignature: "second-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.deleteTeam(teamId);
+
+    for (const [agentId, expected] of [
+      [first.id, { permissionMode: "plan", reasoningEffort: "max", sandboxMode: "workspace-write" }],
+      [second.id, { permissionMode: "dontAsk", reasoningEffort: "xhigh", sandboxMode: "danger-full-access" }],
+    ] as const) {
+      const after = await prisma.agent.findUnique({ where: { id: agentId } });
+      const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+      expect(after?.teamId).toBeNull();
+      expect(meta.lastSessionId).toBeUndefined();
+      expect(meta.codexUsageSnapshot).toBeUndefined();
+      expect(meta.codexResumeSignature).toBeUndefined();
+      expect(meta.permissionMode).toBe(expected.permissionMode);
+      expect(meta.reasoningEffort).toBe(expected.reasoningEffort);
+      expect(meta.sandboxMode).toBe(expected.sandboxMode);
+    }
+  });
+
+  it("patchAgent name change clears resume metadata for self and teammates while preserving local settings", async () => {
+    const team = await prisma.team.create({
+      data: { name: "rename-team-resume", description: "mission before rename" },
+    });
+    const teamId = team.id;
+    const provider = await prisma.provider.create({
+      data: {
+        name: "rename-team-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const renamed = await prisma.agent.create({
+      data: {
+        name: "old teammate name",
+        teamId,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          permissionMode: "acceptEdits",
+          reasoningEffort: "high",
+          sandboxMode: "workspace-write",
+          lastSessionId: "renamed-native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "renamed-runtime-shape",
+        },
+      },
+    });
+    const teammate = await prisma.agent.create({
+      data: {
+        name: "observer teammate",
+        teamId,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          permissionMode: "plan",
+          reasoningEffort: "max",
+          sandboxMode: "danger-full-access",
+          lastSessionId: "teammate-native-session",
+          codexUsageSnapshot: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 },
+          codexResumeSignature: "teammate-runtime-shape",
+        },
+      },
+    });
+    const outside = await prisma.agent.create({
+      data: {
+        name: "outside team",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          lastSessionId: "outside-native-session",
+          codexUsageSnapshot: { input_tokens: 3, cached_input_tokens: 0, output_tokens: 3, reasoning_output_tokens: 0 },
+          codexResumeSignature: "outside-runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(renamed.id, { name: "new teammate name" });
+
+    const renamedAfter = await prisma.agent.findUnique({ where: { id: renamed.id } });
+    const renamedMeta = (renamedAfter?.metadata && typeof renamedAfter.metadata === "object" ? renamedAfter.metadata : {}) as Record<string, unknown>;
+    expect(renamedAfter?.name).toBe("new teammate name");
+    expect(renamedMeta.lastSessionId).toBeUndefined();
+    expect(renamedMeta.codexUsageSnapshot).toBeUndefined();
+    expect(renamedMeta.codexResumeSignature).toBeUndefined();
+    expect(renamedMeta.permissionMode).toBe("acceptEdits");
+    expect(renamedMeta.reasoningEffort).toBe("high");
+    expect(renamedMeta.sandboxMode).toBe("workspace-write");
+
+    const teammateAfter = await prisma.agent.findUnique({ where: { id: teammate.id } });
+    const teammateMeta = (teammateAfter?.metadata && typeof teammateAfter.metadata === "object" ? teammateAfter.metadata : {}) as Record<string, unknown>;
+    expect(teammateMeta.lastSessionId).toBeUndefined();
+    expect(teammateMeta.codexUsageSnapshot).toBeUndefined();
+    expect(teammateMeta.codexResumeSignature).toBeUndefined();
+    expect(teammateMeta.permissionMode).toBe("plan");
+    expect(teammateMeta.reasoningEffort).toBe("max");
+    expect(teammateMeta.sandboxMode).toBe("danger-full-access");
+
+    const outsideAfter = await prisma.agent.findUnique({ where: { id: outside.id } });
+    const outsideMeta = (outsideAfter?.metadata && typeof outsideAfter.metadata === "object" ? outsideAfter.metadata : {}) as Record<string, unknown>;
+    expect(outsideMeta.lastSessionId).toBe("outside-native-session");
+    expect(outsideMeta.codexResumeSignature).toBe("outside-runtime-shape");
+  });
+
   it("patchAgent provider switch preserves explicit model and supported reasoning effort", async () => {
     const sourceProvider = await prisma.provider.create({
       data: {

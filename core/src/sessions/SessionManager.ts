@@ -923,15 +923,7 @@ export class SessionManager {
     const descChanged = patch.description !== undefined && patch.description !== cur.description;
     await prisma.team.update({ where: { id }, data });
     if (nameChanged || descChanged) {
-      const members = await prisma.agent.findMany({ where: { teamId: id } });
-      for (const m of members) {
-        if (readMetaString(m.metadata, "lastSessionId") === null) continue;
-        const updated = await prisma.agent.update({
-          where: { id: m.id },
-          data: { metadata: removeMetadataKeys(m.metadata, [...RESUME_METADATA_KEYS]) },
-        });
-        this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
-      }
+      await this.clearResumeForTeamMembers(id);
     }
     this.hub.broadcast({ type: "team_updated", team: await this.teamSummary(id) });
     return true;
@@ -943,12 +935,30 @@ export class SessionManager {
     // SET NULL on members — preserves agents, they become ungrouped.
     const members = await prisma.agent.findMany({ where: { teamId: id } });
     for (const m of members) {
-      await prisma.agent.update({ where: { id: m.id }, data: { teamId: null } });
-      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary({ ...m, teamId: null }) });
+      const updated = await prisma.agent.update({
+        where: { id: m.id },
+        data: {
+          teamId: null,
+          metadata: removeMetadataKeys(m.metadata, [...RESUME_METADATA_KEYS]),
+        },
+      });
+      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
     }
     await prisma.team.delete({ where: { id } });
     this.hub.broadcast({ type: "team_deleted", teamId: id });
     return true;
+  }
+
+  private async clearResumeForTeamMembers(teamId: string, excludeAgentId?: string): Promise<void> {
+    const members = await prisma.agent.findMany({ where: { teamId } });
+    for (const m of members) {
+      if (m.id === excludeAgentId) continue;
+      const updated = await prisma.agent.update({
+        where: { id: m.id },
+        data: { metadata: removeMetadataKeys(m.metadata, [...RESUME_METADATA_KEYS]) },
+      });
+      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+    }
   }
 
   async listTeams(): Promise<Awaited<ReturnType<typeof this.teamSummary>>[]> {
@@ -1174,7 +1184,13 @@ export class SessionManager {
         clearResumeMetadata();
       }
     }
-    if (patch.name !== undefined) data.name = patch.name;
+    const nameChanged = patch.name !== undefined && patch.name !== cur.name;
+    if (patch.name !== undefined) {
+      data.name = patch.name;
+      if (nameChanged) {
+        clearResumeMetadata();
+      }
+    }
     if (patch.providerId !== undefined) {
       data.providerId = patch.providerId;
       if (patch.providerId !== cur.providerId) {
@@ -1274,6 +1290,9 @@ export class SessionManager {
     const updated = await prisma.agent.update({ where: { id }, data });
     const summary = agentRowToSummary(updated);
     this.hub.broadcast({ type: "agent_updated", agent: summary });
+    if (nameChanged && cur.teamId) {
+      await this.clearResumeForTeamMembers(cur.teamId, id);
+    }
     return summary;
   }
 
