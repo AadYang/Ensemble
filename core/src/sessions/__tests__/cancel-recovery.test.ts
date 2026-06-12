@@ -66,6 +66,34 @@ async function ensureCodexCliPath(): Promise<void> {
   }
 }
 
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string, ms = 1_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 describe("SessionManager cancel + stale-session recovery", () => {
   it("cancel() force-resets DB status to IDLE even when no in-memory run exists", async () => {
     // Simulate the wedge: an agent row is in RUNNING state but the in-memory
@@ -2004,6 +2032,194 @@ describe("SessionManager cancel + stale-session recovery", () => {
           String(m.msg.message).includes("missing an API key"),
       ),
     ).toBe(true);
+  });
+
+  it("finishes a turn on terminal result even when the runtime stream never closes", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "terminal-result-hang-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "test-key",
+        models: ["test-model"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "terminal-result-hang-agent",
+        providerId: provider.id,
+        model: "test-model",
+      },
+    });
+
+    const firstStarted = deferred<void>();
+    const releaseFirstResult = deferred<void>();
+    const neverEnds = new Promise<never>(() => {});
+    const calls: RuntimeOptions[] = [];
+    let firstRuntimeCleanup = false;
+    const runtime: AgentRuntime = {
+      async *query(opts: RuntimeOptions) {
+        calls.push(opts);
+        if (calls.length === 1) {
+          firstStarted.resolve(undefined);
+          yield {
+            type: "sdk_message",
+            payload: {
+              type: "assistant",
+              session_id: "terminal-result-thread-first",
+              message: { content: [{ type: "text", text: "assistant first" }] },
+            },
+          };
+          await releaseFirstResult.promise;
+          try {
+            yield {
+              type: "sdk_message",
+              payload: {
+                type: "result",
+                subtype: "success",
+                session_id: "terminal-result-thread-first",
+                modelUsage: {
+                  "test-model": { inputTokens: 1, outputTokens: 2 },
+                },
+              },
+            };
+            await neverEnds;
+          } finally {
+            firstRuntimeCleanup = true;
+          }
+          return;
+        }
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "assistant",
+            session_id: "terminal-result-thread-queued",
+            message: { content: [{ type: "text", text: "assistant queued" }] },
+          },
+        };
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "result",
+            subtype: "success",
+            session_id: "terminal-result-thread-queued",
+          },
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const first = sessions.sendMessage(agent.id, "first");
+    await firstStarted.promise;
+    const queued = sessions.sendMessage(agent.id, "queued");
+    await Promise.resolve();
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(1);
+
+    releaseFirstResult.resolve(undefined);
+
+    await expect(withTimeout(first, "first terminal result turn")).resolves.toEqual({ finalText: "assistant first" });
+    await expect(withTimeout(queued, "queued terminal result turn")).resolves.toEqual({ finalText: "assistant queued" });
+    expect(calls.map((call) => call.prompt)).toEqual(["first", "queued"]);
+    expect(firstRuntimeCleanup).toBe(true);
+    expect(await prisma.pendingTurn.count({ where: { agentId: agent.id } })).toBe(0);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(agent.id)).toBe(false);
+
+    const firstResultIndex = hub.sessionMessages.findIndex(
+      (m) =>
+        m.sessionId === agent.id &&
+        m.msg.type === "message" &&
+        (m.msg.msg as { type?: string; session_id?: string } | undefined)?.type === "result" &&
+        (m.msg.msg as { session_id?: string } | undefined)?.session_id === "terminal-result-thread-first",
+    );
+    const firstDoneIndex = hub.sessionMessages.findIndex(
+      (m, index) =>
+        index > firstResultIndex &&
+        m.sessionId === agent.id &&
+        m.msg.type === "status" &&
+        m.msg.status === "done",
+    );
+    expect(firstResultIndex).toBeGreaterThan(-1);
+    expect(firstDoneIndex).toBeGreaterThan(firstResultIndex);
+  });
+
+  it("still persists usage and broadcasts result before done on a normal terminal result", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "terminal-result-normal-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "test-key",
+        models: ["gpt-4o-mini"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "terminal-result-normal-agent",
+        providerId: provider.id,
+        model: "gpt-4o-mini",
+      },
+    });
+    const runtime: AgentRuntime = {
+      async *query() {
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "assistant",
+            session_id: "terminal-result-thread-normal",
+            message: { content: [{ type: "text", text: "assistant normal" }] },
+          },
+        };
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "result",
+            subtype: "success",
+            session_id: "terminal-result-thread-normal",
+            modelUsage: {
+              "gpt-4o-mini": { inputTokens: 100, outputTokens: 50 },
+            },
+          },
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    await expect(withTimeout(sessions.sendMessage(agent.id, "normal"), "normal terminal result turn")).resolves.toEqual({
+      finalText: "assistant normal",
+    });
+
+    const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
+    expect(rows.map((row) => row.type)).toEqual(["user", "assistant", "result"]);
+    expect((rows[2]?.payload as { type?: string; session_id?: string } | undefined)?.type).toBe("result");
+    expect((rows[2]?.payload as { session_id?: string } | undefined)?.session_id).toBe("terminal-result-thread-normal");
+
+    const usageRows = await prisma.usageEvent.findMany({ where: { agentId: agent.id } });
+    expect(usageRows).toHaveLength(1);
+    expect(usageRows[0]?.model).toBe("gpt-4o-mini");
+    expect(usageRows[0]?.inputTokens).toBe(100);
+    expect(usageRows[0]?.outputTokens).toBe(50);
+    expect(usageRows[0]?.providerKind).toBe("openai-compat");
+
+    const resultIndex = hub.sessionMessages.findIndex(
+      (m) =>
+        m.sessionId === agent.id &&
+        m.msg.type === "message" &&
+        (m.msg.msg as { type?: string } | undefined)?.type === "result",
+    );
+    const doneIndex = hub.sessionMessages.findIndex(
+      (m, index) =>
+        index > resultIndex &&
+        m.sessionId === agent.id &&
+        m.msg.type === "status" &&
+        m.msg.status === "done",
+    );
+    expect(resultIndex).toBeGreaterThan(-1);
+    expect(doneIndex).toBeGreaterThan(resultIndex);
   });
 
   it("auto-continues once when Codex app-server event stream drops events", async () => {

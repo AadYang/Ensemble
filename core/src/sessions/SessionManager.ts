@@ -2722,6 +2722,10 @@ export class SessionManager {
         });
 
         seq++;
+        // A result message is terminal for this turn. Exit only after the
+        // result has been persisted, usage-accounted, and broadcast so queued
+        // work can drain even if the runtime stream never closes naturally.
+        if (msg.type === "result") break;
       }
       this.clearRuntimeIdleWatchdog(sessionId, runId);
 
