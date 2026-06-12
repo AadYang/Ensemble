@@ -1217,6 +1217,7 @@ export class SessionManager {
         clearResumeMetadata();
       }
     }
+    const teamChanged = patch.teamId !== undefined && patch.teamId !== cur.teamId;
     if (patch.teamId !== undefined) {
       if (patch.teamId !== null) {
         const teamRow = await prisma.team.findUnique({ where: { id: patch.teamId } });
@@ -1225,7 +1226,7 @@ export class SessionManager {
       data.teamId = patch.teamId;
       // Team membership affects the TEAM CONTEXT injected into systemPrompt
       // at runtime; drop lastSessionId so the next turn rebuilds context fresh.
-      if (patch.teamId !== cur.teamId) {
+      if (teamChanged) {
         clearResumeMetadata();
       }
     }
@@ -1292,6 +1293,14 @@ export class SessionManager {
     this.hub.broadcast({ type: "agent_updated", agent: summary });
     if (nameChanged && cur.teamId) {
       await this.clearResumeForTeamMembers(cur.teamId, id);
+    }
+    if (teamChanged) {
+      const touchedTeamIds = new Set<string>();
+      if (cur.teamId) touchedTeamIds.add(cur.teamId);
+      if (patch.teamId) touchedTeamIds.add(patch.teamId);
+      for (const teamId of touchedTeamIds) {
+        await this.clearResumeForTeamMembers(teamId, id);
+      }
     }
     return summary;
   }

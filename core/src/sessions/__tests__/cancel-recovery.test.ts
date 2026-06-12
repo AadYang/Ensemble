@@ -1154,6 +1154,211 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(outsideMeta.codexResumeSignature).toBe("outside-runtime-shape");
   });
 
+  it("patchAgent team move clears resume metadata for self and old/new teammates", async () => {
+    const teamA = await prisma.team.create({ data: { name: "move-team-a", description: "old team" } });
+    const teamB = await prisma.team.create({ data: { name: "move-team-b", description: "new team" } });
+    const teamC = await prisma.team.create({ data: { name: "move-team-c", description: "unrelated team" } });
+    const provider = await prisma.provider.create({
+      data: {
+        name: "team-move-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const resumeMeta = (label: string, extra: Record<string, unknown> = {}) => ({
+      ...extra,
+      lastSessionId: `${label}-native-session`,
+      codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+      codexResumeSignature: `${label}-runtime-shape`,
+    });
+    const moving = await prisma.agent.create({
+      data: {
+        name: "moving-agent",
+        teamId: teamA.id,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: resumeMeta("moving", {
+          permissionMode: "acceptEdits",
+          reasoningEffort: "high",
+          sandboxMode: "workspace-write",
+        }),
+      },
+    });
+    const oldTeammate = await prisma.agent.create({
+      data: {
+        name: "old-teammate",
+        teamId: teamA.id,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: resumeMeta("old-teammate", {
+          permissionMode: "plan",
+          reasoningEffort: "max",
+          sandboxMode: "danger-full-access",
+        }),
+      },
+    });
+    const newTeammate = await prisma.agent.create({
+      data: {
+        name: "new-teammate",
+        teamId: teamB.id,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: resumeMeta("new-teammate", {
+          permissionMode: "dontAsk",
+          reasoningEffort: "xhigh",
+          sandboxMode: "workspace-write",
+        }),
+      },
+    });
+    const unrelatedTeamMember = await prisma.agent.create({
+      data: {
+        name: "unrelated-team-member",
+        teamId: teamC.id,
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: resumeMeta("unrelated-team-member"),
+      },
+    });
+    const ungrouped = await prisma.agent.create({
+      data: {
+        name: "ungrouped-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: resumeMeta("ungrouped"),
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(moving.id, { teamId: teamB.id });
+
+    const movingAfter = await prisma.agent.findUnique({ where: { id: moving.id } });
+    const movingMeta = (movingAfter?.metadata && typeof movingAfter.metadata === "object" ? movingAfter.metadata : {}) as Record<string, unknown>;
+    expect(movingAfter?.teamId).toBe(teamB.id);
+    expect(movingMeta.lastSessionId).toBeUndefined();
+    expect(movingMeta.codexUsageSnapshot).toBeUndefined();
+    expect(movingMeta.codexResumeSignature).toBeUndefined();
+    expect(movingMeta.permissionMode).toBe("acceptEdits");
+    expect(movingMeta.reasoningEffort).toBe("high");
+    expect(movingMeta.sandboxMode).toBe("workspace-write");
+
+    for (const [agentId, expected] of [
+      [oldTeammate.id, { permissionMode: "plan", reasoningEffort: "max", sandboxMode: "danger-full-access" }],
+      [newTeammate.id, { permissionMode: "dontAsk", reasoningEffort: "xhigh", sandboxMode: "workspace-write" }],
+    ] as const) {
+      const after = await prisma.agent.findUnique({ where: { id: agentId } });
+      const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+      expect(meta.lastSessionId).toBeUndefined();
+      expect(meta.codexUsageSnapshot).toBeUndefined();
+      expect(meta.codexResumeSignature).toBeUndefined();
+      expect(meta.permissionMode).toBe(expected.permissionMode);
+      expect(meta.reasoningEffort).toBe(expected.reasoningEffort);
+      expect(meta.sandboxMode).toBe(expected.sandboxMode);
+    }
+
+    for (const [agent, label] of [
+      [unrelatedTeamMember, "unrelated-team-member"],
+      [ungrouped, "ungrouped"],
+    ] as const) {
+      const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+      const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+      expect(meta.lastSessionId).toBe(`${label}-native-session`);
+      expect(meta.codexResumeSignature).toBe(`${label}-runtime-shape`);
+    }
+  });
+
+  it("patchAgent team removal clears resume metadata for self and old teammates", async () => {
+    const team = await prisma.team.create({ data: { name: "remove-team", description: "old team" } });
+    const moving = await prisma.agent.create({
+      data: {
+        name: "remove-moving",
+        teamId: team.id,
+        metadata: {
+          permissionMode: "plan",
+          lastSessionId: "remove-moving-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "remove-moving-shape",
+        },
+      },
+    });
+    const teammate = await prisma.agent.create({
+      data: {
+        name: "remove-teammate",
+        teamId: team.id,
+        metadata: {
+          reasoningEffort: "max",
+          lastSessionId: "remove-teammate-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "remove-teammate-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(moving.id, { teamId: null });
+
+    const movingAfter = await prisma.agent.findUnique({ where: { id: moving.id } });
+    const movingMeta = (movingAfter?.metadata && typeof movingAfter.metadata === "object" ? movingAfter.metadata : {}) as Record<string, unknown>;
+    expect(movingAfter?.teamId).toBeNull();
+    expect(movingMeta.lastSessionId).toBeUndefined();
+    expect(movingMeta.codexUsageSnapshot).toBeUndefined();
+    expect(movingMeta.codexResumeSignature).toBeUndefined();
+    expect(movingMeta.permissionMode).toBe("plan");
+
+    const teammateAfter = await prisma.agent.findUnique({ where: { id: teammate.id } });
+    const teammateMeta = (teammateAfter?.metadata && typeof teammateAfter.metadata === "object" ? teammateAfter.metadata : {}) as Record<string, unknown>;
+    expect(teammateAfter?.teamId).toBe(team.id);
+    expect(teammateMeta.lastSessionId).toBeUndefined();
+    expect(teammateMeta.codexUsageSnapshot).toBeUndefined();
+    expect(teammateMeta.codexResumeSignature).toBeUndefined();
+    expect(teammateMeta.reasoningEffort).toBe("max");
+  });
+
+  it("patchAgent team join clears resume metadata for self and new teammates", async () => {
+    const team = await prisma.team.create({ data: { name: "join-team", description: "new team" } });
+    const joining = await prisma.agent.create({
+      data: {
+        name: "joining-agent",
+        metadata: {
+          sandboxMode: "workspace-write",
+          lastSessionId: "joining-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "joining-shape",
+        },
+      },
+    });
+    const teammate = await prisma.agent.create({
+      data: {
+        name: "join-teammate",
+        teamId: team.id,
+        metadata: {
+          permissionMode: "dontAsk",
+          lastSessionId: "join-teammate-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "join-teammate-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(joining.id, { teamId: team.id });
+
+    const joiningAfter = await prisma.agent.findUnique({ where: { id: joining.id } });
+    const joiningMeta = (joiningAfter?.metadata && typeof joiningAfter.metadata === "object" ? joiningAfter.metadata : {}) as Record<string, unknown>;
+    expect(joiningAfter?.teamId).toBe(team.id);
+    expect(joiningMeta.lastSessionId).toBeUndefined();
+    expect(joiningMeta.codexUsageSnapshot).toBeUndefined();
+    expect(joiningMeta.codexResumeSignature).toBeUndefined();
+    expect(joiningMeta.sandboxMode).toBe("workspace-write");
+
+    const teammateAfter = await prisma.agent.findUnique({ where: { id: teammate.id } });
+    const teammateMeta = (teammateAfter?.metadata && typeof teammateAfter.metadata === "object" ? teammateAfter.metadata : {}) as Record<string, unknown>;
+    expect(teammateMeta.lastSessionId).toBeUndefined();
+    expect(teammateMeta.codexUsageSnapshot).toBeUndefined();
+    expect(teammateMeta.codexResumeSignature).toBeUndefined();
+    expect(teammateMeta.permissionMode).toBe("dontAsk");
+  });
+
   it("patchAgent provider switch preserves explicit model and supported reasoning effort", async () => {
     const sourceProvider = await prisma.provider.create({
       data: {
