@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable } from "../cli-config.js";
+import { CLI_INSTALL_INFO, compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable } from "../cli-config.js";
 
 describe("compareSemver", () => {
   it("returns 0 for identical versions", () => {
@@ -52,6 +52,27 @@ describe("MIN_CODEX_VERSION boundary", () => {
     expect(compareSemver("0.132.0", MIN_CODEX_VERSION)).toBe(0);
     expect(compareSemver("0.132.1", MIN_CODEX_VERSION)).toBe(1);
     expect(compareSemver("0.140.0", MIN_CODEX_VERSION)).toBe(1);
+  });
+});
+
+describe("CLI install metadata", () => {
+  it("keeps install commands centralized for both local CLI runtimes", () => {
+    expect(CLI_INSTALL_INFO.codex.recommendedInstallCommand).toBe("npm install -g @openai/codex");
+    expect(CLI_INSTALL_INFO.codex.minimumVersion).toBe(MIN_CODEX_VERSION);
+    expect(CLI_INSTALL_INFO.codex.loginCommand).toBe("codex login");
+    expect(CLI_INSTALL_INFO.claude.recommendedInstallCommand).toBe("npm install -g @anthropic-ai/claude-code");
+    expect(CLI_INSTALL_INFO.claude.loginCommand).toBe("claude login");
+  });
+
+  it("offers npm, pnpm, and bun commands without an automatic managed install path", () => {
+    expect(CLI_INSTALL_INFO.codex.installCommands.map((c) => c.label)).toEqual(["npm", "pnpm", "bun"]);
+    expect(CLI_INSTALL_INFO.claude.installCommands.map((c) => c.label)).toEqual(["npm", "pnpm", "bun"]);
+    for (const info of Object.values(CLI_INSTALL_INFO)) {
+      for (const cmd of info.installCommands) {
+        expect(cmd.command).not.toContain("ensemble-managed-tools");
+        expect(cmd.command).not.toContain("APPDATA");
+      }
+    }
   });
 });
 

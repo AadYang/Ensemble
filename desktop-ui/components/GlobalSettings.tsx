@@ -513,6 +513,9 @@ function CliPathRow({
   onUseDetected: () => void;
 }) {
   const ok = health?.found === true;
+  const versionLabel = health?.version
+    ? ` · version: ${health.version}${health.versionTooOld ? ` < ${health.minSupportedVersion ?? "minimum"}` : ""}`
+    : "";
   return (
     <label className="flex flex-col gap-1">
       <span className="flex items-center gap-2">
@@ -539,6 +542,8 @@ function CliPathRow({
       />
       <div className="text-[10px] text-[var(--text-faint)] leading-tight break-all">
         detected: {health?.path ?? "(none)"}
+        {versionLabel}
+        {health?.configPath ? ` · config: ${health.configPresent ? "present" : "missing"} (${health.configPath})` : ""}
         {health?.authPath ? ` · auth: ${health.authPresent ? "ok" : "missing"} (${health.authPath})` : ""}
         {health?.error ? ` · ${health.error}` : ""}
       </div>

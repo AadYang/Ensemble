@@ -8,11 +8,66 @@ import type { PlatformKey } from "@agentorch/shared";
 
 export type CliKind = "claude" | "codex";
 export type CliSource = "manual" | "env" | "path" | "common-location" | "vendor" | "missing";
+export type CliAuthStatus = "present" | "missing" | "unknown";
 
 export const MIN_CODEX_VERSION = "0.132.0";
+export const MIN_CLAUDE_VERSION: string | null = null;
+
+export interface CliInstallCommand {
+  label: string;
+  command: string;
+}
+
+export interface CliInstallInfo {
+  kind: CliKind;
+  displayName: string;
+  executableName: string;
+  minimumVersion: string | null;
+  recommendedInstallCommand: string;
+  installCommands: CliInstallCommand[];
+  recommendedUpgradeCommand: string | null;
+  loginCommand: string | null;
+  docsUrl: string;
+}
+
+export const CLI_INSTALL_INFO: Record<CliKind, CliInstallInfo> = {
+  claude: {
+    kind: "claude",
+    displayName: "Claude Code CLI",
+    executableName: "claude",
+    minimumVersion: MIN_CLAUDE_VERSION,
+    recommendedInstallCommand: "npm install -g @anthropic-ai/claude-code",
+    installCommands: [
+      { label: "npm", command: "npm install -g @anthropic-ai/claude-code" },
+      { label: "pnpm", command: "pnpm add -g @anthropic-ai/claude-code" },
+      { label: "bun", command: "bun add -g @anthropic-ai/claude-code" },
+    ],
+    recommendedUpgradeCommand: "npm install -g @anthropic-ai/claude-code@latest",
+    loginCommand: "claude login",
+    docsUrl: "https://docs.anthropic.com/en/docs/claude-code/setup",
+  },
+  codex: {
+    kind: "codex",
+    displayName: "Codex CLI",
+    executableName: "codex",
+    minimumVersion: MIN_CODEX_VERSION,
+    recommendedInstallCommand: "npm install -g @openai/codex",
+    installCommands: [
+      { label: "npm", command: "npm install -g @openai/codex" },
+      { label: "pnpm", command: "pnpm add -g @openai/codex" },
+      { label: "bun", command: "bun add -g @openai/codex" },
+    ],
+    recommendedUpgradeCommand: "npm install -g @openai/codex@latest",
+    loginCommand: "codex login",
+    docsUrl: "https://developers.openai.com/codex/cli",
+  },
+};
 
 export interface CliHealth {
   platformKey: PlatformKey;
+  kind: CliKind;
+  displayName: string;
+  executableName: string;
   found: boolean;
   path: string | null;
   source: CliSource;
@@ -20,8 +75,16 @@ export interface CliHealth {
   version?: string;
   versionTooOld?: boolean;
   minSupportedVersion?: string;
+  configPath?: string | null;
+  configPresent?: boolean;
+  authStatus?: CliAuthStatus;
   authPresent?: boolean;
-  authPath?: string;
+  authPath?: string | null;
+  recommendedInstallCommand: string;
+  installCommands: CliInstallCommand[];
+  recommendedUpgradeCommand?: string | null;
+  loginCommand?: string | null;
+  docsUrl: string;
   error?: string;
 }
 
@@ -35,6 +98,10 @@ const SETTING_CODEX_PATH = "cli.codexPath";
 
 function settingKey(kind: CliKind): string {
   return kind === "claude" ? SETTING_CLAUDE_PATH : SETTING_CODEX_PATH;
+}
+
+function cliInstallInfo(kind: CliKind): CliInstallInfo {
+  return CLI_INSTALL_INFO[kind];
 }
 
 async function getManualPath(kind: CliKind): Promise<string | null> {
@@ -117,6 +184,21 @@ export function probeCodexVersion(codexPath: string): string | null {
   }
 }
 
+export function probeClaudeVersion(claudePath: string): string | null {
+  try {
+    const out = execFileSync(claudePath, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+      windowsHide: true,
+    });
+    const m = String(out).match(/\b(\d+\.\d+\.\d+(?:-[\w.]+)?)\b/);
+    return m && m[1] ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 function resolveManualCliInput(kind: CliKind, input: string): string {
   const expanded = expandHome(input);
   if (isBareCommand(expanded)) {
@@ -137,53 +219,69 @@ function resolveManualCliInput(kind: CliKind, input: string): string {
 
 function detectCli(kind: CliKind, manualPath: string | null): CliHealth {
   const platformKey = currentPlatformKey();
-  const auth =
-    kind === "codex"
-      ? {
-          authPath: join(homedir(), ".codex", "auth.json"),
-          authPresent: existsSync(join(homedir(), ".codex", "auth.json")),
-        }
-      : {};
+  const installInfo = cliInstallInfo(kind);
+  const configPath = kind === "codex" ? join(homedir(), ".codex") : join(homedir(), ".claude");
+  const authPath = kind === "codex" ? join(configPath, "auth.json") : null;
+  const configPresent = existsSync(configPath);
+  const authPresent = authPath ? existsSync(authPath) : undefined;
+  const base = {
+    platformKey,
+    kind,
+    displayName: installInfo.displayName,
+    executableName: installInfo.executableName,
+    manualPath,
+    minSupportedVersion: installInfo.minimumVersion ?? undefined,
+    configPath,
+    configPresent,
+    authPath,
+    ...(authPresent !== undefined ? { authPresent } : {}),
+    authStatus: authPresent === undefined ? "unknown" as const : authPresent ? "present" as const : "missing" as const,
+    recommendedInstallCommand: installInfo.recommendedInstallCommand,
+    installCommands: installInfo.installCommands,
+    recommendedUpgradeCommand: installInfo.recommendedUpgradeCommand,
+    loginCommand: installInfo.loginCommand,
+    docsUrl: installInfo.docsUrl,
+  };
 
-  const decorateCodex = (h: CliHealth): CliHealth => {
-    if (kind !== "codex" || !h.found || !h.path) return h;
-    const version = probeCodexVersion(h.path);
-    if (!version) return { ...h, minSupportedVersion: MIN_CODEX_VERSION };
+  const decorateVersion = (h: CliHealth): CliHealth => {
+    if (!h.found || !h.path) return h;
+    const version = kind === "codex" ? probeCodexVersion(h.path) : probeClaudeVersion(h.path);
+    if (!version) return h;
+    const minimumVersion = installInfo.minimumVersion;
     return {
       ...h,
       version,
-      versionTooOld: compareSemver(version, MIN_CODEX_VERSION) < 0,
-      minSupportedVersion: MIN_CODEX_VERSION,
+      ...(minimumVersion ? { versionTooOld: compareSemver(version, minimumVersion) < 0 } : {}),
     };
   };
 
   if (manualPath) {
     if (existsSync(manualPath) && statSync(manualPath).isFile()) {
       const resolved = resolveCliExecutable(kind, manualPath) ?? manualPath;
-      return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === manualPath ? "manual" : "vendor", manualPath, ...auth });
+      return decorateVersion({ ...base, found: true, path: resolved, source: resolved === manualPath ? "manual" : "vendor" });
     }
-    return { platformKey, found: false, path: null, source: "missing", manualPath, error: `manual path not found: ${manualPath}`, ...auth };
+    return { ...base, found: false, path: null, source: "missing", error: `manual path not found: ${manualPath}` };
   }
 
   const envPath = kind === "codex" ? process.env.CODEX_PATH : process.env.CLAUDE_PATH;
   if (envPath && existsSync(envPath) && statSync(envPath).isFile()) {
     const resolved = resolveCliExecutable(kind, envPath) ?? envPath;
-    return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === envPath ? "env" : "vendor", manualPath, ...auth });
+    return decorateVersion({ ...base, found: true, path: resolved, source: resolved === envPath ? "env" : "vendor" });
   }
 
   const fromPath = findOnPath(kind);
   if (fromPath) {
     const resolved = resolveCliExecutable(kind, fromPath) ?? fromPath;
-    return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === fromPath ? "path" : "vendor", manualPath, ...auth });
+    return decorateVersion({ ...base, found: true, path: resolved, source: resolved === fromPath ? "path" : "vendor" });
   }
 
   const common = findCommonLocation(kind);
   if (common) {
     const resolved = resolveCliExecutable(kind, common) ?? common;
-    return decorateCodex({ platformKey, found: true, path: resolved, source: resolved === common ? "common-location" : "vendor", manualPath, ...auth });
+    return decorateVersion({ ...base, found: true, path: resolved, source: resolved === common ? "common-location" : "vendor" });
   }
 
-  return { platformKey, found: false, path: null, source: "missing", manualPath, ...auth };
+  return { ...base, found: false, path: null, source: "missing" };
 }
 
 function findOnPath(kind: CliKind): string | null {

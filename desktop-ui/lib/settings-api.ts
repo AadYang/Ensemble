@@ -3,12 +3,26 @@ import type { PlatformKey } from "@agentorch/shared";
 
 export interface CliHealth {
   platformKey: PlatformKey;
+  kind: "claude" | "codex";
+  displayName: string;
+  executableName: string;
   found: boolean;
   path: string | null;
   source: "manual" | "env" | "path" | "common-location" | "vendor" | "missing";
   manualPath: string | null;
+  version?: string;
+  versionTooOld?: boolean;
+  minSupportedVersion?: string;
+  configPath?: string | null;
+  configPresent?: boolean;
+  authStatus?: "present" | "missing" | "unknown";
   authPresent?: boolean;
-  authPath?: string;
+  authPath?: string | null;
+  recommendedInstallCommand: string;
+  installCommands: Array<{ label: string; command: string }>;
+  recommendedUpgradeCommand?: string | null;
+  loginCommand?: string | null;
+  docsUrl: string;
   error?: string;
 }
 

@@ -169,6 +169,13 @@ export function AgentSettings({
   const providerCapabilityKnown = providerId === null || selectedProvider !== undefined;
   const selectedProviderKind = selectedProvider?.kind ?? (providerId === null ? "anthropic-local" : null);
   const isCodexProvider = selectedProvider?.kind === "openai-codex";
+  const selectedRuntime = selectedProvider?.currentRuntime ?? null;
+  const providerCliMissing =
+    selectedProvider?.kind === "openai-codex" || selectedProvider?.kind === "anthropic-local"
+      ? selectedRuntime?.cliPath === null || selectedRuntime?.cliFound === false
+      : false;
+  const providerCliVersionTooOld = selectedRuntime?.cliVersionTooOld === true;
+  const providerAuthMissing = selectedProvider?.kind === "openai-codex" && selectedRuntime?.authPresent === false;
   const supportsThinkingMode =
     selectedProviderKind === "anthropic-local" ||
     selectedProviderKind === "anthropic" ||
@@ -327,6 +334,9 @@ export function AgentSettings({
             <span className="text-[10px] text-[var(--err)] leading-tight">
               Provider list failed to load: {providersError}
             </span>
+          )}
+          {(providerCliMissing || providerCliVersionTooOld || providerAuthMissing) && (
+            <CliRuntimeNotice provider={selectedProvider} />
           )}
         </label>
         <label className="flex flex-col gap-1">
@@ -542,4 +552,50 @@ export function AgentSettings({
   );
 
   return createPortal(dialog, document.body);
+}
+
+function CliRuntimeNotice({ provider }: { provider: ProviderDTO | undefined }) {
+  const runtime = provider?.currentRuntime ?? null;
+  if (!provider || !runtime) return null;
+  const cliMissing = runtime.cliPath === null || runtime.cliFound === false;
+  const versionTooOld = runtime.cliVersionTooOld === true;
+  const authMissing = provider.kind === "openai-codex" && runtime.authPresent === false;
+  if (!cliMissing && !versionTooOld && !authMissing) return null;
+  const installCommand = runtime.cliRecommendedInstallCommand ?? (
+    provider.kind === "openai-codex"
+      ? "npm install -g @openai/codex"
+      : "npm install -g @anthropic-ai/claude-code"
+  );
+  const upgradeCommand = runtime.cliRecommendedUpgradeCommand ?? installCommand;
+  const loginCommand = runtime.loginCommand ?? (provider.kind === "openai-codex" ? "codex login" : "claude login");
+  const command = cliMissing ? installCommand : versionTooOld ? upgradeCommand : loginCommand;
+  const label = cliMissing
+    ? `${provider.kind === "openai-codex" ? "Codex" : "Claude Code"} CLI not found`
+    : versionTooOld
+      ? `${provider.kind === "openai-codex" ? "Codex" : "Claude Code"} CLI upgrade recommended`
+      : "Codex CLI login missing";
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+    } catch {
+      // Command remains visible for manual copy.
+    }
+  };
+  return (
+    <div className="text-[10px] text-[var(--warn)] leading-tight border-l-2 border-[var(--warn)] pl-2 flex flex-col gap-1">
+      <span>
+        {label}
+        {runtime.cliVersion ? ` · version: ${runtime.cliVersion}` : ""}
+        {runtime.configPath ? ` · config: ${runtime.configPath}` : ""}
+      </span>
+      <button
+        type="button"
+        onClick={() => void copy()}
+        className="self-start px-2 py-0.5 border border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn)] hover:text-black font-mono"
+        title="Copy CLI command"
+      >
+        copy {command}
+      </button>
+    </div>
+  );
 }

@@ -53,6 +53,7 @@ import { CloudRemoteBridge } from "@/components/CloudRemoteBridge";
 import { CloudAgentTree } from "@/components/CloudAgentTree";
 import { CloudLoginDialog } from "@/components/CloudLoginDialog";
 import { CloudWorkspaceView } from "@/components/CloudWorkspaceView";
+import { CliInstallReminder } from "@/components/CliInstallReminder";
 import { McpServerPanel } from "@/components/McpServerPanel";
 import { SkillPanel } from "@/components/SkillPanel";
 import { ProviderPanel } from "@/components/ProviderPanel";
@@ -704,6 +705,7 @@ export default function Page() {
     <div className="flex h-dvh max-h-dvh min-h-0 min-w-0 flex-col overflow-hidden">
       <CloudBootstrap />
       <CloudRemoteBridge />
+      <CliInstallReminder />
       <header
         data-tauri-drag-region
         className="shrink-0 flex items-center justify-between pl-4 pr-0 py-2 border-b border-[var(--border)] bg-[var(--bg-pane)]/40 select-none"

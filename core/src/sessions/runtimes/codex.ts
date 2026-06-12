@@ -37,7 +37,7 @@ import {
   registerHandlers,
   unregisterHandlers,
 } from "../../mcp-bridge.js";
-import { getCodexCliPath } from "../../cli-config.js";
+import { CLI_INSTALL_INFO, getCodexCliPath } from "../../cli-config.js";
 import { DATA_DIR, PACKAGED, REPO_ROOT } from "../../paths.js";
 import { reloadSkills } from "../../skills/index.js";
 
@@ -637,7 +637,7 @@ export class CodexCliRuntime implements AgentRuntime {
       yield {
         type: "error",
         message:
-          "codex CLI not found on PATH. Install it with `npm i -g @openai/codex` (or download from openai.com), then run `codex login`.",
+          `codex CLI not found on PATH. Install it with \`${CLI_INSTALL_INFO.codex.recommendedInstallCommand}\`, then run \`${CLI_INSTALL_INFO.codex.loginCommand}\`.`,
       };
       unregisterHandlers(opts.sessionId);
       return;

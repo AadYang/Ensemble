@@ -34,11 +34,20 @@ export interface ProviderDTO {
   currentRuntime?: {
     platformKey: PlatformKey;
     cliPath: string | null;
+    cliFound?: boolean;
+    cliSource?: string;
     cliVersion: string | null;
     cliVersionTooOld?: boolean;
     cliMinSupportedVersion?: string | null;
+    cliRecommendedInstallCommand?: string | null;
+    cliRecommendedUpgradeCommand?: string | null;
+    cliDocsUrl?: string | null;
+    configPath?: string | null;
+    configPresent?: boolean | null;
     authPath: string | null;
     authPresent: boolean;
+    authStatus?: string | null;
+    loginCommand?: string | null;
     models: string[];
     defaultSandbox?: SandboxMode | string | null;
     lastHealthAt: string;

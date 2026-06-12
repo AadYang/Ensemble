@@ -58,7 +58,7 @@ import type { Agent as DbAgent, PendingTurn as DbPendingTurn } from "../db.js";
 import { prisma, sqliteDb } from "../db.js";
 import type { WebSocket } from "@fastify/websocket";
 import type { WSHub } from "../ws/hub.js";
-import { getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
+import { CLI_INSTALL_INFO, getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
 import { ensureDataDir } from "../paths.js";
 import { currentPlatformKey } from "../platform-key.js";
 
@@ -2236,8 +2236,8 @@ export class SessionManager {
 
     if (isClaudeKind && !claudeCliPath) {
       throw new Error(
-        `Claude Code CLI not configured for ${currentPlatformKey()}. Install from https://claude.ai/download ` +
-          "or run `npm i -g @anthropic-ai/claude-code`, then restart Ensemble.",
+        `Claude Code CLI not configured for ${currentPlatformKey()}. Install it with ` +
+          `\`${CLI_INSTALL_INFO.claude.recommendedInstallCommand}\`, then refresh Settings > CLI.`,
       );
     }
     if (resolvedProvider?.kind === "anthropic-local" && platformRuntime && !platformRuntime.cliPath) {
@@ -2245,10 +2245,13 @@ export class SessionManager {
     }
     if (isCodexProvider) {
       if (!codexCliPath || (platformRuntime && !platformRuntime.cliPath)) {
-        throw new Error(`Codex CLI is not available on ${currentPlatformKey()}. Configure it in Settings > CLI.`);
+        throw new Error(
+          `Codex CLI is not available on ${currentPlatformKey()}. Install it with ` +
+            `\`${CLI_INSTALL_INFO.codex.recommendedInstallCommand}\`, then refresh Settings > CLI.`,
+        );
       }
       if (platformRuntime && platformRuntime.authPresent === false) {
-        throw new Error(`Codex CLI is not logged in on ${currentPlatformKey()}. Run \`codex login\` for this OS.`);
+        throw new Error(`Codex CLI is not logged in on ${currentPlatformKey()}. Run \`${CLI_INSTALL_INFO.codex.loginCommand}\` for this OS.`);
       }
     }
     // staleResume is set by the stderr watcher if the CLI reports a missing

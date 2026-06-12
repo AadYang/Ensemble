@@ -412,11 +412,20 @@ const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 interface ProviderRuntimeMetadata {
   platformKey: PlatformKey;
   cliPath: string | null;
+  cliFound: boolean;
+  cliSource: string;
   cliVersion: string | null;
   cliVersionTooOld?: boolean;
   cliMinSupportedVersion?: string | null;
+  cliRecommendedInstallCommand?: string | null;
+  cliRecommendedUpgradeCommand?: string | null;
+  cliDocsUrl?: string | null;
+  configPath?: string | null;
+  configPresent?: boolean | null;
   authPath: string | null;
   authPresent: boolean;
+  authStatus?: string | null;
+  loginCommand?: string | null;
   models: string[];
   defaultSandbox?: string | null;
   lastHealthAt: string;
@@ -607,14 +616,25 @@ async function refreshClaudeLocalHealth(): Promise<void> {
     runtimes[platformKey] = {
       platformKey,
       cliPath: health.claude.path,
+      cliFound: health.claude.found,
+      cliSource: health.claude.source,
       cliVersion: null,
       cliMinSupportedVersion: null,
+      cliRecommendedInstallCommand: health.claude.recommendedInstallCommand,
+      cliRecommendedUpgradeCommand: health.claude.recommendedUpgradeCommand ?? null,
+      cliDocsUrl: health.claude.docsUrl,
+      configPath: health.claude.configPath ?? null,
+      configPresent: health.claude.configPresent ?? null,
       authPath: null,
       authPresent,
+      authStatus: health.claude.authStatus ?? null,
+      loginCommand: health.claude.loginCommand ?? null,
       models,
       lastHealthAt: new Date().toISOString(),
       lastError: health.claude.error ?? null,
     };
+    if (health.claude.version) runtimes[platformKey]!.cliVersion = health.claude.version;
+    if (health.claude.versionTooOld === true) runtimes[platformKey]!.cliVersionTooOld = true;
     await prisma.provider.update({ where: { id: p.id }, data: { models, metadata: { ...meta, runtimes } } });
   }
 }
@@ -653,10 +673,19 @@ async function refreshCodexHealth(): Promise<void> {
     const runtime: ProviderRuntimeMetadata = {
       platformKey,
       cliPath: health.codex.path,
+      cliFound: health.codex.found,
+      cliSource: health.codex.source,
       cliVersion: health.codex.version ?? null,
       cliMinSupportedVersion: health.codex.minSupportedVersion ?? null,
+      cliRecommendedInstallCommand: health.codex.recommendedInstallCommand,
+      cliRecommendedUpgradeCommand: health.codex.recommendedUpgradeCommand ?? null,
+      cliDocsUrl: health.codex.docsUrl,
+      configPath: health.codex.configPath ?? null,
+      configPresent: health.codex.configPresent ?? null,
       authPath: health.codex.authPath ?? null,
       authPresent,
+      authStatus: health.codex.authStatus ?? null,
+      loginCommand: health.codex.loginCommand ?? null,
       models: discoveredModels && discoveredModels.length > 0
         ? discoveredModels
         : (runtimes[platformKey]?.models ?? p.models),

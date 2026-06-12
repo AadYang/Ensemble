@@ -15,6 +15,7 @@ import {
 import { PROVIDER_PRESETS } from "@/lib/provider-presets";
 import { useT } from "@/i18n/useT";
 import { getDialog } from "@/lib/dialog";
+import { getCliSettings, type CliSettingsHealth } from "@/lib/settings-api";
 
 // W16 Slice 1.3 + W20 Slice 5.4: form models a runtime+entry decision tree
 // rather than the raw provider kind enum, mapping to kind on submit:
@@ -81,11 +82,14 @@ export function ProviderPanel() {
   // Commercial default for Codex provider creation. Users can still override
   // per provider or per agent.
   const [sandboxMode, setSandboxMode] = useState<SandboxMode | "">("danger-full-access");
+  const [cliHealth, setCliHealth] = useState<CliSettingsHealth | null>(null);
 
   const refresh = async () => {
     try {
       setError(null);
-      setProviders(await listProviders());
+      const [providerRows, cliRows] = await Promise.all([listProviders(), getCliSettings()]);
+      setProviders(providerRows);
+      setCliHealth(cliRows);
     } catch (err) {
       console.warn("listProviders failed", err);
       setError((err as Error).message);
@@ -339,8 +343,8 @@ export function ProviderPanel() {
                 setManualModels={setManualModels}
                 sandboxMode={sandboxMode}
                 setSandboxMode={setSandboxMode}
-                codexCliMissing={p.codexCliMissing === true}
-                authMissing={p.authMissing === true}
+                codexHealth={cliHealth?.codex ?? null}
+                codexRuntime={p.currentRuntime ?? null}
                 applyPreset={applyPreset}
                 hasExistingKey={p.hasApiKey}
                 onSubmit={() => onSubmitEdit(p.id)}
@@ -418,7 +422,7 @@ export function ProviderPanel() {
                 )}
                 {p.codexCliMissing && (
                   <div className="text-[10px] text-[var(--err)] leading-snug pl-2 border-l-2 border-[var(--err)]">
-                    codex CLI not found in PATH. Install: <code className="font-mono">npm i -g @openai/codex</code>
+                    codex CLI not found. Install: <code className="font-mono">{p.currentRuntime?.cliRecommendedInstallCommand ?? "npm install -g @openai/codex"}</code>
                   </div>
                 )}
                 {!p.codexCliMissing && p.authMissing && (
@@ -427,7 +431,7 @@ export function ProviderPanel() {
                     <button
                       onClick={async () => {
                         try {
-                          await navigator.clipboard.writeText("codex login");
+                          await navigator.clipboard.writeText(p.currentRuntime?.loginCommand ?? "codex login");
                           setRefreshFlash({ id: p.id, ok: true, msg: "copied `codex login`" });
                         } catch {
                           setRefreshFlash({ id: p.id, ok: false, msg: "clipboard unavailable" });
@@ -449,7 +453,7 @@ export function ProviderPanel() {
                     <button
                       onClick={async () => {
                         try {
-                          await navigator.clipboard.writeText("npm i -g @openai/codex@latest");
+                          await navigator.clipboard.writeText(p.currentRuntime?.cliRecommendedUpgradeCommand ?? "npm install -g @openai/codex@latest");
                           setRefreshFlash({ id: p.id, ok: true, msg: "copied upgrade command" });
                         } catch {
                           setRefreshFlash({ id: p.id, ok: false, msg: "clipboard unavailable" });
@@ -492,8 +496,8 @@ export function ProviderPanel() {
               setManualModels={setManualModels}
               sandboxMode={sandboxMode}
               setSandboxMode={setSandboxMode}
-              codexCliMissing={false}
-              authMissing={false}
+              codexHealth={cliHealth?.codex ?? null}
+              codexRuntime={null}
               applyPreset={applyPreset}
               hasExistingKey={false}
               onSubmit={onSubmitNew}
@@ -539,8 +543,8 @@ function ProviderForm({
   setManualModels,
   sandboxMode,
   setSandboxMode,
-  codexCliMissing,
-  authMissing,
+  codexHealth,
+  codexRuntime,
   applyPreset,
   hasExistingKey,
   onSubmit,
@@ -564,8 +568,8 @@ function ProviderForm({
   setManualModels: (s: string) => void;
   sandboxMode: SandboxMode | "";
   setSandboxMode: (s: SandboxMode | "") => void;
-  codexCliMissing: boolean;
-  authMissing: boolean;
+  codexHealth: CliSettingsHealth["codex"] | null;
+  codexRuntime: ProviderDTO["currentRuntime"] | null;
   applyPreset: (id: string) => void;
   hasExistingKey: boolean;
   onSubmit: () => void;
@@ -661,8 +665,8 @@ function ProviderForm({
         <CodexForm
           sandboxMode={sandboxMode}
           setSandboxMode={setSandboxMode}
-          codexCliMissing={codexCliMissing}
-          authMissing={authMissing}
+          codexHealth={codexHealth}
+          codexRuntime={codexRuntime}
         />
       ) : (
         <>
@@ -729,14 +733,28 @@ function ProviderForm({
 function CodexForm({
   sandboxMode,
   setSandboxMode,
-  codexCliMissing,
-  authMissing,
+  codexHealth,
+  codexRuntime,
 }: {
   sandboxMode: SandboxMode | "";
   setSandboxMode: (s: SandboxMode | "") => void;
-  codexCliMissing: boolean;
-  authMissing: boolean;
+  codexHealth: CliSettingsHealth["codex"] | null;
+  codexRuntime: ProviderDTO["currentRuntime"] | null;
 }) {
+  const health = codexHealth;
+  const cliMissing = health ? !health.found : codexRuntime ? !codexRuntime.cliPath : false;
+  const codexAuthMissing = health ? health.authPresent === false : codexRuntime?.authPresent === false;
+  const versionTooOld = health?.versionTooOld === true || codexRuntime?.cliVersionTooOld === true;
+  const loginCommand = health?.loginCommand ?? codexRuntime?.loginCommand ?? "codex login";
+  const installCommand = health?.recommendedInstallCommand ?? codexRuntime?.cliRecommendedInstallCommand ?? "npm install -g @openai/codex";
+  const upgradeCommand = health?.recommendedUpgradeCommand ?? codexRuntime?.cliRecommendedUpgradeCommand ?? "npm install -g @openai/codex@latest";
+  const onCopy = async (command: string) => {
+    try {
+      await navigator.clipboard.writeText(command);
+    } catch {
+      // Clipboard may be unavailable in embedded contexts; the command is visible inline.
+    }
+  };
   const onCopyLogin = async () => {
     try {
       await navigator.clipboard.writeText("codex login");
@@ -752,21 +770,42 @@ function CodexForm({
         Experimental Codex CLI provider. It uses ChatGPT-account OAuth via the local `codex` CLI (~/.codex/auth.json).
         Peer tools are exposed through Ensemble's stdio MCP bridge and have passed local smoke testing, but Codex can still affect external Codex CLI sessions.
       </div>
-      {codexCliMissing && (
-        <div className="text-[10px] text-[var(--err)] leading-snug px-0.5 py-1 border-l-2 border-[var(--err)] pl-2 flex flex-col gap-1">
-          <span>codex CLI not found in PATH. Install from npm: <code className="font-mono">npm i -g @openai/codex</code></span>
+      {health && (
+        <div className="text-[10px] text-[var(--text-faint)] leading-snug px-0.5 py-1 pl-2 break-all">
+          executable: {health.path ?? "(not found)"}
+          {health.version ? ` · version: ${health.version}` : ""}
+          {health.configPath ? ` · config: ${health.configPath}` : ""}
+          {health.authPath ? ` · auth: ${health.authPresent ? "ok" : "missing"} (${health.authPath})` : ""}
         </div>
       )}
-      {!codexCliMissing && authMissing && (
+      {cliMissing && (
+        <div className="text-[10px] text-[var(--err)] leading-snug px-0.5 py-1 border-l-2 border-[var(--err)] pl-2 flex flex-col gap-1">
+          <span>codex CLI not found. Install it first: <code className="font-mono">{installCommand}</code></span>
+        </div>
+      )}
+      {!cliMissing && codexAuthMissing && (
         <div className="text-[10px] text-[var(--warn)] leading-snug px-0.5 py-1 border-l-2 border-[var(--warn)] pl-2 flex flex-col gap-1">
           <span>~/.codex/auth.json not found. Sign in with your ChatGPT account first:</span>
           <button
             type="button"
-            onClick={onCopyLogin}
+            onClick={() => void onCopy(loginCommand)}
             className="self-start px-2 py-0.5 border border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn)] hover:text-black transition-colors font-mono"
             title="Copy `codex login` to clipboard"
           >
             ⎘ codex login
+          </button>
+        </div>
+      )}
+      {!cliMissing && versionTooOld && (
+        <div className="text-[10px] text-[var(--warn)] leading-snug px-0.5 py-1 border-l-2 border-[var(--warn)] pl-2 flex flex-col gap-1">
+          <span>codex version is below the minimum supported version. Upgrade is recommended.</span>
+          <button
+            type="button"
+            onClick={() => void onCopy(upgradeCommand)}
+            className="self-start px-2 py-0.5 border border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn)] hover:text-black transition-colors font-mono"
+            title="Copy upgrade command"
+          >
+            copy {upgradeCommand}
           </button>
         </div>
       )}
