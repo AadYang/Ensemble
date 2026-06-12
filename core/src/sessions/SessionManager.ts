@@ -256,7 +256,13 @@ interface ForceStopOptions {
 }
 
 type SendMessageOptions = {
-  peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode; sourceRunId?: string };
+  peerOrigin?: {
+    fromAgentId: string;
+    fromAgentName: string;
+    mode: PeerMode;
+    sourceRunId?: string;
+    coalescibleSourceOutput?: boolean;
+  };
   autoRecoveryAttempt?: "codex-event-stream-lagged";
   suppressUserMessage?: boolean;
 };
@@ -291,6 +297,7 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
         fromAgentName: p.fromAgentName,
         mode,
         ...(typeof p.sourceRunId === "string" ? { sourceRunId: p.sourceRunId } : {}),
+        ...(p.coalescibleSourceOutput === true ? { coalescibleSourceOutput: true } : {}),
       };
     }
   }
@@ -1808,9 +1815,10 @@ export class SessionManager {
     sessionId: string,
     peerOrigin: NonNullable<SendMessageOptions["peerOrigin"]>,
   ): { id: number } | null {
-    // Only live in-flight handoffs are superseded. Completed-source peer_send
-    // calls can be distinct operator messages and must remain FIFO.
-    if (!peerOrigin.sourceRunId) return null;
+    // Only live in-flight source-output handoffs are superseded. Plain body
+    // messages, completed-source messages, and includeSource=false handoffs
+    // must remain FIFO and later merge into a peer batch.
+    if (!peerOrigin.sourceRunId || !peerOrigin.coalescibleSourceOutput) return null;
     const rows = prisma.pendingTurn.findMany({
       where: { agentId: sessionId },
       orderBy: { id: "asc" },
@@ -1819,6 +1827,7 @@ export class SessionManager {
       const existing = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
       if (!existing) continue;
       if (
+        existing.coalescibleSourceOutput === true &&
         existing.fromAgentId === peerOrigin.fromAgentId &&
         existing.mode === peerOrigin.mode &&
         (existing.sourceRunId ?? null) === (peerOrigin.sourceRunId ?? null)
@@ -3039,6 +3048,9 @@ export class SessionManager {
     }
 
     const sourceRunId = this.running.get(fromAgent.id)?.runId;
+    const includeSource =
+      opts.includeSource === true ||
+      ((opts.includeSource === undefined || opts.includeSource === "auto") && mode !== "raw");
     const sourceSnapshot = await this.fetchPeerSourceSnapshot(fromAgent.id);
     const formatted = formatPeerHandoff({
       fromName: fromAgent.name,
@@ -3057,6 +3069,7 @@ export class SessionManager {
       fromAgentName: fromAgent.name,
       mode,
       ...(sourceRunId ? { sourceRunId } : {}),
+      ...(sourceRunId && includeSource ? { coalescibleSourceOutput: true } : {}),
     };
     const willReplaceQueuedPeerHandoff = targetWasBusy && this.findQueuedPeerHandoff(targetId, peerOrigin) !== null;
     if (interrupt) {

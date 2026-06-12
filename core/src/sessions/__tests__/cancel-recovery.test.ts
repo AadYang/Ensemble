@@ -530,6 +530,120 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
   });
 
+  it("does not coalesce default raw peer_send messages from the same running source", async () => {
+    const source = await prisma.agent.create({ data: { name: "raw-running-source" } });
+    const target = await prisma.agent.create({ data: { name: "raw-batch-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "source-run",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "source is still working",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // Raw auto should not include this live source output and should not coalesce.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live raw source output" });
+
+    const first = await sessions.sendPeerMessage(source.id, target.name, "first raw body", "raw");
+    const second = await sessions.sendPeerMessage(source.id, target.name, "second raw body", "raw");
+    await Promise.resolve();
+
+    expect(first).toContain("queued for");
+    expect(second).toContain("queued for");
+    expect(second).not.toContain("replaced stale queued peer handoff");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(2);
+    const queuedRows = await prisma.pendingTurn.findMany({ where: { agentId: target.id }, orderBy: { id: "asc" } });
+    expect(queuedRows[0]?.userInput).toContain("first raw body");
+    expect(queuedRows[0]?.userInput).not.toContain("live raw source output");
+    expect(queuedRows[1]?.userInput).toContain("second raw body");
+
+    const drained: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (_sessionId: string, text: string) => {
+      drained.push(text);
+      return { finalText: "raw batch drained" };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.delete(target.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).drainQueuedTurns(target.id);
+    await Promise.resolve();
+
+    expect(drained).toHaveLength(1);
+    expect(drained[0]).toContain('<peer-batch count="2">');
+    expect(drained[0]).toContain("first raw body");
+    expect(drained[0]).toContain("second raw body");
+    expect(drained[0]).not.toContain("live raw source output");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+  });
+
+  it("coalesces raw peer_send when includeSource=true because source-output can go stale", async () => {
+    const source = await prisma.agent.create({ data: { name: "raw-source-output-source" } });
+    const target = await prisma.agent.create({ data: { name: "raw-source-output-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "source-run",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "source running",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "raw source snapshot 1" });
+    const first = await sessions.sendPeerMessage(source.id, target.name, "raw one", "raw", { includeSource: true });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "raw source snapshot 2" });
+    const second = await sessions.sendPeerMessage(source.id, target.name, "raw two", "raw", { includeSource: true });
+    await Promise.resolve();
+
+    expect(first).toContain("queued for");
+    expect(second).toContain("replaced stale queued peer handoff for");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(1);
+    const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
+    expect(queued?.userInput).toContain("raw source snapshot 2");
+    expect(queued?.userInput).toContain("raw two");
+    expect(queued?.userInput).not.toContain("raw source snapshot 1");
+    expect(queued?.userInput).not.toContain("raw one");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).clearQueuedTurns(target.id);
+  });
+
   it("does not coalesce peer_send handoffs from different sources or modes", async () => {
     const sourceA = await prisma.agent.create({ data: { name: "source-a" } });
     const sourceB = await prisma.agent.create({ data: { name: "source-b" } });
