@@ -24,10 +24,10 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, basename, extname } from "node:path";
+import { join, basename, extname, delimiter, resolve } from "node:path";
 import { DATA_DIR } from "../paths.js";
 
-export type SkillSource = "project" | "ensemble" | "claude-user" | "codex-user";
+export type SkillSource = "project" | "ensemble" | "claude-user" | "codex-user" | "system";
 
 export interface SkillEntry {
   /** Skill identifier from frontmatter. Slug-style; case-sensitive. */
@@ -47,7 +47,19 @@ export interface SkillEntry {
   path: string;
 }
 
-const SOURCE_PRIORITY: SkillSource[] = ["project", "ensemble", "claude-user", "codex-user"];
+// System skills are built-in fallbacks only. User/project skills must be able
+// to override them by name so local behavior and precise memory stay in control.
+const SOURCE_PRIORITY: SkillSource[] = ["project", "ensemble", "claude-user", "codex-user", "system"];
+
+interface SkillRootOverrides {
+  ensemble?: string;
+  claudeUser?: string;
+  codexUser?: string;
+  systemDirs?: string[];
+  disableProject?: boolean;
+}
+
+let rootOverrides: SkillRootOverrides | null = null;
 
 function ensembleSkillsDir(): string {
   return join(DATA_DIR, "skills");
@@ -58,8 +70,57 @@ function claudeUserSkillsDir(): string {
 function codexUserSkillsDir(): string {
   return join(homedir(), ".codex", "skills");
 }
-function projectSkillsDir(workspace: string): string {
+function projectSkillsDir(workspace: string): string | null {
+  if (rootOverrides?.disableProject) return null;
   return join(workspace, ".claude", "skills");
+}
+
+function splitEnvPathList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(delimiter)
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+function uniqueExistingDirs(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of paths) {
+    const full = resolve(p);
+    if (seen.has(full) || !existsSync(full)) continue;
+    try {
+      if (!statSync(full).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    seen.add(full);
+    out.push(full);
+  }
+  return out;
+}
+
+function runtimeSystemSkillsDirs(): string[] {
+  const runtimeRoot = join(DATA_DIR, "codex-runtime");
+  if (!existsSync(runtimeRoot)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(runtimeRoot).sort();
+  } catch {
+    return [];
+  }
+  return entries.map((name) => join(runtimeRoot, name, "skills", ".system"));
+}
+
+function systemSkillsDirs(): string[] {
+  if (rootOverrides?.systemDirs) return uniqueExistingDirs(rootOverrides.systemDirs);
+  return uniqueExistingDirs([
+    ...splitEnvPathList(process.env.ENSEMBLE_SYSTEM_SKILLS_DIR),
+    ...splitEnvPathList(process.env.CODEX_SYSTEM_SKILLS_DIR),
+    ...(process.env.CODEX_HOME ? [join(process.env.CODEX_HOME, "skills", ".system")] : []),
+    join(homedir(), ".codex", "skills", ".system"),
+    join(homedir(), ".claude", "skills", ".system"),
+    ...runtimeSystemSkillsDirs(),
+  ]);
 }
 
 /** Walk a single skills root dir and return SKILL.md (or flat *.md) paths. */
@@ -171,6 +232,11 @@ interface CacheState {
 let cache: CacheState | null = null;
 const CACHE_TTL_MS = 30_000;
 
+function cacheKeyFor(workspaces: string[] = []): string {
+  const systemKey = systemSkillsDirs().slice().sort().join("|");
+  return `${workspaces.slice().sort().join("|")}::system=${systemKey}`;
+}
+
 /** Merge skills from all four source dirs, dedup by name with priority. The
  *  optional `workspaces` set lets project-source contribute the .claude/skills
  *  dirs from any codex-workspace-using agent — but for v2 we keep things simple
@@ -178,11 +244,18 @@ const CACHE_TTL_MS = 30_000;
  *  with the active agent's workspace (if any) per-turn. */
 function buildRegistry(workspaces: string[] = []): Map<string, SkillEntry> {
   // Collect candidates grouped by source.
+  const projectPaths = rootOverrides?.disableProject
+    ? []
+    : workspaces.flatMap((w) => {
+        const dir = projectSkillsDir(w);
+        return dir ? discoverInDir(dir) : [];
+      });
   const grouped: Array<{ source: SkillSource; paths: string[] }> = [
-    { source: "project", paths: workspaces.flatMap((w) => discoverInDir(projectSkillsDir(w))) },
-    { source: "ensemble", paths: discoverInDir(ensembleSkillsDir()) },
-    { source: "claude-user", paths: discoverInDir(claudeUserSkillsDir()) },
-    { source: "codex-user", paths: discoverInDir(codexUserSkillsDir()) },
+    { source: "project", paths: projectPaths },
+    { source: "ensemble", paths: discoverInDir(rootOverrides?.ensemble ?? ensembleSkillsDir()) },
+    { source: "claude-user", paths: discoverInDir(rootOverrides?.claudeUser ?? claudeUserSkillsDir()) },
+    { source: "codex-user", paths: discoverInDir(rootOverrides?.codexUser ?? codexUserSkillsDir()) },
+    { source: "system", paths: systemSkillsDirs().flatMap((dir) => discoverInDir(dir)) },
   ];
   const byName = new Map<string, SkillEntry>();
   // Walk in priority order; first writer wins.
@@ -195,9 +268,11 @@ function buildRegistry(workspaces: string[] = []): Map<string, SkillEntry> {
       if (byName.has(entry.name)) {
         // Lower-priority duplicate — skip but log so user knows
         const existing = byName.get(entry.name)!;
-        console.warn(
-          `[skills] duplicate name "${entry.name}": keeping ${existing.source} (${existing.path}), shadowed ${entry.source} (${entry.path})`,
-        );
+        if (existing.source !== "system" || entry.source !== "system") {
+          console.warn(
+            `[skills] duplicate name "${entry.name}": keeping ${existing.source} (${existing.path}), shadowed ${entry.source} (${entry.path})`,
+          );
+        }
         continue;
       }
       byName.set(entry.name, entry);
@@ -207,7 +282,7 @@ function buildRegistry(workspaces: string[] = []): Map<string, SkillEntry> {
 }
 
 export function loadSkills(workspaces: string[] = []): SkillEntry[] {
-  const key = workspaces.slice().sort().join("|");
+  const key = cacheKeyFor(workspaces);
   const now = Date.now();
   if (cache && cache.workspaceCacheKey === key && now - cache.loadedAt < CACHE_TTL_MS) {
     return Array.from(cache.byName.values());
@@ -231,5 +306,10 @@ export function reloadSkills(): void {
 export function __setSkillsForTest(entries: SkillEntry[]): void {
   const byName = new Map<string, SkillEntry>();
   for (const e of entries) byName.set(e.name, e);
-  cache = { loadedAt: Date.now(), workspaceCacheKey: "", byName };
+  cache = { loadedAt: Date.now(), workspaceCacheKey: cacheKeyFor(), byName };
+}
+
+export function __setSkillRootOverridesForTest(overrides: SkillRootOverrides | null): void {
+  rootOverrides = overrides;
+  reloadSkills();
 }

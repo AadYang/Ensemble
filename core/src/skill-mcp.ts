@@ -1,5 +1,5 @@
 // Claude SDK MCP factory for the skill_invoke + skill_list tools. Same shape
-// as peer-mcp.ts / help-mcp.ts. Stateless — the closure just captures the
+// as peer-mcp.ts / help-mcp.ts. Stateless: the closure just captures the
 // active workspace path so project-source skills can resolve.
 
 import { z } from "zod";
@@ -8,7 +8,7 @@ import {
   tool,
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
-import { loadSkills, findSkill, formatSkillBody } from "./skills/index.js";
+import { loadSkills, formatSkillInvokeForTool, formatSkillListForTool } from "./skills/index.js";
 
 export const SKILL_MCP_SERVER_NAME = "agentorch-skill";
 export const SKILL_INVOKE_TOOL_NAME = `mcp__${SKILL_MCP_SERVER_NAME}__skill_invoke`;
@@ -27,7 +27,7 @@ export function makeSkillMcpServer(ctx: SkillRuntimeContext): McpSdkServerConfig
     [
       "List the skills currently available to this agent. Each entry includes",
       "name, description (when to use), source (project / ensemble / claude-user /",
-      "codex-user), and any advisory tool restrictions.",
+      "codex-user / system), and any advisory tool restrictions.",
       "",
       "Skills may auto-activate based on the user's message (you'll see them in",
       "your system prompt under ACTIVE SKILLS). Call skill_invoke <name> to",
@@ -35,18 +35,17 @@ export function makeSkillMcpServer(ctx: SkillRuntimeContext): McpSdkServerConfig
     ].join("\n"),
     {},
     async () => {
-      const list = loadSkills(workspaces);
-      if (list.length === 0) {
+      if (loadSkills(workspaces).length === 0) {
         return {
           content: [
-            { type: "text" as const, text: "No skills loaded. Add SKILL.md files to <ensemble dataDir>/skills/, ~/.claude/skills/, or ~/.codex/skills/." },
+            {
+              type: "text" as const,
+              text: "No skills loaded. Add SKILL.md files to <ensemble dataDir>/skills/, ~/.claude/skills/, or ~/.codex/skills/.",
+            },
           ],
         };
       }
-      const lines = list.map(
-        (s) => `${s.name} [${s.source}] — ${s.description}` + (s.tools ? `  (recommended tools: ${s.tools.join(", ")})` : ""),
-      );
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      return { content: [{ type: "text" as const, text: formatSkillListForTool(workspaces) }] };
     },
   );
 
@@ -63,20 +62,9 @@ export function makeSkillMcpServer(ctx: SkillRuntimeContext): McpSdkServerConfig
     {
       name: z.string().min(1).describe("Skill name (slug from SKILL.md frontmatter)."),
     },
-    async ({ name }) => {
-      const skill = findSkill(name, workspaces);
-      if (!skill) {
-        const all = loadSkills(workspaces).map((s) => s.name).join(", ") || "(none)";
-        return {
-          content: [
-            { type: "text" as const, text: `No skill named "${name}". Available: ${all}` },
-          ],
-        };
-      }
-      return {
-        content: [{ type: "text" as const, text: formatSkillBody(skill, ctx.runtimeKind) }],
-      };
-    },
+    async ({ name }) => ({
+      content: [{ type: "text" as const, text: formatSkillInvokeForTool(name, workspaces, ctx.runtimeKind) }],
+    }),
   );
 
   return createSdkMcpServer({

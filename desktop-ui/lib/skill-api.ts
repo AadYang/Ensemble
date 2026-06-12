@@ -1,6 +1,6 @@
 import type { AgentSummary } from "@agentorch/shared";
 
-export type SkillSource = "project" | "ensemble" | "claude-user" | "codex-user";
+export type SkillSource = "project" | "ensemble" | "claude-user" | "codex-user" | "system";
 
 export interface SkillDTO {
   name: string;

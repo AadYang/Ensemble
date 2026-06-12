@@ -18,6 +18,7 @@ const SOURCE_BADGE: Record<SkillSource, { label: string; color: string }> = {
   ensemble: { label: "ensemble", color: "var(--ok)" },
   "claude-user": { label: "claude", color: "var(--warn)" },
   "codex-user": { label: "codex", color: "#bb88ff" },
+  system: { label: "system", color: "var(--text-faint)" },
 };
 
 export function SkillPanel() {

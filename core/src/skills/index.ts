@@ -5,13 +5,14 @@
 //   - forcedSkills:   string[]   names ALWAYS injected this turn regardless of score
 
 export type { SkillEntry, SkillSource } from "./loader.js";
-export { loadSkills, findSkill, reloadSkills, __setSkillsForTest } from "./loader.js";
+export { loadSkills, findSkill, reloadSkills, __setSkillsForTest, __setSkillRootOverridesForTest } from "./loader.js";
 export {
   pickActiveSkills,
   formatActiveSkills,
   formatSkillBody,
   scoreSkillMatch,
 } from "./activate.js";
+export { formatSkillListForTool, formatSkillInvokeForTool } from "./tool-format.js";
 
 export function readSkillBlocklist(metadata: unknown): Set<string> {
   if (metadata && typeof metadata === "object" && "disabledSkills" in metadata) {

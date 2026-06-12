@@ -39,6 +39,7 @@ import {
 } from "../../mcp-bridge.js";
 import { getCodexCliPath } from "../../cli-config.js";
 import { DATA_DIR, PACKAGED, REPO_ROOT } from "../../paths.js";
+import { reloadSkills } from "../../skills/index.js";
 
 // Resolve the user's already-installed Codex binary. The npm shim is often a
 // shell script, so we need to locate the native platform executable.
@@ -678,6 +679,7 @@ export class CodexCliRuntime implements AgentRuntime {
         reasoningEffort,
       );
       codexEnv.CODEX_HOME = codexHome;
+      reloadSkills();
     }
     const canResumeNative = isLikelyCodexThreadId(opts.resume);
     const preflight = await preflightCodexMcp({

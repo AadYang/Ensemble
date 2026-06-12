@@ -250,8 +250,13 @@ Source directories (priority high → low; first wins on name conflicts):
   2. ensemble      <DATA_DIR>/skills/<name>/SKILL.md   (managed via UI panel + HTTP API)
   3. claude-user   ~/.claude/skills/<name>/SKILL.md    (shared with Claude Code)
   4. codex-user    ~/.codex/skills/<name>/SKILL.md     (shared with Codex CLI)
+  5. system        built-in runtime skills such as skill-creator / skill-installer
 
 Flat-file form ~/.claude/skills/<name>.md (no directory) also accepted.
+
+Use project / ensemble / user skills for long-lived behavior and precise
+procedural memory. Keep them concise, invokeable, forceable, and auto-activatable
+by description; do not paste large memory dumps into every agent prompt.
 
 Activation:
   - AUTO: Ensemble scores skill descriptions against each user message,
@@ -271,7 +276,7 @@ HTTP API (managed skills only — ensemble-source):
   POST   /api/skills            create  { name, description, body, tools?, model? }
   PATCH  /api/skills/:name      edit
   DELETE /api/skills/:name      delete
-  POST   /api/skills/reload     force re-scan of all 4 source dirs
+  POST   /api/skills/reload     force re-scan of all source dirs
 
 Tools you have inside Ensemble:
   skill_list                    enumerate available skills (with descriptions)

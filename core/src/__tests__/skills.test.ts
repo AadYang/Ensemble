@@ -1,9 +1,15 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
+  __setSkillRootOverridesForTest,
   __setSkillsForTest,
   pickActiveSkills,
   formatActiveSkills,
   formatSkillBody,
+  formatSkillInvokeForTool,
+  formatSkillListForTool,
   scoreSkillMatch,
   type SkillEntry,
 } from "../skills/index.js";
@@ -134,11 +140,78 @@ describe("formatSkillBody", () => {
 });
 
 describe("registry test seam", () => {
-  beforeEach(() => __setSkillsForTest([]));
+  beforeEach(() => {
+    __setSkillRootOverridesForTest({ systemDirs: [], disableProject: true });
+    __setSkillsForTest([]);
+  });
+
   it("allows tests to swap the registry", async () => {
     const { findSkill, loadSkills } = await import("../skills/index.js");
     __setSkillsForTest([mk("seeded", "test desc")]);
     expect(loadSkills().map((s) => s.name)).toEqual(["seeded"]);
     expect(findSkill("seeded")?.description).toBe("test desc");
+  });
+});
+
+function writeSkill(root: string, name: string, description: string, body: string): void {
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "SKILL.md"),
+    `---\nname: ${name}\ndescription: ${description}\n---\n\n${body}\n`,
+    "utf8",
+  );
+}
+
+describe("skill source registry", () => {
+  let temp: string;
+
+  beforeEach(() => {
+    temp = mkdtempSync(join(tmpdir(), "ensemble-skills-"));
+    __setSkillRootOverridesForTest({
+      ensemble: join(temp, "ensemble"),
+      claudeUser: join(temp, "claude-user"),
+      codexUser: join(temp, "codex-user"),
+      systemDirs: [join(temp, "system")],
+      disableProject: false,
+    });
+  });
+
+  afterEach(() => {
+    __setSkillRootOverridesForTest(null);
+    rmSync(temp, { recursive: true, force: true });
+  });
+
+  it("lists and invokes system skills such as skill-creator", async () => {
+    const { findSkill, loadSkills } = await import("../skills/index.js");
+    writeSkill(
+      join(temp, "system"),
+      "skill-creator",
+      "Guide for creating effective skills",
+      "Create concise reusable skill instructions.",
+    );
+
+    const list = loadSkills();
+    expect(list.map((s) => `${s.name}:${s.source}`)).toEqual(["skill-creator:system"]);
+    const skill = findSkill("skill-creator");
+    expect(skill?.source).toBe("system");
+    expect(skill?.body).toContain("Create concise");
+    expect(formatSkillListForTool()).toContain("skill-creator [system]");
+    expect(formatSkillInvokeForTool("skill-creator", [], "openai-codex")).toContain("[skill: skill-creator]");
+  });
+
+  it("keeps higher-priority skills when a system skill has the same name", async () => {
+    const { findSkill, loadSkills } = await import("../skills/index.js");
+    const workspace = join(temp, "workspace");
+    writeSkill(join(workspace, ".claude", "skills"), "skill-creator", "Project creator", "project body");
+    writeSkill(join(temp, "system"), "skill-creator", "System creator", "system body");
+    writeSkill(join(temp, "ensemble"), "memory", "Managed behavior skill", "managed body");
+    writeSkill(join(temp, "system"), "memory", "System behavior skill", "system memory");
+
+    const list = loadSkills([workspace]);
+    expect(list.find((s) => s.name === "skill-creator")?.source).toBe("project");
+    expect(findSkill("skill-creator", [workspace])?.body).toBe("project body");
+    expect(list.find((s) => s.name === "memory")?.source).toBe("ensemble");
+    expect(findSkill("memory", [workspace])?.body).toBe("managed body");
   });
 });

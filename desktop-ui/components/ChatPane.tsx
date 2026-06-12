@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { measureChatInputHeight } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import {
   clearAgentContext,
@@ -273,11 +274,16 @@ export function ChatPane({ agentId }: { agentId: string }) {
     el.style.height = "auto";
     const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 20;
     const verticalChrome = el.offsetHeight - el.clientHeight;
-    const maxHeight = lineHeight * CHAT_INPUT_MAX_ROWS + verticalChrome;
-    const nextHeight = Math.min(el.scrollHeight, maxHeight);
-    el.style.height = `${nextHeight}px`;
-    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
-  }, []);
+    const next = measureChatInputHeight({
+      value: input,
+      scrollHeight: el.scrollHeight,
+      lineHeight,
+      verticalChrome,
+      maxRows: CHAT_INPUT_MAX_ROWS,
+    });
+    el.style.height = `${next.height}px`;
+    el.style.overflowY = next.overflowY;
+  }, [input]);
 
   useLayoutEffect(() => {
     resizeInput();
@@ -792,7 +798,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
             ref={inputRef}
             className={`relative w-full ${
               ghostSuffix ? "bg-transparent" : "bg-[var(--bg-pane)]"
-            } border border-[var(--border)] px-2 py-1 outline-none focus:border-[var(--accent)] text-sm font-mono leading-[1.25rem] resize-none min-h-[2rem] overflow-hidden align-bottom`}
+            } border border-[var(--border)] px-2 py-1 outline-none focus:border-[var(--accent)] text-sm font-mono leading-[1.25rem] resize-none overflow-hidden align-bottom`}
             value={input}
             onChange={(e) => {
               updateInput(e.target.value);
