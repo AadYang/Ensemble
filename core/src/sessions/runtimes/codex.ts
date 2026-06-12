@@ -989,6 +989,15 @@ export function buildCodexRuntimeErrorEvent(
   message: string,
   opts: { usedNativeResume: boolean; turnStarted: boolean; turnCompleted: boolean },
 ): RuntimeErrorEvent {
+  if (isCodexEventStreamLagged(message)) {
+    return {
+      type: "error",
+      message,
+      code: "CODEX_EVENT_STREAM_LAGGED",
+      recoverable: true,
+      resumeScoped: false,
+    };
+  }
   const interruptedNativeResume = opts.usedNativeResume && opts.turnStarted && !opts.turnCompleted;
   if (!interruptedNativeResume) return { type: "error", message };
   return {
@@ -998,6 +1007,15 @@ export function buildCodexRuntimeErrorEvent(
     recoverable: true,
     resumeScoped: true,
   };
+}
+
+export function isCodexEventStreamLagged(message: string): boolean {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("in-process app-server event stream lagged") ||
+    (msg.includes("app-server event stream") && msg.includes("dropped event")) ||
+    (msg.includes("event stream lagged") && msg.includes("dropped event"))
+  );
 }
 
 function normalizeUsage(value: unknown): TranslateOut["usage"] {

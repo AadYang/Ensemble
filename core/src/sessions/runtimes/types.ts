@@ -102,7 +102,7 @@ export interface RuntimeOptions {
   skillInvoke?: (args: { name: string }) => Promise<string>;
 }
 
-export type RuntimeErrorCode = "RESUME_TURN_INTERRUPTED";
+export type RuntimeErrorCode = "RESUME_TURN_INTERRUPTED" | "CODEX_EVENT_STREAM_LAGGED";
 
 export interface RuntimeErrorEvent {
   type: "error";

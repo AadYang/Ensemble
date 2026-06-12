@@ -20,6 +20,7 @@
 //    startup and resets every such row to IDLE.
 
 import { describe, it, expect, beforeAll } from "vitest";
+import type { AgentRuntime, RuntimeOptions } from "../runtimes/types.js";
 
 // In-memory DB so the test doesn't touch the user's real ~/.ensemble.
 process.env.AGENTORCH_DB_PATH = ":memory:";
@@ -1455,6 +1456,105 @@ describe("SessionManager cancel + stale-session recovery", () => {
           m.sessionId === agent.id &&
           m.msg.code === "QUERY_FAILED" &&
           String(m.msg.message).includes("missing an API key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("auto-continues once when Codex app-server event stream drops events", async () => {
+    await prisma.appSetting.create({ data: { key: "cli.codexPath", value: process.execPath } });
+    const provider = await prisma.provider.create({
+      data: {
+        name: "codex-lagged-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "codex-lagged-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: {
+          permissionMode: "plan",
+          reasoningEffort: "high",
+          sandboxMode: "workspace-write",
+          lastSessionId: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+          codexUsageSnapshot: { input_tokens: 9, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+          systemPromptHash: "stale-hash",
+        },
+      },
+    });
+    const calls: RuntimeOptions[] = [];
+    const runtime: AgentRuntime = {
+      async *query(opts: RuntimeOptions) {
+        calls.push(opts);
+        if (calls.length === 1) {
+          yield {
+            type: "error",
+            message: "QUERY_FAILED · in-process app-server event stream lagged; dropped events",
+            code: "CODEX_EVENT_STREAM_LAGGED",
+            recoverable: true,
+            resumeScoped: false,
+          };
+          return;
+        }
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "assistant",
+            session_id: "019ea530-56b8-7333-8b3c-5bd5ae5c2c79",
+            message: { content: [{ type: "text", text: "continued from recovered history" }] },
+          },
+        };
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "result",
+            subtype: "success",
+            session_id: "019ea530-56b8-7333-8b3c-5bd5ae5c2c79",
+          },
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const result = await sessions.sendMessage(agent.id, "finish the current implementation");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(result).toBeNull();
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.prompt).toBe("finish the current implementation");
+    expect(calls[1]?.resume).toBeUndefined();
+    expect(calls[1]?.prompt).toBe("continue");
+    expect(JSON.stringify(calls[1]?.history)).toContain("Previous Ensemble turn was interrupted");
+    expect(JSON.stringify(calls[1]?.history)).toContain("finish the current implementation");
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(after?.status).toBe("DONE");
+    expect(meta.lastSessionId).toBe("019ea530-56b8-7333-8b3c-5bd5ae5c2c79");
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeDefined();
+    expect(meta.permissionMode).toBe("plan");
+    expect(meta.reasoningEffort).toBe("high");
+    expect(meta.sandboxMode).toBe("workspace-write");
+
+    const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
+    const userRows = rows.filter((row) => row.type === "user");
+    expect(userRows).toHaveLength(1);
+    expect(JSON.stringify(rows)).toContain("interrupted_turn");
+    expect(JSON.stringify(rows)).toContain("CODEX_EVENT_STREAM_LAGGED");
+    expect(JSON.stringify(rows)).toContain("continued from recovered history");
+    expect(
+      hub.sessionMessages.some(
+        (m) =>
+          m.sessionId === agent.id &&
+          m.msg.type === "error" &&
+          m.msg.code === "CODEX_EVENT_STREAM_RECOVERING",
       ),
     ).toBe(true);
   });

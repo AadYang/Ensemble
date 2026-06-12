@@ -8,6 +8,7 @@ import {
   buildCodexRuntimeErrorEvent,
   buildCodexMcpListArgs,
   buildCurrentTurnPrompt,
+  isCodexEventStreamLagged,
   prepareCodexHomeForRuntime,
   renderMcpConfigTomlForCodexRuntime,
 } from "../codex.js";
@@ -137,6 +138,23 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     })).toEqual({
       type: "error",
       message: "provider failed",
+    });
+  });
+
+  it("marks Codex app-server event stream lag as recoverable", () => {
+    const message = "QUERY_FAILED · in-process app-server event stream lagged; dropped events";
+
+    expect(isCodexEventStreamLagged(message)).toBe(true);
+    expect(buildCodexRuntimeErrorEvent(message, {
+      usedNativeResume: false,
+      turnStarted: true,
+      turnCompleted: false,
+    })).toEqual({
+      type: "error",
+      message,
+      code: "CODEX_EVENT_STREAM_LAGGED",
+      recoverable: true,
+      resumeScoped: false,
     });
   });
 

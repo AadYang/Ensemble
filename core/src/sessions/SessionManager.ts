@@ -7,7 +7,7 @@ import type { CanUseTool, Options, PermissionResult } from "@anthropic-ai/claude
 import type { SdkMessage } from "@agentorch/shared";
 import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
 import { chooseRuntime } from "./runtimes/index.js";
-import type { RuntimeErrorCode, RuntimeErrorEvent, RuntimeOptions } from "./runtimes/types.js";
+import type { AgentRuntime, RuntimeErrorCode, RuntimeErrorEvent, RuntimeOptions } from "./runtimes/types.js";
 import {
   normalizeCodexUsageSnapshot,
   type CodexUsageSnapshot,
@@ -254,28 +254,37 @@ interface ForceStopOptions {
 
 type SendMessageOptions = {
   peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode };
+  autoRecoveryAttempt?: "codex-event-stream-lagged";
+  suppressUserMessage?: boolean;
 };
 
 function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
   if (!raw || typeof raw !== "object") return undefined;
-  const peerOrigin = (raw as { peerOrigin?: unknown }).peerOrigin;
-  if (!peerOrigin || typeof peerOrigin !== "object") return undefined;
-  const p = peerOrigin as Record<string, unknown>;
-  const mode = p.mode;
-  if (
-    typeof p.fromAgentId !== "string" ||
-    typeof p.fromAgentName !== "string" ||
-    (mode !== "continue" && mode !== "review" && mode !== "fork" && mode !== "raw")
-  ) {
-    return undefined;
+  const out: SendMessageOptions = {};
+  const autoRecoveryAttempt = (raw as { autoRecoveryAttempt?: unknown }).autoRecoveryAttempt;
+  if (autoRecoveryAttempt === "codex-event-stream-lagged") {
+    out.autoRecoveryAttempt = autoRecoveryAttempt;
   }
-  return {
-    peerOrigin: {
-      fromAgentId: p.fromAgentId,
-      fromAgentName: p.fromAgentName,
-      mode,
-    },
-  };
+  if ((raw as { suppressUserMessage?: unknown }).suppressUserMessage === true) {
+    out.suppressUserMessage = true;
+  }
+  const peerOrigin = (raw as { peerOrigin?: unknown }).peerOrigin;
+  if (peerOrigin && typeof peerOrigin === "object") {
+    const p = peerOrigin as Record<string, unknown>;
+    const mode = p.mode;
+    if (
+      typeof p.fromAgentId === "string" &&
+      typeof p.fromAgentName === "string" &&
+      (mode === "continue" || mode === "review" || mode === "fork" || mode === "raw")
+    ) {
+      out.peerOrigin = {
+        fromAgentId: p.fromAgentId,
+        fromAgentName: p.fromAgentName,
+        mode,
+      };
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 const dbToProto = (s: string): ProtoStatus => {
@@ -437,6 +446,11 @@ export const isRuntimeResumeRecoverySignal = (
   code === "RESUME_TURN_INTERRUPTED" &&
   recoverable === true &&
   resumeScoped === true;
+
+export const isRuntimeCodexEventStreamRecoverySignal = (
+  code: unknown,
+  recoverable: unknown,
+): boolean => code === "CODEX_EVENT_STREAM_LAGGED" && recoverable === true;
 
 // Legacy fallback for runtimes/CLI versions that still flatten transport
 // failures to text. New Codex recovery uses RuntimeErrorEvent.code instead.
@@ -766,7 +780,10 @@ export class SessionManager {
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
 
-  constructor(private hub: WSHub) {}
+  constructor(
+    private hub: WSHub,
+    private runtimeResolver: (kind: string) => AgentRuntime = chooseRuntime,
+  ) {}
 
   private getRuntimeIdleTimeoutMs(): number {
     return readRuntimeIdleTimeoutMs();
@@ -1602,7 +1619,7 @@ export class SessionManager {
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), abortMs);
 
-    const runtime = chooseRuntime(resolvedProvider?.kind ?? "anthropic-local");
+    const runtime = this.runtimeResolver(resolvedProvider?.kind ?? "anthropic-local");
     const runtimeCwd =
       resolvedProvider?.kind === "openai-codex"
         ? agent.codexWorkspace || CODEX_DEFAULT_CWD
@@ -1985,6 +2002,7 @@ export class SessionManager {
     let staleResume = false;
     let usedResumeSessionId: string | null = null;
     let resumeInvalidReasonForRun: string | null = null;
+    let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
     this.running.set(sessionId, {
       id: sessionId,
       runId,
@@ -2004,31 +2022,37 @@ export class SessionManager {
     // Persist + broadcast the user input itself. SDK doesn't echo user prompts back
     // through its stream, so without this step a peer-relayed message would never
     // appear in the recipient's chat history.
-    const userMsgPayload = {
-      type: "user" as const,
-      message: { role: "user", content: userInput },
-      ...(opts?.peerOrigin ? { _peerOrigin: opts.peerOrigin } : {}),
-    };
-    const userPersisted = await prisma.message.create({
-      data: {
-        agentId: sessionId,
-        seq,
-        type: "user",
-        payload: userMsgPayload,
-      },
-    });
-    this.hub.sendToSession(sessionId, {
-      type: "message",
-      sessionId,
-      seq: userPersisted.seq,
-      msg: userMsgPayload as never,
-    });
+    const userMsgPayload = opts?.suppressUserMessage
+      ? null
+      : {
+          type: "user" as const,
+          message: { role: "user", content: userInput },
+          ...(opts?.peerOrigin ? { _peerOrigin: opts.peerOrigin } : {}),
+        };
+    const userPersisted = userMsgPayload
+      ? await prisma.message.create({
+          data: {
+            agentId: sessionId,
+            seq,
+            type: "user",
+            payload: userMsgPayload,
+          },
+        })
+      : null;
+    if (userPersisted && userMsgPayload) {
+      this.hub.sendToSession(sessionId, {
+        type: "message",
+        sessionId,
+        seq: userPersisted.seq,
+        msg: userMsgPayload as never,
+      });
+    }
     const activeRunAfterUser = this.running.get(sessionId);
-    if (activeRunAfterUser?.runId === runId) {
+    if (activeRunAfterUser?.runId === runId && userPersisted) {
       activeRunAfterUser.userMessageSeq = userPersisted.seq;
       activeRunAfterUser.seq = seq + 1;
     }
-    seq++;
+    if (userPersisted) seq++;
 
     const mcpServers = await this.loadEnabledMcpServers();
     const peerMcp = makePeerMcpServer(this, sessionId);
@@ -2125,11 +2149,14 @@ export class SessionManager {
     }
     // staleResume is set by the stderr watcher if the CLI reports a missing
     // resume target; the catch path clears that cached session id.
-      console.log(`[sendMessage] persisted user msg seq=${userPersisted.seq}, dispatching to runtime cli=${claudeCliPath ?? codexCliPath ?? "(sdk)"}`);
+      console.log(
+        `[sendMessage] persisted user msg seq=${userPersisted?.seq ?? "(suppressed)"}, ` +
+          `dispatching to runtime cli=${claudeCliPath ?? codexCliPath ?? "(sdk)"}`,
+      );
       // W16 Slice 1.6: dispatch via AgentRuntime abstraction instead of
       // directly calling the Claude SDK's query(). chooseRuntime falls back
       // to ClaudeAgentRuntime when no provider is bound (legacy default flow).
-      const runtime = chooseRuntime(resolvedProvider?.kind ?? "anthropic-local");
+      const runtime = this.runtimeResolver(resolvedProvider?.kind ?? "anthropic-local");
       // W16 Slice 2.1: OpenAIAgentRuntime needs prior turns reconstructed
       // (no SDK-side resume concept). Read prior user/assistant messages from
       // db and hand them to the runtime — Claude side ignores `history`
@@ -2151,7 +2178,7 @@ export class SessionManager {
               // Drop the user message we just persisted (it's opts.prompt) and
               // the system/init / stream_event / result rows — those don't
               // round-trip into the OpenAI Agents input items.
-              .filter((m) => m.seq < userPersisted.seq)
+              .filter((m) => m.seq < (userPersisted?.seq ?? seq))
           : [];
       const priorMessages: SdkMessage[] =
         isOpenAIKind ? buildRuntimeHistoryForTurn(priorRows) : [];
@@ -2529,14 +2556,34 @@ export class SessionManager {
         runtimeDetails.runtimeCode === undefined &&
         isResumeScopedStreamFailure(rawMsg, usedResumeSessionId);
       const recoverableResumeFailure = structuredResumeFailure || legacyResumeFailure;
-      if (resumeInvalidReasonForRun !== null || staleResume || recoverableResumeFailure) {
+      const recoverableCodexEventStreamFailure = isRuntimeCodexEventStreamRecoverySignal(
+        runtimeDetails.runtimeCode,
+        runtimeDetails.runtimeRecoverable,
+      );
+      if (resumeInvalidReasonForRun !== null || staleResume || recoverableResumeFailure || recoverableCodexEventStreamFailure) {
         persistData.metadata = removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]);
         console.warn(
           `[sendMessage] clearing resume metadata agent=${sessionId.slice(0, 8)} ` +
             `run=${runId.slice(0, 8)} stale=${staleResume} ` +
             `resumeInvalidReason=${resumeInvalidReasonForRun ?? "(none)"} ` +
-            `structuredResumeFailure=${structuredResumeFailure} legacyResumeFailure=${legacyResumeFailure}`,
+            `structuredResumeFailure=${structuredResumeFailure} legacyResumeFailure=${legacyResumeFailure} ` +
+            `codexEventStreamFailure=${recoverableCodexEventStreamFailure}`,
         );
+      }
+      const shouldAutoRecoverCodexEventStream =
+        !aborted &&
+        recoverableCodexEventStreamFailure &&
+        opts?.autoRecoveryAttempt !== "codex-event-stream-lagged";
+      if (shouldAutoRecoverCodexEventStream) {
+        persistData.status = "IDLE";
+        autoRecoverAfterRun = {
+          userInput: "continue",
+          opts: {
+            ...(opts?.peerOrigin ? { peerOrigin: opts.peerOrigin } : {}),
+            autoRecoveryAttempt: "codex-event-stream-lagged",
+            suppressUserMessage: true,
+          },
+        };
       }
       // Same guard as the success path. cancel() owns the canonical IDLE state
       // once it's removed this run from the map.
@@ -2554,17 +2601,25 @@ export class SessionManager {
           const friendly = staleResume
             ? "Previous conversation session was lost (the CLI's local session file is gone). " +
               "Cleared cached session id; please send your message again to start fresh."
+            : shouldAutoRecoverCodexEventStream
+              ? rawMsg + "\n\nThe local Codex event stream fell behind and dropped events. Ensemble saved the interrupted turn, cleared cached Codex resume state, and is automatically continuing from local history."
             : recoverableResumeFailure
               ? rawMsg + "\n\nCleared cached session state for this agent. Please send your message again; Ensemble will start a fresh runtime session while preserving the local chat history."
             : rawMsg;
           this.hub.sendToSession(sessionId, {
             type: "error",
             sessionId,
-            code: staleResume ? "SESSION_LOST" : "QUERY_FAILED",
+            code: shouldAutoRecoverCodexEventStream
+              ? "CODEX_EVENT_STREAM_RECOVERING"
+              : staleResume ? "SESSION_LOST" : "QUERY_FAILED",
             message: friendly,
           });
         }
-        this.hub.sendToSession(sessionId, { type: "status", sessionId, status: aborted ? "idle" : "error" });
+        this.hub.sendToSession(sessionId, {
+          type: "status",
+          sessionId,
+          status: aborted || shouldAutoRecoverCodexEventStream ? "idle" : "error",
+        });
       } else {
         console.log(`[sendMessage] run=${runId.slice(0, 8)} error post-cancel; skipping DB update`);
       }
@@ -2582,7 +2637,19 @@ export class SessionManager {
           for (const [, q] of qb) q.resolve("[run ended before answer]");
           this.pendingQuestions.delete(sessionId);
         }
-        this.drainQueuedTurns(sessionId);
+        if (autoRecoverAfterRun) {
+          const recoveryDrainToken = this.beginDrain(sessionId);
+          void this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)
+            .catch((err) => {
+              console.error(`[codex-event-stream-recovery] retry for ${sessionId} failed:`, err);
+              return null;
+            })
+            .finally(() => {
+              this.finishDrain(sessionId, recoveryDrainToken);
+            });
+        } else {
+          this.drainQueuedTurns(sessionId);
+        }
       }
     }
   }
