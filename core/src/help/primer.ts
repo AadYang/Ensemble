@@ -31,7 +31,8 @@ Slash commands available in chat (the / is literal):
 ↑/↓ in the input box walks through your prior inputs for this agent (CLI-style).
 
 Cross-agent communication tools you have:
-  peer_send  → send a message to another agent (modes: continue / review / fork / raw)
+  peer_send  → send a message to another agent (modes: continue / review / fork / raw;
+               urgent interrupt is available only with a required reason)
   peer_query → read another agent's recent text turns (synchronous, no run)
 On Codex CLI agents these are exposed through Ensemble's local stdio MCP bridge.
 

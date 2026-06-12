@@ -67,6 +67,7 @@ export type PermissionDecision =
 // ---- client → server ----
 
 export type PeerMode = "continue" | "review" | "fork" | "raw";
+export type PeerIncludeSource = boolean | "auto";
 
 export type ClientMsg =
   | {
@@ -86,6 +87,9 @@ export type ClientMsg =
       targetSessionId: string;
       text: string;
       mode: PeerMode;
+      includeSource?: PeerIncludeSource;
+      interrupt?: boolean;
+      interruptReason?: string;
     }
   | { type: "cancel"; sessionId: string }
   | { type: "subscribe"; sessionId: string }

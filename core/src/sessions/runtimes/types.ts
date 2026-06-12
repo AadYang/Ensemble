@@ -18,7 +18,7 @@ import type {
   McpServerConfig,
   PermissionMode,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { ReasoningEffort, SdkMessage } from "@agentorch/shared";
+import type { PeerIncludeSource, ReasoningEffort, SdkMessage } from "@agentorch/shared";
 
 import type { Provider } from "../../db.js";
 
@@ -93,6 +93,9 @@ export interface RuntimeOptions {
     target: string;
     message: string;
     mode?: "continue" | "review" | "fork" | "raw";
+    includeSource?: PeerIncludeSource;
+    interrupt?: boolean;
+    interruptReason?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;

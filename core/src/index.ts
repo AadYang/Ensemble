@@ -78,7 +78,8 @@ const hub = new WSHub();
 const sessions = new SessionManager(hub);
 mountMcpBridge(fastify, {
   getFallbackHandlers: (agentId) => ({
-    peerSend: ({ target, message, mode }) => sessions.sendPeerMessage(agentId, target, message, mode),
+    peerSend: ({ target, message, mode, includeSource, interrupt, interruptReason }) =>
+      sessions.sendPeerMessage(agentId, target, message, mode, { includeSource, interrupt, interruptReason }),
     peerQuery: ({ target, limit }) => sessions.fetchPeerHistory(agentId, target, limit),
   }),
 });
@@ -113,6 +114,9 @@ const ClientMsgSchema = z.discriminatedUnion("type", [
     targetSessionId: z.string().uuid(),
     text: z.string().min(1),
     mode: z.enum(["continue", "review", "fork", "raw"]),
+    includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
+    interrupt: z.boolean().optional(),
+    interruptReason: z.string().optional(),
   }),
   z.object({ type: z.literal("cancel"), sessionId: z.string().uuid() }),
   z.object({ type: z.literal("subscribe"), sessionId: z.string().uuid() }),
@@ -1805,7 +1809,11 @@ fastify.register(async (instance) => {
             break;
           case "peer_send":
             void sessions
-              .sendPeerMessage(parsed.fromSessionId, parsed.targetSessionId, parsed.text, parsed.mode)
+              .sendPeerMessage(parsed.fromSessionId, parsed.targetSessionId, parsed.text, parsed.mode, {
+                includeSource: parsed.includeSource,
+                interrupt: parsed.interrupt,
+                interruptReason: parsed.interruptReason,
+              })
               .then((result) => {
                 if (result.startsWith("error")) {
                   socket.send(

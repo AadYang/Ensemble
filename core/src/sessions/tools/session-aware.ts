@@ -17,6 +17,7 @@
 // `mcp__agentorch-peer__peer_send` long names in Slice 5.5.
 
 import { z } from "zod";
+import type { PeerIncludeSource } from "@agentorch/shared";
 import type { NormalizedTool } from "./types.js";
 
 const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
@@ -25,6 +26,9 @@ type PeerSendCallback = (args: {
   target: string;
   message: string;
   mode?: typeof PEER_MODES[number];
+  includeSource?: PeerIncludeSource;
+  interrupt?: boolean;
+  interruptReason?: string;
 }) => Promise<string>;
 
 type PeerQueryCallback = (args: { target: string; limit?: number }) => Promise<string>;
@@ -47,6 +51,18 @@ const PEER_SEND_SCHEMA = z.object({
     .enum(PEER_MODES)
     .optional()
     .describe("Handoff semantics: continue|review|fork|raw. Default 'raw'."),
+  includeSource: z
+    .union([z.boolean(), z.literal("auto")])
+    .optional()
+    .describe("Whether to include source-output. Default 'auto': raw=false, continue/review/fork=true."),
+  interrupt: z
+    .boolean()
+    .optional()
+    .describe("Emergency only. Interrupt the target's current run so this message is delivered immediately."),
+  interruptReason: z
+    .string()
+    .optional()
+    .describe("Required when interrupt=true. Explain why delayed delivery would be harmful or stale."),
 });
 
 /** peer_send NormalizedTool factory. Mirror of Claude side peer-mcp.ts.
@@ -65,7 +81,13 @@ export function makePeerSendTool(send: PeerSendCallback): NormalizedTool<typeof 
       "  - fork:     same task, different approach; recipient should NOT replicate your path.",
       "  - raw:      plain message forwarding (default).",
       "",
-      "All modes embed a <<<source-output>>> block carrying your most recent output.",
+      "Source context defaults to includeSource='auto': raw sends only your message;",
+      "continue/review/fork include a bounded <<<source-output>>> block with your current",
+      "or most recent key output. Use peer_query when more context is needed.",
+      "",
+      "interrupt=true is emergency-only: use it only when delayed delivery would make",
+      "the message stale or cause the target to continue incorrectly. You must provide",
+      "interruptReason. Ordinary notifications, questions, and handoffs must not interrupt.",
       "",
       "Use the target agent's name (preferred) or its UUID.",
       "Returns delivery status; does NOT wait for the recipient to reply.",

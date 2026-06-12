@@ -1,4 +1,4 @@
-import type { PeerMode } from "@agentorch/shared";
+import type { PeerIncludeSource, PeerMode } from "@agentorch/shared";
 
 const CONTEXT_TEMPLATE = (vars: {
   fromName: string;
@@ -102,18 +102,35 @@ export function formatPeerHandoff(args: {
    *  the last completed assistant answer. This prevents recipients from
    *  treating a stale completed answer as the latest source state. */
   sourceState?: "running" | "interrupted" | "completed" | "empty";
+  /** "auto": raw stays compact, continue/review/fork include source output.
+   *  true/false explicitly override that default. */
+  includeSource?: PeerIncludeSource;
+  interruptReason?: string;
 }): string {
+  const includeSource =
+    args.includeSource === true ||
+    ((args.includeSource === undefined || args.includeSource === "auto") && args.mode !== "raw");
+  const sourceLastOutput = includeSource ? args.sourceLastOutput : undefined;
   if (args.mode === "raw") {
-    if (args.sourceLastOutput) {
+    const header = args.interruptReason
+      ? [
+          `[from ${args.fromName} (id=${args.fromId.slice(0, 8)})]`,
+          `Urgent interrupt reason: ${args.interruptReason}`,
+        ]
+      : [`[from ${args.fromName}]`];
+    if (sourceLastOutput) {
       return [
-        `[from ${args.fromName} (id=${args.fromId.slice(0, 8)})]`,
+        ...header,
         `Source state: ${args.sourceState ?? "completed"}`,
         `<<<source-output`,
-        args.sourceLastOutput,
+        sourceLastOutput,
         `source-output>>>`,
         ``,
         args.body,
       ].join("\n");
+    }
+    if (args.interruptReason) {
+      return [...header, "", args.body].join("\n");
     }
     return `[from ${args.fromName}] ${args.body}`;
   }
@@ -122,9 +139,12 @@ export function formatPeerHandoff(args: {
     fromId: args.fromId,
     mode: args.mode,
     body: args.body,
-    sourceLastOutput: args.sourceLastOutput,
+    sourceLastOutput,
     sourceState: args.sourceState,
   });
   const instruction = readPeerInstruction(args.receiverMetadata, args.mode);
-  return `${context}\n\n${instruction}`;
+  const interrupt = args.interruptReason
+    ? `\n\nUrgent interrupt reason from source agent:\n${args.interruptReason}`
+    : "";
+  return `${context}${interrupt}\n\n${instruction}`;
 }

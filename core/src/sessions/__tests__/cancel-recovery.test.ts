@@ -646,8 +646,239 @@ describe("SessionManager cancel + stale-session recovery", () => {
     (sessions as any).drainQueuedTurns(target.id);
 
     await expect(first).resolves.toEqual({ finalText: "first ordinary queued turn" });
+    await Promise.resolve();
     await expect(second).resolves.toEqual({ finalText: "second ordinary queued turn" });
     expect(drained).toEqual(["first ordinary queued turn", "second ordinary queued turn"]);
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+  });
+
+  it("batches consecutive queued peer_send turns in order", async () => {
+    const sourceA = await prisma.agent.create({ data: { name: "batch-source-a" } });
+    const sourceB = await prisma.agent.create({ data: { name: "batch-source-b" } });
+    const target = await prisma.agent.create({ data: { name: "batch-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(sourceA.id, target.name, "first peer note", "raw");
+    await sessions.sendPeerMessage(sourceB.id, target.name, "second peer note", "review");
+    await sessions.sendPeerMessage(sourceA.id, target.name, "third peer note", "fork");
+    await Promise.resolve();
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(3);
+
+    const drained: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (_sessionId: string, text: string) => {
+      drained.push(text);
+      return { finalText: "batched peer result" };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.delete(target.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).drainQueuedTurns(target.id);
+    await Promise.resolve();
+
+    expect(drained).toHaveLength(1);
+    expect(drained[0]).toContain('<peer-batch count="3">');
+    expect(drained[0]).toContain("--- message 1");
+    expect(drained[0]).toContain("From: batch-source-a");
+    expect(drained[0]).toContain("Mode: raw");
+    expect(drained[0]).toContain("first peer note");
+    expect(drained[0]).toContain("--- message 2");
+    expect(drained[0]).toContain("From: batch-source-b");
+    expect(drained[0]).toContain("Mode: review");
+    expect(drained[0]).toContain("second peer note");
+    expect(drained[0]).toContain("--- message 3");
+    expect(drained[0]).toContain("Mode: fork");
+    expect(drained[0]).toContain("third peer note");
+    expect(drained[0]).toContain("</peer-batch>");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+  });
+
+  it("does not batch peer_send turns across an ordinary queued turn", async () => {
+    const sourceA = await prisma.agent.create({ data: { name: "batch-boundary-a" } });
+    const sourceB = await prisma.agent.create({ data: { name: "batch-boundary-b" } });
+    const target = await prisma.agent.create({ data: { name: "batch-boundary-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    await sessions.sendPeerMessage(sourceA.id, target.name, "peer before ordinary", "raw");
+    const ordinary = sessions.sendMessage(target.id, "ordinary queued turn");
+    await sessions.sendPeerMessage(sourceB.id, target.name, "peer after ordinary", "raw");
+    await Promise.resolve();
+
+    const drained: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (_sessionId: string, text: string) => {
+      drained.push(text);
+      return { finalText: text };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.delete(target.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).drainQueuedTurns(target.id);
+
+    await expect(ordinary).resolves.toEqual({ finalText: "ordinary queued turn" });
+    await Promise.resolve();
+
+    expect(drained).toHaveLength(3);
+    expect(drained[0]).toContain("peer before ordinary");
+    expect(drained[0]).not.toContain("<peer-batch");
+    expect(drained[1]).toBe("ordinary queued turn");
+    expect(drained[2]).toContain("peer after ordinary");
+    expect(drained[2]).not.toContain("peer before ordinary");
+  });
+
+  it("peer_send without interrupt queues and does not abort a running target", async () => {
+    const source = await prisma.agent.create({ data: { name: "no-interrupt-source" } });
+    const target = await prisma.agent.create({ data: { name: "no-interrupt-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-active",
+      abort,
+      seq: 0,
+      userInput: "target active",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+
+    const result = await sessions.sendPeerMessage(source.id, target.name, "ordinary peer note", "raw", {
+      interrupt: false,
+    });
+
+    expect(result).toContain("queued for");
+    expect(abort.signal.aborted).toBe(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(target.id)).toBe(true);
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).clearQueuedTurns(target.id);
+  });
+
+  it("peer_send interrupt persists interrupted context and immediately starts the target message", async () => {
+    const source = await prisma.agent.create({ data: { name: "interrupt-source" } });
+    const target = await prisma.agent.create({ data: { name: "interrupt-target" } });
+    await prisma.agent.update({ where: { id: target.id }, data: { status: "RUNNING" } });
+    await prisma.message.create({
+      data: {
+        agentId: target.id,
+        seq: 0,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "target active request" } },
+      },
+    });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-active",
+      abort,
+      seq: 1,
+      userInput: "target active request",
+      startedSeq: 0,
+      userMessageSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).recordLiveTranscript(target.id, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial target work" } },
+    });
+    let delivered: string | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async (_sessionId: string, text: string) => {
+      delivered = text;
+      return { finalText: "urgent delivered" };
+    };
+
+    const result = await sessions.sendPeerMessage(source.id, target.name, "urgent correction", "raw", {
+      interrupt: true,
+      interruptReason: "target is editing the wrong workspace",
+    });
+    await Promise.resolve();
+
+    expect(result).toContain("interrupted and delivered");
+    expect(result).toContain("target is editing the wrong workspace");
+    expect(abort.signal.aborted).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.has(target.id)).toBe(false);
+    expect(delivered).toContain("Urgent interrupt reason: target is editing the wrong workspace");
+    expect(delivered).toContain("urgent correction");
+    const systemRows = await prisma.message.findMany({ where: { agentId: target.id, type: "system" } });
+    expect(systemRows).toHaveLength(1);
+    const payloadText = JSON.stringify(systemRows[0]!.payload);
+    expect(payloadText).toContain("peer_send interrupt: target is editing the wrong workspace");
+    expect(payloadText).toContain("target active request");
+    expect(payloadText).toContain("partial target work");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+  });
+
+  it("peer_send interrupt requires a reason and does not execute", async () => {
+    const source = await prisma.agent.create({ data: { name: "missing-reason-source" } });
+    const target = await prisma.agent.create({ data: { name: "missing-reason-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-active",
+      abort,
+      seq: 0,
+      userInput: "target active",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    let delivered = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).runMessageNow = async () => {
+      delivered = true;
+      return null;
+    };
+
+    const result = await sessions.sendPeerMessage(source.id, target.name, "urgent without reason", "raw", {
+      interrupt: true,
+      interruptReason: "   ",
+    });
+
+    expect(result).toBe("error: interruptReason is required when interrupt=true");
+    expect(abort.signal.aborted).toBe(false);
+    expect(delivered).toBe(false);
     expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
   });
 

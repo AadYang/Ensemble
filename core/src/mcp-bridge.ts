@@ -19,6 +19,7 @@ import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { PeerIncludeSource } from "@agentorch/shared";
 
 export const BRIDGE_TOKEN = randomUUID();
 // The internal Fastify route. Other API routes in core/src/index.ts are
@@ -67,6 +68,9 @@ export interface BridgeHandlers {
     target: string;
     message: string;
     mode?: "continue" | "review" | "fork" | "raw";
+    includeSource?: PeerIncludeSource;
+    interrupt?: boolean;
+    interruptReason?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
@@ -114,6 +118,9 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
         target: String(args.target ?? ""),
         message: String(args.message ?? ""),
         mode: args.mode === "continue" || args.mode === "review" || args.mode === "fork" || args.mode === "raw" ? args.mode : undefined,
+        includeSource: args.includeSource === true || args.includeSource === false || args.includeSource === "auto" ? args.includeSource : undefined,
+        interrupt: args.interrupt === true,
+        interruptReason: typeof args.interruptReason === "string" ? args.interruptReason : undefined,
       });
     case "peer_query":
       if (!handlers.peerQuery) throw new Error("peer_query is not available for this agent");
@@ -151,11 +158,14 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   const mcp = new McpServer({ name: "agentorch-internal", version: "1.0.0" });
   mcp.tool(
     "peer_send",
-    "Send a chat message to another agent in this workspace. Bidirectional. Modes: continue|review|fork|raw (default raw). All modes embed source-output now.",
+    "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include bounded source-output. interrupt=true is emergency-only and requires interruptReason.",
     {
       target: z.string().min(1),
       message: z.string().min(1),
       mode: z.enum(["continue", "review", "fork", "raw"]).optional(),
+      includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
+      interrupt: z.boolean().optional(),
+      interruptReason: z.string().optional(),
     },
     async (args) => ({ content: [{ type: "text", text: await invoke("peer_send", args) }] }),
   );
@@ -266,11 +276,14 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const peerSend = handlers.peerSend;
       mcp.tool(
         "peer_send",
-        "Send a chat message to another agent in this workspace. Bidirectional. Modes: continue|review|fork|raw (default raw). All modes embed source-output now.",
+        "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include bounded source-output. interrupt=true is emergency-only and requires interruptReason.",
         {
           target: z.string().min(1),
           message: z.string().min(1),
           mode: z.enum(["continue", "review", "fork", "raw"]).optional(),
+          includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
+          interrupt: z.boolean().optional(),
+          interruptReason: z.string().optional(),
         },
         async (args) => {
           const text = await peerSend(args);

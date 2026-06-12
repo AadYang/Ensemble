@@ -46,6 +46,7 @@ import {
 import type {
   AgentStatus as ProtoStatus,
   AgentSummary,
+  PeerIncludeSource,
   PeerMode,
   PermissionDecision,
   PermissionMode,
@@ -53,7 +54,7 @@ import type {
   SandboxMode,
 } from "@agentorch/shared";
 import { formatPeerHandoff } from "./peerHandoff.js";
-import type { Agent as DbAgent } from "../db.js";
+import type { Agent as DbAgent, PendingTurn as DbPendingTurn } from "../db.js";
 import { prisma, sqliteDb } from "../db.js";
 import type { WebSocket } from "@fastify/websocket";
 import type { WSHub } from "../ws/hub.js";
@@ -250,12 +251,20 @@ interface ForceStopOptions {
   protoStatus: "idle" | "error" | "done";
   error?: { code: string; message: string };
   logPrefix: string;
+  drainQueued?: boolean;
+  interruptedReason?: string;
 }
 
 type SendMessageOptions = {
   peerOrigin?: { fromAgentId: string; fromAgentName: string; mode: PeerMode; sourceRunId?: string };
   autoRecoveryAttempt?: "codex-event-stream-lagged";
   suppressUserMessage?: boolean;
+};
+
+type PeerSendOptions = {
+  includeSource?: PeerIncludeSource;
+  interrupt?: boolean;
+  interruptReason?: string;
 };
 
 function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
@@ -1090,6 +1099,9 @@ export class SessionManager {
     lines.push("       Fires a new turn for <target>. Returns immediately —");
     lines.push("       it does NOT wait for them to reply. Their answer (if any)");
     lines.push("       arrives later as a fresh turn directed at YOU.");
+    lines.push("       includeSource defaults to auto: raw=false, continue/review/fork=true.");
+    lines.push("       Emergency only: interrupt=true requires interruptReason and may");
+    lines.push("       stop the target's current run. Do not use it for ordinary messages.");
     lines.push("");
     lines.push("  peer_query(target=\"<name>\", limit=<N>)");
     lines.push("       Read-only DB pull of teammate's recent text turns. Does NOT");
@@ -1110,10 +1122,8 @@ export class SessionManager {
     lines.push("  read context before deciding ............. peer_query first");
     lines.push("  broadcast a statement to all .............. peer_send to each");
     lines.push("");
-    lines.push("All peer_send modes auto-embed your latest assistant output as a");
-    lines.push("<<<source-output>>> block for the recipient. So `message` is the");
-    lines.push("cover note (\"here's my立论, your turn to rebut\"), NOT a repeat");
-    lines.push("of what you just produced.");
+    lines.push("Raw peer_send does not embed source-output by default. For continue/review/fork,");
+    lines.push("`message` is the cover note and Ensemble adds a bounded source-output block.");
     lines.push("");
     lines.push("Async, not synchronous: peer_send ends your turn. If you need a");
     lines.push("teammate's answer in real-time, you can't — wait for their reply");
@@ -1821,29 +1831,69 @@ export class SessionManager {
 
   private drainQueuedTurns(sessionId: string): void {
     if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
-    const next = prisma.pendingTurn.findFirst({
+    const rows = prisma.pendingTurn.findMany({
       where: { agentId: sessionId },
       orderBy: { id: "asc" },
     });
-    if (!next) {
+    if (rows.length === 0) {
       this.queuedTurns.delete(sessionId);
       return;
     }
-    prisma.pendingTurn.delete({ where: { id: next.id } });
-    const resolver = this.queuedTurns.get(sessionId)?.get(next.id);
-    this.queuedTurns.get(sessionId)?.delete(next.id);
+    const nextRows = this.takeNextQueuedTurnSegment(rows);
+    for (const row of nextRows) {
+      prisma.pendingTurn.delete({ where: { id: row.id } });
+    }
+    const resolvers = nextRows
+      .map((row) => {
+        const resolver = this.queuedTurns.get(sessionId)?.get(row.id);
+        this.queuedTurns.get(sessionId)?.delete(row.id);
+        return resolver;
+      })
+      .filter((resolve): resolve is (result: { finalText: string } | null) => void => Boolean(resolve));
     if (this.queuedTurns.get(sessionId)?.size === 0) this.queuedTurns.delete(sessionId);
-    const opts = normalizeQueuedTurnOpts(next.opts);
+    const userInput = this.formatQueuedTurnSegment(nextRows);
+    const opts = nextRows.length === 1 ? normalizeQueuedTurnOpts(nextRows[0]!.opts) : undefined;
     const drainToken = this.beginDrain(sessionId);
-    void this.runMessageNow(sessionId, next.userInput, opts)
-      .then((result) => resolver?.(result))
+    void this.runMessageNow(sessionId, userInput, opts)
+      .then((result) => {
+        for (const resolve of resolvers) resolve(result);
+      })
       .catch((err) => {
         console.error(`[queued-turn] sendMessage to ${sessionId} failed:`, err);
-        resolver?.(null);
+        for (const resolve of resolvers) resolve(null);
       })
       .finally(() => {
         this.finishDrain(sessionId, drainToken);
       });
+  }
+
+  private takeNextQueuedTurnSegment(rows: DbPendingTurn[]): DbPendingTurn[] {
+    const first = rows[0];
+    if (!first) return [];
+    if (!normalizeQueuedTurnOpts(first.opts)?.peerOrigin) return [first];
+    const segment: DbPendingTurn[] = [];
+    for (const row of rows) {
+      if (!normalizeQueuedTurnOpts(row.opts)?.peerOrigin) break;
+      segment.push(row);
+    }
+    return segment;
+  }
+
+  private formatQueuedTurnSegment(rows: DbPendingTurn[]): string {
+    if (rows.length === 1) return rows[0]!.userInput;
+    const lines = [`<peer-batch count="${rows.length}">`];
+    rows.forEach((row, idx) => {
+      const origin = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      lines.push(
+        `--- message ${idx + 1} id=${row.id} queuedAt=${row.createdAt.toISOString()}`,
+        `From: ${origin?.fromAgentName ?? "unknown"}${origin?.fromAgentId ? ` (id=${origin.fromAgentId.slice(0, 8)})` : ""}`,
+        `Mode: ${origin?.mode ?? "raw"}`,
+      );
+      if (origin?.sourceRunId) lines.push(`Source run: ${origin.sourceRunId.slice(0, 8)}`);
+      lines.push("", row.userInput.trim(), "");
+    });
+    lines.push("</peer-batch>");
+    return lines.join("\n");
   }
 
   private clearQueuedTurns(sessionId: string): void {
@@ -2970,7 +3020,13 @@ export class SessionManager {
     target: string,
     body: string,
     mode: PeerMode = "raw",
+    opts: PeerSendOptions = {},
   ): Promise<string> {
+    const interrupt = opts.interrupt === true;
+    const interruptReason = opts.interruptReason?.trim() ?? "";
+    if (interrupt && !interruptReason) {
+      return "error: interruptReason is required when interrupt=true";
+    }
     const fromAgent = await prisma.agent.findUnique({ where: { id: fromAgentId } });
     if (!fromAgent) return `error: source agent ${fromAgentId} not found`;
 
@@ -2992,6 +3048,8 @@ export class SessionManager {
       body,
       sourceLastOutput: sourceSnapshot.sourceOutput,
       sourceState: sourceSnapshot.sourceRunState,
+      includeSource: opts.includeSource ?? "auto",
+      ...(interrupt ? { interruptReason } : {}),
     });
     const targetWasBusy = this.running.has(targetId) || this.drainingQueues.has(targetId);
     const peerOrigin = {
@@ -3001,13 +3059,42 @@ export class SessionManager {
       ...(sourceRunId ? { sourceRunId } : {}),
     };
     const willReplaceQueuedPeerHandoff = targetWasBusy && this.findQueuedPeerHandoff(targetId, peerOrigin) !== null;
-    void this.sendMessage(targetId, formatted, {
-      peerOrigin,
-    }).catch((err) => {
+    if (interrupt) {
+      await this.interruptForPeerSend(targetId, interruptReason);
+      void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
+        console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
+      });
+      return `interrupted and delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode}, reason=${interruptReason})`;
+    }
+    void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
       console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
     });
     const delivery = willReplaceQueuedPeerHandoff ? "replaced stale queued peer handoff for" : targetWasBusy ? "queued for" : "delivered to";
     return `${delivery} "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode})`;
+  }
+
+  private async interruptForPeerSend(
+    targetId: string,
+    reason: string,
+  ): Promise<void> {
+    if (
+      this.running.has(targetId) ||
+      this.drainingQueues.has(targetId) ||
+      this.pending.has(targetId) ||
+      this.pendingQuestions.has(targetId)
+    ) {
+      await this.forceStopRun(targetId, {
+        dbStatus: "IDLE",
+        protoStatus: "idle",
+        logPrefix: "peer-send-interrupt",
+        error: {
+          code: "PEER_SEND_INTERRUPT",
+          message: `Interrupted by urgent peer_send: ${reason}`,
+        },
+        drainQueued: false,
+        interruptedReason: `peer_send interrupt: ${reason}`,
+      });
+    }
   }
 
   private async forceStopRun(sessionId: string, opts: ForceStopOptions): Promise<boolean> {
@@ -3018,7 +3105,7 @@ export class SessionManager {
 
     if (r) {
       console.log(`[${opts.logPrefix}] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
-      await this.persistInterruptedTurn(sessionId, r, opts.error?.code ?? opts.logPrefix);
+      await this.persistInterruptedTurn(sessionId, r, opts.interruptedReason ?? opts.error?.code ?? opts.logPrefix);
       try { r.abort.abort(); } catch { /* signal already aborted */ }
       this.clearRuntimeIdleWatchdog(sessionId, r.runId);
     } else {
@@ -3067,7 +3154,7 @@ export class SessionManager {
         });
       }
       this.hub.sendToSession(sessionId, { type: "status", sessionId, status: opts.protoStatus });
-      this.drainQueuedTurns(sessionId);
+      if (opts.drainQueued !== false) this.drainQueuedTurns(sessionId);
     } catch (err) {
       console.warn(`[${opts.logPrefix}] DB reset for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`);
     }

@@ -32,6 +32,8 @@ export function PeerSendPopover({
   const [targetId, setTargetId] = useState<string>(peers[0]?.summary.id ?? "");
   const [text, setText] = useState("");
   const [mode, setMode] = useState<PeerMode>("raw");
+  const [interrupt, setInterrupt] = useState(false);
+  const [interruptReason, setInterruptReason] = useState("");
   const [busy, setBusy] = useState(false);
 
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
@@ -96,7 +98,8 @@ export function PeerSendPopover({
 
   const onSend = () => {
     const trimmed = text.trim();
-    if (!trimmed || !targetId) return;
+    const reason = interruptReason.trim();
+    if (!trimmed || !targetId || (interrupt && !reason)) return;
     setBusy(true);
     const targetAgent = agents[targetId];
     const targetName = targetAgent?.summary.name ?? targetId.slice(0, 8);
@@ -106,9 +109,15 @@ export function PeerSendPopover({
       targetSessionId: targetId,
       text: trimmed,
       mode,
+      interrupt,
+      ...(interrupt ? { interruptReason: reason } : {}),
     });
     // Outgoing log on the sender side so they see what they sent.
-    appendUserTurn(fromAgentId, trimmed, { direction: "out", fromName: targetName, mode });
+    appendUserTurn(
+      fromAgentId,
+      interrupt ? `${trimmed}\n\n[urgent interrupt: ${reason}]` : trimmed,
+      { direction: "out", fromName: targetName, mode },
+    );
     onClose();
   };
 
@@ -205,10 +214,30 @@ export function PeerSendPopover({
               }}
               className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)] resize-y font-mono"
             />
+            <div className="border border-[var(--border)] bg-[var(--bg-pane)]/40 p-2 flex flex-col gap-2">
+              <label className="flex items-center gap-2 text-[var(--text-dim)]">
+                <input
+                  type="checkbox"
+                  checked={interrupt}
+                  onChange={(e) => setInterrupt(e.target.checked)}
+                />
+                <span className={interrupt ? "text-[var(--warn)]" : ""}>
+                  {t("peer.popover.interruptLabel")}
+                </span>
+              </label>
+              {interrupt && (
+                <input
+                  value={interruptReason}
+                  onChange={(e) => setInterruptReason(e.target.value)}
+                  placeholder={t("peer.popover.interruptReasonPlaceholder")}
+                  className="bg-[var(--bg-pane)] border border-[var(--warn)] px-1.5 py-1 outline-none focus:border-[var(--accent)] text-[11px]"
+                />
+              )}
+            </div>
             <div className="flex gap-2">
               <button
                 onClick={onSend}
-                disabled={!text.trim() || !targetId || busy}
+                disabled={!text.trim() || !targetId || busy || (interrupt && !interruptReason.trim())}
                 className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
               >
                 {t("peer.popover.send")}

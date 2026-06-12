@@ -126,6 +126,7 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
         // Hand off to the parent — the same dialog UI used by the auto-
         // check at launch, so users see one consistent prompt.
         onShowUpdate(result);
+        onClose();
       } else {
         setVersionStatus({ kind: "up-to-date", latest: result.release.version });
       }

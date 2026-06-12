@@ -197,8 +197,11 @@ peer_send (async push — recipient processes as a new user turn):
     - review:   "audit what I just produced"
     - fork:     "same task, different approach — don't retrace my path"
     - raw:      plain forwarding
-  All modes embed your most recent assistant output as a <<<source-output>>>
-  block so the recipient has the actual artifact to react to.
+  includeSource defaults to "auto": raw sends only the message; continue,
+  review, and fork include a bounded <<<source-output>>> block with the
+  sender's current or most recent key output.
+  interrupt=true is emergency-only and requires interruptReason. Use it only
+  when delayed delivery would make the message stale or cause wrong work.
 
 peer_query (sync pull — read peer's recent text turns from DB):
   - Does NOT cause the target agent to run

@@ -1,115 +1,102 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { formatPeerHandoff } from "../peerHandoff.js";
 
+const base = {
+  fromName: "agent-3",
+  fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
+  receiverMetadata: null,
+  sourceLastOutput: "source artifact",
+} as const;
+
 describe("formatPeerHandoff", () => {
-  it("review mode embeds sourceLastOutput in a source-output block", () => {
+  it("raw mode defaults to a compact message without source-output", () => {
     const out = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-      receiverMetadata: null,
-      mode: "review",
-      body: "他总结的对么",
-      sourceLastOutput: "README 主要内容如下：Ensemble 是一个桌面级多 agent ...",
+      ...base,
+      mode: "raw",
+      body: "fyi",
     });
+
+    expect(out).toBe("[from agent-3] fyi");
+    expect(out).not.toContain("<<<source-output");
+    expect(out).not.toContain("source artifact");
+  });
+
+  it("raw mode can explicitly include source-output", () => {
+    const out = formatPeerHandoff({
+      ...base,
+      mode: "raw",
+      body: "fyi",
+      includeSource: true,
+      sourceState: "running",
+    });
+
+    expect(out).toContain("[from agent-3");
+    expect(out).toContain("Source state: running");
     expect(out).toContain("<<<source-output");
-    expect(out).toContain("README 主要内容如下");
+    expect(out).toContain("source artifact");
     expect(out).toContain("source-output>>>");
-    expect(out).toContain("Operator's accompanying note");
-    expect(out).toContain("他总结的对么");
+    expect(out).toContain("fyi");
   });
 
-  it("continue mode embeds sourceLastOutput as the trajectory to continue from", () => {
-    const out = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-      receiverMetadata: null,
-      mode: "continue",
-      body: "继续做下去",
-      sourceLastOutput: "已完成步骤 1-3，进行中：步骤 4 ...",
-    });
-    expect(out).toContain("\n<<<source-output\n");
-    expect(out).toContain("已完成步骤 1-3");
-    expect(out).toContain("Operator's accompanying note");
-    expect(out).toContain("继续做下去");
-  });
-
-  it("fork mode embeds sourceLastOutput as the path to avoid retracing", () => {
-    const out = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-      receiverMetadata: null,
-      mode: "fork",
-      body: "换个思路重做",
-      sourceLastOutput: "我试过用 regex 解析 HTML，效果很差",
-    });
-    expect(out).toContain("\n<<<source-output\n");
-    expect(out).toContain("regex 解析 HTML");
-    expect(out).toContain("换个思路重做");
-  });
-
-  it("non-raw modes without sourceLastOutput omit the embedded block", () => {
-    for (const mode of ["review", "continue", "fork"] as const) {
+  it("continue, review, and fork auto-include source-output", () => {
+    for (const mode of ["continue", "review", "fork"] as const) {
       const out = formatPeerHandoff({
-        fromName: "agent-3",
-        fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-        receiverMetadata: null,
+        ...base,
         mode,
-        body: "x",
+        body: `${mode} note`,
       });
-      expect(out, `${mode}: should not embed when missing`).not.toContain("\n<<<source-output\n");
+
+      expect(out, mode).toContain(`<peer-handoff mode="${mode}"`);
+      expect(out, mode).toContain("\n<<<source-output\n");
+      expect(out, mode).toContain("source artifact");
+      expect(out, mode).toContain(`${mode} note`);
     }
   });
 
-  it("raw mode embeds sourceLastOutput when provided (compact form)", () => {
+  it("non-raw modes can explicitly omit source-output", () => {
     const out = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-      receiverMetadata: null,
-      mode: "raw",
-      body: "fyi",
-      sourceLastOutput: "README 摘要：xxx",
+      ...base,
+      mode: "review",
+      body: "review without source",
+      includeSource: false,
     });
-    expect(out).toContain("[from agent-3 (id=7f7359a4)]");
-    expect(out).toContain("<<<source-output");
-    expect(out).toContain("README 摘要：xxx");
-    expect(out).toContain("source-output>>>");
-    expect(out).toContain("fyi");
-    // no instruction prose for raw
-    expect(out).not.toContain("你正在以");
+
+    expect(out).toContain(`<peer-handoff mode="review"`);
+    expect(out).not.toContain("\n<<<source-output\n");
+    expect(out).not.toContain("source artifact");
   });
 
-  it("labels source state when source output is live or interrupted", () => {
-    const review = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
+  it("omits source-output when no sourceLastOutput is available", () => {
+    const out = formatPeerHandoff({
+      fromName: base.fromName,
+      fromId: base.fromId,
       receiverMetadata: null,
       mode: "review",
       body: "review",
-      sourceState: "interrupted",
-      sourceLastOutput: "partial work",
     });
-    expect(review).toContain("Source state: interrupted");
 
-    const raw = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-      receiverMetadata: null,
-      mode: "raw",
-      body: "fyi",
-      sourceState: "running",
-      sourceLastOutput: "live work",
-    });
-    expect(raw).toContain("Source state: running");
+    expect(out).not.toContain("\n<<<source-output\n");
   });
 
-  it("raw mode without sourceLastOutput keeps the legacy compact form", () => {
-    const out = formatPeerHandoff({
-      fromName: "agent-3",
-      fromId: "7f7359a4-4bdf-4671-901c-1d12d6a6c0b4",
-      receiverMetadata: null,
+  it("labels urgent interrupt reasons", () => {
+    const raw = formatPeerHandoff({
+      ...base,
       mode: "raw",
-      body: "hi",
+      body: "stop and read this",
+      interruptReason: "the active task is using the wrong target",
     });
-    expect(out).toBe("[from agent-3] hi");
+    expect(raw).toContain("Urgent interrupt reason: the active task is using the wrong target");
+    expect(raw).toContain("stop and read this");
+    expect(raw).not.toContain("source artifact");
+
+    const review = formatPeerHandoff({
+      ...base,
+      mode: "review",
+      body: "audit urgently",
+      interruptReason: "security fix is about to be reverted",
+    });
+    expect(review).toContain("Urgent interrupt reason from source agent:");
+    expect(review).toContain("security fix is about to be reverted");
+    expect(review).toContain("source artifact");
   });
 });
