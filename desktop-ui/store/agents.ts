@@ -221,6 +221,13 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
     }
     case "system":
       if ((msg as { subtype?: string }).subtype === "thinking_tokens") return null;
+      const systemText = (msg as { text?: unknown }).text;
+      if (
+        (msg as { subtype?: string }).subtype === "compact_status" &&
+        typeof systemText === "string"
+      ) {
+        return { seq, kind: "system", text: systemText };
+      }
       return { seq, kind: "system", text: `system · ${(msg as { subtype?: string }).subtype ?? ""}` };
     case "stream_event":
     case "rate_limit_event":

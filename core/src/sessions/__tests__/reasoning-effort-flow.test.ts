@@ -36,8 +36,26 @@ let SessionManager: typeof import("../SessionManager.js").SessionManager;
 let runtimeHistoryFromCompletedTurns: typeof import("../SessionManager.js").runtimeHistoryFromCompletedTurns;
 
 class StubHub {
-  sendToSession(): void {}
-  broadcast(): void {}
+  events: Array<{ kind: "session" | "broadcast"; msg: Record<string, unknown> }> = [];
+  onEvent?: (event: { kind: "session" | "broadcast"; msg: Record<string, unknown> }) => void;
+  sendToSession(_sessionId: string, msg: Record<string, unknown>): void {
+    const event = { kind: "session" as const, msg };
+    this.events.push(event);
+    this.onEvent?.(event);
+  }
+  broadcast(msg: Record<string, unknown>): void {
+    const event = { kind: "broadcast" as const, msg };
+    this.events.push(event);
+    this.onEvent?.(event);
+  }
+}
+
+function expectOrderedEvents(order: string[], first: string, second: string): void {
+  const firstIndex = order.indexOf(first);
+  const secondIndex = order.indexOf(second);
+  expect(firstIndex).toBeGreaterThanOrEqual(0);
+  expect(secondIndex).toBeGreaterThanOrEqual(0);
+  expect(firstIndex).toBeLessThan(secondIndex);
 }
 
 beforeAll(async () => {
@@ -170,6 +188,68 @@ describe("reasoning effort flow", () => {
     const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
     expect(meta.lastSessionId).not.toBe("stale-native-session");
     expect(meta.codexUsageSnapshot).toBeUndefined();
+  });
+
+  it("broadcasts visible running state before auto-compact work starts", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "auto-compact-order-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "sk-test",
+        models: ["test-model"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "auto-compact-order-agent",
+        providerId: provider.id,
+        model: "test-model",
+      },
+    });
+    for (let i = 0; i < 82; i++) {
+      await prisma.message.create({
+        data: {
+          agentId: agent.id,
+          seq: i,
+          type: i % 2 === 0 ? "user" : "assistant",
+          payload:
+            i % 2 === 0
+              ? { type: "user", message: { role: "user", content: `old question ${i} ${"x".repeat(650)}` } }
+              : { type: "assistant", message: { content: [{ type: "text", text: `old answer ${i} ${"y".repeat(650)}` }] } },
+        },
+      });
+    }
+    const hub = new StubHub();
+    const sessions = new SessionManager(hub as never);
+    const order: string[] = [];
+    hub.onEvent = (event) => {
+      if (event.kind === "session" && event.msg.type === "message") {
+        const msg = event.msg.msg as { subtype?: string };
+        if (msg.subtype === "compact_status") order.push("compact-message");
+      }
+      if (event.kind === "session" && event.msg.type === "status" && event.msg.status === "running") {
+        order.push("running-status");
+      }
+      if (
+        event.kind === "session" &&
+        event.msg.type === "status" &&
+        (event.msg.status === "idle" || event.msg.status === "done" || event.msg.status === "error")
+      ) {
+        order.push("final-status");
+      }
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).quickQuery = async () => {
+      order.push("compact-work");
+      return "compact summary after visible state";
+    };
+
+    await sessions.sendMessage(agent.id, "new prompt after compact");
+
+    expectOrderedEvents(order, "compact-message", "compact-work");
+    expectOrderedEvents(order, "running-status", "compact-work");
+    expectOrderedEvents(order, "compact-work", "final-status");
   });
 
   it("keeps interrupted context in local history after model switch clears native resume", async () => {
@@ -464,12 +544,32 @@ describe("reasoning effort flow", () => {
         payload: { type: "assistant", message: { content: [{ type: "text", text: "old answer" }] } },
       },
     });
-    const sessions = new SessionManager(new StubHub() as never);
+    const hub = new StubHub();
+    const sessions = new SessionManager(hub as never);
+    const order: string[] = [];
+    hub.onEvent = (event) => {
+      if (event.kind === "session" && event.msg.type === "message") {
+        const msg = event.msg.msg as { subtype?: string };
+        if (msg.subtype === "compact_status") order.push("compact-message");
+      }
+      if (event.kind === "session" && event.msg.type === "status" && event.msg.status === "running") {
+        order.push("running-status");
+      }
+      if (event.kind === "session" && event.msg.type === "status" && event.msg.status === "idle") {
+        order.push("final-status");
+      }
+    };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (sessions as any).quickQuery = async () => "summary after compact";
+    (sessions as any).quickQuery = async () => {
+      order.push("compact-work");
+      return "summary after compact";
+    };
 
     await sessions.compactAgent(agent.id);
 
+    expectOrderedEvents(order, "compact-message", "compact-work");
+    expectOrderedEvents(order, "running-status", "compact-work");
+    expectOrderedEvents(order, "compact-work", "final-status");
     const after = await prisma.agent.findUnique({ where: { id: agent.id } });
     const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
     expect(meta.lastSessionId).toBeUndefined();

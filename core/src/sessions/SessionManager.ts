@@ -86,7 +86,14 @@ const AUTO_COMPACT_MIN_MESSAGES = 40;
 const AUTO_COMPACT_TRIGGER_CHARS = 28_000;
 const AUTO_COMPACT_KEEP_MESSAGES = 16;
 const AUTO_COMPACT_SUMMARY_MAX_CHARS = 40_000;
+const COMPACT_START_TEXT = "Compacting conversation context...";
+const COMPACT_FAILURE_PREFIX = "Context compact failed:";
 const RUNTIME_IDLE_TIMEOUT_DEFAULT_MS = 20 * 60 * 1000;
+
+const flushVisibleState = (): Promise<void> =>
+  new Promise((resolve) => {
+    setImmediate(resolve);
+  });
 
 function readRuntimeIdleTimeoutMs(): number {
   const raw = process.env.ENSEMBLE_RUNTIME_IDLE_TIMEOUT_MS;
@@ -1460,8 +1467,60 @@ export class SessionManager {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
     this.clearQueuedTurns(id);
-    await this.cancel(id);
+    if (
+      this.running.has(id) ||
+      this.drainingQueues.has(id) ||
+      this.pending.has(id) ||
+      this.pendingQuestions.has(id)
+    ) {
+      await this.cancel(id);
+    }
+    const runId = randomUUID();
+    const startedSeq = this.nextMessageSeq(id);
+    this.running.set(id, {
+      id,
+      runId,
+      abort: new AbortController(),
+      seq: startedSeq,
+      userInput: "/compact",
+      startedSeq,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    try {
+      await this.appendCompactStatusMessage(id, COMPACT_START_TEXT);
+      await this.updateAgentStatus(id, "RUNNING", "running");
+      await flushVisibleState();
+      if (!this.isRunOwner(id, runId)) {
+        return { summary: "(compact cancelled)" };
+      }
+      const out = await this.compactAgentHistory(cur, () => this.isRunOwner(id, runId));
+      if (this.isRunOwner(id, runId)) {
+        const updated = await prisma.agent.update({ where: { id }, data: { status: "IDLE" } });
+        this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+        this.hub.sendToSession(id, { type: "status", sessionId: id, status: "idle" });
+      }
+      return out;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (this.isRunOwner(id, runId)) {
+        await this.appendCompactStatusMessage(id, `${COMPACT_FAILURE_PREFIX} ${message}`);
+        const updated = await prisma.agent.update({ where: { id }, data: { status: "IDLE" } });
+        this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+        this.hub.sendToSession(id, { type: "status", sessionId: id, status: "idle" });
+      }
+      throw err;
+    } finally {
+      if (this.isRunOwner(id, runId)) {
+        this.clearRuntimeIdleWatchdog(id, runId);
+        this.running.delete(id);
+        this.drainQueuedTurns(id);
+      }
+    }
+  }
 
+  private async compactAgentHistory(cur: DbAgent, shouldContinue?: () => boolean): Promise<{ summary: string }> {
+    const id = cur.id;
     const messages = await prisma.message.findMany({
       where: { agentId: id },
       orderBy: { seq: "asc" },
@@ -1487,6 +1546,9 @@ export class SessionManager {
 
     const summary = (await this.quickQuery(id, prompt, 45_000)).trim() ||
       "(model returned empty summary)";
+    if (shouldContinue && !shouldContinue()) {
+      return { summary };
+    }
 
     // Wipe old rows + replace with one system row carrying the summary.
     await prisma.message.delete({ where: { agentId: id } });
@@ -1516,25 +1578,48 @@ export class SessionManager {
   }
 
   /** /status — runtime-agnostic snapshot of an agent's current state. */
-  private async maybeAutoCompactBeforeTurn(agent: DbAgent): Promise<void> {
+  private async maybeAutoCompactBeforeTurn(
+    agent: DbAgent,
+    shouldContinue?: () => boolean,
+  ): Promise<"skipped" | "compacted" | "failed" | "cancelled"> {
     const rows = await prisma.message.findMany({
       where: { agentId: agent.id },
       orderBy: { seq: "asc" },
     });
-    if (rows.length < AUTO_COMPACT_MIN_MESSAGES) return;
+    if (rows.length < AUTO_COMPACT_MIN_MESSAGES) return "skipped";
 
     const totalChars = rows.reduce((sum, row) => sum + messageRowText(row).length, 0);
-    if (totalChars < AUTO_COMPACT_TRIGGER_CHARS) return;
+    if (totalChars < AUTO_COMPACT_TRIGGER_CHARS) return "skipped";
 
     const keepStart = Math.max(0, rows.length - AUTO_COMPACT_KEEP_MESSAGES);
     const rowsToSummarize = rows.slice(0, keepStart);
     const rowsToKeep = rows.slice(keepStart);
     const lines = transcriptLinesFromRows(rowsToSummarize);
-    if (lines.length === 0) return;
+    if (lines.length === 0) return "skipped";
+
+    await this.appendCompactStatusMessage(agent.id, COMPACT_START_TEXT);
+    await this.updateAgentStatus(agent.id, "RUNNING", "running");
+    await flushVisibleState();
+    if (shouldContinue && !shouldContinue()) {
+      return "cancelled";
+    }
 
     const transcript = truncateTranscript(lines.join("\n\n"), AUTO_COMPACT_SUMMARY_MAX_CHARS);
-    const summary = (await this.quickQuery(agent.id, compactPromptFromTranscript(transcript), 45_000)).trim();
-    if (!summary) return;
+    let summary = "";
+    try {
+      summary = (await this.quickQuery(agent.id, compactPromptFromTranscript(transcript), 45_000)).trim();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.appendCompactStatusMessage(agent.id, `${COMPACT_FAILURE_PREFIX} ${message}`);
+      return "failed";
+    }
+    if (!summary) {
+      await this.appendCompactStatusMessage(agent.id, `${COMPACT_FAILURE_PREFIX} model returned empty summary`);
+      return "failed";
+    }
+    if (shouldContinue && !shouldContinue()) {
+      return "cancelled";
+    }
 
     this.replaceMessageHistory(agent.id, summary, rowsToKeep);
     await prisma.agent.update({
@@ -1547,6 +1632,7 @@ export class SessionManager {
       seq: 0,
       msg: { type: "system", subtype: "compact", text: summary } as never,
     });
+    return "compacted";
   }
 
   private replaceMessageHistory(
@@ -1989,6 +2075,29 @@ export class SessionManager {
     return (last?.seq ?? -1) + 1;
   }
 
+  private isRunOwner(sessionId: string, runId: string): boolean {
+    return this.running.get(sessionId)?.runId === runId;
+  }
+
+  private async appendCompactStatusMessage(sessionId: string, text: string): Promise<number> {
+    const payload = { type: "system" as const, subtype: "compact_status", text };
+    const row = await prisma.message.create({
+      data: {
+        agentId: sessionId,
+        seq: this.nextMessageSeq(sessionId),
+        type: "system",
+        payload,
+      },
+    });
+    this.hub.sendToSession(sessionId, {
+      type: "message",
+      sessionId,
+      seq: row.seq,
+      msg: payload as never,
+    });
+    return row.seq;
+  }
+
   private interruptedTurnAlreadyPersisted(sessionId: string, run: RunningSession): boolean {
     if (run.userMessageSeq === undefined) return false;
     const rows = prisma.message.findMany({
@@ -2080,20 +2189,6 @@ export class SessionManager {
       return null;
     }
 
-    let activeAgent = agent;
-    try {
-      await this.maybeAutoCompactBeforeTurn(activeAgent);
-      const refreshedAgent = await prisma.agent.findUnique({ where: { id: sessionId } });
-      if (!refreshedAgent) {
-        this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
-        return null;
-      }
-      activeAgent = refreshedAgent;
-    } catch (err) {
-      console.warn(`[auto-compact] skipped agent=${sessionId.slice(0, 8)}: ${(err as Error).message}`);
-    }
-    agent = activeAgent;
-
     const lastMsg = await prisma.message.findFirst({
       where: { agentId: sessionId },
       orderBy: { seq: "desc" },
@@ -2121,6 +2216,31 @@ export class SessionManager {
 
     try {
     console.log(`[sendMessage] start agent=${sessionId.slice(0, 8)} run=${runId.slice(0, 8)} text="${userInput.slice(0, 40)}"`);
+
+    try {
+      const compactResult = await this.maybeAutoCompactBeforeTurn(agent, () => this.isRunOwner(sessionId, runId));
+      if (compactResult === "cancelled" || !this.isRunOwner(sessionId, runId)) {
+        return null;
+      }
+      const refreshedAgent = await prisma.agent.findUnique({ where: { id: sessionId } });
+      if (!refreshedAgent) {
+        this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
+        return null;
+      }
+      agent = refreshedAgent;
+      const refreshedLastMsg = await prisma.message.findFirst({
+        where: { agentId: sessionId },
+        orderBy: { seq: "desc" },
+      });
+      seq = (refreshedLastMsg?.seq ?? -1) + 1;
+      const activeRunAfterCompact = this.running.get(sessionId);
+      if (activeRunAfterCompact?.runId === runId) {
+        activeRunAfterCompact.seq = seq;
+        activeRunAfterCompact.startedSeq = seq;
+      }
+    } catch (err) {
+      console.warn(`[auto-compact] skipped agent=${sessionId.slice(0, 8)}: ${(err as Error).message}`);
+    }
     await this.updateAgentStatus(sessionId, "RUNNING", "running");
 
     // Persist + broadcast the user input itself. SDK doesn't echo user prompts back

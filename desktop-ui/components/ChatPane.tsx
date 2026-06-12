@@ -431,7 +431,6 @@ export function ChatPane({ agentId }: { agentId: string }) {
         return;
       }
       case "compact": {
-        appendNotice(agentId, t("slash.compact.starting"));
         try {
           await compactAgent(agentId);
         } catch (err) {
