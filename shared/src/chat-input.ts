@@ -1,8 +1,9 @@
 export interface ChatInputHeightInput {
   value: string;
-  scrollHeight: number;
+  measuredHeight: number;
   lineHeight: number;
-  verticalChrome: number;
+  /** Vertical padding + border in CSS pixels. */
+  verticalBoxChrome: number;
   maxRows: number;
 }
 
@@ -13,16 +14,17 @@ export interface ChatInputHeightResult {
 
 export function measureChatInputHeight(input: ChatInputHeightInput): ChatInputHeightResult {
   const lineHeight = Number.isFinite(input.lineHeight) && input.lineHeight > 0 ? input.lineHeight : 20;
-  const verticalChrome = Number.isFinite(input.verticalChrome) && input.verticalChrome >= 0 ? input.verticalChrome : 0;
+  const verticalBoxChrome =
+    Number.isFinite(input.verticalBoxChrome) && input.verticalBoxChrome >= 0 ? input.verticalBoxChrome : 0;
   const maxRows = Number.isFinite(input.maxRows) && input.maxRows > 0 ? Math.floor(input.maxRows) : 1;
-  const singleLineHeight = lineHeight + verticalChrome;
-  const maxHeight = lineHeight * maxRows + verticalChrome;
+  const singleLineHeight = lineHeight + verticalBoxChrome;
+  const maxHeight = lineHeight * maxRows + verticalBoxChrome;
   if (input.value.length === 0) {
     return { height: Math.min(singleLineHeight, maxHeight), overflowY: "hidden" };
   }
 
-  const contentHeight = Number.isFinite(input.scrollHeight) && input.scrollHeight > 0
-    ? input.scrollHeight
+  const contentHeight = Number.isFinite(input.measuredHeight) && input.measuredHeight > 0
+    ? input.measuredHeight
     : singleLineHeight;
   return {
     height: Math.min(contentHeight, maxHeight),

@@ -272,13 +272,16 @@ export function ChatPane({ agentId }: { agentId: string }) {
     const el = inputRef.current;
     if (!el) return;
     el.style.height = "auto";
-    const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 20;
-    const verticalChrome = el.offsetHeight - el.clientHeight;
+    const style = getComputedStyle(el);
+    const lineHeight = parseFloat(style.lineHeight) || 20;
+    const paddingY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+    const borderY = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+    const verticalBoxChrome = paddingY + borderY;
     const next = measureChatInputHeight({
       value: input,
-      scrollHeight: el.scrollHeight,
+      measuredHeight: el.scrollHeight + borderY,
       lineHeight,
-      verticalChrome,
+      verticalBoxChrome,
       maxRows: CHAT_INPUT_MAX_ROWS,
     });
     el.style.height = `${next.height}px`;
