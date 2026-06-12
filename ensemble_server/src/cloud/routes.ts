@@ -17,7 +17,10 @@ import { bearerToken, authenticateCloudRequest, requireCloudAuth } from "./sessi
 
 const EMAIL_MAX = 255;
 const PASSWORD_MAX = 1024;
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Account workspace sessions are intentionally long lived. Product semantics:
+// switching between local/cloud workspaces must not sign the user out; only an
+// explicit logout should end the saved desktop/web session in normal use.
+const SESSION_TTL_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 const CLOUD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 8;

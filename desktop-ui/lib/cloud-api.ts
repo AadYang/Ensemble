@@ -137,10 +137,6 @@ export function loadCloudSession(): CloudSession | null {
   try {
     const parsed = JSON.parse(raw) as Partial<StoredCloudSession>;
     if (!parsed.origin || !parsed.token || !parsed.expiresAt || !parsed.account) return null;
-    if (new Date(parsed.expiresAt).getTime() <= Date.now()) {
-      window.localStorage.removeItem(CLOUD_SESSION_KEY);
-      return null;
-    }
     return {
       origin: normalizeOrigin(parsed.origin),
       token: parsed.token,

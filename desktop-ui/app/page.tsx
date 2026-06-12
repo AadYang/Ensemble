@@ -1,11 +1,18 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getWS } from "@/lib/ws";
-import { listAgents, listMessages } from "@/lib/agent-api";
+import { listAgents } from "@/lib/agent-api";
 import { listTeams } from "@/lib/team-api";
 import { getDialog } from "@/lib/dialog";
-import type { SdkMessage } from "@agentorch/shared";
+import type {
+  AgentSummary,
+  LayoutNode,
+  LayoutWorkspace,
+  SdkMessage,
+  TeamSummary,
+  WorkspaceSelection,
+} from "@agentorch/shared";
 import {
   createWorkspace,
   fetchWorkspace,
@@ -14,7 +21,26 @@ import {
   renameWorkspace,
   type WorkspaceSummaryDTO,
 } from "@/lib/layout-api";
-import type { LayoutNode } from "@agentorch/shared";
+import {
+  buildCloudSnapshotFromLocal,
+  cloudConfigSignature,
+  createCloudWorkspace,
+  fetchCloudMe,
+  fetchCloudSnapshot,
+  listCloudWorkspaces,
+  logoutCloud,
+  syncCloudBatch,
+  upsertCloudSnapshot,
+  type CloudSession,
+  type CloudWorkspace,
+} from "@/lib/cloud-api";
+import { listMessages, type PersistedMessage } from "@/lib/agent-api";
+import {
+  filterWorkspaceEntitiesForLayout,
+  formatWorkspaceSelectionKey,
+  parseStoredWorkspaceSelection,
+  parseWorkspaceSelectionKey,
+} from "@agentorch/shared";
 import { hydrateLocaleFromStorage, selectActiveWindow, useStore } from "@/store/agents";
 import { LayoutRenderer } from "@/components/LayoutRenderer";
 import { PermissionDialog } from "@/components/PermissionDialog";
@@ -23,7 +49,9 @@ import { DialogHost } from "@/components/DialogHost";
 import { AgentTree } from "@/components/AgentTree";
 import { CloudBootstrap } from "@/components/CloudBootstrap";
 import { CloudRemoteBridge } from "@/components/CloudRemoteBridge";
-import { CloudWorkspacePanel } from "@/components/CloudWorkspacePanel";
+import { CloudAgentTree } from "@/components/CloudAgentTree";
+import { CloudLoginDialog } from "@/components/CloudLoginDialog";
+import { CloudWorkspaceView } from "@/components/CloudWorkspaceView";
 import { McpServerPanel } from "@/components/McpServerPanel";
 import { SkillPanel } from "@/components/SkillPanel";
 import { ProviderPanel } from "@/components/ProviderPanel";
@@ -74,12 +102,33 @@ export default function Page() {
   const setWorkspaces = useStore((s) => s.setWorkspaces);
   const currentWorkspaceId = useStore((s) => s.currentWorkspaceId);
   const setCurrentWorkspace = useStore((s) => s.setCurrentWorkspace);
+  const cloudSession = useStore((s) => s.cloudSession);
+  const cloudWorkspaces = useStore((s) => s.cloudWorkspaces);
+  const cloudCurrentWorkspaceId = useStore((s) => s.cloudCurrentWorkspaceId);
+  const cloudSnapshot = useStore((s) => s.cloudSnapshot);
+  const setCloudSession = useStore((s) => s.setCloudSession);
+  const setCloudAccount = useStore((s) => s.setCloudAccount);
+  const setCloudWorkspaces = useStore((s) => s.setCloudWorkspaces);
+  const setCloudCurrentWorkspace = useStore((s) => s.setCloudCurrentWorkspace);
+  const setCloudSnapshot = useStore((s) => s.setCloudSnapshot);
+  const setCloudRevision = useStore((s) => s.setCloudRevision);
+  const setCloudMessageCursors = useStore((s) => s.setCloudMessageCursors);
+  const setCloudConfigSignature = useStore((s) => s.setCloudConfigSignature);
+  const cloudRevisions = useStore((s) => s.cloudRevisions);
+  const cloudMessageCursors = useStore((s) => s.cloudMessageCursors);
+  const cloudConfigSignatures = useStore((s) => s.cloudConfigSignatures);
 
   const aw = useStore(selectActiveWindow);
   const activePaneId = aw?.activePaneId ?? "";
 
   const t = useT();
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false);
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceSelection | null>(null);
+  const [cloudLoginOpen, setCloudLoginOpen] = useState(false);
+  const [cloudActiveAgentId, setCloudActiveAgentId] = useState<string | null>(null);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<string | null>(null);
+  const [cloudError, setCloudError] = useState<string | null>(null);
   // W17: usage stats dialog visibility. Lives in the store so slash commands
   // (/cost) and the toolbar button can flip it from anywhere.
   const usageOpen = useStore((s) => s.usageOpen);
@@ -217,11 +266,16 @@ export default function Page() {
         const list = await listWorkspaces();
         if (cancelled) return;
         setWorkspaces(list);
-        if (list.length === 0) return;
         const lastUsed =
           typeof window !== "undefined" ? window.localStorage.getItem(LAST_WORKSPACE_KEY) : null;
-        const target = list.find((w) => w.id === lastUsed) ?? list[0]!;
-        await selectWorkspace(target.id);
+        const stored = parseStoredWorkspaceSelection(lastUsed);
+        if (stored?.kind === "cloud") {
+          setActiveWorkspace(stored);
+          return;
+        }
+        if (list.length === 0) return;
+        const target = list.find((w) => w.id === stored?.id) ?? list[0]!;
+        await selectLocalWorkspace(target.id);
       } catch (err) {
         console.warn("workspaces boot failed", err);
       } finally {
@@ -234,17 +288,38 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const selectWorkspace = async (id: string) => {
+  const selectLocalWorkspace = async (id: string) => {
     const dto = await fetchWorkspace(id);
+    const selection: WorkspaceSelection = { kind: "local", id };
+    setActiveWorkspace(selection);
     setCurrentWorkspace(id);
     setLayout(dto.layout);
-    if (typeof window !== "undefined") window.localStorage.setItem(LAST_WORKSPACE_KEY, id);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LAST_WORKSPACE_KEY, formatWorkspaceSelectionKey(selection));
+    }
     lastSavedRef.current = JSON.stringify({ windows: dto.layout.windows, activeWindowId: dto.layout.activeWindowId });
   };
 
+  useEffect(() => {
+    if (activeWorkspace?.kind !== "cloud") return;
+    if (!cloudSession || cloudWorkspaces.length === 0) return;
+    const target =
+      cloudWorkspaces.find((workspace) => workspace.id === activeWorkspace.id) ??
+      cloudWorkspaces[0] ??
+      null;
+    if (!target) return;
+    if (target.id !== activeWorkspace.id) {
+      setActiveWorkspace({ kind: "cloud", id: target.id });
+    }
+    if (cloudCurrentWorkspaceId !== target.id || cloudSnapshot?.workspace.id !== target.id) {
+      void selectCloudWorkspace(target.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeWorkspace, cloudSession, cloudWorkspaces]);
+
   // Debounce-save active workspace's layout whenever the windows tree changes.
   useEffect(() => {
-    if (!loadedRef.current || !currentWorkspaceId) return;
+    if (!loadedRef.current || activeWorkspace?.kind !== "local" || !currentWorkspaceId) return;
     const payload = JSON.stringify({ windows, activeWindowId });
     if (payload === lastSavedRef.current) return;
     const t = window.setTimeout(() => {
@@ -255,7 +330,7 @@ export default function Page() {
         .catch((err) => console.warn("layout save failed", err));
     }, 500);
     return () => window.clearTimeout(t);
-  }, [windows, activeWindowId, currentWorkspaceId]);
+  }, [windows, activeWindowId, currentWorkspaceId, activeWorkspace]);
 
   useEffect(() => {
     ws.connect();
@@ -349,7 +424,7 @@ export default function Page() {
       const created = await createWorkspace(wsName.trim());
       const list = await listWorkspaces();
       setWorkspaces(list);
-      await selectWorkspace(created.id);
+      await selectLocalWorkspace(created.id);
     } catch (err) {
       console.warn("create workspace failed", err);
     }
@@ -369,11 +444,208 @@ export default function Page() {
     }
   };
 
+  const selectCloudWorkspace = useCallback(async (id: string) => {
+    const session = useStore.getState().cloudSession;
+    if (!session) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      const snapshot = await fetchCloudSnapshot(session, id);
+      const selection: WorkspaceSelection = { kind: "cloud", id };
+      setActiveWorkspace(selection);
+      setCloudCurrentWorkspace(id);
+      setCloudSnapshot(snapshot);
+      setCloudRevision(id, snapshot.workspace.revision);
+      setCloudMessageCursors(id, cursorsFromSnapshot(snapshot));
+      setCloudConfigSignature(id, cloudConfigSignature(snapshot));
+      setCloudActiveAgentId((cur) => (snapshot.agents.some((agent) => agent.id === cur) ? cur : snapshot.agents[0]?.id ?? null));
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(LAST_WORKSPACE_KEY, formatWorkspaceSelectionKey(selection));
+      }
+      setCloudStatus("cloud workspace loaded");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  }, [setCloudConfigSignature, setCloudCurrentWorkspace, setCloudMessageCursors, setCloudRevision, setCloudSnapshot]);
+
+  const onSelectWorkspace = async (key: string) => {
+    const parsed = parseWorkspaceSelectionKey(key);
+    if (!parsed) return;
+    if (parsed.kind === "local") {
+      await selectLocalWorkspace(parsed.id);
+      return;
+    }
+    await selectCloudWorkspace(parsed.id);
+  };
+
+  const onCreateCloudWorkspace = async () => {
+    if (!cloudSession) {
+      setCloudLoginOpen(true);
+      return;
+    }
+    const currentLocalName = workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.name ?? "local";
+    const name = await getDialog().prompt({
+      title: "Cloud workspace name",
+      defaultValue: `${currentLocalName} cloud`,
+    });
+    if (!name?.trim()) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      const created = await createCloudWorkspace(cloudSession, name.trim());
+      const list = await listCloudWorkspaces(cloudSession);
+      setCloudWorkspaces(list);
+      await selectCloudWorkspace(created.id);
+      setCloudStatus("cloud workspace created");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const refreshCloud = async (session = cloudSession) => {
+    if (!session) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      const [account, list] = await Promise.all([
+        fetchCloudMe(session),
+        listCloudWorkspaces(session),
+      ]);
+      setCloudAccount(account);
+      setCloudWorkspaces(list);
+      const target =
+        list.find((workspace) => workspace.id === cloudCurrentWorkspaceId) ??
+        list.find((workspace) => activeWorkspace?.kind === "cloud" && workspace.id === activeWorkspace.id) ??
+        list[0] ??
+        null;
+      if (target) await selectCloudWorkspace(target.id);
+      else {
+        setCloudCurrentWorkspace(null);
+        setCloudSnapshot(null);
+      }
+      setCloudStatus("cloud workspace list refreshed");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const onCopyLocalToCloud = async () => {
+    if (!cloudSession || !cloudCurrentWorkspaceId || !currentWorkspaceId) return;
+    const ok = await getDialog().confirm({
+      title: "Copy current workspace to cloud",
+      message:
+        "This uploads agents, teams, and conversation history attached to the current local workspace layout. Secrets and local resume/auth state are filtered before upload.",
+      okLabel: "upload",
+    });
+    if (!ok) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      const localWorkspace = await fetchWorkspace(currentWorkspaceId);
+      const snapshot = await buildLocalSnapshotForLayout(
+        Object.values(useStore.getState().agents).map((agent) => agent.summary),
+        Object.values(useStore.getState().teams),
+        localWorkspace.layout,
+      );
+      const uploaded = await upsertCloudSnapshot(cloudSession, cloudCurrentWorkspaceId, snapshot);
+      setCloudSnapshot(uploaded.snapshot);
+      setCloudRevision(cloudCurrentWorkspaceId, uploaded.snapshot.workspace.revision);
+      setCloudMessageCursors(cloudCurrentWorkspaceId, cursorsFromList(uploaded.messageCursors));
+      setCloudConfigSignature(cloudCurrentWorkspaceId, cloudConfigSignature(snapshot));
+      const list = await listCloudWorkspaces(cloudSession);
+      setCloudWorkspaces(list);
+      setCloudActiveAgentId(uploaded.snapshot.agents[0]?.id ?? null);
+      setCloudStatus(`uploaded ${snapshot.agents.length} agents and ${snapshot.messages.length} messages`);
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const onSyncCloudChanges = async () => {
+    if (!cloudSession || !cloudCurrentWorkspaceId || !currentWorkspaceId) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      const localWorkspace = await fetchWorkspace(currentWorkspaceId);
+      const cursor = cloudMessageCursors[cloudCurrentWorkspaceId] ?? {};
+      const batch = await buildIncrementalBatchForLayout(
+        Object.values(useStore.getState().agents).map((agent) => agent.summary),
+        Object.values(useStore.getState().teams),
+        localWorkspace.layout,
+        cursor,
+        cloudConfigSignatures[cloudCurrentWorkspaceId] ?? null,
+      );
+      if (batch.messages.length === 0 && !batch.teams && !batch.agents) {
+        setCloudStatus("no new cloud changes to sync");
+        return;
+      }
+      const expectedRevision = cloudRevisions[cloudCurrentWorkspaceId] ?? cloudSnapshot?.workspace.revision;
+      const result = await syncCloudBatch(cloudSession, cloudCurrentWorkspaceId, {
+        expectedRevision,
+        ...batch,
+      });
+      setCloudRevision(cloudCurrentWorkspaceId, result.workspace.revision);
+      setCloudMessageCursors(cloudCurrentWorkspaceId, cursorsFromList(result.messageCursors));
+      if (batch.configSignature) setCloudConfigSignature(cloudCurrentWorkspaceId, batch.configSignature);
+      const snapshot = await fetchCloudSnapshot(cloudSession, cloudCurrentWorkspaceId);
+      setCloudSnapshot(snapshot);
+      const list = await listCloudWorkspaces(cloudSession);
+      setCloudWorkspaces(list);
+      setCloudStatus(`synced ${result.applied.messages} new messages`);
+    } catch (err) {
+      if ((err as Error).message.includes("revision_conflict")) {
+        setCloudError("cloud workspace changed elsewhere; refresh and retry");
+      } else {
+        setCloudError((err as Error).message);
+      }
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const onLogoutCloud = async () => {
+    if (!cloudSession) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      await logoutCloud(cloudSession);
+      setCloudSession(null);
+      setCloudWorkspaces([]);
+      setCloudCurrentWorkspace(null);
+      setCloudSnapshot(null);
+      setCloudActiveAgentId(null);
+      if (activeWorkspace?.kind === "cloud") {
+        const target = currentWorkspaceId ?? workspaces[0]?.id ?? null;
+        if (target) await selectLocalWorkspace(target);
+        else setActiveWorkspace(null);
+      }
+      setCloudStatus("signed out");
+    } catch (err) {
+      setCloudError((err as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
   const agentList = Object.values(agents);
   const activeCount = agentList.filter(
     (a) => a.summary.status === "running" || a.summary.status === "awaiting_permission",
   ).length;
   const idleCount = agentList.length - activeCount;
+  const activeWorkspaceKey = activeWorkspace
+    ? formatWorkspaceSelectionKey(activeWorkspace)
+    : currentWorkspaceId
+      ? formatWorkspaceSelectionKey({ kind: "local", id: currentWorkspaceId })
+      : "";
+  const showingCloudWorkspace = activeWorkspace?.kind === "cloud";
 
   const activeAgentId = useMemo(() => {
     if (!aw) return null;
@@ -484,48 +756,75 @@ export default function Page() {
           style={{ width: sidebarWidth, minWidth: SIDEBAR_MIN_WIDTH, maxWidth: SIDEBAR_MAX_WIDTH }}
           className="shrink-0 border-r border-[var(--border)] flex flex-col min-h-0 bg-[var(--bg-pane)]/30 relative"
         >
-          <WorkspaceSelector
+          <CloudWorkspaceSelector
             workspaces={workspaces}
-            currentId={currentWorkspaceId}
-            onSelect={selectWorkspace}
-            onCreate={onCreateWorkspace}
+            cloudSession={cloudSession}
+            cloudWorkspaces={cloudWorkspaces}
+            currentKey={activeWorkspaceKey}
+            onSelect={onSelectWorkspace}
+            onCreateLocal={onCreateWorkspace}
+            onLoginCloud={() => setCloudLoginOpen(true)}
+            onCreateCloud={onCreateCloudWorkspace}
             onRename={onRenameWorkspace}
+            disableRename={showingCloudWorkspace}
           />
-          <CloudWorkspacePanel
-            localWorkspaces={workspaces}
-            currentLocalWorkspaceId={currentWorkspaceId}
-          />
-          <div className="p-3 border-b border-[var(--border)] flex flex-col gap-2">
-            <div className="flex gap-1">
-              <button
-                className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
-                onClick={() => setNewAgentOpen(true)}
-                disabled={!connected}
-              >
-                {t("agent.create")}
-              </button>
-              <button
-                className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30 transition-colors"
-                onClick={() => setNewTeamOpen(true)}
-                disabled={!connected}
-                title={t("team.create.title")}
-              >
-                {t("team.create")}
-              </button>
-            </div>
-            <div className="text-[10px] text-[var(--text-dim)] leading-tight">
-              {t("agent.attachHint", { paneId: activePaneId.slice(0, 6) })}
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto">
-            <AgentTree
-              activeId={activeId}
-              boundAgentIds={boundAgentIds}
-              onPick={(a) => {
-                setActive(a.id);
-                attachAgentToPane(activePaneId, a.id);
-              }}
+          {cloudSession && (
+            <CloudAccountControls
+              session={cloudSession}
+              currentCloudWorkspaceId={cloudCurrentWorkspaceId}
+              busy={cloudBusy}
+              status={cloudStatus}
+              error={cloudError}
+              hasCloudWorkspace={!!cloudCurrentWorkspaceId}
+              onRefresh={() => void refreshCloud()}
+              onCreateCloud={() => void onCreateCloudWorkspace()}
+              onCopyLocal={() => void onCopyLocalToCloud()}
+              onSync={() => void onSyncCloudChanges()}
+              onLogout={() => void onLogoutCloud()}
             />
+          )}
+          {!showingCloudWorkspace && (
+            <div className="p-3 border-b border-[var(--border)] flex flex-col gap-2">
+              <div className="flex gap-1">
+                <button
+                  className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+                  onClick={() => setNewAgentOpen(true)}
+                  disabled={!connected}
+                >
+                  {t("agent.create")}
+                </button>
+                <button
+                  className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30 transition-colors"
+                  onClick={() => setNewTeamOpen(true)}
+                  disabled={!connected}
+                  title={t("team.create.title")}
+                >
+                  {t("team.create")}
+                </button>
+              </div>
+              <div className="text-[10px] text-[var(--text-dim)] leading-tight">
+                {t("agent.attachHint", { paneId: activePaneId.slice(0, 6) })}
+              </div>
+            </div>
+          )}
+          <div className="flex-1 overflow-y-auto">
+            {showingCloudWorkspace ? (
+              <CloudAgentTree
+                agents={cloudSnapshot?.agents ?? []}
+                teams={cloudSnapshot?.teams ?? []}
+                activeId={cloudActiveAgentId}
+                onPick={setCloudActiveAgentId}
+              />
+            ) : (
+              <AgentTree
+                activeId={activeId}
+                boundAgentIds={boundAgentIds}
+                onPick={(a) => {
+                  setActive(a.id);
+                  attachAgentToPane(activePaneId, a.id);
+                }}
+              />
+            )}
           </div>
           <ProviderPanel />
           <McpServerPanel />
@@ -550,7 +849,9 @@ export default function Page() {
         )}
 
         <main className="flex-1 flex flex-col min-w-0 min-h-0">
-          {aw ? (
+          {showingCloudWorkspace ? (
+            <CloudWorkspaceView activeAgentId={cloudActiveAgentId} onPickAgent={setCloudActiveAgentId} />
+          ) : aw ? (
             <LayoutRenderer node={aw.root} />
           ) : (
             <div className="flex-1 flex items-center justify-center text-[var(--text-dim)]">
@@ -561,6 +862,20 @@ export default function Page() {
       </div>
 
       <footer className="shrink-0 px-3 py-1 border-t border-[var(--border)] bg-[var(--bg-pane)]/60 flex items-center gap-2 text-[10px] tracking-wider overflow-x-auto overflow-y-hidden whitespace-nowrap">
+        {showingCloudWorkspace ? (
+          <>
+            <span className="border border-[var(--accent)] text-[var(--accent)] px-2 py-0.5">[cloud]</span>
+            <span className="text-[var(--text)]">{cloudSnapshot?.workspace.name ?? "cloud workspace"}</span>
+            <span className="text-[var(--text-dim)]">
+              {cloudSnapshot ? `${cloudSnapshot.agents.length} agents / ${cloudSnapshot.messages.length} messages` : "loading"}
+            </span>
+            <span className="flex-1" />
+            <span className="text-[var(--text-dim)]">
+              {cloudActiveAgentId ? `agent ${cloudActiveAgentId.slice(0, 8)}` : "no cloud agent"}
+            </span>
+          </>
+        ) : (
+          <>
         {windows.map((w, i) => {
           const isActive = w.id === activeWindowId;
           const active = windowHasActivity(w.root);
@@ -609,6 +924,8 @@ export default function Page() {
           <span className="text-[var(--text-faint)]">{t("footer.noAgent")}</span>
         )}
         <span className="text-[var(--text-dim)]">{t("footer.help")}</span>
+          </>
+        )}
       </footer>
 
       <PermissionDialog />
@@ -660,7 +977,209 @@ export default function Page() {
           }}
         />
       )}
+      {cloudLoginOpen && (
+        <CloudLoginDialog
+          onClose={() => setCloudLoginOpen(false)}
+          onSignedIn={(firstWorkspaceId) => {
+            if (firstWorkspaceId) {
+              const selection: WorkspaceSelection = { kind: "cloud", id: firstWorkspaceId };
+              setActiveWorkspace(selection);
+              if (typeof window !== "undefined") {
+                window.localStorage.setItem(LAST_WORKSPACE_KEY, formatWorkspaceSelectionKey(selection));
+              }
+            }
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function CloudWorkspaceSelector({
+  workspaces,
+  cloudSession,
+  cloudWorkspaces,
+  currentKey,
+  onSelect,
+  onCreateLocal,
+  onLoginCloud,
+  onCreateCloud,
+  onRename,
+  disableRename,
+}: {
+  workspaces: WorkspaceSummaryDTO[];
+  cloudSession: CloudSession | null;
+  cloudWorkspaces: CloudWorkspace[];
+  currentKey: string;
+  onSelect: (key: string) => Promise<void>;
+  onCreateLocal: () => Promise<void>;
+  onLoginCloud: () => void;
+  onCreateCloud: () => Promise<void>;
+  onRename: () => Promise<void>;
+  disableRename: boolean;
+}) {
+  const t = useT();
+  const [menuOpen, setMenuOpen] = useState(false);
+  return (
+    <div className="px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 text-xs relative">
+      <span className="text-[var(--text-faint)]">{t("ws.label")}</span>
+      <select
+        className="min-w-0 flex-1 bg-[var(--bg-pane)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)] text-[var(--text)]"
+        value={currentKey}
+        onChange={(e) => {
+          if (e.target.value) void onSelect(e.target.value);
+        }}
+      >
+        {!currentKey && <option value="">{t("ws.placeholder")}</option>}
+        <optgroup label="Local">
+          {workspaces.map((w) => (
+            <option key={`local:${w.id}`} value={formatWorkspaceSelectionKey({ kind: "local", id: w.id })}>
+              local / {w.name}
+            </option>
+          ))}
+        </optgroup>
+        {cloudSession && (
+          <optgroup label="Cloud">
+            {cloudWorkspaces.length === 0 ? (
+              <option value="" disabled>cloud / no workspace</option>
+            ) : (
+              cloudWorkspaces.map((w) => (
+                <option key={`cloud:${w.id}`} value={formatWorkspaceSelectionKey({ kind: "cloud", id: w.id })}>
+                  cloud / {w.name}
+                </option>
+              ))
+            )}
+          </optgroup>
+        )}
+      </select>
+      <button
+        title={disableRename ? "Cloud workspace names are managed in the account workspace." : t("ws.rename.title")}
+        onClick={() => void onRename()}
+        disabled={disableRename}
+        className="px-1 text-[var(--text-dim)] hover:text-[var(--accent)] disabled:opacity-30"
+      >
+        鉁?
+      </button>
+      <button
+        title={t("ws.new.title")}
+        onClick={() => setMenuOpen((prev) => !prev)}
+        className="px-1 text-[var(--text-dim)] hover:text-[var(--accent)]"
+      >
+        +
+      </button>
+      {menuOpen && (
+        <div className="absolute right-3 top-8 z-30 w-48 border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl shadow-black/40">
+          <button
+            type="button"
+            className="w-full text-left px-2 py-1.5 text-[var(--text-dim)] hover:text-[var(--accent)] hover:bg-[var(--bg-pane)]"
+            onClick={() => {
+              setMenuOpen(false);
+              void onCreateLocal();
+            }}
+          >
+            New local workspace
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-2 py-1.5 text-[var(--text-dim)] hover:text-[var(--accent)] hover:bg-[var(--bg-pane)]"
+            onClick={() => {
+              setMenuOpen(false);
+              if (cloudSession) void onCreateCloud();
+              else onLoginCloud();
+            }}
+          >
+            {cloudSession ? "New cloud workspace" : "Login cloud workspace"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CloudAccountControls({
+  session,
+  currentCloudWorkspaceId,
+  busy,
+  status,
+  error,
+  hasCloudWorkspace,
+  onRefresh,
+  onCreateCloud,
+  onCopyLocal,
+  onSync,
+  onLogout,
+}: {
+  session: CloudSession;
+  currentCloudWorkspaceId: string | null;
+  busy: boolean;
+  status: string | null;
+  error: string | null;
+  hasCloudWorkspace: boolean;
+  onRefresh: () => void;
+  onCreateCloud: () => void;
+  onCopyLocal: () => void;
+  onSync: () => void;
+  onLogout: () => void;
+}) {
+  return (
+    <section className="border-b border-[var(--border)] px-3 py-2 text-xs flex flex-col gap-2">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-[var(--text-faint)]">cloud</span>
+        <span className="text-[var(--text)] truncate" title={session.account.email}>
+          {session.account.displayName || session.account.email}
+        </span>
+        <span className="flex-1" />
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={busy}
+          className="px-1 text-[var(--text-dim)] hover:text-[var(--accent)] disabled:opacity-30"
+          title="Refresh cloud workspace list"
+        >
+          refresh
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-1">
+        <button
+          type="button"
+          onClick={onCreateCloud}
+          disabled={busy}
+          className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30"
+        >
+          new cloud
+        </button>
+        <button
+          type="button"
+          onClick={onLogout}
+          disabled={busy}
+          className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)] disabled:opacity-30"
+        >
+          sign out
+        </button>
+        <button
+          type="button"
+          onClick={onCopyLocal}
+          disabled={busy || !hasCloudWorkspace}
+          className="px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+          title="Upload a sanitized copy of the current local workspace to the selected cloud workspace"
+        >
+          copy local
+        </button>
+        <button
+          type="button"
+          onClick={onSync}
+          disabled={busy || !hasCloudWorkspace}
+          className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30"
+        >
+          sync
+        </button>
+      </div>
+      <div className="text-[10px] text-[var(--text-faint)] leading-tight break-words">
+        {currentCloudWorkspaceId ? `selected cloud workspace: ${currentCloudWorkspaceId}` : "create or select a cloud workspace"}
+      </div>
+      {status && <div className="text-[10px] text-[var(--ok)] leading-tight">{status}</div>}
+      {error && <div className="text-[10px] text-[var(--err)] leading-tight break-words">{error}</div>}
+    </section>
   );
 }
 
@@ -712,6 +1231,67 @@ function WorkspaceSelector({
       </button>
     </div>
   );
+}
+
+async function buildLocalSnapshotForLayout(
+  agents: AgentSummary[],
+  teams: TeamSummary[],
+  layout: LayoutWorkspace,
+) {
+  const scoped = filterWorkspaceEntitiesForLayout({ agents, teams, layout });
+  const messagesByAgent: Record<string, PersistedMessage[]> = {};
+  await Promise.all(
+    scoped.agents.map(async (agent) => {
+      messagesByAgent[agent.id] = await listMessages(agent.id, 500);
+    }),
+  );
+  return buildCloudSnapshotFromLocal({
+    agents: scoped.agents,
+    teams: scoped.teams,
+    messagesByAgent,
+  });
+}
+
+async function buildIncrementalBatchForLayout(
+  agents: AgentSummary[],
+  teams: TeamSummary[],
+  layout: LayoutWorkspace,
+  cursor: Record<string, number>,
+  previousSignature: string | null,
+) {
+  const scoped = filterWorkspaceEntitiesForLayout({ agents, teams, layout });
+  const messagesByAgent: Record<string, PersistedMessage[]> = {};
+  await Promise.all(
+    scoped.agents.map(async (agent) => {
+      messagesByAgent[agent.id] = await listMessages(agent.id, 500, cursor[agent.id] ?? -1);
+    }),
+  );
+  const snapshot = buildCloudSnapshotFromLocal({
+    agents: scoped.agents,
+    teams: scoped.teams,
+    messagesByAgent,
+  });
+  const signature = cloudConfigSignature(snapshot);
+  const configChanged = signature !== previousSignature;
+  return {
+    ...(configChanged ? { teams: snapshot.teams, agents: snapshot.agents } : {}),
+    messages: snapshot.messages,
+    configSignature: signature,
+  };
+}
+
+function cursorsFromSnapshot(snapshot: { messages: Array<{ agentId: string; seq: number }> }): Record<string, number> {
+  const cursors: Record<string, number> = {};
+  for (const message of snapshot.messages) {
+    cursors[message.agentId] = Math.max(cursors[message.agentId] ?? -1, message.seq);
+  }
+  return cursors;
+}
+
+function cursorsFromList(list: Array<{ agentId: string; maxSeq: number }>): Record<string, number> {
+  const cursors: Record<string, number> = {};
+  for (const cursor of list) cursors[cursor.agentId] = cursor.maxSeq;
+  return cursors;
 }
 
 function useUptime(): string {

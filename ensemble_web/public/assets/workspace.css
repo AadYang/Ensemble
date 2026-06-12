@@ -26,17 +26,23 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .shell {
   min-height: 100vh;
+  height: 100vh;
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .sidebar {
-  min-height: 100vh;
+  min-height: 0;
+  height: 100vh;
   border-right: 1px solid var(--border);
   background: var(--pane);
   display: flex;
   flex-direction: column;
   min-width: 0;
+  overflow: visible;
+  position: relative;
+  z-index: 3;
 }
 
 .brandbar {
@@ -108,6 +114,12 @@ textarea { resize: vertical; min-height: 72px; max-height: 220px; }
   gap: 10px;
   align-items: center;
 }
+.account-panel {
+  position: relative;
+  z-index: 4;
+  flex: 0 0 auto;
+  overflow: visible;
+}
 .account-row > div { min-width: 0; flex: 1; }
 .account-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .muted { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -117,6 +129,8 @@ textarea { resize: vertical; min-height: 72px; max-height: 220px; }
   flex: 1;
   display: flex;
   flex-direction: column;
+  position: relative;
+  z-index: 1;
 }
 .section-head {
   height: 36px;
@@ -270,9 +284,20 @@ textarea { resize: vertical; min-height: 72px; max-height: 220px; }
 .hidden { display: none !important; }
 
 @media (max-width: 820px) {
-  .shell { grid-template-columns: 1fr; }
-  .sidebar { min-height: auto; border-right: 0; border-bottom: 1px solid var(--border); }
-  .agent-list { max-height: 220px; }
+  .shell {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    height: auto;
+    min-height: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    overflow: visible;
+  }
+  .agent-list { max-height: 220px; overflow: auto; }
   .topbar { align-items: flex-start; flex-direction: column; }
   .settings-grid { grid-template-columns: 1fr; }
   .composer { grid-template-columns: 1fr; }

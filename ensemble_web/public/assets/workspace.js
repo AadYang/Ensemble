@@ -85,10 +85,6 @@
       if (!raw) return null;
       const session = JSON.parse(raw);
       if (!session || !session.origin || !session.token || !session.expiresAt) return null;
-      if (new Date(session.expiresAt).getTime() <= Date.now()) {
-        localStorage.removeItem(SESSION_KEY);
-        return null;
-      }
       session.origin = normalizeOrigin(session.origin);
       return session;
     } catch {
@@ -638,8 +634,8 @@
     state.session = { origin: restored.origin, token: restored.token, expiresAt: restored.expiresAt };
     state.account = restored.account || null;
     void hydrateAccount().catch((err) => {
-      setNotice(err.message, "error");
-      logout();
+      renderShell();
+      setNotice(`Cloud session could not connect: ${err.message}`, "error");
     });
   } else {
     renderShell();
