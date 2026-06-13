@@ -104,6 +104,19 @@ function extractNextStepHint(text: string): string | null {
   return null;
 }
 
+function makeScrollFollowSignal(turns: readonly ChatTurn[], status: string): string {
+  const last = turns[turns.length - 1];
+  return [
+    status,
+    turns.length,
+    last?.seq ?? "",
+    last?.kind ?? "",
+    last?.text.length ?? 0,
+    last?.streaming ? "streaming" : "",
+    last?.toolName ?? "",
+  ].join("|");
+}
+
 export function ChatPane({ agentId }: { agentId: string }) {
   const ws = getWS();
   const agent = useStore((s) => s.agents[agentId]);
@@ -138,6 +151,10 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const lastSeenResultSeqRef = useRef<number>(-Infinity);
   const t = useT();
   const updateInput = useCallback((text: string) => setInputDraft(agentId, text), [agentId, setInputDraft]);
+  const scrollFollowSignal = agent
+    ? makeScrollFollowSignal(agent.turns, agent.summary.status)
+    : "missing";
+  const scrollObserverReady = agent !== undefined;
 
   // Reset history pointer + next-step hint when switching agents.
   useEffect(() => {
@@ -203,12 +220,12 @@ export function ChatPane({ agentId }: { agentId: string }) {
     followBottomRef.current = true;
   }, [agentId]);
 
-  // Kick animation on every rendered-turn change. This covers appended rows
-  // and streaming deltas that rewrite the final assistant row without changing
-  // turns.length.
+  // Kick animation when visible scroll-affecting state changes. This covers
+  // appended rows and streaming deltas that rewrite the final assistant row
+  // without depending on the whole turns array object.
   useLayoutEffect(() => {
     if (followBottomRef.current) kickScrollAnim();
-  }, [agent?.turns, agent?.summary.status, kickScrollAnim]);
+  }, [scrollFollowSignal, kickScrollAnim]);
 
   // Watch the inner content for size changes so streaming deltas (which
   // extend the last turn in place and don't change turns.length) also
@@ -232,7 +249,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
       ro.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [agentId, kickScrollAnim]);
+  }, [agentId, scrollObserverReady, kickScrollAnim]);
 
   useEffect(() => {
     const kickIfFollowing = () => {
