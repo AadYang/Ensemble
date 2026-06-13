@@ -31,6 +31,8 @@ type PickerState =
 // selector — always use a module-level constant.
 const EMPTY_HISTORY: readonly string[] = Object.freeze([]);
 const CHAT_INPUT_MAX_ROWS = 6;
+const AUTO_FOLLOW_PAUSE_PX = 64;
+const AUTO_FOLLOW_RESUME_PX = 64;
 
 const PEER_INCOMING_RE = /^\[(?:from|来自) ([^\]]+)\]\s*([\s\S]*)$/;
 const PEER_OUTGOING_RE = /^→\s*(?:to|发往)\s+([^:]+):\s*([\s\S]*)$/;
@@ -126,6 +128,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const draftRef = useRef<string>("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollContentRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Next-step ghost hint: when a turn ends, scan the last assistant text for
   // a question / action-suggesting sentence. Show as ghost text in an empty
@@ -166,7 +169,10 @@ export function ChatPane({ agentId }: { agentId: string }) {
       if (!el || !followBottomRef.current) return;
       const target = el.scrollHeight - el.clientHeight;
       const distance = target - el.scrollTop;
-      if (distance <= 0.5) return;
+      if (distance <= 0.5) {
+        expectedTopRef.current = el.scrollTop;
+        return;
+      }
       const dt = Math.min(0.1, (now - lastTickRef.current) / 1000);
       lastTickRef.current = now;
       // Catch up over ~2 seconds, bounded between 200 and 600 px/s.
@@ -180,6 +186,13 @@ export function ChatPane({ agentId }: { agentId: string }) {
     rafIdRef.current = requestAnimationFrame(tick);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current != null) cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    };
+  }, []);
+
   // Jump (no animation) to the bottom when switching agents. Animating
   // through 200 historical turns would be silly.
   useEffect(() => {
@@ -190,25 +203,51 @@ export function ChatPane({ agentId }: { agentId: string }) {
     followBottomRef.current = true;
   }, [agentId]);
 
-  // Kick animation on turn count changes (new turn appended) — covers
-  // tool_use rows, user turns, system rows, etc.
-  useEffect(() => {
+  // Kick animation on every rendered-turn change. This covers appended rows
+  // and streaming deltas that rewrite the final assistant row without changing
+  // turns.length.
+  useLayoutEffect(() => {
     if (followBottomRef.current) kickScrollAnim();
-  }, [agent?.turns.length, kickScrollAnim]);
+  }, [agent?.turns, agent?.summary.status, kickScrollAnim]);
 
   // Watch the inner content for size changes so streaming deltas (which
   // extend the last turn in place and don't change turns.length) also
   // re-trigger the animation.
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => {
-      if (followBottomRef.current) kickScrollAnim();
-    });
-    for (const child of Array.from(el.children)) ro.observe(child);
+    const content = scrollContentRef.current;
+    if (!el || !content) return;
+    let frame: number | null = null;
+    const requestKick = () => {
+      if (!followBottomRef.current || frame !== null) return;
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        if (followBottomRef.current) kickScrollAnim();
+      });
+    };
+    const ro = new ResizeObserver(requestKick);
+    ro.observe(content);
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
   }, [agentId, kickScrollAnim]);
+
+  useEffect(() => {
+    const kickIfFollowing = () => {
+      if (followBottomRef.current) kickScrollAnim();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") kickIfFollowing();
+    };
+    window.addEventListener("focus", kickIfFollowing);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", kickIfFollowing);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [kickScrollAnim]);
 
   // Distinguish user-initiated scroll from our own animated scroll. If the
   // observed scrollTop differs meaningfully from what the animation just
@@ -224,9 +263,9 @@ export function ChatPane({ agentId }: { agentId: string }) {
       }
       expectedTopRef.current = actual;
       const distance = el.scrollHeight - el.clientHeight - actual;
-      if (distance > 64) {
+      if (distance > AUTO_FOLLOW_PAUSE_PX) {
         followBottomRef.current = false;
-      } else if (distance <= 8) {
+      } else if (distance <= AUTO_FOLLOW_RESUME_PX) {
         followBottomRef.current = true;
         kickScrollAnim();
       }
@@ -730,14 +769,16 @@ export function ChatPane({ agentId }: { agentId: string }) {
         )}
       </div>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 flex flex-col gap-2 min-h-0">
-        {turns.length === 0 && (
-          <div className="text-[var(--text-dim)] text-xs">{t("chat.empty")}</div>
-        )}
-        {turns.map((turn, i) => (
-          <Turn key={i} t={turn} tr={t} />
-        ))}
-        {summary.status === "running" && <div className="stream-cursor h-4" />}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 min-h-0">
+        <div ref={scrollContentRef} className="flex min-h-full flex-col gap-2">
+          {turns.length === 0 && (
+            <div className="text-[var(--text-dim)] text-xs">{t("chat.empty")}</div>
+          )}
+          {turns.map((turn, i) => (
+            <Turn key={i} t={turn} tr={t} />
+          ))}
+          {summary.status === "running" && <div className="stream-cursor h-4" />}
+        </div>
       </div>
 
       {picker && (
