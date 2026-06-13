@@ -11,6 +11,9 @@
 // Surface area is small on purpose — anything more complex belongs to
 // SessionManager so OpenAIAgentRuntime (Slice 2+) doesn't need to duplicate it.
 
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ReasoningEffort, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeOptions } from "./types.js";
@@ -29,9 +32,61 @@ function maxThinkingTokensForEffort(effort?: ReasoningEffort | null): number | u
   return THINKING_TOKEN_BUDGETS[effort];
 }
 
+const CLAUDE_LOCAL_AUTH_ENV_KEYS = new Set([
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "CLAUDE_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function claudeSettingsPath(): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
+  return join(configDir, "settings.json");
+}
+
+function readClaudeLocalAuthEnv(): Record<string, string> {
+  const path = claudeSettingsPath();
+  if (!existsSync(path)) return {};
+
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.env)) return {};
+
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed.env)) {
+      if (!CLAUDE_LOCAL_AUTH_ENV_KEYS.has(key)) continue;
+      if (typeof value !== "string" || value.trim().length === 0) continue;
+      env[key] = value;
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
+function mergeClaudeLocalAuthEnv(opts: RuntimeOptions): Record<string, string> {
+  if (opts.provider.kind !== "anthropic-local") return opts.env;
+
+  const settingsEnv = readClaudeLocalAuthEnv();
+  if (Object.keys(settingsEnv).length === 0) return opts.env;
+
+  const merged = { ...opts.env };
+  for (const [key, value] of Object.entries(settingsEnv)) {
+    if (!merged[key]) merged[key] = value;
+  }
+  return merged;
+}
+
 export class ClaudeAgentRuntime implements AgentRuntime {
   async *query(opts: RuntimeOptions): AsyncIterable<RuntimeEvent> {
     const maxThinkingTokens = maxThinkingTokensForEffort(opts.reasoningEffort);
+    const env = mergeClaudeLocalAuthEnv(opts);
     const stream = query({
       prompt: opts.prompt,
       options: {
@@ -48,7 +103,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         cwd: opts.cwd,
         ...(opts.resume ? { resume: opts.resume } : {}),
         mcpServers: opts.mcpServers,
-        ...(Object.keys(opts.env).length > 0 ? { env: opts.env } : {}),
+        ...(Object.keys(env).length > 0 ? { env } : {}),
         // The SDK's public option is `systemPrompt`, not `customSystemPrompt` —
         // any unknown key gets silently dropped into ...rest, and the SDK then
         // falls back to the built-in `claude_code` preset which auto-loads
@@ -58,14 +113,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // memory file said — never our team-context block.
         //
         // Passing a string here switches the SDK out of preset mode entirely:
-        // no auto-memory, no CLAUDE.md walk-up, no settings.json. Our prompt
-        // is the WHOLE system prompt the model sees.
+        // no auto-memory and no CLAUDE.md walk-up. Our prompt is the WHOLE
+        // system prompt the model sees.
         ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
-        // Explicitly disable filesystem settings loading. SDK doc: "When
-        // omitted or empty, no filesystem settings are loaded (SDK isolation
-        // mode)." We want isolation: every Ensemble agent's identity comes
-        // from our composed systemPrompt, period. No surprise content from
-        // ~/.claude/settings.json or .claude/settings.local.json.
+        // Explicitly disable SDK filesystem settings loading. We restore only
+        // a small auth-env allowlist from user settings above, so agent
+        // identity, memory, hooks, and MCP stay controlled by Ensemble.
         settingSources: [],
       },
     });
