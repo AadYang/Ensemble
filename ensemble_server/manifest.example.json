@@ -2,18 +2,18 @@
   "schemaVersion": 2,
   "compatVersion": "0.0.25",
   "version": "0.0.27",
-  "publishedAt": "2026-06-15T08:27:45Z",
+  "publishedAt": "2026-06-15T08:45:00Z",
   "downloadUrl": "https://ensemble-ai.cn/download/Ensemble_0.0.27_x64-setup.exe",
-  "sha256": "2b3308e6ae8e54c4ab1f2bd79100ad08d691045e25a9dab9daa65a57dd12ef3c",
-  "sizeBytes": 42434361,
+  "sha256": "2f5a485cbb58d067b1dd35687871271f542d67021f37f7e9e7f8b5ef4895de91",
+  "sizeBytes": 42411417,
   "platforms": {
     "windows-x64": {
       "version": "0.0.27",
-      "publishedAt": "2026-06-15T08:27:45Z",
+      "publishedAt": "2026-06-15T08:45:00Z",
       "downloadUrl": "https://ensemble-ai.cn/download/Ensemble_0.0.27_x64-setup.exe",
-      "sha256": "2b3308e6ae8e54c4ab1f2bd79100ad08d691045e25a9dab9daa65a57dd12ef3c",
-      "sizeBytes": 42434361,
-      "releaseNotes": "Windows 0.0.27: fixes Codex native resume timeout recovery so transient request timeouts stay normal query failures and do not clear cached session state. macOS remains 0.0.26 from the Mac team.",
+      "sha256": "2f5a485cbb58d067b1dd35687871271f542d67021f37f7e9e7f8b5ef4895de91",
+      "sizeBytes": 42411417,
+      "releaseNotes": "Windows 0.0.27: fixes Codex native resume timeout recovery and updates the built-in tutorial Windows download reference. macOS remains 0.0.26 from the Mac team.",
       "mandatory": false,
       "minSupportedVersion": "0.0.18"
     },
@@ -38,7 +38,7 @@
       "minSupportedVersion": "0.0.18"
     }
   },
-  "releaseNotes": "Windows 0.0.27: fixes Codex native resume timeout recovery so transient request timeouts stay normal query failures and do not clear cached session state. macOS remains 0.0.26 from the Mac team.",
+  "releaseNotes": "Windows 0.0.27: fixes Codex native resume timeout recovery and updates the built-in tutorial Windows download reference. macOS remains 0.0.26 from the Mac team.",
   "mandatory": false,
   "minSupportedVersion": "0.0.18"
 }
