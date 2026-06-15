@@ -9,6 +9,7 @@ import {
   buildCodexMcpListArgs,
   buildCurrentTurnPrompt,
   isCodexEventStreamLagged,
+  isNativeResumeTransportFailure,
   prepareCodexHomeForRuntime,
   renderMcpConfigTomlForCodexRuntime,
 } from "../codex.js";
@@ -118,14 +119,17 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     expect(prompt).toContain("Do not resume, hand off, or continue older tasks");
   });
 
-  it("marks interrupted native resume turns with structured recovery metadata", () => {
-    expect(buildCodexRuntimeErrorEvent("closed before completion", {
+  it("marks native resume transport failures with structured recovery metadata", () => {
+    const message = "stream disconnected before completion: failed to send websocket request";
+
+    expect(isNativeResumeTransportFailure(message)).toBe(true);
+    expect(buildCodexRuntimeErrorEvent(message, {
       usedNativeResume: true,
       turnStarted: true,
       turnCompleted: false,
     })).toEqual({
       type: "error",
-      message: "closed before completion",
+      message,
       code: "RESUME_TURN_INTERRUPTED",
       recoverable: true,
       resumeScoped: true,
@@ -138,6 +142,28 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     })).toEqual({
       type: "error",
       message: "provider failed",
+    });
+    expect(buildCodexRuntimeErrorEvent("QUERY_FAILED · provider request failed", {
+      usedNativeResume: true,
+      turnStarted: true,
+      turnCompleted: false,
+    })).toEqual({
+      type: "error",
+      message: "QUERY_FAILED · provider request failed",
+    });
+  });
+
+  it("does not mark ordinary request timeouts as native resume recovery", () => {
+    const message = "Reconnecting... 2/5 (request timed out)";
+
+    expect(isNativeResumeTransportFailure(message)).toBe(false);
+    expect(buildCodexRuntimeErrorEvent(message, {
+      usedNativeResume: true,
+      turnStarted: true,
+      turnCompleted: false,
+    })).toEqual({
+      type: "error",
+      message,
     });
   });
 

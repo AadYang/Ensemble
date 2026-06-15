@@ -481,6 +481,7 @@ export const isRuntimeCodexEventStreamRecoverySignal = (
 export const isResumeScopedStreamFailure = (rawMsg: string, usedResumeSessionId: string | null): boolean => {
   if (!usedResumeSessionId) return false;
   const msg = rawMsg.toLowerCase();
+  if (isTransientTimeoutFailure(msg)) return false;
   return (
     msg.includes("stream disconnected before completion") ||
     msg.includes("failed to send websocket request") ||
@@ -489,6 +490,11 @@ export const isResumeScopedStreamFailure = (rawMsg: string, usedResumeSessionId:
     msg.includes("connection aborted")
   );
 };
+
+const isTransientTimeoutFailure = (msg: string): boolean =>
+  msg.includes("request timed out") ||
+  msg.includes("timed out") ||
+  /\btimeout\b/.test(msg);
 
 export const runtimeHistoryFromCompletedTurns = (
   rows: Array<{ type: string; payload: unknown; seq?: number }>,

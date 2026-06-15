@@ -1298,6 +1298,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
 
     expect(isResumeScopedStreamFailure(msg, "codex-thread-id")).toBe(true);
     expect(isResumeScopedStreamFailure(msg, null)).toBe(false);
+    expect(isResumeScopedStreamFailure("Reconnecting... 2/5 (request timed out)", "codex-thread-id")).toBe(false);
     expect(isResumeScopedStreamFailure("provider is missing an API key", "codex-thread-id")).toBe(false);
   });
 
@@ -2319,6 +2320,80 @@ describe("SessionManager cancel + stale-session recovery", () => {
           m.msg.code === "CODEX_EVENT_STREAM_RECOVERING",
       ),
     ).toBe(true);
+  });
+
+  it("does not ask users to resend when Codex native resume sees an ordinary request timeout", async () => {
+    await ensureCodexCliPath();
+    const provider = await prisma.provider.create({
+      data: {
+        name: "codex-timeout-provider",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "codex-timeout-agent",
+        providerId: provider.id,
+        model: "gpt-5.5",
+      },
+    });
+    const calls: RuntimeOptions[] = [];
+    const runtime: AgentRuntime = {
+      async *query(opts: RuntimeOptions) {
+        calls.push(opts);
+        if (calls.length === 1) {
+          yield {
+            type: "sdk_message",
+            payload: {
+              type: "assistant",
+              session_id: "019ea530-56b8-7333-8b3c-5bd5ae5c2c79",
+              message: { content: [{ type: "text", text: "first turn done" }] },
+            },
+          };
+          yield {
+            type: "sdk_message",
+            payload: {
+              type: "result",
+              subtype: "success",
+              session_id: "019ea530-56b8-7333-8b3c-5bd5ae5c2c79",
+            },
+          };
+          return;
+        }
+        yield {
+          type: "error",
+          message: "Reconnecting... 2/5 (request timed out)",
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    await expect(sessions.sendMessage(agent.id, "establish native resume")).resolves.toEqual({ finalText: "first turn done" });
+    const result = await sessions.sendMessage(agent.id, "continue after transient timeout");
+
+    expect(result).toBeNull();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.resume).toBe("019ea530-56b8-7333-8b3c-5bd5ae5c2c79");
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    expect(after?.status).toBe("ERROR");
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(meta.lastSessionId).toBe("019ea530-56b8-7333-8b3c-5bd5ae5c2c79");
+    expect(meta.codexResumeSignature).toBeDefined();
+    expect(meta.systemPromptHash).toBeDefined();
+    const errorMessage = [...hub.sessionMessages]
+      .reverse()
+      .find((m) => m.sessionId === agent.id && m.msg.type === "error")
+      ?.msg;
+    expect(errorMessage).toMatchObject({
+      code: "QUERY_FAILED",
+      message: "Reconnecting... 2/5 (request timed out)",
+    });
+    expect(String(errorMessage?.message)).not.toContain("Cleared cached session state");
+    expect(String(errorMessage?.message)).not.toContain("Please send your message again");
   });
 
   it("runs suppressed Codex event-stream recovery before queued user input", async () => {

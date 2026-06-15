@@ -1001,7 +1001,7 @@ export function buildCodexRuntimeErrorEvent(
     };
   }
   const interruptedNativeResume = opts.usedNativeResume && opts.turnStarted && !opts.turnCompleted;
-  if (!interruptedNativeResume) return { type: "error", message };
+  if (!interruptedNativeResume || !isNativeResumeTransportFailure(message)) return { type: "error", message };
   return {
     type: "error",
     message,
@@ -1009,6 +1009,28 @@ export function buildCodexRuntimeErrorEvent(
     recoverable: true,
     resumeScoped: true,
   };
+}
+
+export function isNativeResumeTransportFailure(message: string): boolean {
+  const msg = message.toLowerCase();
+  if (isTransientCodexTimeoutFailure(msg)) return false;
+  return (
+    msg.includes("stream disconnected before completion") ||
+    msg.includes("failed to send websocket request") ||
+    msg.includes("os error 10053") ||
+    msg.includes("connection reset") ||
+    msg.includes("connection aborted") ||
+    msg.includes("closed before completion") ||
+    msg.includes("ended before turn.completed")
+  );
+}
+
+function isTransientCodexTimeoutFailure(message: string): boolean {
+  return (
+    message.includes("request timed out") ||
+    message.includes("timed out") ||
+    /\btimeout\b/.test(message)
+  );
 }
 
 export function isCodexEventStreamLagged(message: string): boolean {
