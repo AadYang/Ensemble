@@ -1,12 +1,19 @@
-# Ensemble 操作手册（迁移自 AgentUI，部分内容仍是 AgentUI 形态）
+# Ensemble 操作手册（历史手册，部分章节待刷新）
 
-> 📋 **兼容性提示**：本手册迁自 AgentUI，绝大多数概念（agent / pane / window / workspace、operation flow、键位、peer_send 模式等）在 Ensemble 完全适用。
+> 📋 **新版提示（2026-06）**：快速上手、发布状态、Cloud beta、Teams、Skills、Codex CLI、平台隔离更新等信息请优先看 [`../README.md`](../README.md) 和内置 / 官网教程。本手册是历史操作手册，仍保留大量细节，但部分章节待按当前实现彻底刷新。
 >
-> **不再适用的部分**（仅 AgentUI 形态相关，懒得逐字改，看的时候自行换算）：
-> - "Postgres" → Ensemble 用 node:sqlite；行为一致，存储引擎不同
+> **当前实现差异**：
+> - 存储是本地 SQLite（`agentorch.db` 文件名为兼容历史保留），不是 Postgres。
+> - Ensemble 有 `ensemble_server` 和 Cloud beta，负责账号、workspace 同步、网页工作区、远程发送和部分远程设置；agent 实际执行仍在桌面端。
+> - Windows 与 macOS 使用平台隔离 manifest；不同平台安装包版本可以独立推进。
+>
+> 📋 **兼容性提示**：很多概念（agent / pane / window / workspace、operation flow、键位、peer_send 模式等）在当前 Ensemble 仍适用。
+>
+> **不再适用的部分**（历史形态相关，看的时候按当前实现换算）：
+> - "Postgres" → Ensemble 用 SQLite；行为一致，存储引擎不同
 > - "Docker" / docker-compose 启动 → Ensemble 是 Tauri 桌面 app，无 docker 依赖
-> - "WebSocket :3001" 端口 → Ensemble 是 sidecar 动态端口，用户感知不到
-> - "浏览器访问 localhost:3000" → Ensemble 直接装包打开，无浏览器步骤
+> - 固定 WebSocket 端口 → Ensemble 是本地 sidecar 动态端口，用户感知不到
+> - 浏览器访问本地开发地址 → Ensemble 直接装包打开，无浏览器步骤
 >
 > 全 Ensemble 视角的快速入门看 [`../README.md`](../README.md)，架构看 [`./architecture.md`](./architecture.md)。
 
@@ -16,11 +23,11 @@
 
 | 概念 | 是什么 | 储存在哪 |
 |---|---|---|
-| **agent** | 一个独立的 Claude session，有自己的对话历史、消息流、工具调用记录 | Postgres `Agent` 行（含 messages） |
-| **provider** | 模型供应商配置（Anthropic 直连 / OpenAI-compat / LiteLLM 转发等）。每个 agent 绑定一个 provider | Postgres `Provider` 行 |
+| **agent** | 一个独立 session，有自己的对话历史、消息流、工具调用记录 | SQLite `Agent` 行（含 messages） |
+| **provider** | 模型供应商配置（Anthropic / OpenAI / Codex / compat 等）。每个 agent 绑定一个 provider | SQLite `Provider` 行 |
 | **pane** | 屏幕上一个矩形区域，**可以**挂 0 或 1 个 agent | 仅 client 状态（写到 workspace.layout JSON） |
 | **window** | 一组 pane 的二叉树布局（tmux 的 tab） | workspace.layout 里 |
-| **workspace** | 一组 window（一个"工作桌面"） | Postgres `Workspace` 行 |
+| **workspace** | 一组 window（一个"工作桌面"） | SQLite `Workspace` 行 |
 
 **关键心智**：agent 和 pane 是**多对多解耦**的——agent 是数据，pane 是视图框。一个 agent 可以不在任何 pane 上（在 sidebar 列表里待着），一个 pane 可以是空的。
 
@@ -179,7 +186,7 @@ active pane 标题栏 hover 显示 `⚙` 齿轮按钮 → 弹 popover：
 | `+` | 新建 workspace |
 
 > 上次用过的 workspace 存 `localStorage["agentorch:last-workspace"]`，刷新后自动回到那个。
-> 不能从 UI 删 workspace（防误删；server 有 `DELETE /workspaces/:id` REST 但拒绝删最后一个）。
+> 不能从 UI 删 workspace（防误删；本地 sidecar API 有 `DELETE /workspaces/:id` 但拒绝删最后一个）。
 
 ---
 
@@ -189,7 +196,7 @@ active pane 标题栏 hover 显示 `⚙` 齿轮按钮 → 弹 popover：
 - **会弹**：`Edit`、`Write`、`Bash`（有副作用的 `rm`/`mkdir`/`>` 等）、`ExitPlanMode`（plan 模式专用）
 - **不弹**：`Read`、`Glob`、`Grep`、只读 `Bash`（`echo`/`ls`/`git status`）、SDK 内置 `Task`、`peer_send` / `ask_user`（系统级 MCP，`allowedTools` 自动批）
 
-> 这是 SDK CLI 内置 sandbox 行为。peer_send / ask_user 在 server 端 `allowedTools` 自动批准，避免每次跨 agent 通信 / 用户问询都额外弹一遍工具审批。
+> 这是 SDK CLI 内置 sandbox 行为。peer_send / ask_user 在本地 sidecar 的 `allowedTools` 自动批准，避免每次跨 agent 通信 / 用户问询都额外弹一遍工具审批。
 
 ### 6.2 弹窗 UI / 操作
 
@@ -262,7 +269,7 @@ prefix + `?` 弹出全屏键位帮助 modal，三列分组（pane / window / mod
 
 ### 11.2 添加 provider 的两种 runtime × 两种接入方式
 
-W16 之后形态完整 4 态决策树（form 里的两组 radio）：
+当前 Provider 面板按 runtime 和接入方式组织：
 
 | Runtime | 接入方式 | kind | 说明 |
 |---|---|---|---|
@@ -271,11 +278,11 @@ W16 之后形态完整 4 态决策树（form 里的两组 radio）：
 | OpenAI | 官方 | `openai-compat`（baseUrl 锁死 `https://api.openai.com/v1`） | 填 platform.openai.com 的 API key |
 | OpenAI | 第三方兼容 | `openai-compat` | 自填 baseUrl（DeepSeek/GLM 的 OpenAI 端点 / timicc / etc.） + apiKey |
 
-每 runtime 都走对应的 SDK 原生集成——Claude → `@anthropic-ai/claude-agent-sdk`（CLI sidecar），OpenAI → `@openai/agents`（in-process）。**不存在协议翻译层**——W15 时代的 musistudio gateway 在 Slice 6 (W16) 整段删除。
+每 runtime 都走对应的当前实现：Claude → 本机 `claude` CLI subprocess，OpenAI → `@openai/agents` in-process，Codex → 本机 `codex` CLI subprocess。用户不需要启动额外协议翻译层。
 
-### 11.3 已停用的 kind / 模式（v0.0.2 + 之后）
+### 11.3 已停用的 kind / 模式
 
-`bedrock` / `vertex` / `autoManaged` 三种历史 kind 在启动时被自动 disable，UI 顶部 banner 显示数量 + 一键 `⇪` 迁移按钮——把原 baseUrl + apiKey 重新组合成 `openai-compat` 新 provider，旧 row 删除。
+`bedrock` / `vertex` / `autoManaged` 是历史开发期 kind。当前用户操作路径应使用 `anthropic-local`、`anthropic`、`openai-compat` 或 `openai-codex`；遇到旧 provider 行时，按 UI 提示迁移到当前 provider 类型。
 
 ### 11.4 baseUrl 写法
 
@@ -285,7 +292,7 @@ W16 之后形态完整 4 态决策树（form 里的两组 radio）：
 - 本机 OAuth：留空（Claude 官方 entry）
 
 ### 11.5 刷新模型列表
-provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provider.models`，AgentSettings 下拉读这个 cache。对 `anthropic-local` 直接 fallback hardcoded list；对 `openai-compat` / `anthropic` 第三方走 `probeModels` 多 URL + 双套 auth header。
+provider 行的 `↻` 按钮：本地 sidecar 调候选 URL 拉模型 ID 写入 `Provider.models`，AgentSettings 下拉读这个 cache。对 `anthropic-local` 直接 fallback hardcoded list；对 `openai-compat` / `anthropic` 第三方走 `probeModels` 多 URL + 双套 auth header。
 
 ### 11.6 删除 provider
 - 默认 provider 没有删除按钮
@@ -293,7 +300,7 @@ provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provide
 
 ### 11.7 已知限制
 - Claude side 和 OpenAI side 用相同 systemPrompt 时**行为不完全一致**——Claude CLI 会再注入 hooks / settingSources / CLAUDE.md，OpenAI side 直接把 instructions 当 system message。切 runtime 时模型回应风格可能漂移
-- OpenAI side v1 还没接外部 stdio/http MCP server（Slice 5 只做了内置 peer_send / ask_user / Task / ExitPlanMode）
+- 外部 MCP server 支持按当前 runtime 能力接入；用户侧只需要在 MCP 面板添加 stdio / http / sse server，并在目标 agent 的下一轮消息中使用。
 - Codex CLI 的 ChatGPT-OAuth 形式 token **不能直接用**（@openai/agents 只懂 API key）；想跑 OpenAI 官方必须有 platform.openai.com 的 sk-... key
 
 ---
@@ -312,7 +319,7 @@ provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provide
 | `fork` | 橙 | ⑂ | 同一任务**换个思路**重做；源消息是反面参考，避免复刻其路径 |
 
 **实现细节**：
-- `raw` 走旧 `[from X] body` 文本格式；其它 3 种用 `<peer-handoff>` 结构化块 + 模式专属 instruction（写在 `server/src/sessions/peerHandoff.ts`）
+- `raw` 走简短转发文本；其它 3 种用 `<peer-handoff>` 结构化块 + 模式专属 instruction（由本地 sidecar 生成）
 - 接收方的 user message payload 携带 `_peerOrigin = {fromAgentName, fromAgentId, mode}`，前端按这个字段渲染角标
 - 接收方收到的 prompt = context block（不可改 ground truth）+ instruction（每模式默认；可被 `Agent.metadata.peerInstructions[mode]` 覆盖——后端已支持，UI 待加）
 
@@ -326,9 +333,9 @@ provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provide
 ### 12.3 模型主动调（peer_send 工具）
 模型可以主动给其他 agent 发消息。**工具名因 runtime 不同**：
 - Claude side：`mcp__agentorch-peer__peer_send({target, message, mode?})`（SDK MCP namespace）
-- OpenAI side：`peer_send({target, message, mode?})`（plain function tool，W16 Slice 5.1 注册）
+- OpenAI side：`peer_send({target, message, mode?})`（plain function tool）
 
-前端 ToolCard 通过 `displayToolName` 工具把两种名字都 strip 成 `peer_send` 显示，跨 runtime 一致。SessionManager 端处理消息送达不区分 runtime——target agent 的 runtime 是 Claude 还是 OpenAI 由其 providerId 决定，sendMessage 路径自适应。已实测双向工作（Claude → OpenAI 和反向，见 W16 Slice 7 E2E）。
+前端 ToolCard 通过 `displayToolName` 工具把不同 runtime 的工具名统一显示为 `peer_send`。SessionManager 端处理消息送达不区分 runtime：target agent 的 runtime 由其 providerId 决定，sendMessage 路径自适应。
 - 工具自动批准（`allowedTools` 白名单），不弹用户审批
 - `mode` 可选；省略 = `"raw"`（兼容旧行为）；模型可以根据语义自己选 continue / review / fork
 - target 可以是 agent name（推荐）或 UUID；同名取最新创建（`createdAt desc`）
@@ -350,9 +357,9 @@ provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provide
 | SDK 内置 `Task` 工具不经过 canUseTool | 模型自动派生的 subagent 看不到独立 chat。要"独立 child"用设置弹窗 `+ child` 手动派生 |
 | 同名 agent peer_send 取最新 | 命名时加唯一后缀避歧义 |
 | chat 输入框 focused 时 `Ctrl+B` 不进 prefix | 先点 pane 空白处 |
-| 跨实例 LISTEN/NOTIFY 30s TTL 自我去重 | 单 server 部署不影响；多 server 部署生产需加 server-id tag |
+| 跨实例事件去重 | 普通桌面端只跑一个本地 sidecar，不需要用户处理 |
 | `z` zoom pane 没做 | 关掉其他 pane 替代 |
-| 删 workspace 没 UI | server 有 REST，UI 故意保守 |
+| 删 workspace 没 UI | 本地 sidecar 有 API，UI 故意保守 |
 | 跑非 Claude 模型时 systemPrompt 行为漂移 | OpenAI runtime 直传 instructions；Claude side 会二次拼装。文档显式说明 |
 | Provider apiKey 明文存 SQLite | 开发期接受；后续可加列级加密 |
 
@@ -362,31 +369,29 @@ provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provide
 
 | 现象 | 排查 |
 |---|---|
-| `ws disconnected` 红点常驻 | server 没起来；`curl http://localhost:3001/health` 探测 |
-| 发消息没反应 | F12 console 看 WS 错；常见是 `claude login` 凭证过期 |
+| `ws disconnected` 红点常驻 | 本地 sidecar 未就绪或已退出；重启桌面应用，必要时查看应用日志 |
+| 发消息没反应 | 先看 Provider 是否可用；常见是本机 `claude` / `codex` CLI 缺失或登录态过期 |
 | 工具调用后没弹审批弹窗 | 那个工具属"自动批"类（Read/Glob/Grep/echo Bash/peer_send） |
-| 刷新后布局丢了 | server 日志看 `PUT /api/workspaces/:id` 错误；workspace.layout 受 zod 严格校验 |
-| autoManaged provider 创建后模型仍走 Claude | 检查 LiteLLM 是否 running（顶部 service bar）+ agent 是否真的绑到该 provider |
-| LiteLLM start 后立即发消息失败 | 容器需要几秒初始化；service bar 显示 running 后再等 5s 试 |
+| 刷新后布局丢了 | 查看本地 sidecar 日志里 workspace 保存错误；workspace.layout 受 zod 严格校验 |
 | 切了 provider 但 model 下拉空 | 在 ProviderPanel 该行点 `↻` 刷新模型；或上游 endpoint 不可达 |
 | peer_send 报"no peer matches" | target 名拼错，或目标 agent 已删；检查 sidebar |
 | peer_send 报 BUSY | 目标正在跑别的 query，等它完成再试 |
 | 删 provider 报 409 in use | 有 agent 还绑着；先 AgentSettings 切到别的 provider |
 | `D:/tmp/...` 文件类操作失败 | 路径用正斜杠或转义反斜杠；Bash 在 Windows SDK 子进程跑 |
 | 触发了工具调用但状态卡 `awaiting_permission` 不弹框 | 通常是 store 里 agents 没 hydrate（旧版 bug），现在 mount 时自动 GET `/agents` 并 subscribe；如仍出现，刷一下页面 |
-| 重启 server 后看不到老 agent | 检查 server 日志是否真起来（`curl http://localhost:3001/health`）；agent 在 Postgres `Agent` 表里，server 起来后页面 mount 会拉回 |
+| 重启 sidecar 后看不到老 agent | 检查本地 sidecar 是否正常启动；agent 在 SQLite `Agent` 表里，本地服务就绪后页面会拉回 |
 
 ---
 
 ## 15. 持久化 / 跨重启 / 跨刷新
 
-| 维度 | 存哪 | 重启 server 后 | 刷新 / 重开浏览器后 |
+| 维度 | 存哪 | 重启本地 sidecar 后 | 刷新 / 重开桌面后 |
 |---|---|---|---|
-| Agent 元数据（id / name / model / provider / permissionMode / status / closed） | Postgres `Agent` | ✅ | ✅（`GET /agents` 在 mount 时拉） |
-| 对话消息（user / assistant / tool / system / result） | Postgres `Message`（每条带 `agentId+seq`） | ✅ | ✅（`GET /agents/:id/messages?limit=200` 在 mount 时拉，逐条 `ingestSdkMessage`） |
-| pending 工具审批 / `ask_user` 问询 | server 内存 `Map<sessionId, ...>` | ❌（重启即丢） | ✅ 同一 server 重连时 `replayPendingFor` 重发 |
-| 布局（windows / panes / 绑定） | Postgres `Workspace.layout` JSON | ✅ | ✅（debounce 500ms 写回） |
-| Provider / MCP servers | Postgres `Provider` / `McpServer` | ✅ | ✅ |
+| Agent 元数据（id / name / model / provider / permissionMode / status / closed） | SQLite `Agent` | ✅ | ✅（`GET /agents` 在 mount 时拉） |
+| 对话消息（user / assistant / tool / system / result） | SQLite `Message`（每条带 `agentId+seq`） | ✅ | ✅（`GET /agents/:id/messages?limit=200` 在 mount 时拉，逐条 `ingestSdkMessage`） |
+| pending 工具审批 / `ask_user` 问询 | 本地 sidecar 内存 `Map<sessionId, ...>` | ❌（重启即丢） | ✅ 同一 sidecar 重连时 `replayPendingFor` 重发 |
+| 布局（windows / panes / 绑定） | SQLite `Workspace.layout` JSON | ✅ | ✅（debounce 500ms 写回） |
+| Provider / MCP servers | SQLite `Provider` / `McpServer` | ✅ | ✅ |
 | 上次用过的 workspace | `localStorage["agentorch:last-workspace"]` | — | ✅ |
 | 语言（en/zh） | `localStorage["agentorch:locale"]` | — | ✅ |
 | SDK session_id（用于 resume 续接对话上下文） | `Agent.metadata.lastSessionId` | ✅（close 时写入，restart / 下次 sendMessage 自动 resume） | ✅ |
@@ -397,8 +402,8 @@ provider 行的 `↻` 按钮：server 调候选 URL 拉模型 ID 写入 `Provide
 
 ### 15.2 端到端"我啥都不丢"流程
 1. 创 agent → 发 N 条消息 → close（`◼` 或 `/close`）
-2. 关浏览器、关电脑、重启 server、过夜
-3. 第二天 `pnpm db:up && pnpm dev` → 浏览器开 :3000
+2. 关闭 Ensemble、关电脑或重启本地 sidecar、过夜
+3. 第二天重新打开 Ensemble 桌面应用
 4. agent 列表 / 历史消息 / 上次的 layout 全回来
 5. AgentSettings `▶ restart` → 接着发消息，模型记得之前聊过什么
 

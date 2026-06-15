@@ -22,29 +22,38 @@
 <body>
 <main>
   <h1>Ensemble 新手教程</h1>
-  <p>Ensemble 是一个桌面多 Agent 工作台。你可以把 Claude、OpenAI、OpenAI Compat 和 Codex CLI agent 放在同一个 workspace 里，让它们通过 <code>peer_send</code> / <code>peer_query</code> 协作。</p>
+  <p>Ensemble 是一个桌面多 Agent 工作台。你可以把 Claude、OpenAI、OpenAI Compat 和 Codex CLI agent 组织成 team，在同一个 workspace 里通过 <code>peer_send</code> / <code>peer_query</code> 协作。</p>
 
   <h2>快速开始</h2>
   <ol>
-    <li>下载并安装 Windows 版 <code>Ensemble_0.0.14_x64-setup.exe</code>。</li>
+    <li>下载并安装当前平台版本：Windows x64 为 <code>Ensemble_0.0.25_x64-setup.exe</code>；macOS Apple Silicon / Intel 为 <code>Ensemble_0.0.26_aarch64.dmg</code> / <code>Ensemble_0.0.26_x64.dmg</code>。</li>
     <li>打开左侧 <b>Providers</b>，添加至少一个 provider。</li>
-    <li>点击 Agent 区域的 <b>+</b>，选择 provider 和 model。</li>
+    <li>点击 <b>+ team</b> 创建团队，给每个成员选择独立 provider、model 和角色 prompt；也可以先用 <b>+</b> 创建单 agent。</li>
     <li>在聊天框输入任务，按 Enter 发送。</li>
   </ol>
+  <blockquote>
+    Windows 与 macOS 按平台隔离 manifest 更新。客户端只选择自己系统和架构对应的安装包；缺失某个平台条目时不会误提示下载另一个系统的安装包。
+  </blockquote>
 
   <h2>Provider</h2>
   <table>
     <thead><tr><th>Provider</th><th>用途</th><th>凭据</th></tr></thead>
     <tbody>
-      <tr><td>anthropic-local</td><td>使用本机 Claude Code 登录态</td><td><code>claude</code> CLI</td></tr>
+      <tr><td>anthropic-local</td><td>使用本机 Claude Code 登录态</td><td>已安装并登录的 <code>claude</code> CLI</td></tr>
       <tr><td>openai-local</td><td>OpenAI 官方 API</td><td><code>sk-...</code></td></tr>
       <tr><td>openai-compat</td><td>OpenAI 兼容服务</td><td><code>baseUrl</code> + <code>apiKey</code></td></tr>
-      <tr><td>openai-codex</td><td>使用本机 Codex CLI / ChatGPT 登录态</td><td><code>codex login</code></td></tr>
+      <tr><td>openai-codex</td><td>使用本机 Codex CLI / ChatGPT 登录态</td><td>已安装并登录的 <code>codex</code> CLI</td></tr>
     </tbody>
   </table>
+  <p>本地 Claude / Codex 需要先在系统终端安装并登录对应 CLI。Ensemble 复用本机凭证，不存 token；CLI 缺失或未登录时会在应用内提醒。</p>
+
+  <h2>Teams</h2>
+  <p>团队把一组 agent 的共同目标、成员角色和跨模型协作关系固定下来。创建 team 时可以为每个成员独立选择 provider + model：例如 Claude 做架构、Codex 做代码执行、GPT 做审阅。</p>
+  <p>团队 purpose 会注入成员 prompt。编辑团队、成员角色或团队归属后，Ensemble 会清理对应 resume 指针，让下一轮使用新 prompt，同时保留聊天历史和用户设置。</p>
 
   <h2>Agent 互相通知</h2>
-  <p><code>peer_send</code> 用来向另一个 agent 发送新消息，<code>peer_query</code> 用来读取另一个 agent 的最近上下文。</p>
+  <p><code>peer_send</code> 用来异步向另一个 agent 发送新消息，<code>peer_query</code> 用来读取另一个 agent 的最近上下文且不触发运行。</p>
+  <p><code>peer_send</code> 支持 <code>raw</code> / <code>continue</code> / <code>review</code> / <code>fork</code>。<code>includeSource</code> 默认为 <code>auto</code>：raw 只送消息，其他交接模式会附带有界来源输出。目标正在运行时消息会排队，批量 queued peer send 会合并；紧急 <code>interrupt</code> 必须写明 <code>interruptReason</code>，只作为安全阀。</p>
   <pre><code>请通知 Reviewer：
 target: Reviewer
 mode: review
@@ -54,17 +63,27 @@ message: 请检查这个实现是否有回归风险。</code></pre>
   <ol>
     <li>先安装并登录 Codex CLI：<code>npm i -g @openai/codex</code>，然后运行 <code>codex login</code>。</li>
     <li>在 Ensemble 的 Provider 面板添加 <b>OpenAI -> Codex CLI</b>。</li>
-    <li>为 Codex agent 设置 workspace 和 sandbox。</li>
+    <li>为 Codex agent 设置 workspace、sandbox 和 reasoning effort。</li>
   </ol>
   <blockquote class="warn">
-    Codex CLI 仍是本机 CLI 运行态，可能影响外部 Codex CLI 会话；外部会话被打断时可用 <code>codex resume</code> 恢复。当前版本已通过 stdio MCP bridge 支持 Codex agent 调用 <code>peer_send</code> / <code>peer_query</code>。
+    Codex 是本机 CLI subprocess，不是旧 SDK 直连。Ensemble 使用隔离 <code>CODEX_HOME</code>，支持 <code>read-only</code> / <code>workspace-write</code> / <code>danger-full-access</code> sandbox；Codex peer tools 通过本地 stdio MCP bridge 暴露。
   </blockquote>
+  <p>Claude / Codex 的 thinking mode 可在 Agent 设置中通过 reasoning effort 继承或覆盖。</p>
+
+  <h2>Cloud beta</h2>
+  <p>Cloud beta 通过 Ensemble server / cloud infrastructure 提供账号、workspace 同步、网页工作区、远程发送和部分 agent 设置入口。登录网页后，桌面在线时可以向本地 agent 发送消息并查看结果；模型调用、本地文件访问、CLI 登录态、MCP 和权限审批仍由桌面端执行。</p>
+  <p>官网 <a href="/workspace.html">Cloud workspace</a> 可查看同步后的 teams、agents 和消息；桌面在线时，可以从网页向指定本地 agent 发送远程消息、查看返回结果，或提交部分设置变更。</p>
 
   <h2>MCP 和 Skills</h2>
-  <p>MCP 面板支持 <code>stdio</code>、<code>http</code>、<code>sse</code>。Skills 使用 <code>SKILL.md</code>，适合沉淀可复用工作流。</p>
+  <p>MCP 是外部工具服务，支持 <code>stdio</code>、<code>http</code>、<code>sse</code>。Skills 是 <code>SKILL.md</code> 指令包，来源包括 project、ensemble、user 和 system，支持 auto、forced 和 disabled 状态。</p>
+  <p>左侧 Skills 面板可以新建、编辑和重扫 ensemble 管理的 skill；agent 可用 <code>skill_list</code> 查看技能，用 <code>skill_invoke</code> 加载指定技能。</p>
+
+  <h2>用量统计</h2>
+  <p>输入 <code>/cost</code> 可打开 Usage Stats，按 agent、model、provider、日期查看 token / cost breakdown，并导出 CSV。Codex 订阅型 turn 会记录 token，但不会按 API 单价重复计费。</p>
 
   <h2>常见问题</h2>
   <p>如果目标 agent 收到消息但运行失败，说明 <code>peer_send</code> 已送达，失败点通常在目标 provider 的 key、baseUrl 或 model。</p>
+  <p>流式输出会自动跟随到底部；如果你手动滚动离开底部，Ensemble 会尊重当前位置。</p>
   <p><a href="/">返回官网首页</a></p>
 </main>
 </body>
