@@ -58,6 +58,20 @@ function expectOrderedEvents(order: string[], first: string, second: string): vo
   expect(firstIndex).toBeLessThan(secondIndex);
 }
 
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
   ({ SessionManager, runtimeHistoryFromCompletedTurns } = await import("../SessionManager.js"));
@@ -601,6 +615,97 @@ describe("reasoning effort flow", () => {
     expect(meta.reasoningEffort).toBe("high");
     expect(meta.sandboxMode).toBe("workspace-write");
     expect(meta.systemPromptHash).toBe("stored-prompt-hash");
+  });
+
+  it("resetRuntimeSession stops a running turn so it cannot restore resume metadata", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "reset-running-provider",
+        kind: "openai-codex",
+        models: ["test-model"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "reset-running-agent",
+        providerId: provider.id,
+        model: "test-model",
+        metadata: {
+          lastSessionId: "old-native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "old-runtime-shape",
+          systemPromptHash: "old-hash",
+        },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 0,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "preexisting history" } },
+      },
+    });
+    const runtimeStarted = deferred<void>();
+    const releaseResult = deferred<void>();
+    const runtime = {
+      async *query() {
+        runtimeStarted.resolve(undefined);
+        await releaseResult.promise;
+        yield {
+          type: "sdk_message" as const,
+          payload: {
+            type: "assistant" as const,
+            session_id: "new-native-session",
+            message: { content: [{ type: "text", text: "late assistant" }] },
+          },
+        };
+        yield {
+          type: "sdk_message" as const,
+          payload: {
+            type: "result" as const,
+            subtype: "success",
+            session_id: "new-native-session",
+            _codexUsageSnapshot: {
+              input_tokens: 9,
+              cached_input_tokens: 0,
+              output_tokens: 9,
+              reasoning_output_tokens: 0,
+            },
+            modelUsage: {},
+          },
+        };
+      },
+    };
+    const hub = new StubHub();
+    const sessions = new SessionManager(hub as never, () => runtime);
+
+    const running = sessions.sendMessage(agent.id, "running request");
+    await runtimeStarted.promise;
+
+    const summary = await sessions.resetRuntimeSession(agent.id);
+    releaseResult.resolve(undefined);
+    await running;
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(summary?.hasResumeInfo).toBe(false);
+    expect(after?.status).toBe("IDLE");
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+    expect(meta.systemPromptHash).toBe("old-hash");
+    expect(await prisma.message.count({ where: { agentId: agent.id } })).toBeGreaterThan(0);
+    expect(
+      hub.events.some(
+        (event) =>
+          event.kind === "session" &&
+          event.msg.sessionId === agent.id &&
+          event.msg.type === "error" &&
+          event.msg.code === "RUNTIME_SESSION_RESET",
+      ),
+    ).toBe(true);
   });
 
   it("compactAgent clears native resume metadata", async () => {

@@ -1432,9 +1432,30 @@ export class SessionManager {
   async resetRuntimeSession(id: string): Promise<AgentSummary | null> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
+    if (
+      this.running.has(id) ||
+      this.drainingQueues.has(id) ||
+      this.pending.has(id) ||
+      this.pendingQuestions.has(id)
+    ) {
+      this.clearQueuedTurns(id);
+      await this.forceStopRun(id, {
+        dbStatus: "IDLE",
+        protoStatus: "idle",
+        logPrefix: "reset-runtime-session",
+        error: {
+          code: "RUNTIME_SESSION_RESET",
+          message: "Runtime session reset requested. Stopped the active turn and cleared saved resume metadata.",
+        },
+        drainQueued: false,
+        interruptedReason: "runtime session reset",
+      });
+    }
+    const latest = await prisma.agent.findUnique({ where: { id } });
+    if (!latest) return null;
     const updated = await prisma.agent.update({
       where: { id },
-      data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
+      data: { metadata: removeMetadataKeys(latest.metadata, [...RESUME_METADATA_KEYS]) },
     });
     const summary = agentRowToSummary(updated);
     this.hub.broadcast({ type: "agent_updated", agent: summary });
