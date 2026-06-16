@@ -7,6 +7,7 @@ import {
   closeAgent,
   deleteAgent,
   patchAgent,
+  resetRuntimeSession,
   restartAgent,
 } from "@/lib/agent-api";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
@@ -202,6 +203,7 @@ export function AgentSettings({
     : undefined;
   const effectiveSystemPrompt: string | null = systemPrompt.trim() ? systemPrompt : null;
   const effectiveTeamId: string | null = teamId || null;
+  const roleWeak = !effectiveTeamId && !effectiveSystemPrompt;
   const dirty =
     name.trim() !== summary.name ||
     model !== summary.model ||
@@ -247,6 +249,7 @@ export function AgentSettings({
 
   const onCloseAgent = () => guard(() => closeAgent(agentId));
   const onRestart = () => guard(() => restartAgent(agentId));
+  const onResetRuntime = () => guard(() => resetRuntimeSession(agentId));
   const onDelete = async () => {
     const ok = await getDialog().confirm({
       title: t("settings.delete.confirm", { name: summary.name }),
@@ -378,6 +381,11 @@ export function AgentSettings({
           <span className="text-[10px] text-[var(--text-faint)] leading-tight">
             {t("settings.systemPromptHint")}
           </span>
+          {roleWeak && (
+            <span className="text-[10px] text-[var(--warn)] leading-tight">
+              {t("settings.roleWeak")}
+            </span>
+          )}
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
@@ -519,6 +527,14 @@ export function AgentSettings({
             </button>
           </div>
           <div className="flex gap-2 self-start">
+            <button
+              onClick={onResetRuntime}
+              disabled={busy}
+              className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors disabled:opacity-30"
+              title={t("settings.resetRuntime.title")}
+            >
+              {t("settings.resetRuntime")}
+            </button>
             <button
               onClick={onSpawnChild}
               disabled={busy}

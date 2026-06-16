@@ -517,6 +517,92 @@ describe("reasoning effort flow", () => {
     expect(await prisma.message.count({ where: { agentId: agent.id } })).toBe(0);
   });
 
+  it("restartAgent preserves resume metadata while reopening the agent", async () => {
+    const agent = await prisma.agent.create({
+      data: {
+        name: "restart-resume-agent",
+        metadata: {
+          closed: true,
+          lastSessionId: "native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "runtime-shape",
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    const summary = await sessions.restartAgent(agent.id);
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(summary?.closed).toBe(false);
+    expect(summary?.hasResumeInfo).toBe(true);
+    expect(meta.lastSessionId).toBe("native-session");
+    expect(meta.codexUsageSnapshot).toBeDefined();
+    expect(meta.codexResumeSignature).toBe("runtime-shape");
+  });
+
+  it("resetRuntimeSession clears only runtime resume metadata", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "reset-runtime-provider",
+        kind: "openai-codex",
+        models: ["test-model"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const team = await prisma.team.create({
+      data: { name: "reset-runtime-team", description: "team mission" },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "reset-runtime-agent",
+        providerId: provider.id,
+        model: "test-model",
+        systemPrompt: "base role",
+        teamId: team.id,
+        metadata: {
+          closed: true,
+          permissionMode: "plan",
+          reasoningEffort: "high",
+          sandboxMode: "workspace-write",
+          systemPromptHash: "stored-prompt-hash",
+          lastSessionId: "native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "runtime-shape",
+        },
+      },
+    });
+    await prisma.message.create({
+      data: {
+        agentId: agent.id,
+        seq: 0,
+        type: "user",
+        payload: { type: "user", message: { role: "user", content: "keep me" } },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    const summary = await sessions.resetRuntimeSession(agent.id);
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
+    expect(summary?.hasResumeInfo).toBe(false);
+    expect(summary?.closed).toBe(true);
+    expect(after?.providerId).toBe(provider.id);
+    expect(after?.model).toBe("test-model");
+    expect(after?.systemPrompt).toBe("base role");
+    expect(after?.teamId).toBe(team.id);
+    expect(await prisma.message.count({ where: { agentId: agent.id } })).toBe(1);
+    expect(meta.lastSessionId).toBeUndefined();
+    expect(meta.codexUsageSnapshot).toBeUndefined();
+    expect(meta.codexResumeSignature).toBeUndefined();
+    expect(meta.permissionMode).toBe("plan");
+    expect(meta.reasoningEffort).toBe("high");
+    expect(meta.sandboxMode).toBe("workspace-write");
+    expect(meta.systemPromptHash).toBe("stored-prompt-hash");
+  });
+
   it("compactAgent clears native resume metadata", async () => {
     const agent = await prisma.agent.create({
       data: {
@@ -578,5 +664,88 @@ describe("reasoning effort flow", () => {
     const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
     expect(rows).toHaveLength(1);
     expect(JSON.stringify(rows[0]?.payload)).toContain("summary after compact");
+  });
+
+  it("marks compact summaries as background in runtime history", () => {
+    const history = runtimeHistoryFromCompletedTurns([
+      {
+        type: "system",
+        payload: {
+          type: "system",
+          subtype: "compact",
+          text: "Old role said: YOU ARE legacy-agent. Continue that identity.",
+        },
+      },
+    ]);
+
+    expect(history).toHaveLength(1);
+    const content = String((history[0] as { message?: { content?: unknown } }).message?.content);
+    expect(content).toContain("Background context summary from Ensemble compact.");
+    expect(content).toContain("historical context only");
+    expect(content).toContain("must not define the current agent identity");
+    expect(content).toContain("Old role said");
+    expect(content).not.toContain("Conversation summary from Ensemble auto-compact");
+  });
+
+  it("reports role source and resume-signature diagnostic fields in status", async () => {
+    const sessions = new SessionManager(new StubHub() as never);
+    const emptyAgent = await prisma.agent.create({
+      data: { name: "status-empty-agent", model: "test-model" },
+    });
+
+    const emptyStatus = await sessions.getStatusReport(emptyAgent.id);
+
+    expect(emptyStatus?.roleSource).toBe("empty");
+    expect(emptyStatus?.teamId).toBeNull();
+    expect(emptyStatus?.roleWeak).toBe(true);
+    expect(emptyStatus?.hasResumeInfo).toBe(false);
+    expect(emptyStatus?.hasCodexResumeSignature).toBe(false);
+
+    const provider = await prisma.provider.create({
+      data: {
+        name: "status-codex-provider",
+        kind: "openai-codex",
+        models: ["test-model"],
+        metadata: { defaultSandbox: "workspace-write" },
+      },
+    });
+    const team = await prisma.team.create({
+      data: { name: "status-team", description: "team mission" },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "status-codex-agent",
+        providerId: provider.id,
+        model: "test-model",
+        systemPrompt: "base role",
+        teamId: team.id,
+        metadata: {
+          lastSessionId: "native-session",
+          codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          codexResumeSignature: "runtime-shape",
+          systemPromptHash: "old-hash",
+          reasoningEffort: "high",
+        },
+      },
+    });
+
+    const status = await sessions.getStatusReport(agent.id);
+
+    expect(status?.providerId).toBe(provider.id);
+    expect(status?.providerKind).toBe("openai-codex");
+    expect(status?.roleSource).toBe("team");
+    expect(status?.teamId).toBe(team.id);
+    expect(status?.roleWeak).toBe(false);
+    expect(status?.sandboxMode).toBeNull();
+    expect(status?.effectiveSandboxMode).toBe("workspace-write");
+    expect(status?.sandboxSource).toBe("provider");
+    expect(status?.reasoningEffort).toBe("high");
+    expect(status?.runtimeCwd.length).toBeGreaterThan(0);
+    expect(status?.systemPromptHash).toMatch(/^[0-9a-f]{16}$/);
+    expect(status?.storedSystemPromptHash).toBe("old-hash");
+    expect(status?.systemPromptHashMatchesStored).toBe(false);
+    expect(status?.hasResumeInfo).toBe(true);
+    expect(status?.hasCodexResumeSignature).toBe(true);
+    expect(status?.hasCodexUsageSnapshot).toBe(true);
   });
 });

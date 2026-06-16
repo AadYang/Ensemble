@@ -1321,6 +1321,15 @@ fastify.post<{ Params: { id: string } }>("/agents/:id/restart", async (req, repl
   return updated;
 });
 
+fastify.post<{ Params: { id: string } }>("/agents/:id/reset-runtime-session", async (req, reply) => {
+  const updated = await sessions.resetRuntimeSession(req.params.id);
+  if (!updated) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return updated;
+});
+
 fastify.delete<{ Params: { id: string } }>("/agents/:id", async (req, reply) => {
   const ok = await sessions.deleteAgent(req.params.id);
   if (!ok) {

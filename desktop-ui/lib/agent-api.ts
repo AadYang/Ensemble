@@ -59,6 +59,12 @@ export async function restartAgent(id: string): Promise<AgentSummary> {
   return (await res.json()) as AgentSummary;
 }
 
+export async function resetRuntimeSession(id: string): Promise<AgentSummary> {
+  const res = await fetch(`/api/agents/${id}/reset-runtime-session`, { method: "POST" });
+  if (!res.ok) throw new Error(`resetRuntimeSession: ${res.status}`);
+  return (await res.json()) as AgentSummary;
+}
+
 export async function deleteAgent(id: string): Promise<void> {
   const res = await fetch(`/api/agents/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`deleteAgent: ${res.status}`);
@@ -77,14 +83,26 @@ export async function compactAgent(id: string): Promise<{ summary: string }> {
 
 export interface AgentStatusReport {
   name: string;
+  providerId: string | null;
   providerName: string | null;
   providerKind: string | null;
   model: string;
+  roleSource: "team" | "base" | "empty";
+  teamId: string | null;
+  roleWeak: boolean;
   permissionMode: PermissionMode;
   sandboxMode: "read-only" | "workspace-write" | "danger-full-access" | null;
+  effectiveSandboxMode: "read-only" | "workspace-write" | "danger-full-access" | null;
+  sandboxSource: "agent" | "provider" | "default" | "n/a";
   reasoningEffort: ReasoningEffort | null;
   codexWorkspace: string | null;
+  runtimeCwd: string;
+  systemPromptHash: string;
+  storedSystemPromptHash: string | null;
+  systemPromptHashMatchesStored: boolean;
   hasResumeInfo: boolean;
+  hasCodexResumeSignature: boolean;
+  hasCodexUsageSnapshot: boolean;
   closed: boolean;
   messages: number;
   enabledMcpServers: number;

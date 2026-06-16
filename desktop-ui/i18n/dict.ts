@@ -259,6 +259,7 @@ const en: Dict = {
   "settings.label.systemPrompt": "role / system prompt",
   "settings.label.team": "team",
   "settings.placeholder.systemPrompt": "what this agent does, how it speaks, what to avoid...",
+  "settings.roleWeak": "role constraints weak: no team and no role prompt are set.",
   "settings.systemPromptHint": "changing this resets the resume pointer — next turn opens a fresh session so the new prompt takes effect.",
   "settings.team.ungrouped": "(no team)",
   "settings.modelHint.noCache": "no cached models for this provider — refresh in the provider panel",
@@ -271,6 +272,8 @@ const en: Dict = {
   "settings.close.title": "abort run + lock chat. resume info kept for restart",
   "settings.restart": "▶ restart",
   "settings.restart.title": "resume from saved session_id on next message",
+  "settings.resetRuntime": "reset runtime",
+  "settings.resetRuntime.title": "clear saved resume/session metadata only. history and agent/team settings are kept.",
   "settings.delete": "× delete",
   "settings.delete.title": "permanent delete (messages + permissions cascade)",
   "settings.delete.confirm": `delete agent "{name}"? this is permanent.`,
@@ -391,6 +394,7 @@ const en: Dict = {
   /skill <enable|disable|auto> <name>   set per-agent skill override
   /close               close this agent (preserves resume info)
   /restart             restart this agent (resumes prior session)
+  /reset-runtime       clear saved resume info only; keep history and settings
   /exit  /quit         alias of /close
   /help                this help
   / (anything else)    passes through to the model as a normal user message
@@ -407,6 +411,7 @@ const en: Dict = {
   "slash.provider.empty": "no providers configured — add one in the provider panel",
   "slash.close.applied": "agent closed",
   "slash.restart.applied": "agent restarted",
+  "slash.resetRuntime.applied": "runtime session reset (history and settings kept)",
   "slash.compact.starting": "[compact] asking model to summarize prior context...",
   "slash.mcp.empty": "no MCP servers enabled",
   "slash.skills.empty": "no skills loaded — drop SKILL.md into ~/.claude/skills/ or use the Skills panel",

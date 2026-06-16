@@ -9,6 +9,7 @@ import {
   compactAgent,
   getAgentStatusReport,
   patchAgent,
+  resetRuntimeSession,
   restartAgent,
 } from "@/lib/agent-api";
 import { listSkills, toggleAgentSkill } from "@/lib/skill-api";
@@ -56,6 +57,7 @@ const SLASH_COMMAND_HINTS: readonly string[] = Object.freeze([
   "/provider ",
   "/close",
   "/restart",
+  "/reset-runtime",
   "/exit",
   "/quit",
 ]);
@@ -476,6 +478,16 @@ export function ChatPane({ agentId }: { agentId: string }) {
         }
         return;
       }
+      case "reset-runtime":
+      case "fresh-restart": {
+        try {
+          await resetRuntimeSession(agentId);
+          appendNotice(agentId, t("slash.resetRuntime.applied"));
+        } catch (err) {
+          appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
+        }
+        return;
+      }
       case "clear": {
         try {
           await clearAgentContext(agentId);
@@ -504,16 +516,29 @@ export function ChatPane({ agentId }: { agentId: string }) {
           const s = await getAgentStatusReport(agentId);
           const lines = [
             `name=${s.name}`,
-            `provider=${s.providerName ?? "(default)"} (${s.providerKind ?? "?"})`,
+            `provider=${s.providerName ?? "(default)"} (${s.providerKind ?? "?"}) id=${s.providerId ?? "(default)"}`,
             `model=${s.model}`,
+            `roleSource=${s.roleSource}`,
+            `teamId=${s.teamId ?? "(none)"}`,
+            s.roleWeak ? "roleWeak=true (no team and no role prompt; role constraints are weak)" : null,
             `permissionMode=${s.permissionMode}`,
             s.providerKind === "openai-codex"
-              ? `sandbox=${s.sandboxMode ?? "(inherit)"}`
+              ? `sandboxOverride=${s.sandboxMode ?? "(inherit)"}`
               : null,
+            s.providerKind === "openai-codex"
+              ? `effectiveSandbox=${s.effectiveSandboxMode ?? "(none)"} (${s.sandboxSource})`
+              : null,
+            `reasoningEffort=${s.reasoningEffort ?? "(inherit)"}`,
+            `cwd=${s.runtimeCwd}`,
             s.codexWorkspace ? `codexWorkspace=${s.codexWorkspace}` : null,
+            `systemPromptHash=${s.systemPromptHash}`,
+            `storedSystemPromptHash=${s.storedSystemPromptHash ?? "(none)"}`,
+            `systemPromptHashMatchesStored=${s.systemPromptHashMatchesStored ? "yes" : "no"}`,
             `messages=${s.messages}`,
             `enabledMcpServers=${s.enabledMcpServers}`,
             `resumeInfo=${s.hasResumeInfo ? "yes" : "no"}`,
+            `codexResumeSignature=${s.hasCodexResumeSignature ? "yes" : "no"}`,
+            `codexUsageSnapshot=${s.hasCodexUsageSnapshot ? "yes" : "no"}`,
             s.closed ? "closed=true" : null,
           ].filter(Boolean);
           appendNotice(agentId, lines.join("\n"));

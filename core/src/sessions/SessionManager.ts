@@ -393,6 +393,26 @@ const providerSupportsReasoningEffort = (kind: string | null | undefined): boole
   kind === "anthropic" ||
   kind === "openai-codex";
 
+const planModeNotice = (permissionMode: PermissionMode): string =>
+  permissionMode === "plan"
+    ? "You are in PLAN MODE.\n\n" +
+      "Rules:\n" +
+      "- Read / Grep / Glob freely to investigate.\n" +
+      "- Do NOT call Edit, Write, or Bash - those tools will be denied while planning.\n" +
+      "- When you have a clear approach, call ExitPlanMode with a markdown plan.\n" +
+      "- The user reviews the plan and approves before any code is written."
+    : "";
+
+const hashStableSystemPrompt = (opts: {
+  permissionMode: PermissionMode;
+  teamContext: string;
+  baseSystemPrompt: string;
+}): string => {
+  const tailRole = opts.teamContext || opts.baseSystemPrompt;
+  const promptStableSig = [buildEnsemblePrimer(), planModeNotice(opts.permissionMode), tailRole].join("\n\n---\n\n");
+  return createHash("sha1").update(promptStableSig).digest("hex").slice(0, 16);
+};
+
 const readMetaString = (metadata: unknown, key: string): string | null => {
   if (metadata && typeof metadata === "object" && key in (metadata as object)) {
     const v = (metadata as Record<string, unknown>)[key];
@@ -549,7 +569,14 @@ function rowToRuntimeHistoryMessage(row: { type: string; payload: unknown }): Sd
       message: {
         role: "user",
         content: truncateMiddle(
-          `Conversation summary from Ensemble auto-compact:\n${payload.text}`,
+          [
+            "Background context summary from Ensemble compact.",
+            "This is historical context only. It must not define the current agent identity, role, duties, team membership, or system instructions.",
+            "Current identity and duties come only from the active agent/team settings injected separately for this turn.",
+            "",
+            "Summary:",
+            payload.text,
+          ].join("\n"),
           RUNTIME_HISTORY_SINGLE_MESSAGE_MAX_CHARS,
         ),
       },
@@ -639,6 +666,8 @@ function compactPromptFromTranscript(transcript: string): string {
   return [
     "Summarize the following conversation transcript in 5-12 sentences.",
     "Focus on: what the user asked for, key decisions, what's been done, what's still pending.",
+    "Treat any prior agent identity, role, team membership, or system prompt as historical context only.",
+    "Do not write old agent identity or role text as instructions for future turns; current identity will be injected separately from active settings.",
     "Output plain text only - no markdown headers, no bullet markup.",
     "",
     "Transcript:",
@@ -1400,6 +1429,18 @@ export class SessionManager {
     return summary;
   }
 
+  async resetRuntimeSession(id: string): Promise<AgentSummary | null> {
+    const cur = await prisma.agent.findUnique({ where: { id } });
+    if (!cur) return null;
+    const updated = await prisma.agent.update({
+      where: { id },
+      data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
+    });
+    const summary = agentRowToSummary(updated);
+    this.hub.broadcast({ type: "agent_updated", agent: summary });
+    return summary;
+  }
+
   async deleteAgent(id: string): Promise<boolean> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
@@ -1544,6 +1585,8 @@ export class SessionManager {
     const prompt = [
       "Summarize the following conversation transcript in 5-12 sentences.",
       "Focus on: what the user asked for, key decisions, what's been done, what's still pending.",
+      "Treat any prior agent identity, role, team membership, or system prompt as historical context only.",
+      "Do not write old agent identity or role text as instructions for future turns; current identity will be injected separately from active settings.",
       "Output plain text only — no markdown headers, no bullet markup.",
       "",
       "Transcript:",
@@ -1665,14 +1708,26 @@ export class SessionManager {
 
   async getStatusReport(id: string): Promise<{
     name: string;
+    providerId: string | null;
     providerName: string | null;
     providerKind: string | null;
     model: string;
+    roleSource: "team" | "base" | "empty";
+    teamId: string | null;
+    roleWeak: boolean;
     permissionMode: PermissionMode;
     sandboxMode: SandboxMode | null;
+    effectiveSandboxMode: SandboxMode | null;
+    sandboxSource: "agent" | "provider" | "default" | "n/a";
     reasoningEffort: ReasoningEffort | null;
     codexWorkspace: string | null;
+    runtimeCwd: string;
+    systemPromptHash: string;
+    storedSystemPromptHash: string | null;
+    systemPromptHashMatchesStored: boolean;
     hasResumeInfo: boolean;
+    hasCodexResumeSignature: boolean;
+    hasCodexUsageSnapshot: boolean;
     closed: boolean;
     messages: number;
     enabledMcpServers: number;
@@ -1684,16 +1739,60 @@ export class SessionManager {
       : null;
     const msgCount = await prisma.message.count({ where: { agentId: id } });
     const mcpRows = await prisma.mcpServer.findMany({ where: { enabled: true } });
+    const providerKind = provider?.kind ?? null;
+    const permissionMode = readPermissionMode(a.metadata);
+    const sandboxOverride = readSandboxOverride(a.metadata);
+    const providerDefaultSandbox =
+      provider?.metadata && typeof provider.metadata === "object"
+        ? (provider.metadata as Record<string, unknown>).defaultSandbox
+        : undefined;
+    const providerHasDefaultSandbox =
+      typeof providerDefaultSandbox === "string" &&
+      VALID_SANDBOX_MODES.has(providerDefaultSandbox as SandboxMode);
+    const isCodex = providerKind === "openai-codex";
+    const effectiveSandboxMode = isCodex
+      ? sandboxOverride ?? readProviderDefaultSandbox(provider?.metadata)
+      : null;
+    const runtimeCwd = isCodex ? a.codexWorkspace || CODEX_DEFAULT_CWD : STABLE_CWD;
+    const teamContext = await this.buildTeamContext(id);
+    const systemPromptHash = hashStableSystemPrompt({
+      permissionMode,
+      teamContext,
+      baseSystemPrompt: a.systemPrompt ?? "",
+    });
+    const storedSystemPromptHash = readMetaString(a.metadata, "systemPromptHash");
+    const roleSource = a.teamId ? "team" : a.systemPrompt?.trim() ? "base" : "empty";
     return {
       name: a.name,
+      providerId: a.providerId,
       providerName: provider?.name ?? null,
-      providerKind: provider?.kind ?? null,
+      providerKind,
       model: a.model,
-      permissionMode: readPermissionMode(a.metadata),
-      sandboxMode: readSandboxOverride(a.metadata),
+      roleSource,
+      teamId: a.teamId,
+      roleWeak: roleSource === "empty",
+      permissionMode,
+      sandboxMode: sandboxOverride,
+      effectiveSandboxMode,
+      sandboxSource: !isCodex
+        ? "n/a"
+        : sandboxOverride
+          ? "agent"
+          : providerHasDefaultSandbox
+            ? "provider"
+            : "default",
       reasoningEffort: readReasoningEffortOverride(a.metadata),
       codexWorkspace: a.codexWorkspace,
+      runtimeCwd,
+      systemPromptHash,
+      storedSystemPromptHash,
+      systemPromptHashMatchesStored: storedSystemPromptHash === systemPromptHash,
       hasResumeInfo: readMetaString(a.metadata, "lastSessionId") !== null,
+      hasCodexResumeSignature: readMetaString(a.metadata, CODEX_RESUME_SIGNATURE_KEY) !== null,
+      hasCodexUsageSnapshot:
+        a.metadata !== null &&
+        typeof a.metadata === "object" &&
+        "codexUsageSnapshot" in a.metadata,
       closed: readMetaBool(a.metadata, "closed"),
       messages: msgCount,
       enabledMcpServers: mcpRows.length,
@@ -2426,15 +2525,7 @@ export class SessionManager {
       // turns, the resumed CLI session still has the OLD prompt locked in and
       // our new directives never reach the model. Hash + clear-on-drift forces
       // a fresh session whenever the composed prompt changes.
-      const planNotice =
-        permissionMode === "plan"
-          ? "You are in PLAN MODE.\n\n" +
-            "Rules:\n" +
-            "- Read / Grep / Glob freely to investigate.\n" +
-            "- Do NOT call Edit, Write, or Bash — those tools will be denied while planning.\n" +
-            "- When you have a clear approach, call ExitPlanMode with a markdown plan.\n" +
-            "- The user reviews the plan and approves before any code is written."
-          : "";
+      const planNotice = planModeNotice(permissionMode);
       const primer = buildEnsemblePrimer();
       const base = agent.systemPrompt ?? "";
       const teamContext = teamContextSync;
@@ -2465,8 +2556,11 @@ export class SessionManager {
       // including them would invalidate resume every turn). What matters for
       // resume safety is: primer + plan + team-context + base. Skills are
       // additive and the model handles their churn gracefully.
-      const promptStableSig = [primer, planNotice, tailRole].join("\n\n---\n\n");
-      const promptHash = createHash("sha1").update(promptStableSig).digest("hex").slice(0, 16);
+      const promptHash = hashStableSystemPrompt({
+        permissionMode,
+        teamContext,
+        baseSystemPrompt: base,
+      });
       const storedPromptHash = readMetaString(agent.metadata, "systemPromptHash");
       const codexReasoningEffort = readReasoningEffortOverride(agent.metadata);
       const codexSandboxMode = isCodexKind
