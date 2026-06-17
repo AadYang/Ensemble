@@ -36,13 +36,16 @@ type Broadcast = Record<string, unknown>;
 class StubHub {
   broadcasts: Broadcast[] = [];
   sessionMessages: Array<{ sessionId: string; msg: Broadcast }> = [];
+  socketMessages: Broadcast[] = [];
   size(): number { return 0; }
   add(): void {}
   remove(): void {}
   subscribe(): void {}
   unsubscribe(): void {}
   replayPendingFor(): void {}
-  sendTo(): void {}
+  sendTo(_socket: unknown, msg: Broadcast): void {
+    this.socketMessages.push(msg);
+  }
   sendToSession(sessionId: string, msg: Broadcast): void {
     this.sessionMessages.push({ sessionId, msg });
   }
@@ -152,6 +155,47 @@ describe("SessionManager cancel + stale-session recovery", () => {
       .map((br) => (br.agent as { id?: string })?.id);
     expect(updatedIds).toEqual(expect.arrayContaining([a.id, b.id, c.id]));
     expect(updatedIds).not.toContain(d.id);
+
+    const idleStatusIds = hub.sessionMessages
+      .filter((entry) => entry.msg.type === "status" && entry.msg.status === "idle")
+      .map((entry) => entry.sessionId);
+    expect(idleStatusIds).toEqual(expect.arrayContaining([a.id, b.id, c.id]));
+    expect(idleStatusIds).not.toContain(d.id);
+  });
+
+  it("replaySubscriptionStateFor sends current summary/status before pending prompts", async () => {
+    const agent = await prisma.agent.create({ data: { name: "resync-agent" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "AWAITING_USER_INPUT" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const questionPromise = sessions.askUser(agent.id, "Pick a path", ["A", "B"]);
+    await Promise.resolve();
+
+    await sessions.replaySubscriptionStateFor(agent.id, {} as never);
+
+    expect(hub.socketMessages.map((msg) => msg.type)).toEqual([
+      "agent_updated",
+      "status",
+      "user_question",
+    ]);
+    expect((hub.socketMessages[0]?.agent as { id?: string; status?: string })?.id).toBe(agent.id);
+    expect((hub.socketMessages[0]?.agent as { status?: string })?.status).toBe("awaiting_user_input");
+    expect(hub.socketMessages[1]).toMatchObject({
+      type: "status",
+      sessionId: agent.id,
+      status: "awaiting_user_input",
+    });
+    expect(hub.socketMessages[2]).toMatchObject({
+      type: "user_question",
+      sessionId: agent.id,
+      question: "Pick a path",
+      options: ["A", "B"],
+    });
+
+    const reqId = String(hub.socketMessages[2]?.reqId);
+    sessions.resolveUserQuestion(agent.id, reqId, "A");
+    await expect(questionPromise).resolves.toBe("A");
   });
 
   it("runtime force-stop only affects the matching run", async () => {

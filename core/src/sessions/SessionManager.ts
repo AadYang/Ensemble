@@ -3282,6 +3282,17 @@ export class SessionManager {
     return out;
   }
 
+  /** Re-emit the authoritative current state to a freshly subscribed socket,
+   * then replay any unanswered permission/user questions. This makes subscribe
+   * a resync point for clients that missed recovery broadcasts while offline. */
+  async replaySubscriptionStateFor(sessionId: string, socket: WebSocket): Promise<void> {
+    const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
+    if (!agent) return;
+    this.hub.sendTo(socket, { type: "agent_updated", agent: agentRowToSummary(agent) });
+    this.hub.sendTo(socket, { type: "status", sessionId, status: dbToProto(agent.status) });
+    this.replayPendingFor(sessionId, socket);
+  }
+
   /** Re-emit any unanswered permission requests to a freshly subscribed socket
    * so a client that reconnected mid-tool-use sees the dialog again. */
   replayPendingFor(sessionId: string, socket: WebSocket): void {
@@ -3828,6 +3839,7 @@ export class SessionManager {
             data: { status: "IDLE" },
           });
           this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+          this.hub.sendToSession(a.id, { type: "status", sessionId: a.id, status: "idle" });
         }
       }
       this.drainPersistedQueues();

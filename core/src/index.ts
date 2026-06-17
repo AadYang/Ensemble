@@ -1907,7 +1907,7 @@ fastify.register(async (instance) => {
             break;
           case "subscribe":
             hub.subscribe(socket, parsed.sessionId);
-            sessions.replayPendingFor(parsed.sessionId, socket);
+            void sessions.replaySubscriptionStateFor(parsed.sessionId, socket);
             break;
           case "unsubscribe":
             hub.unsubscribe(socket, parsed.sessionId);
@@ -1926,21 +1926,6 @@ fastify.register(async (instance) => {
     socket.on("close", () => hub.remove(socket));
   });
 });
-
-// Reset agents stuck in non-terminal status from a prior crash/kill. Without
-// this, the frontend hydrates them as RUNNING and disables send / shows a
-// cancel button that goes nowhere (no actual run exists in the new process).
-// prisma is sync over node:sqlite so no await needed.
-{
-  const staleStatuses = ["RUNNING", "AWAITING_PERMISSION", "AWAITING_USER_INPUT"];
-  const allAgents = prisma.agent.findMany({});
-  for (const a of allAgents) {
-    if (staleStatuses.includes(a.status)) {
-      prisma.agent.update({ where: { id: a.id }, data: { status: "IDLE" } });
-      fastify.log.info(`reset stale agent ${a.id.slice(0, 8)} (${a.status} → IDLE)`);
-    }
-  }
-}
 
 // Static frontend (only when the export build exists at the expected path).
 // Dev mode uses `next dev` on :3000 with rewrites — server stays API/WS only.

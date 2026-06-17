@@ -1,7 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useRef } from "react";
-import type { AgentSummary, CloudAgentConfigPatch, ServerMsg } from "@agentorch/shared";
+import {
+  forwardLocalEventForCloudRemoteRequest,
+  type AgentSummary,
+  type CloudAgentConfigPatch,
+  type ServerMsg,
+} from "@agentorch/shared";
 import { closeAgent, patchAgent, restartAgent } from "@/lib/agent-api";
 import { CloudRealtimeClient } from "@/lib/cloud-realtime";
 import { cloudConfigSignature, type CloudAgent, type CloudSnapshot } from "@/lib/cloud-api";
@@ -130,43 +135,13 @@ export function CloudRemoteBridge() {
     });
 
     const unsubscribeLocal = localWs.subscribe((msg: ServerMsg) => {
-      if (msg.type === "message") {
-        const request = activeRequestsRef.current.get(msg.sessionId);
-        if (!request) return;
-        client.send({
-          type: "agent_message",
-          workspaceId: request.workspaceId,
-          agentId: msg.sessionId,
-          seq: msg.seq,
-          msg: msg.msg,
-        });
-        return;
-      }
-      if (msg.type === "status") {
-        const request = activeRequestsRef.current.get(msg.sessionId);
-        if (!request) return;
-        client.send({
-          type: "agent_status",
-          workspaceId: request.workspaceId,
-          agentId: msg.sessionId,
-          status: msg.status,
-        });
-        if (msg.status === "done" || msg.status === "error" || msg.status === "idle") {
-          activeRequestsRef.current.delete(msg.sessionId);
-        }
-        return;
-      }
-      if (msg.type === "error" && msg.sessionId) {
-        const request = activeRequestsRef.current.get(msg.sessionId);
-        if (!request) return;
-        client.send({
-          type: "remote_error",
-          workspaceId: request.workspaceId,
-          agentId: msg.sessionId,
-          code: msg.code,
-          message: msg.message,
-        });
-      }
+      const sessionId = "sessionId" in msg ? msg.sessionId : undefined;
+      if (!sessionId) return;
+      const request = activeRequestsRef.current.get(sessionId);
+      if (!request) return;
+      const result = forwardLocalEventForCloudRemoteRequest(request, msg);
+      for (const outbound of result.messages) client.send(outbound);
+      if (result.releaseRequest) activeRequestsRef.current.delete(sessionId);
     });
 
     client.connect();

@@ -706,6 +706,24 @@ describe("reasoning effort flow", () => {
           event.msg.code === "RUNTIME_SESSION_RESET",
       ),
     ).toBe(true);
+    expect(
+      hub.events.some(
+        (event) =>
+          event.kind === "session" &&
+          event.msg.sessionId === agent.id &&
+          event.msg.type === "status" &&
+          event.msg.status === "idle",
+      ),
+    ).toBe(true);
+    expect(
+      hub.events.some(
+        (event) =>
+          event.kind === "broadcast" &&
+          event.msg.type === "agent_updated" &&
+          (event.msg.agent as { id?: string; hasResumeInfo?: boolean })?.id === agent.id &&
+          (event.msg.agent as { hasResumeInfo?: boolean })?.hasResumeInfo === false,
+      ),
+    ).toBe(true);
   });
 
   it("compactAgent clears native resume metadata", async () => {
