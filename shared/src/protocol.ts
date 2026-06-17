@@ -68,6 +68,15 @@ export type PermissionDecision =
 
 export type PeerMode = "continue" | "review" | "fork" | "raw";
 export type PeerIncludeSource = boolean | "auto";
+export type PeerCorrelationKind = "decision" | "request";
+
+export interface PeerCorrelationMetadata {
+  messageId?: string;
+  correlationId?: string;
+  correlationKind?: PeerCorrelationKind;
+  replyToCorrelationId?: string;
+  causalRunId?: string;
+}
 
 export type ClientMsg =
   | {
@@ -90,6 +99,11 @@ export type ClientMsg =
       includeSource?: PeerIncludeSource;
       interrupt?: boolean;
       interruptReason?: string;
+      messageId?: string;
+      correlationId?: string;
+      correlationKind?: PeerCorrelationKind;
+      replyToCorrelationId?: string;
+      causalRunId?: string;
     }
   | { type: "cancel"; sessionId: string }
   | { type: "subscribe"; sessionId: string }

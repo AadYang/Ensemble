@@ -46,6 +46,7 @@ import {
 import type {
   AgentStatus as ProtoStatus,
   AgentSummary,
+  PeerCorrelationKind,
   PeerIncludeSource,
   PeerMode,
   PermissionDecision,
@@ -200,10 +201,14 @@ interface RunningSession {
   userMessageSeq?: number;
   peerOrigin?: SendMessageOptions["peerOrigin"];
   startedAt: string;
+  pendingTurnHighWaterId: number;
   sawResult?: boolean;
   interruptedPersisted?: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
   idleWatchdogPaused?: boolean;
+  nonInteractive?: boolean;
+  blockedFreshnessAction?: FreshnessBlockedAction;
+  freshnessContinuationUsed?: boolean;
   /** Per-turn auto-allow cache, keyed by toolName. User clicking "Allow" on
    *  a permission dialog adds the tool name here; subsequent canUseTool calls
    *  with the same toolName during this turn skip the dialog. Cleared when
@@ -267,17 +272,48 @@ type SendMessageOptions = {
     fromAgentId: string;
     fromAgentName: string;
     mode: PeerMode;
+    messageId?: string;
+    correlationId?: string;
+    correlationKind?: PeerCorrelationKind;
+    replyToCorrelationId?: string;
     sourceRunId?: string;
+    causalRunId?: string;
     coalescibleSourceOutput?: boolean;
   };
   autoRecoveryAttempt?: "codex-event-stream-lagged";
   suppressUserMessage?: boolean;
+  freshnessContinuationForRunId?: string;
+  nonInteractive?: boolean;
+  suppressRuntimeMetadata?: boolean;
 };
 
 type PeerSendOptions = {
   includeSource?: PeerIncludeSource;
   interrupt?: boolean;
   interruptReason?: string;
+  messageId?: string;
+  correlationId?: string;
+  correlationKind?: PeerCorrelationKind;
+  replyToCorrelationId?: string;
+  causalRunId?: string;
+};
+
+type FreshnessBlockedAction = {
+  tool: "peer_send" | "ask_user";
+  targetAgentId?: string;
+  targetAgentName?: string;
+  correlationId?: string;
+  replyToCorrelationId?: string;
+};
+
+type DrainQueuedOptions = {
+  preferPeerAfterId?: number;
+  freshnessContinuationRun?: RunningSession;
+};
+
+type QueuedPeerTurn = {
+  row: DbPendingTurn;
+  origin: NonNullable<SendMessageOptions["peerOrigin"]>;
 };
 
 function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
@@ -303,12 +339,46 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
         fromAgentId: p.fromAgentId,
         fromAgentName: p.fromAgentName,
         mode,
+        ...(typeof p.messageId === "string" ? { messageId: p.messageId } : {}),
+        ...(typeof p.correlationId === "string" ? { correlationId: p.correlationId } : {}),
+        ...(p.correlationKind === "decision" || p.correlationKind === "request"
+          ? { correlationKind: p.correlationKind }
+          : {}),
+        ...(typeof p.replyToCorrelationId === "string" ? { replyToCorrelationId: p.replyToCorrelationId } : {}),
         ...(typeof p.sourceRunId === "string" ? { sourceRunId: p.sourceRunId } : {}),
+        ...(typeof p.causalRunId === "string" ? { causalRunId: p.causalRunId } : {}),
         ...(p.coalescibleSourceOutput === true ? { coalescibleSourceOutput: true } : {}),
       };
     }
   }
+  const freshnessContinuationForRunId = (raw as { freshnessContinuationForRunId?: unknown }).freshnessContinuationForRunId;
+  if (typeof freshnessContinuationForRunId === "string") {
+    out.freshnessContinuationForRunId = freshnessContinuationForRunId;
+  }
+  if ((raw as { nonInteractive?: unknown }).nonInteractive === true) {
+    out.nonInteractive = true;
+  }
+  if ((raw as { suppressRuntimeMetadata?: unknown }).suppressRuntimeMetadata === true) {
+    out.suppressRuntimeMetadata = true;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function peerCorrelationFamily(peerOrigin: {
+  correlationId?: string;
+  replyToCorrelationId?: string;
+}): Set<string> {
+  const family = new Set<string>();
+  if (peerOrigin.correlationId?.trim()) family.add(peerOrigin.correlationId.trim());
+  if (peerOrigin.replyToCorrelationId?.trim()) family.add(peerOrigin.replyToCorrelationId.trim());
+  return family;
+}
+
+function setsIntersect(a: Set<string>, b: Set<string>): boolean {
+  for (const value of a) {
+    if (b.has(value)) return true;
+  }
+  return false;
 }
 
 const dbToProto = (s: string): ProtoStatus => {
@@ -835,6 +905,7 @@ export class SessionManager {
   private running = new Map<string, RunningSession>();
   private queuedTurns = new Map<string, Map<number, (result: { finalText: string } | null) => void>>();
   private drainingQueues = new Map<string, string>();
+  private pendingDrainOptions = new Map<string, DrainQueuedOptions>();
   private liveTranscripts = new Map<string, LiveTranscript>();
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
@@ -920,8 +991,18 @@ export class SessionManager {
   private finishDrain(sessionId: string, token: string): void {
     if (this.drainingQueues.get(sessionId) === token) {
       this.drainingQueues.delete(sessionId);
-      this.drainQueuedTurns(sessionId);
+      const options = this.pendingDrainOptions.get(sessionId);
+      this.pendingDrainOptions.delete(sessionId);
+      this.drainQueuedTurns(sessionId, options);
     }
+  }
+
+  private pendingTurnHighWaterId(sessionId: string): number {
+    const row = prisma.pendingTurn.findFirst({
+      where: { agentId: sessionId },
+      orderBy: { id: "desc" },
+    });
+    return row?.id ?? 0;
   }
 
   async createAgent(opts: {
@@ -1553,6 +1634,7 @@ export class SessionManager {
       userInput: "/compact",
       startedSeq,
       startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: this.pendingTurnHighWaterId(id),
       autoAllowedTools: new Set<string>(),
     });
     try {
@@ -1991,7 +2073,9 @@ export class SessionManager {
       const peerOrigin = opts?.peerOrigin;
       let row: { id: number };
       if (peerOrigin) {
-        const existing = this.findQueuedPeerHandoff(sessionId, peerOrigin);
+        const existing =
+          this.findQueuedPeerHandoff(sessionId, peerOrigin) ??
+          this.findQueuedPeerCorrelationDuplicate(sessionId, peerOrigin);
         if (existing) {
           prisma.pendingTurn.update({
             where: { id: existing.id },
@@ -2050,8 +2134,128 @@ export class SessionManager {
     return null;
   }
 
-  private drainQueuedTurns(sessionId: string): void {
-    if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
+  private findQueuedPeerCorrelationDuplicate(
+    sessionId: string,
+    peerOrigin: NonNullable<SendMessageOptions["peerOrigin"]>,
+  ): { id: number } | null {
+    const family = peerCorrelationFamily(peerOrigin);
+    if (family.size === 0 && !peerOrigin.messageId) return null;
+    const rows = prisma.pendingTurn.findMany({
+      where: { agentId: sessionId },
+      orderBy: { id: "asc" },
+    });
+    for (const row of rows) {
+      const existing = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      if (!existing || existing.fromAgentId !== peerOrigin.fromAgentId) continue;
+      if (peerOrigin.messageId && existing.messageId === peerOrigin.messageId) return { id: row.id };
+      if (setsIntersect(family, peerCorrelationFamily(existing))) {
+        return { id: row.id };
+      }
+    }
+    return null;
+  }
+
+  private queuedPeerTurnsSince(sessionId: string, afterId: number): QueuedPeerTurn[] {
+    const highWater = Number.isFinite(afterId) ? afterId : 0;
+    const rows = prisma.pendingTurn.findMany({
+      where: { agentId: sessionId },
+      orderBy: { id: "asc" },
+    });
+    const out: QueuedPeerTurn[] = [];
+    for (const row of rows) {
+      if (row.id <= highWater) continue;
+      const origin = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      if (origin) out.push({ row, origin });
+    }
+    return out;
+  }
+
+  private findFreshnessBlockingPeerTurns(
+    run: RunningSession,
+    action: FreshnessBlockedAction,
+  ): QueuedPeerTurn[] {
+    const queued = this.queuedPeerTurnsSince(run.id, run.pendingTurnHighWaterId);
+    return queued.filter(({ origin }) => {
+      const actionCorrelationIds = new Set(
+        [action.correlationId, action.replyToCorrelationId].filter((v): v is string => Boolean(v)),
+      );
+      const originCorrelationIds = new Set(
+        [origin.correlationId, origin.replyToCorrelationId].filter((v): v is string => Boolean(v)),
+      );
+      const correlationRelated =
+        actionCorrelationIds.size > 0 &&
+        [...actionCorrelationIds].some((id) => originCorrelationIds.has(id));
+      if (correlationRelated) return true;
+      if (action.targetAgentId) return origin.fromAgentId === action.targetAgentId;
+      return true;
+    });
+  }
+
+  private formatFreshnessBlockedResult(action: FreshnessBlockedAction, queued: QueuedPeerTurn[]): string {
+    const sendText = action.tool === "peer_send"
+      ? `peer_send to "${action.targetAgentName ?? action.targetAgentId ?? "peer"}" was not sent.`
+      : "ask_user was not opened.";
+    const sources = Array.from(new Set(queued.map(({ origin }) => origin.fromAgentName))).join(", ");
+    const correlations = Array.from(
+      new Set(
+        queued
+          .flatMap(({ origin }) => [origin.correlationId, origin.replyToCorrelationId])
+          .filter((v): v is string => Boolean(v)),
+      ),
+    );
+    return [
+      `freshness-blocked: newer inbound peer message(s) are already queued for this agent from ${sources || "peer agents"}.`,
+      sendText,
+      correlations.length > 0 ? `Related correlation id(s): ${correlations.join(", ")}.` : "",
+      "Process the queued inbound peer message(s) first, then decide whether to cancel, merge, or resend the action with updated context.",
+    ].filter(Boolean).join(" ");
+  }
+
+  private formatFreshnessContinuation(run: RunningSession, rows: DbPendingTurn[]): string {
+    const action = run.blockedFreshnessAction;
+    const lines = [
+      "Ensemble freshness check: newer peer message(s) arrived while your previous run was active.",
+      action
+        ? `A stale ${action.tool} action was blocked. Reconcile the queued peer input before acting again.`
+        : "Reconcile the queued peer input before continuing.",
+      "Do not ask the human for input in this reconciliation turn. Cancel, merge, or resend only if still needed.",
+      `Original run id: ${run.runId}`,
+      "",
+      `<fresh-peer-inbox count="${rows.length}">`,
+    ];
+    rows.forEach((row, idx) => {
+      const origin = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      lines.push(
+        `--- message ${idx + 1} id=${row.id} queuedAt=${row.createdAt.toISOString()}`,
+        `From: ${origin?.fromAgentName ?? "unknown"}${origin?.fromAgentId ? ` (id=${origin.fromAgentId.slice(0, 8)})` : ""}`,
+        `Mode: ${origin?.mode ?? "raw"}`,
+      );
+      if (origin?.correlationId) lines.push(`Correlation: ${origin.correlationId}`);
+      if (origin?.correlationKind) lines.push(`Correlation kind: ${origin.correlationKind}`);
+      if (origin?.replyToCorrelationId) lines.push(`Reply to correlation: ${origin.replyToCorrelationId}`);
+      lines.push("", truncateMiddle(row.userInput.trim(), 1_600), "");
+    });
+    lines.push("</fresh-peer-inbox>");
+    return lines.join("\n");
+  }
+
+  private runEndDrainOptions(run: RunningSession): DrainQueuedOptions | undefined {
+    const queued = this.queuedPeerTurnsSince(run.id, run.pendingTurnHighWaterId);
+    if (queued.length === 0) return undefined;
+    if (run.blockedFreshnessAction && !run.freshnessContinuationUsed && !run.nonInteractive) {
+      return {
+        preferPeerAfterId: run.pendingTurnHighWaterId,
+        freshnessContinuationRun: { ...run, freshnessContinuationUsed: true },
+      };
+    }
+    return { preferPeerAfterId: run.pendingTurnHighWaterId };
+  }
+
+  private drainQueuedTurns(sessionId: string, drainOpts: DrainQueuedOptions = {}): void {
+    if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) {
+      if (Object.keys(drainOpts).length > 0) this.pendingDrainOptions.set(sessionId, drainOpts);
+      return;
+    }
     const rows = prisma.pendingTurn.findMany({
       where: { agentId: sessionId },
       orderBy: { id: "asc" },
@@ -2060,7 +2264,7 @@ export class SessionManager {
       this.queuedTurns.delete(sessionId);
       return;
     }
-    const nextRows = this.takeNextQueuedTurnSegment(rows);
+    const nextRows = this.takeNextQueuedTurnSegment(rows, drainOpts);
     for (const row of nextRows) {
       prisma.pendingTurn.delete({ where: { id: row.id } });
     }
@@ -2072,10 +2276,21 @@ export class SessionManager {
       })
       .filter((resolve): resolve is (result: { finalText: string } | null) => void => Boolean(resolve));
     if (this.queuedTurns.get(sessionId)?.size === 0) this.queuedTurns.delete(sessionId);
-    const userInput = this.formatQueuedTurnSegment(nextRows);
-    const opts = nextRows.length === 1 ? normalizeQueuedTurnOpts(nextRows[0]!.opts) : undefined;
+    const userInput = drainOpts.freshnessContinuationRun
+      ? this.formatFreshnessContinuation(drainOpts.freshnessContinuationRun, nextRows)
+      : this.formatQueuedTurnSegment(nextRows);
+    const runOpts = drainOpts.freshnessContinuationRun
+      ? {
+          freshnessContinuationForRunId: drainOpts.freshnessContinuationRun.runId,
+          nonInteractive: true,
+          suppressRuntimeMetadata: true,
+          suppressUserMessage: true,
+        }
+      : nextRows.length === 1
+        ? normalizeQueuedTurnOpts(nextRows[0]!.opts)
+        : undefined;
     const drainToken = this.beginDrain(sessionId);
-    void this.runMessageNow(sessionId, userInput, opts)
+    void this.runMessageNow(sessionId, userInput, runOpts)
       .then((result) => {
         for (const resolve of resolvers) resolve(result);
       })
@@ -2088,12 +2303,19 @@ export class SessionManager {
       });
   }
 
-  private takeNextQueuedTurnSegment(rows: DbPendingTurn[]): DbPendingTurn[] {
-    const first = rows[0];
+  private takeNextQueuedTurnSegment(rows: DbPendingTurn[], opts: DrainQueuedOptions = {}): DbPendingTurn[] {
+    if (opts.freshnessContinuationRun && opts.preferPeerAfterId !== undefined) {
+      return rows.filter((row) => row.id > opts.preferPeerAfterId! && normalizeQueuedTurnOpts(row.opts)?.peerOrigin);
+    }
+    let first = rows[0];
+    if (opts.preferPeerAfterId !== undefined) {
+      const preferred = rows.find((row) => row.id > opts.preferPeerAfterId! && normalizeQueuedTurnOpts(row.opts)?.peerOrigin);
+      if (preferred) first = preferred;
+    }
     if (!first) return [];
     if (!normalizeQueuedTurnOpts(first.opts)?.peerOrigin) return [first];
     const segment: DbPendingTurn[] = [];
-    for (const row of rows) {
+    for (const row of rows.slice(rows.indexOf(first))) {
       if (!normalizeQueuedTurnOpts(row.opts)?.peerOrigin) break;
       segment.push(row);
     }
@@ -2110,7 +2332,12 @@ export class SessionManager {
         `From: ${origin?.fromAgentName ?? "unknown"}${origin?.fromAgentId ? ` (id=${origin.fromAgentId.slice(0, 8)})` : ""}`,
         `Mode: ${origin?.mode ?? "raw"}`,
       );
+      if (origin?.messageId) lines.push(`Message id: ${origin.messageId}`);
+      if (origin?.correlationId) lines.push(`Correlation: ${origin.correlationId}`);
+      if (origin?.correlationKind) lines.push(`Correlation kind: ${origin.correlationKind}`);
+      if (origin?.replyToCorrelationId) lines.push(`Reply to correlation: ${origin.replyToCorrelationId}`);
       if (origin?.sourceRunId) lines.push(`Source run: ${origin.sourceRunId.slice(0, 8)}`);
+      if (origin?.causalRunId) lines.push(`Causal run: ${origin.causalRunId.slice(0, 8)}`);
       lines.push("", row.userInput.trim(), "");
     });
     lines.push("</peer-batch>");
@@ -2118,6 +2345,7 @@ export class SessionManager {
   }
 
   private clearQueuedTurns(sessionId: string): void {
+    this.pendingDrainOptions.delete(sessionId);
     const rows = prisma.pendingTurn.findMany({ where: { agentId: sessionId } });
     for (const row of rows) {
       prisma.pendingTurn.delete({ where: { id: row.id } });
@@ -2323,6 +2551,7 @@ export class SessionManager {
 
     const abort = new AbortController();
     const runId = randomUUID();
+    const pendingTurnHighWaterId = this.pendingTurnHighWaterId(sessionId);
     let staleResume = false;
     let usedResumeSessionId: string | null = null;
     let resumeInvalidReasonForRun: string | null = null;
@@ -2337,35 +2566,40 @@ export class SessionManager {
       startedSeq: seq,
       peerOrigin: opts?.peerOrigin,
       startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId,
       autoAllowedTools: new Set<string>(),
+      ...(opts?.freshnessContinuationForRunId ? { freshnessContinuationUsed: true } : {}),
+      ...(opts?.nonInteractive ? { nonInteractive: true } : {}),
     });
 
     try {
     console.log(`[sendMessage] start agent=${sessionId.slice(0, 8)} run=${runId.slice(0, 8)} text="${userInput.slice(0, 40)}"`);
 
-    try {
-      const compactResult = await this.maybeAutoCompactBeforeTurn(agent, () => this.isRunOwner(sessionId, runId));
-      if (compactResult === "cancelled" || !this.isRunOwner(sessionId, runId)) {
-        return null;
+    if (!opts?.nonInteractive) {
+      try {
+        const compactResult = await this.maybeAutoCompactBeforeTurn(agent, () => this.isRunOwner(sessionId, runId));
+        if (compactResult === "cancelled" || !this.isRunOwner(sessionId, runId)) {
+          return null;
+        }
+        const refreshedAgent = await prisma.agent.findUnique({ where: { id: sessionId } });
+        if (!refreshedAgent) {
+          this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
+          return null;
+        }
+        agent = refreshedAgent;
+        const refreshedLastMsg = await prisma.message.findFirst({
+          where: { agentId: sessionId },
+          orderBy: { seq: "desc" },
+        });
+        seq = (refreshedLastMsg?.seq ?? -1) + 1;
+        const activeRunAfterCompact = this.running.get(sessionId);
+        if (activeRunAfterCompact?.runId === runId) {
+          activeRunAfterCompact.seq = seq;
+          activeRunAfterCompact.startedSeq = seq;
+        }
+      } catch (err) {
+        console.warn(`[auto-compact] skipped agent=${sessionId.slice(0, 8)}: ${(err as Error).message}`);
       }
-      const refreshedAgent = await prisma.agent.findUnique({ where: { id: sessionId } });
-      if (!refreshedAgent) {
-        this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
-        return null;
-      }
-      agent = refreshedAgent;
-      const refreshedLastMsg = await prisma.message.findFirst({
-        where: { agentId: sessionId },
-        orderBy: { seq: "desc" },
-      });
-      seq = (refreshedLastMsg?.seq ?? -1) + 1;
-      const activeRunAfterCompact = this.running.get(sessionId);
-      if (activeRunAfterCompact?.runId === runId) {
-        activeRunAfterCompact.seq = seq;
-        activeRunAfterCompact.startedSeq = seq;
-      }
-    } catch (err) {
-      console.warn(`[auto-compact] skipped agent=${sessionId.slice(0, 8)}: ${(err as Error).message}`);
     }
     await this.updateAgentStatus(sessionId, "RUNNING", "running");
 
@@ -2675,7 +2909,14 @@ export class SessionManager {
         // circuit to auto-allow; sandboxMode handles refusal of risky ops.
         canUseTool: isCodexKind
           ? async () => ({ behavior: "allow" as const, updatedInput: {} })
-          : this.makeCanUseTool(sessionId),
+          : opts?.nonInteractive
+            ? async () => ({
+                behavior: "deny" as const,
+                message:
+                  "Denied: this is a non-interactive freshness reconciliation turn. " +
+                  "Do not use permission-gated tools or ask the human; reconcile the queued peer input in text.",
+              })
+            : this.makeCanUseTool(sessionId),
         includePartialMessages: true,
         // Pass AbortController so the runtime kills its underlying subprocess
         // when the user clicks cancel — without this, our for-await abort
@@ -2851,27 +3092,29 @@ export class SessionManager {
       this.clearRuntimeIdleWatchdog(sessionId, runId);
 
       const persistData: { status: "DONE"; metadata?: object } = { status: "DONE" };
-      const metaPatch: Record<string, unknown> = {};
-      if (capturedSessionId && capturedSessionId !== effectiveLastSessionId) {
-        metaPatch.lastSessionId = capturedSessionId;
-      }
-      // Always persist the current promptHash on success so the next turn can
-      // detect drift correctly even if the hash didn't change this turn.
-      if (storedPromptHash !== promptHash) {
-        metaPatch.systemPromptHash = promptHash;
-      }
-      if (latestCodexUsageSnapshot) {
-        metaPatch.codexUsageSnapshot = latestCodexUsageSnapshot;
-      }
-      if (codexResumeSignature && storedCodexResumeSignature !== codexResumeSignature) {
-        metaPatch[CODEX_RESUME_SIGNATURE_KEY] = codexResumeSignature;
-      }
-      if (resumeInvalidReasonForRun !== null || Object.keys(metaPatch).length > 0) {
-        const baseMetadata =
-          resumeInvalidReasonForRun !== null
-            ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
-            : agent.metadata;
-        persistData.metadata = mergeMetadata(baseMetadata, metaPatch);
+      if (!opts?.suppressRuntimeMetadata) {
+        const metaPatch: Record<string, unknown> = {};
+        if (capturedSessionId && capturedSessionId !== effectiveLastSessionId) {
+          metaPatch.lastSessionId = capturedSessionId;
+        }
+        // Always persist the current promptHash on success so the next turn can
+        // detect drift correctly even if the hash didn't change this turn.
+        if (storedPromptHash !== promptHash) {
+          metaPatch.systemPromptHash = promptHash;
+        }
+        if (latestCodexUsageSnapshot) {
+          metaPatch.codexUsageSnapshot = latestCodexUsageSnapshot;
+        }
+        if (codexResumeSignature && storedCodexResumeSignature !== codexResumeSignature) {
+          metaPatch[CODEX_RESUME_SIGNATURE_KEY] = codexResumeSignature;
+        }
+        if (resumeInvalidReasonForRun !== null || Object.keys(metaPatch).length > 0) {
+          const baseMetadata =
+            resumeInvalidReasonForRun !== null
+              ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
+              : agent.metadata;
+          persistData.metadata = mergeMetadata(baseMetadata, metaPatch);
+        }
       }
       // Guard: cancel() may have already force-cleared state and set status
       // back to IDLE. If our runId no longer owns this.running, defer to cancel.
@@ -2980,6 +3223,8 @@ export class SessionManager {
       // is gone; a brand-new sendMessage could already have set its own entry.
       // Without this guard a wedged old run's finally would corrupt the new run.
       if (this.running.get(sessionId)?.runId === runId) {
+        const activeRun = this.running.get(sessionId)!;
+        const freshnessDrainOpts = this.runEndDrainOptions(activeRun);
         this.clearRuntimeIdleWatchdog(sessionId, runId);
         this.running.delete(sessionId);
         this.pending.delete(sessionId);
@@ -2999,7 +3244,7 @@ export class SessionManager {
               this.finishDrain(sessionId, recoveryDrainToken);
             });
         } else {
-          this.drainQueuedTurns(sessionId);
+          this.drainQueuedTurns(sessionId, freshnessDrainOpts);
         }
       }
     }
@@ -3068,6 +3313,18 @@ export class SessionManager {
 
   /** Called by ask_user MCP tool. Suspends until the user clicks an option. */
   async askUser(sessionId: string, question: string, options: string[]): Promise<string> {
+    const run = this.running.get(sessionId);
+    if (run?.nonInteractive) {
+      return "freshness-blocked: ask_user is disabled for this non-interactive freshness continuation. Reconcile the queued peer message(s) without human input.";
+    }
+    if (run) {
+      const action: FreshnessBlockedAction = { tool: "ask_user" };
+      const queued = this.findFreshnessBlockingPeerTurns(run, action);
+      if (queued.length > 0) {
+        run.blockedFreshnessAction = action;
+        return this.formatFreshnessBlockedResult(action, queued);
+      }
+    }
     const reqId = randomUUID();
     await this.updateAgentStatus(sessionId, "AWAITING_USER_INPUT", "awaiting_user_input");
     this.hub.sendToSession(sessionId, {
@@ -3295,7 +3552,22 @@ export class SessionManager {
       return `error: peer agent "${targetAgent.name}" is closed; user must restart it before it can receive messages`;
     }
 
-    const sourceRunId = this.running.get(fromAgent.id)?.runId;
+    const sourceRun = this.running.get(fromAgent.id);
+    const sourceRunId = sourceRun?.runId;
+    const action: FreshnessBlockedAction = {
+      tool: "peer_send",
+      targetAgentId: targetAgent.id,
+      targetAgentName: targetAgent.name,
+      ...(opts.correlationId ? { correlationId: opts.correlationId } : {}),
+      ...(opts.replyToCorrelationId ? { replyToCorrelationId: opts.replyToCorrelationId } : {}),
+    };
+    if (sourceRun && !interrupt) {
+      const queued = this.findFreshnessBlockingPeerTurns(sourceRun, action);
+      if (queued.length > 0) {
+        sourceRun.blockedFreshnessAction = action;
+        return this.formatFreshnessBlockedResult(action, queued);
+      }
+    }
     const includeSource =
       opts.includeSource === true ||
       ((opts.includeSource === undefined || opts.includeSource === "auto") && mode !== "raw");
@@ -3316,16 +3588,25 @@ export class SessionManager {
       fromAgentId: fromAgent.id,
       fromAgentName: fromAgent.name,
       mode,
+      messageId: opts.messageId?.trim() || randomUUID(),
+      ...(opts.correlationId?.trim() ? { correlationId: opts.correlationId.trim() } : {}),
+      ...(opts.correlationKind ? { correlationKind: opts.correlationKind } : {}),
+      ...(opts.replyToCorrelationId?.trim() ? { replyToCorrelationId: opts.replyToCorrelationId.trim() } : {}),
       ...(sourceRunId ? { sourceRunId } : {}),
+      ...(opts.causalRunId?.trim() ? { causalRunId: opts.causalRunId.trim() } : sourceRunId ? { causalRunId: sourceRunId } : {}),
       ...(sourceRunId && includeSource ? { coalescibleSourceOutput: true } : {}),
     };
     const willReplaceQueuedPeerHandoff = targetWasBusy && this.findQueuedPeerHandoff(targetId, peerOrigin) !== null;
+    const duplicateCorrelation = targetWasBusy ? this.findQueuedPeerCorrelationDuplicate(targetId, peerOrigin) : null;
     if (interrupt) {
       await this.interruptForPeerSend(targetId, interruptReason);
       void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
         console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
       });
       return `interrupted and delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode}, reason=${interruptReason})`;
+    }
+    if (duplicateCorrelation) {
+      return `suppressed duplicate peer_send for "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode}, queuedTurn=${duplicateCorrelation.id}); queued correlation/message already covers this request`;
     }
     void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
       console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
@@ -3375,6 +3656,7 @@ export class SessionManager {
 
     this.running.delete(sessionId);
     this.drainingQueues.delete(sessionId);
+    this.pendingDrainOptions.delete(sessionId);
     this.liveTranscripts.delete(sessionId);
     const sessionPending = this.pending.get(sessionId);
     if (sessionPending) {
@@ -3476,6 +3758,7 @@ export class SessionManager {
     // and a fresh send_message can be accepted without races.
     this.running.delete(sessionId);
     this.drainingQueues.delete(sessionId);
+    this.pendingDrainOptions.delete(sessionId);
     const sessionPending = this.pending.get(sessionId);
     if (sessionPending) {
       for (const [, p] of sessionPending) {

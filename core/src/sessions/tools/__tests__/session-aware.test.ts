@@ -31,6 +31,42 @@ describe("makePeerSendTool", () => {
       { which: "A", target: "z", mode: undefined },
     ]);
   });
+
+  it("forwards correlation metadata", async () => {
+    let observed: unknown;
+    const send = async (args: {
+      target: string;
+      message: string;
+      messageId?: string;
+      correlationId?: string;
+      correlationKind?: "decision" | "request";
+      replyToCorrelationId?: string;
+      causalRunId?: string;
+    }) => {
+      observed = args;
+      return "sent";
+    };
+    const tool = makePeerSendTool(send);
+
+    expect(
+      await tool.execute({
+        target: "peer",
+        message: "body",
+        messageId: "msg-1",
+        correlationId: "corr-1",
+        correlationKind: "request",
+        replyToCorrelationId: "decision-0",
+        causalRunId: "run-1",
+      }),
+    ).toBe("sent");
+    expect(observed).toMatchObject({
+      messageId: "msg-1",
+      correlationId: "corr-1",
+      correlationKind: "request",
+      replyToCorrelationId: "decision-0",
+      causalRunId: "run-1",
+    });
+  });
 });
 
 describe("makePeerQueryTool", () => {

@@ -78,8 +78,29 @@ const hub = new WSHub();
 const sessions = new SessionManager(hub);
 mountMcpBridge(fastify, {
   getFallbackHandlers: (agentId) => ({
-    peerSend: ({ target, message, mode, includeSource, interrupt, interruptReason }) =>
-      sessions.sendPeerMessage(agentId, target, message, mode, { includeSource, interrupt, interruptReason }),
+    peerSend: ({
+      target,
+      message,
+      mode,
+      includeSource,
+      interrupt,
+      interruptReason,
+      messageId,
+      correlationId,
+      correlationKind,
+      replyToCorrelationId,
+      causalRunId,
+    }) =>
+      sessions.sendPeerMessage(agentId, target, message, mode, {
+        includeSource,
+        interrupt,
+        interruptReason,
+        messageId,
+        correlationId,
+        correlationKind,
+        replyToCorrelationId,
+        causalRunId,
+      }),
     peerQuery: ({ target, limit }) => sessions.fetchPeerHistory(agentId, target, limit),
   }),
 });
@@ -117,6 +138,11 @@ const ClientMsgSchema = z.discriminatedUnion("type", [
     includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
     interrupt: z.boolean().optional(),
     interruptReason: z.string().optional(),
+    messageId: z.string().optional(),
+    correlationId: z.string().optional(),
+    correlationKind: z.enum(["decision", "request"]).optional(),
+    replyToCorrelationId: z.string().optional(),
+    causalRunId: z.string().optional(),
   }),
   z.object({ type: z.literal("cancel"), sessionId: z.string().uuid() }),
   z.object({ type: z.literal("subscribe"), sessionId: z.string().uuid() }),
@@ -1851,6 +1877,11 @@ fastify.register(async (instance) => {
                 includeSource: parsed.includeSource,
                 interrupt: parsed.interrupt,
                 interruptReason: parsed.interruptReason,
+                messageId: parsed.messageId,
+                correlationId: parsed.correlationId,
+                correlationKind: parsed.correlationKind,
+                replyToCorrelationId: parsed.replyToCorrelationId,
+                causalRunId: parsed.causalRunId,
               })
               .then((result) => {
                 if (result.startsWith("error")) {

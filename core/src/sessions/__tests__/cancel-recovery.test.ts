@@ -488,6 +488,214 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(result).not.toContain("busy");
   });
 
+  it("blocks stale peer_send when a newer inbound peer turn from the target is already queued", async () => {
+    const source = await prisma.agent.create({ data: { name: "fresh-source-a" } });
+    const target = await prisma.agent.create({ data: { name: "fresh-target-b" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(source.id, {
+      id: source.id,
+      runId: "run-a",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "A is running",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+    await prisma.pendingTurn.create({
+      data: {
+        agentId: source.id,
+        userInput: "[from fresh-target-b] decision is approved",
+        opts: {
+          peerOrigin: {
+            fromAgentId: target.id,
+            fromAgentName: target.name,
+            mode: "raw",
+            messageId: "msg-b-1",
+            correlationId: "decision-1",
+            correlationKind: "decision",
+          },
+        },
+      },
+    });
+
+    const result = await sessions.sendPeerMessage(source.id, target.name, "what is your decision?", "raw", {
+      correlationId: "decision-1",
+      correlationKind: "request",
+    });
+
+    expect(result).toContain("freshness-blocked");
+    expect(result).toContain("was not sent");
+    expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
+    expect(await prisma.pendingTurn.count({ where: { agentId: source.id } })).toBe(1);
+  });
+
+  it("ask_user returns a freshness result instead of entering human-waiting state when peer inbox is fresh", async () => {
+    const agent = await prisma.agent.create({ data: { name: "fresh-ask-agent" } });
+    const peer = await prisma.agent.create({ data: { name: "fresh-ask-peer" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-ask",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "agent is running",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+    await prisma.pendingTurn.create({
+      data: {
+        agentId: agent.id,
+        userInput: "[from fresh-ask-peer] choose option A",
+        opts: {
+          peerOrigin: {
+            fromAgentId: peer.id,
+            fromAgentName: peer.name,
+            mode: "raw",
+            messageId: "msg-peer-answer",
+            correlationId: "ask-1",
+            correlationKind: "decision",
+          },
+        },
+      },
+    });
+
+    const result = await sessions.askUser(agent.id, "Which option?", ["A", "B"]);
+
+    expect(result).toContain("freshness-blocked");
+    expect(result).toContain("ask_user was not opened");
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).not.toBe("AWAITING_USER_INPUT");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).pendingQuestions.has(agent.id)).toBe(false);
+    expect(hub.sessionMessages.some((m) => m.sessionId === agent.id && m.msg.type === "user_question")).toBe(false);
+  });
+
+  it("run-end freshness prioritizes new peer turns and triggers only one suppressed continuation", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "freshness-runtime-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "test-key",
+        models: ["test-model"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "freshness-runtime-agent",
+        providerId: provider.id,
+        model: "test-model",
+      },
+    });
+    const peer = await prisma.agent.create({ data: { name: "freshness-runtime-peer" } });
+    const runtimeStarted = deferred<void>();
+    const releaseRuntime = deferred<void>();
+    const calls: RuntimeOptions[] = [];
+    let nonInteractiveAskResult = "";
+    let nonInteractivePermissionBehavior = "";
+    const runtime: AgentRuntime = {
+      async *query(opts: RuntimeOptions) {
+        calls.push(opts);
+        if (calls.length === 1) {
+          runtimeStarted.resolve(undefined);
+          await releaseRuntime.promise;
+        } else if (calls.length === 2) {
+          nonInteractiveAskResult = (await opts.askUser?.({ question: "wait?", options: ["yes", "no"] })) ?? "";
+          const decision = await opts.canUseTool("Bash", { command: "echo hi" }, {} as never);
+          nonInteractivePermissionBehavior = decision.behavior;
+        }
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "assistant",
+            session_id: `fresh-thread-${calls.length}`,
+            message: { content: [{ type: "text", text: `assistant ${calls.length}` }] },
+          },
+        };
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "result",
+            subtype: "success",
+            session_id: `fresh-thread-${calls.length}`,
+          },
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const first = sessions.sendMessage(agent.id, "start run");
+    await runtimeStarted.promise;
+    await prisma.pendingTurn.create({
+      data: {
+        agentId: agent.id,
+        userInput: "[from freshness-runtime-peer] peer decision",
+        opts: {
+          peerOrigin: {
+            fromAgentId: peer.id,
+            fromAgentName: peer.name,
+            mode: "raw",
+            messageId: "fresh-msg-1",
+            correlationId: "fresh-decision",
+            correlationKind: "decision",
+          },
+        },
+      },
+    });
+    await prisma.pendingTurn.create({
+      data: {
+        agentId: agent.id,
+        userInput: "ordinary queued turn should wait",
+        opts: {},
+      },
+    });
+    await prisma.pendingTurn.create({
+      data: {
+        agentId: agent.id,
+        userInput: "[from freshness-runtime-peer] follow-up peer context",
+        opts: {
+          peerOrigin: {
+            fromAgentId: peer.id,
+            fromAgentName: peer.name,
+            mode: "raw",
+            messageId: "fresh-msg-2",
+            correlationId: "fresh-decision-2",
+            correlationKind: "decision",
+          },
+        },
+      },
+    });
+    const stale = await sessions.askUser(agent.id, "Need a decision?", ["yes", "no"]);
+    expect(stale).toContain("ask_user was not opened");
+
+    releaseRuntime.resolve(undefined);
+    await expect(withTimeout(first, "first freshness run")).resolves.toEqual({ finalText: "assistant 1" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls).toHaveLength(3);
+    expect(calls[1]!.prompt).toContain("Ensemble freshness check");
+    expect(calls[1]!.prompt).toContain("peer decision");
+    expect(calls[1]!.prompt).toContain("follow-up peer context");
+    expect(calls[1]!.prompt).not.toContain("ordinary queued turn should wait");
+    expect(nonInteractiveAskResult).toContain("non-interactive freshness continuation");
+    expect(nonInteractivePermissionBehavior).toBe("deny");
+    expect(calls[2]!.prompt).toBe("ordinary queued turn should wait");
+    const userRows = await prisma.message.findMany({ where: { agentId: agent.id, type: "user" }, orderBy: { seq: "asc" } });
+    expect(userRows.map((row) => JSON.stringify(row.payload)).join("\n")).not.toContain("Ensemble freshness check");
+  });
+
   it("coalesces superseded peer_send handoffs from the same running source and mode", async () => {
     const source = await prisma.agent.create({ data: { name: "coalesce-source" } });
     const target = await prisma.agent.create({ data: { name: "coalesce-target" } });
@@ -668,6 +876,49 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(queued?.userInput).toContain("raw two");
     expect(queued?.userInput).not.toContain("raw source snapshot 1");
     expect(queued?.userInput).not.toContain("raw one");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).clearQueuedTurns(target.id);
+  });
+
+  it("dedupes queued peer_send messages with the same correlation metadata", async () => {
+    const source = await prisma.agent.create({ data: { name: "correlation-dedupe-source" } });
+    const target = await prisma.agent.create({ data: { name: "correlation-dedupe-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(target.id, {
+      id: target.id,
+      runId: "target-busy",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "target busy",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+
+    const first = await sessions.sendPeerMessage(source.id, target.name, "first request", "raw", {
+      correlationId: "corr-42",
+      correlationKind: "request",
+    });
+    const second = await sessions.sendPeerMessage(source.id, target.name, "updated request", "raw", {
+      correlationId: "corr-42",
+      correlationKind: "request",
+    });
+    await Promise.resolve();
+
+    expect(first).toContain("queued for");
+    expect(second).toContain("suppressed duplicate peer_send");
+    const rows = await prisma.pendingTurn.findMany({ where: { agentId: target.id }, orderBy: { id: "asc" } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.userInput).toContain("first request");
+    expect(rows[0]?.userInput).not.toContain("updated request");
+    const origin = (rows[0]?.opts as { peerOrigin?: { correlationId?: string; correlationKind?: string; messageId?: string } }).peerOrigin;
+    expect(origin?.correlationId).toBe("corr-42");
+    expect(origin?.correlationKind).toBe("request");
+    expect(origin?.messageId).toBeTruthy();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (sessions as any).clearQueuedTurns(target.id);
   });

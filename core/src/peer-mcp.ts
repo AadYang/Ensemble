@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import type { PeerIncludeSource } from "@agentorch/shared";
+import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
 import type { SessionManager } from "./sessions/SessionManager.js";
 
 export const PEER_MCP_SERVER_NAME = "agentorch-peer";
@@ -8,6 +8,7 @@ export const PEER_SEND_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_send`;
 export const PEER_QUERY_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_query`;
 
 const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
+const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
 
 /** Pure closure over `fromAgentId`. Extracted so the closure-binding
  *  invariant can be unit-tested without booting the SDK. The MCP server
@@ -22,12 +23,22 @@ export function makePeerSendHandler(
   includeSource?: PeerIncludeSource;
   interrupt?: boolean;
   interruptReason?: string;
+  messageId?: string;
+  correlationId?: string;
+  correlationKind?: PeerCorrelationKind;
+  replyToCorrelationId?: string;
+  causalRunId?: string;
 }) => Promise<string> {
   return async (args) =>
     sessions.sendPeerMessage(fromAgentId, args.target, args.message, args.mode ?? "raw", {
       includeSource: args.includeSource,
       interrupt: args.interrupt,
       interruptReason: args.interruptReason,
+      messageId: args.messageId,
+      correlationId: args.correlationId,
+      correlationKind: args.correlationKind,
+      replyToCorrelationId: args.replyToCorrelationId,
+      causalRunId: args.causalRunId,
     });
 }
 
@@ -98,6 +109,14 @@ export function makePeerMcpServer(
         .string()
         .optional()
         .describe("Required when interrupt=true. Explain why delayed delivery would be harmful or stale."),
+      messageId: z.string().optional().describe("Optional sender-generated id for this peer message."),
+      correlationId: z.string().optional().describe("Optional id tying related peer request/decision messages together."),
+      correlationKind: z
+        .enum(PEER_CORRELATION_KINDS)
+        .optional()
+        .describe("Optional correlation semantic: decision or request."),
+      replyToCorrelationId: z.string().optional().describe("Optional correlationId this message answers."),
+      causalRunId: z.string().optional().describe("Optional sender-side run id or causal clock for this message."),
     },
     async (args) => {
       const result = await sendHandler(args);

@@ -19,7 +19,7 @@ import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { PeerIncludeSource } from "@agentorch/shared";
+import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
 
 export const BRIDGE_TOKEN = randomUUID();
 // The internal Fastify route. Other API routes in core/src/index.ts are
@@ -31,6 +31,7 @@ const BRIDGE_ROUTE_INTERNAL = "/mcp/internal";
 const BRIDGE_ROUTE_PUBLIC = "/api/mcp/internal";
 
 let bridgePort: number | null = null;
+const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
 
 export function setBridgePort(port: number): void {
   bridgePort = port;
@@ -71,6 +72,11 @@ export interface BridgeHandlers {
     includeSource?: PeerIncludeSource;
     interrupt?: boolean;
     interruptReason?: string;
+    messageId?: string;
+    correlationId?: string;
+    correlationKind?: PeerCorrelationKind;
+    replyToCorrelationId?: string;
+    causalRunId?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
@@ -121,6 +127,13 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
         includeSource: args.includeSource === true || args.includeSource === false || args.includeSource === "auto" ? args.includeSource : undefined,
         interrupt: args.interrupt === true,
         interruptReason: typeof args.interruptReason === "string" ? args.interruptReason : undefined,
+        messageId: typeof args.messageId === "string" ? args.messageId : undefined,
+        correlationId: typeof args.correlationId === "string" ? args.correlationId : undefined,
+        correlationKind: PEER_CORRELATION_KINDS.includes(args.correlationKind as PeerCorrelationKind)
+          ? args.correlationKind as PeerCorrelationKind
+          : undefined,
+        replyToCorrelationId: typeof args.replyToCorrelationId === "string" ? args.replyToCorrelationId : undefined,
+        causalRunId: typeof args.causalRunId === "string" ? args.causalRunId : undefined,
       });
     case "peer_query":
       if (!handlers.peerQuery) throw new Error("peer_query is not available for this agent");
@@ -166,6 +179,11 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
       includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
       interrupt: z.boolean().optional(),
       interruptReason: z.string().optional(),
+      messageId: z.string().optional(),
+      correlationId: z.string().optional(),
+      correlationKind: z.enum(PEER_CORRELATION_KINDS).optional(),
+      replyToCorrelationId: z.string().optional(),
+      causalRunId: z.string().optional(),
     },
     async (args) => ({ content: [{ type: "text", text: await invoke("peer_send", args) }] }),
   );
@@ -284,6 +302,11 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
           includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
           interrupt: z.boolean().optional(),
           interruptReason: z.string().optional(),
+          messageId: z.string().optional(),
+          correlationId: z.string().optional(),
+          correlationKind: z.enum(PEER_CORRELATION_KINDS).optional(),
+          replyToCorrelationId: z.string().optional(),
+          causalRunId: z.string().optional(),
         },
         async (args) => {
           const text = await peerSend(args);

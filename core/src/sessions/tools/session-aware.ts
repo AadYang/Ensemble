@@ -17,10 +17,11 @@
 // `mcp__agentorch-peer__peer_send` long names in Slice 5.5.
 
 import { z } from "zod";
-import type { PeerIncludeSource } from "@agentorch/shared";
+import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
 import type { NormalizedTool } from "./types.js";
 
 const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
+const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
 
 type PeerSendCallback = (args: {
   target: string;
@@ -29,6 +30,11 @@ type PeerSendCallback = (args: {
   includeSource?: PeerIncludeSource;
   interrupt?: boolean;
   interruptReason?: string;
+  messageId?: string;
+  correlationId?: string;
+  correlationKind?: PeerCorrelationKind;
+  replyToCorrelationId?: string;
+  causalRunId?: string;
 }) => Promise<string>;
 
 type PeerQueryCallback = (args: { target: string; limit?: number }) => Promise<string>;
@@ -63,6 +69,14 @@ const PEER_SEND_SCHEMA = z.object({
     .string()
     .optional()
     .describe("Required when interrupt=true. Explain why delayed delivery would be harmful or stale."),
+  messageId: z.string().optional().describe("Optional sender-generated id for this peer message."),
+  correlationId: z.string().optional().describe("Optional id tying related peer request/decision messages together."),
+  correlationKind: z
+    .enum(PEER_CORRELATION_KINDS)
+    .optional()
+    .describe("Optional correlation semantic: decision or request."),
+  replyToCorrelationId: z.string().optional().describe("Optional correlationId this message answers."),
+  causalRunId: z.string().optional().describe("Optional sender-side run id or causal clock for this message."),
 });
 
 /** peer_send NormalizedTool factory. Mirror of Claude side peer-mcp.ts.

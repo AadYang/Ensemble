@@ -62,6 +62,41 @@ describe("peer-mcp closure binding", () => {
     await h({ target: "p", message: "hi" });
     expect(observedMode).toBe("raw");
   });
+
+  it("forwards correlation metadata to SessionManager", async () => {
+    let observed: unknown;
+    const mockSessions = {
+      sendPeerMessage: async (
+        _from: string,
+        _target: string,
+        _msg: string,
+        _mode: string,
+        opts: unknown,
+      ) => {
+        observed = opts;
+        return "ok";
+      },
+    } as unknown as SessionManager;
+    const h = makePeerSendHandler(mockSessions, "agent-Z");
+
+    await h({
+      target: "p",
+      message: "hi",
+      messageId: "msg-1",
+      correlationId: "corr-1",
+      correlationKind: "decision",
+      replyToCorrelationId: "req-1",
+      causalRunId: "run-1",
+    });
+
+    expect(observed).toMatchObject({
+      messageId: "msg-1",
+      correlationId: "corr-1",
+      correlationKind: "decision",
+      replyToCorrelationId: "req-1",
+      causalRunId: "run-1",
+    });
+  });
 });
 
 describe("ask-user-mcp closure binding", () => {

@@ -154,8 +154,12 @@ describe("mcpServersToCodexConfig", () => {
   it("invokes registered tools through the stdio proxy callback endpoint", async () => {
     const fastify = Fastify({ logger: false });
     mountMcpBridge(fastify);
+    let observed: unknown;
     registerHandlers("agent-stdio", {
-      peerSend: async (args) => `sent:${args.target}:${args.message}:${args.mode ?? "raw"}`,
+      peerSend: async (args) => {
+        observed = args;
+        return `sent:${args.target}:${args.message}:${args.mode ?? "raw"}`;
+      },
     });
 
     try {
@@ -166,10 +170,26 @@ describe("mcpServersToCodexConfig", () => {
           authorization: `Bearer ${BRIDGE_TOKEN}`,
           "content-type": "application/json",
         },
-        payload: JSON.stringify({ target: "A", message: "hello", mode: "raw" }),
+        payload: JSON.stringify({
+          target: "A",
+          message: "hello",
+          mode: "raw",
+          messageId: "msg-1",
+          correlationId: "corr-1",
+          correlationKind: "decision",
+          replyToCorrelationId: "req-1",
+          causalRunId: "run-1",
+        }),
       });
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({ content: "sent:A:hello:raw" });
+      expect(observed).toMatchObject({
+        messageId: "msg-1",
+        correlationId: "corr-1",
+        correlationKind: "decision",
+        replyToCorrelationId: "req-1",
+        causalRunId: "run-1",
+      });
     } finally {
       unregisterHandlers("agent-stdio");
       await fastify.close();
