@@ -3,7 +3,13 @@
 // peer-mcp / ask-user-mcp at the new tool layer.
 
 import { describe, it, expect } from "vitest";
-import { makePeerSendTool, makePeerQueryTool, makeAskUserTool, makeTaskTool } from "../session-aware.js";
+import {
+  makeAskUserTool,
+  makeConversationSearchTool,
+  makePeerQueryTool,
+  makePeerSendTool,
+  makeTaskTool,
+} from "../session-aware.js";
 import { exitPlanModeTool } from "../exit-plan-mode.js";
 import { shouldRequireApproval } from "../index.js";
 
@@ -86,6 +92,20 @@ describe("makePeerQueryTool", () => {
   });
 });
 
+describe("makeConversationSearchTool", () => {
+  it("binds its callback and forwards scope args", async () => {
+    const calls: Array<{ query: string; scope?: string; target?: string; limit?: number }> = [];
+    const search = async (args: { query: string; scope?: "team" | "self" | "agent"; target?: string; limit?: number }) => {
+      calls.push(args);
+      return `search:${args.query}:${args.scope ?? "team"}`;
+    };
+    const tool = makeConversationSearchTool(search);
+
+    expect(await tool.execute({ query: "migration", scope: "agent", target: "A", limit: 3 })).toBe("search:migration:agent");
+    expect(calls).toEqual([{ query: "migration", scope: "agent", target: "A", limit: 3 }]);
+  });
+});
+
 describe("makeAskUserTool", () => {
   it("binds its own ask callback", async () => {
     let observed = "";
@@ -137,14 +157,17 @@ describe("session-aware tools never gate", () => {
   it.each([
     ["default", "peer_send"],
     ["default", "peer_query"],
+    ["default", "conversation_search"],
     ["default", "ask_user"],
     ["default", "Task"],
     ["plan", "peer_send"],
     ["plan", "peer_query"],
+    ["plan", "conversation_search"],
     ["plan", "ask_user"],
     ["plan", "Task"],
     ["acceptEdits", "peer_send"],
     ["acceptEdits", "peer_query"],
+    ["acceptEdits", "conversation_search"],
     ["acceptEdits", "ask_user"],
     ["acceptEdits", "Task"],
   ])("%s mode + %s tool → no approval", (mode, tool) => {

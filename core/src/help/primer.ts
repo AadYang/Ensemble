@@ -34,6 +34,8 @@ Cross-agent communication tools you have:
   peer_send  → send a message to another agent (modes: continue / review / fork / raw;
                urgent interrupt is available only with a required reason)
   peer_query → read another agent's recent text turns (synchronous, no run)
+  conversation_search -> keyword search prior user/assistant messages
+               (read-only DB lookup; default scope team, fallback self)
 On Codex CLI agents these are exposed through Ensemble's local stdio MCP bridge.
 
 Skills (SKILL.md files for pre-packaged task instructions — Claude Code/Codex format):

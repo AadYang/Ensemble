@@ -24,6 +24,7 @@ import type {
   ReasoningEffort,
   SdkMessage,
 } from "@agentorch/shared";
+import type { ConversationSearchArgs } from "../../conversation-search.js";
 
 import type { Provider } from "../../db.js";
 
@@ -108,6 +109,7 @@ export interface RuntimeOptions {
     causalRunId?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
+  conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
   spawnTask?: (args: { description: string; prompt: string }) => Promise<{ finalText: string; subagentId: string }>;
   ensembleHelp?: (args: { topic?: string }) => Promise<string>;

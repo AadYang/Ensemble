@@ -27,6 +27,8 @@ User-facing surfaces (DO NOT try to script these — point the user to them):
 Inter-agent communication (you have these tools):
   - peer_send (push: continue / review / fork / raw modes)
   - peer_query (read-only history pull, doesn't run the peer)
+  - conversation_search (read-only keyword search over prior user/assistant text;
+    default scope team, fallback self when unteamed)
   - These are direct function tools on OpenAI providers, MCP tools on Claude
     providers, and stdio MCP tools on the experimental Codex CLI provider.
   - Codex peer tools are routed through Ensemble's local stdio MCP bridge and
@@ -208,6 +210,14 @@ peer_query (sync pull — read peer's recent text turns from DB):
   - Returns oldest → newest text turns, prefixed [user] / [assistant]
   - Tool-use noise filtered out
   - Use when you got a handoff and need more context than the embedded source
+
+conversation_search (sync lookup - keyword search across prior text):
+  - Does NOT cause any target agent to run; pure read-only DB query
+  - Default scope is team. If the caller has no team, it falls back to self and
+    says so in the result header
+  - scope=self searches only this agent; scope=agent requires target name/UUID
+  - Returns bounded matches with agent, seq, role, createdAt, and snippet
+  - Filters tool-use/tool-result/raw event noise; only user/assistant text
 
 Typical pattern:
   agent-A peer_send(target=B, mode=review, body="audit this")

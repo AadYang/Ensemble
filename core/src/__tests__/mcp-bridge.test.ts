@@ -99,6 +99,7 @@ describe("mcpServersToCodexConfig", () => {
     registerHandlers("agent-abc", {
       peerSend: async () => "sent",
       peerQuery: async () => "history",
+      conversationSearch: async () => "search",
       ensembleHelp: async () => "help",
     });
 
@@ -144,6 +145,7 @@ describe("mcpServersToCodexConfig", () => {
       expect(tools.statusCode).toBe(200);
       expect(tools.body).toContain("\"peer_send\"");
       expect(tools.body).toContain("\"peer_query\"");
+      expect(tools.body).toContain("\"conversation_search\"");
       expect(tools.body).toContain("\"ensemble_help\"");
     } finally {
       unregisterHandlers("agent-abc");
@@ -196,12 +198,53 @@ describe("mcpServersToCodexConfig", () => {
     }
   });
 
+  it("invokes conversation_search through the stdio proxy callback endpoint", async () => {
+    const fastify = Fastify({ logger: false });
+    mountMcpBridge(fastify);
+    let observed: unknown;
+    registerHandlers("agent-stdio-search", {
+      conversationSearch: async (args) => {
+        observed = args;
+        return `search:${args.query}:${args.scope ?? "team"}:${args.target ?? ""}:${args.limit ?? ""}`;
+      },
+    });
+
+    try {
+      const res = await fastify.inject({
+        method: "POST",
+        url: "/mcp/internal-tool/agent-stdio-search/conversation_search",
+        headers: {
+          authorization: `Bearer ${BRIDGE_TOKEN}`,
+          "content-type": "application/json",
+        },
+        payload: JSON.stringify({
+          query: "migration",
+          scope: "agent",
+          target: "Engineer",
+          limit: 4,
+        }),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ content: "search:migration:agent:Engineer:4" });
+      expect(observed).toMatchObject({
+        query: "migration",
+        scope: "agent",
+        target: "Engineer",
+        limit: 4,
+      });
+    } finally {
+      unregisterHandlers("agent-stdio-search");
+      await fastify.close();
+    }
+  });
+
   it("falls back to persistent peer handlers when turn handlers are not active", async () => {
     const fastify = Fastify({ logger: false });
     mountMcpBridge(fastify, {
       getFallbackHandlers: (agentId) => ({
         peerSend: async (args) => `fallback:${agentId}:${args.target}:${args.message}:${args.mode ?? "raw"}`,
         peerQuery: async () => "fallback-history",
+        conversationSearch: async (args) => `fallback-search:${agentId}:${args.query}`,
       }),
     });
 
@@ -218,6 +261,20 @@ describe("mcpServersToCodexConfig", () => {
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({
         content: "fallback:agent-visible:Engineer:fix bug:raw",
+      });
+
+      const search = await fastify.inject({
+        method: "POST",
+        url: "/mcp/internal-tool/agent-visible/conversation_search",
+        headers: {
+          authorization: `Bearer ${BRIDGE_TOKEN}`,
+          "content-type": "application/json",
+        },
+        payload: JSON.stringify({ query: "old decision" }),
+      });
+      expect(search.statusCode).toBe(200);
+      expect(JSON.parse(search.body)).toEqual({
+        content: "fallback-search:agent-visible:old decision",
       });
     } finally {
       await fastify.close();

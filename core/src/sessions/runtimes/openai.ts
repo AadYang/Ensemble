@@ -29,6 +29,7 @@ import {
   toOpenAITool,
   makePeerSendTool,
   makePeerQueryTool,
+  makeConversationSearchTool,
   makeAskUserTool,
   makeTaskTool,
   makeEnsembleHelpTool,
@@ -75,6 +76,7 @@ export class OpenAIAgentRuntime implements AgentRuntime {
     const sessionAware: AnyNormalizedTool[] = [];
     if (opts.peerSend) sessionAware.push(makePeerSendTool(opts.peerSend));
     if (opts.peerQuery) sessionAware.push(makePeerQueryTool(opts.peerQuery));
+    if (opts.conversationSearch) sessionAware.push(makeConversationSearchTool(opts.conversationSearch));
     if (opts.askUser) sessionAware.push(makeAskUserTool(opts.askUser));
     if (opts.spawnTask) sessionAware.push(makeTaskTool(opts.spawnTask));
     if (opts.ensembleHelp) sessionAware.push(makeEnsembleHelpTool(opts.ensembleHelp));

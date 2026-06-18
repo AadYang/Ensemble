@@ -16,9 +16,11 @@ import {
   makePeerMcpServer,
   makePeerSendHandler,
   makePeerQueryHandler,
+  makeConversationSearchHandler,
   PEER_MCP_SERVER_NAME,
   PEER_SEND_TOOL_NAME,
   PEER_QUERY_TOOL_NAME,
+  CONVERSATION_SEARCH_TOOL_NAME,
 } from "../peer-mcp.js";
 import { makeHelpMcpServer, HELP_MCP_SERVER_NAME, ENSEMBLE_HELP_TOOL_NAME } from "../help-mcp.js";
 import { buildEnsemblePrimer, formatEnsembleHelp } from "../help/index.js";
@@ -62,6 +64,7 @@ import type { WSHub } from "../ws/hub.js";
 import { CLI_INSTALL_INFO, getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
 import { ensureDataDir } from "../paths.js";
 import { currentPlatformKey } from "../platform-key.js";
+import { conversationSearch, type ConversationSearchArgs } from "../conversation-search.js";
 
 /** Stable cwd for the spawned claude CLI. The CLI scopes session files by
  * `~/.claude/projects/<encoded-cwd>/`, so if we let the CLI inherit our
@@ -1236,6 +1239,8 @@ export class SessionManager {
     lines.push("  peer_query(target=\"<name>\", limit=<N>)");
     lines.push("       Read-only DB pull of teammate's recent text turns. Does NOT");
     lines.push("       trigger them. Use when you need more context before acting.");
+    lines.push("  conversation_search(query=\"<keywords>\", scope=\"team|self|agent\", target?)");
+    lines.push("       Read-only keyword lookup across prior user/assistant messages. Does NOT run agents.");
     lines.push("");
     lines.push("Intent → exact call:");
     lines.push("");
@@ -2898,6 +2903,7 @@ export class SessionManager {
         allowedTools: [
           PEER_SEND_TOOL_NAME,
           PEER_QUERY_TOOL_NAME,
+          CONVERSATION_SEARCH_TOOL_NAME,
           ASK_USER_TOOL_NAME,
           ENSEMBLE_HELP_TOOL_NAME,
           SKILL_INVOKE_TOOL_NAME,
@@ -2971,6 +2977,7 @@ export class SessionManager {
         // bind fromAgentId via the Slice 1.7 handler factories.
         peerSend: makePeerSendHandler(this, sessionId),
         peerQuery: makePeerQueryHandler(this, sessionId),
+        conversationSearch: makeConversationSearchHandler(this, sessionId),
         askUser: makeAskUserHandler(this, sessionId),
         spawnTask: ({ description, prompt }) => this.spawnTaskSubagent(sessionId, description, prompt),
         ensembleHelp: async ({ topic }) => formatEnsembleHelp(topic),
@@ -3535,6 +3542,10 @@ export class SessionManager {
     if (full.length <= MAX_QUERY_CHARS) return full;
     const half = Math.floor(MAX_QUERY_CHARS / 2) - 60;
     return `${full.slice(0, half)}\n\n[... ${full.length - half * 2} chars truncated ...]\n\n${full.slice(-half)}`;
+  }
+
+  async conversationSearch(fromAgentId: string, args: ConversationSearchArgs): Promise<string> {
+    return conversationSearch(fromAgentId, args);
   }
 
   /** Called by the peer_send MCP tool. Validates and forwards a peer message.

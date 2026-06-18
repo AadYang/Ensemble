@@ -102,6 +102,7 @@ mountMcpBridge(fastify, {
         causalRunId,
       }),
     peerQuery: ({ target, limit }) => sessions.fetchPeerHistory(agentId, target, limit),
+    conversationSearch: (args) => sessions.conversationSearch(agentId, args),
   }),
 });
 

@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
+import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs } from "./conversation-search.js";
 import type { SessionManager } from "./sessions/SessionManager.js";
 
 export const PEER_MCP_SERVER_NAME = "agentorch-peer";
 export const PEER_SEND_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_send`;
 export const PEER_QUERY_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_query`;
+export const CONVERSATION_SEARCH_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__conversation_search`;
 
 const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
 const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
@@ -51,6 +53,13 @@ export function makePeerQueryHandler(
   return async (args) => sessions.fetchPeerHistory(fromAgentId, args.target, args.limit ?? 20);
 }
 
+export function makeConversationSearchHandler(
+  sessions: Pick<SessionManager, "conversationSearch">,
+  fromAgentId: string,
+): (args: ConversationSearchArgs) => Promise<string> {
+  return async (args) => sessions.conversationSearch(fromAgentId, args);
+}
+
 /** Build a per-call MCP server whose `peer_send` tool is bound to a specific
  * source agent. Each query() invocation gets its own instance so the handler's
  * closure knows which agent is sending. */
@@ -60,6 +69,7 @@ export function makePeerMcpServer(
 ): McpSdkServerConfigWithInstance {
   const sendHandler = makePeerSendHandler(sessions, fromAgentId);
   const queryHandler = makePeerQueryHandler(sessions, fromAgentId);
+  const searchHandler = makeConversationSearchHandler(sessions, fromAgentId);
   const peerSend = tool(
     "peer_send",
     [
@@ -152,9 +162,36 @@ export function makePeerMcpServer(
       return { content: [{ type: "text" as const, text: result }] };
     },
   );
+  const conversationSearch = tool(
+    "conversation_search",
+    [
+      "Search prior Ensemble conversation text by keyword (read-only DB lookup).",
+      "Does NOT run any target agent and does not modify memory, resume, model,",
+      "provider, permissionMode, or sandbox settings.",
+      "",
+      "Default scope is team. If this agent has no team, team falls back to self.",
+      "Use scope='self' for this agent only or scope='agent' with target name/UUID.",
+      "",
+      "Returns bounded matches with agent, seq, role, createdAt, and snippet.",
+      "Tool-use/tool-result/raw event noise is filtered out.",
+    ].join("\n"),
+    {
+      query: z.string().min(1).describe("Keyword or short phrase to search for in prior user/assistant text."),
+      scope: z
+        .enum(CONVERSATION_SEARCH_SCOPES)
+        .optional()
+        .describe("Search scope. Default team; if this agent has no team, team falls back to self."),
+      target: z.string().optional().describe("Agent name or UUID. Required when scope='agent'."),
+      limit: z.number().int().min(1).max(25).optional().describe("Maximum matches to return (default 8, max 25)."),
+    },
+    async (args) => {
+      const result = await searchHandler(args);
+      return { content: [{ type: "text" as const, text: result }] };
+    },
+  );
   return createSdkMcpServer({
     name: PEER_MCP_SERVER_NAME,
     version: "0.3.0",
-    tools: [peerSend, peerQuery],
+    tools: [peerSend, peerQuery, conversationSearch],
   });
 }

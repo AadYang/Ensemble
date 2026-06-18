@@ -560,7 +560,7 @@ async function preflightCodexMcp(opts: {
       output,
       message:
         `Codex CLI MCP preflight failed: ${opts.internalMcpServerName} was not visible in \`codex mcp list\`. ` +
-        "peer_send/peer_query cannot be exposed to this Codex turn.",
+        "peer_send/peer_query/conversation_search cannot be exposed to this Codex turn.",
     };
   } catch (err) {
     return {
@@ -586,6 +586,7 @@ export class CodexCliRuntime implements AgentRuntime {
     registerHandlers(opts.sessionId, {
       peerSend: opts.peerSend,
       peerQuery: opts.peerQuery,
+      conversationSearch: opts.conversationSearch,
       askUser: opts.askUser,
       spawnTask: opts.spawnTask,
       ensembleHelp: opts.ensembleHelp,
@@ -608,6 +609,7 @@ export class CodexCliRuntime implements AgentRuntime {
     const wantsBridge =
       opts.peerSend ||
       opts.peerQuery ||
+      opts.conversationSearch ||
       opts.askUser ||
       opts.spawnTask ||
       opts.ensembleHelp ||
@@ -654,7 +656,7 @@ export class CodexCliRuntime implements AgentRuntime {
     // connection setup (proxy env, cert store), and skill resolution. That
     // surfaces as: agentorch-internal "registered" via --config (codex mcp list
     // shows it) but its MCP initialize handshake never completes, so the
-    // model never sees peer_send/peer_query.
+    // model never sees peer_send/peer_query/conversation_search.
     //
     // Always seed from process.env. SessionManager's opts.env / providerEnv
     // layer on top so explicit overrides still win.

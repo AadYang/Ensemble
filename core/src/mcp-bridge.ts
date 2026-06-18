@@ -20,6 +20,7 @@ import type { FastifyInstance } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
+import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs, type ConversationSearchScope } from "./conversation-search.js";
 
 export const BRIDGE_TOKEN = randomUUID();
 // The internal Fastify route. Other API routes in core/src/index.ts are
@@ -79,6 +80,7 @@ export interface BridgeHandlers {
     causalRunId?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
+  conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
   spawnTask?: (args: { description: string; prompt: string }) => Promise<{
     finalText: string;
@@ -108,6 +110,7 @@ export function unregisterHandlers(agentId: string): void {
 export type InternalToolName =
   | "peer_send"
   | "peer_query"
+  | "conversation_search"
   | "ensemble_help"
   | "skill_list"
   | "skill_invoke"
@@ -141,6 +144,20 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
         target: String(args.target ?? ""),
         limit: typeof args.limit === "number" ? args.limit : undefined,
       });
+    case "conversation_search":
+      if (!handlers.conversationSearch) throw new Error("conversation_search is not available for this agent");
+      {
+        const scope =
+          typeof args.scope === "string" && CONVERSATION_SEARCH_SCOPES.includes(args.scope as ConversationSearchScope)
+            ? args.scope as ConversationSearchScope
+            : undefined;
+        return handlers.conversationSearch({
+          query: String(args.query ?? ""),
+          scope,
+          target: typeof args.target === "string" ? args.target : undefined,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        });
+      }
     case "ensemble_help":
       if (!handlers.ensembleHelp) throw new Error("ensemble_help is not available for this agent");
       return handlers.ensembleHelp({ topic: typeof args.topic === "string" ? args.topic : undefined });
@@ -195,6 +212,17 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
       limit: z.number().int().min(1).max(50).optional(),
     },
     async (args) => ({ content: [{ type: "text", text: await invoke("peer_query", args) }] }),
+  );
+  mcp.tool(
+    "conversation_search",
+    "Search prior Ensemble conversation text by keyword (read-only DB lookup; does NOT run target agents). Default scope=team, fallback self when no team. Returns agent, seq, role, createdAt, snippet.",
+    {
+      query: z.string().min(1),
+      scope: z.enum(CONVERSATION_SEARCH_SCOPES).optional(),
+      target: z.string().optional(),
+      limit: z.number().int().min(1).max(25).optional(),
+    },
+    async (args) => ({ content: [{ type: "text", text: await invoke("conversation_search", args) }] }),
   );
   mcp.tool(
     "ensemble_help",
@@ -325,6 +353,23 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
         },
         async (args) => {
           const text = await peerQuery(args);
+          return { content: [{ type: "text", text }] };
+        },
+      );
+    }
+    if (handlers.conversationSearch) {
+      const conversationSearch = handlers.conversationSearch;
+      mcp.tool(
+        "conversation_search",
+        "Search prior Ensemble conversation text by keyword (read-only DB lookup; does NOT run target agents). Default scope=team, fallback self when no team. Returns agent, seq, role, createdAt, snippet.",
+        {
+          query: z.string().min(1),
+          scope: z.enum(CONVERSATION_SEARCH_SCOPES).optional(),
+          target: z.string().optional(),
+          limit: z.number().int().min(1).max(25).optional(),
+        },
+        async (args) => {
+          const text = await conversationSearch(args);
           return { content: [{ type: "text", text }] };
         },
       );

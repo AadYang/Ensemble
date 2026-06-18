@@ -18,6 +18,7 @@
 
 import { z } from "zod";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
+import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs } from "../../conversation-search.js";
 import type { NormalizedTool } from "./types.js";
 
 const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
@@ -38,6 +39,7 @@ type PeerSendCallback = (args: {
 }) => Promise<string>;
 
 type PeerQueryCallback = (args: { target: string; limit?: number }) => Promise<string>;
+type ConversationSearchCallback = (args: ConversationSearchArgs) => Promise<string>;
 
 type AskUserCallback = (args: { question: string; options: string[] }) => Promise<string>;
 
@@ -141,6 +143,48 @@ export function makePeerQueryTool(query: PeerQueryCallback): NormalizedTool<type
     parameters: PEER_QUERY_SCHEMA,
     async execute(args) {
       return query(args);
+    },
+  };
+}
+
+const CONVERSATION_SEARCH_SCHEMA = z.object({
+  query: z.string().min(1).describe("Keyword or short phrase to search for in prior user/assistant text."),
+  scope: z
+    .enum(CONVERSATION_SEARCH_SCOPES)
+    .optional()
+    .describe("Search scope. Default team; if this agent has no team, team falls back to self."),
+  target: z
+    .string()
+    .optional()
+    .describe("Agent name or UUID. Required when scope='agent'."),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(25)
+    .optional()
+    .describe("Maximum matches to return (default 8, max 25)."),
+});
+
+export function makeConversationSearchTool(
+  search: ConversationSearchCallback,
+): NormalizedTool<typeof CONVERSATION_SEARCH_SCHEMA> {
+  return {
+    name: "conversation_search",
+    description: [
+      "Search prior Ensemble conversation text by keyword (read-only DB lookup).",
+      "Does NOT run any target agent and does not modify memory, resume, model,",
+      "provider, permissionMode, or sandbox settings.",
+      "",
+      "Default scope is team. If this agent has no team, team falls back to self.",
+      "Use scope='self' for this agent only or scope='agent' with target name/UUID.",
+      "",
+      "Returns bounded matches with agent, seq, role, createdAt, and snippet.",
+      "Tool-use/tool-result/raw event noise is filtered out.",
+    ].join("\n"),
+    parameters: CONVERSATION_SEARCH_SCHEMA,
+    async execute(args) {
+      return search(args);
     },
   };
 }

@@ -57,9 +57,17 @@ describe("buildEnsemblePrimer", () => {
     }
   });
 
-  it("mentions peer_send and peer_query", () => {
+  it("mentions peer_send, peer_query, and conversation_search", () => {
     const p = buildEnsemblePrimer();
     expect(p).toContain("peer_send");
     expect(p).toContain("peer_query");
+    expect(p).toContain("conversation_search");
+  });
+
+  it("documents conversation_search in peer_messaging help", () => {
+    const out = formatEnsembleHelp("peer_messaging");
+    expect(out).toContain("conversation_search");
+    expect(out).toContain("read-only DB query");
+    expect(out).toContain("scope=self");
   });
 });

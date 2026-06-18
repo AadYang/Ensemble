@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { makePeerSendHandler } from "../../../peer-mcp.js";
+import { makeConversationSearchHandler, makePeerSendHandler } from "../../../peer-mcp.js";
 import { makeAskUserHandler } from "../../../ask-user-mcp.js";
 import type { SessionManager } from "../../SessionManager.js";
 
@@ -96,6 +96,27 @@ describe("peer-mcp closure binding", () => {
       replyToCorrelationId: "req-1",
       causalRunId: "run-1",
     });
+  });
+
+  it("conversation_search binds its own fromAgentId without running peers", async () => {
+    const calls: Array<{ from: string; query: string; scope?: string }> = [];
+    const mockSessions = {
+      conversationSearch: async (from: string, args: { query: string; scope?: "team" | "self" | "agent" }) => {
+        calls.push({ from, query: args.query, scope: args.scope });
+        return "matches";
+      },
+    } as unknown as SessionManager;
+
+    const handlerA = makeConversationSearchHandler(mockSessions, "agent-A");
+    const handlerB = makeConversationSearchHandler(mockSessions, "agent-B");
+
+    await handlerA({ query: "migration", scope: "team" });
+    await handlerB({ query: "decision", scope: "self" });
+
+    expect(calls).toEqual([
+      { from: "agent-A", query: "migration", scope: "team" },
+      { from: "agent-B", query: "decision", scope: "self" },
+    ]);
   });
 });
 
