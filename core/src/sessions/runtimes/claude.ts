@@ -93,6 +93,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         model: opts.model,
         ...(maxThinkingTokens !== undefined ? { maxThinkingTokens } : {}),
         permissionMode: opts.permissionMode,
+        ...(opts.permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
         tools: opts.tools,
         allowedTools: opts.allowedTools,
         canUseTool: opts.canUseTool,

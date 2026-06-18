@@ -161,6 +161,24 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(options).not.toHaveProperty("maxThinkingTokens");
   });
 
+  it("passes the dangerous skip flag only for bypassPermissions", async () => {
+    const rt = new ClaudeAgentRuntime();
+
+    for (const permissionMode of ["default", "plan", "acceptEdits", "dontAsk"] as const) {
+      queuedMessages.push([]);
+      for await (const _ of rt.query({ ...baseOpts(), permissionMode })) {
+        // consume stream
+      }
+      expect(lastQueryOptions()).not.toHaveProperty("allowDangerouslySkipPermissions");
+    }
+
+    queuedMessages.push([]);
+    for await (const _ of rt.query({ ...baseOpts(), permissionMode: "bypassPermissions" })) {
+      // consume stream
+    }
+    expect(lastQueryOptions().allowDangerouslySkipPermissions).toBe(true);
+  });
+
   it("restores Claude local auth env from user settings without loading SDK settings", async () => {
     writeClaudeSettings({
       env: {
