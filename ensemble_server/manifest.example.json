@@ -1,19 +1,19 @@
 {
   "schemaVersion": 2,
   "compatVersion": "0.0.25",
-  "version": "0.0.27",
-  "publishedAt": "2026-06-15T08:45:00Z",
-  "downloadUrl": "https://ensemble-ai.cn/download/Ensemble_0.0.27_x64-setup.exe",
-  "sha256": "2f5a485cbb58d067b1dd35687871271f542d67021f37f7e9e7f8b5ef4895de91",
-  "sizeBytes": 42411417,
+  "version": "0.0.28",
+  "publishedAt": "2026-06-26T02:20:28Z",
+  "downloadUrl": "https://ensemble-ai.cn/download/Ensemble_0.0.28_x64-setup.exe",
+  "sha256": "3816e6b22a0bf8676b6218c437841feb0bfd1177a6947a2312fcd086f896d980",
+  "sizeBytes": 42577362,
   "platforms": {
     "windows-x64": {
-      "version": "0.0.27",
-      "publishedAt": "2026-06-15T08:45:00Z",
-      "downloadUrl": "https://ensemble-ai.cn/download/Ensemble_0.0.27_x64-setup.exe",
-      "sha256": "2f5a485cbb58d067b1dd35687871271f542d67021f37f7e9e7f8b5ef4895de91",
-      "sizeBytes": 42411417,
-      "releaseNotes": "Windows 0.0.27: fixes Codex native resume timeout recovery and updates the built-in tutorial Windows download reference. macOS remains 0.0.26 from the Mac team.",
+      "version": "0.0.28",
+      "publishedAt": "2026-06-26T02:20:28Z",
+      "downloadUrl": "https://ensemble-ai.cn/download/Ensemble_0.0.28_x64-setup.exe",
+      "sha256": "3816e6b22a0bf8676b6218c437841feb0bfd1177a6947a2312fcd086f896d980",
+      "sizeBytes": 42577362,
+      "releaseNotes": "Windows 0.0.28: release built from main 3e715d2. macOS remains 0.0.26 from the Mac team.",
       "mandatory": false,
       "minSupportedVersion": "0.0.18"
     },
@@ -38,7 +38,7 @@
       "minSupportedVersion": "0.0.18"
     }
   },
-  "releaseNotes": "Windows 0.0.27: fixes Codex native resume timeout recovery and updates the built-in tutorial Windows download reference. macOS remains 0.0.26 from the Mac team.",
+  "releaseNotes": "Windows 0.0.28: release built from main 3e715d2. macOS remains 0.0.26 from the Mac team.",
   "mandatory": false,
   "minSupportedVersion": "0.0.18"
 }

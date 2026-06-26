@@ -7,9 +7,9 @@ set -euo pipefail
 
 WEB_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$WEB_ROOT/.." && pwd)"
-SSH_KEY="$REPO_ROOT/ensemble_server/tencent_cloud_key.pem"
-SSH_USER="ubuntu"
-SSH_HOST="43.156.94.143"
+SSH_KEY="${SSH_KEY:-$REPO_ROOT/ensemble_server/tengent_bj.pem}"
+SSH_USER="${SSH_USER:-ubuntu}"
+SSH_HOST="${SSH_HOST:-49.232.1.174}"
 REMOTE_DIR="/var/www/ensemble-site"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$SSH_KEY")

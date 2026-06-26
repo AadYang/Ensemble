@@ -16,8 +16,8 @@ set -euo pipefail
 
 # ─── Config (only edit ip/host/email if they change) ─────────────────────────
 SSH_USER="ubuntu"
-SSH_HOST="43.156.94.143"
-SSH_KEY="$(cd "$(dirname "$0")/.." && pwd)/tencent_cloud_key.pem"
+SSH_HOST="${SSH_HOST:-49.232.1.174}"
+SSH_KEY="${SSH_KEY:-$(cd "$(dirname "$0")/.." && pwd)/tengent_bj.pem}"
 # Apex hosts the backend (API + downloads). www hosts the website (separate
 # placeholder vhost). Both share the same TLS cert.
 API_HOST="ensemble-ai.cn"
