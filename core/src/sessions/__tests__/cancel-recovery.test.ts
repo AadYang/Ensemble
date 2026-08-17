@@ -655,6 +655,10 @@ describe("SessionManager cancel + stale-session recovery", () => {
         } else if (calls.length === 2) {
           nonInteractiveAskResult = (await opts.askUser?.({ question: "wait?", options: ["yes", "no"] })) ?? "";
           const decision = await opts.canUseTool("Bash", { command: "echo hi" }, {} as never);
+          // SDK 0.3.x widened CanUseTool's return to PermissionResult | null.
+          // SessionManager always returns a non-null result on this path; fail
+          // loudly if that ever changes rather than masking it with a default.
+          if (!decision) throw new Error("expected non-null permission decision");
           nonInteractivePermissionBehavior = decision.behavior;
         }
         yield {

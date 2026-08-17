@@ -245,11 +245,21 @@ export class OpenAIAgentRuntime implements AgentRuntime {
             // toolUseID; OpenAI runtime synthesizes one since the SDK's
             // raw item doesn't surface a stable call id we can borrow.
             toolUseID: item.rawItem.id ?? randomUUID(),
+            // SDK 0.3.x added a required requestId (control-response
+            // correlation id for out-of-band responses). The OpenAI runtime
+            // resolves permissions inline and never uses it — synthesize a
+            // value purely to satisfy the shared CanUseTool contract.
+            requestId: randomUUID(),
           });
-          if (decision.behavior === "allow") {
+          // canUseTool return widened to PermissionResult | null in SDK 0.3.x.
+          // SessionManager's implementation always returns a non-null result on
+          // the normal path; treat a null defensively as a conservative deny so
+          // a future/abnormal implementation can never silently auto-approve.
+          if (decision?.behavior === "allow") {
             result.state.approve(item);
           } else {
-            result.state.reject(item, decision.message ? { message: decision.message } : undefined);
+            const message = decision && decision.behavior === "deny" ? decision.message : undefined;
+            result.state.reject(item, message ? { message } : undefined);
           }
         }
         runInput = result.state;
