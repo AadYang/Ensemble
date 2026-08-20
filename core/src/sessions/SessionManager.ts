@@ -57,6 +57,11 @@ import type {
   SandboxMode,
 } from "@agentorch/shared";
 import { formatPeerHandoff } from "./peerHandoff.js";
+import {
+  classifyBackgroundTaskMessage,
+  applyBackgroundTaskDelta,
+  shouldFinalizeTurn,
+} from "./backgroundTasks.js";
 import type { Agent as DbAgent, PendingTurn as DbPendingTurn } from "../db.js";
 import { prisma, sqliteDb } from "../db.js";
 import type { WebSocket } from "@fastify/websocket";
@@ -3002,6 +3007,11 @@ export class SessionManager {
       const stream = runtime.query(runtimeOpts);
 
       let firstMsg = true;
+      // Slice 1 (method A): keep the turn alive after `result` until every
+      // drain-blocking Claude background task reports terminal, instead of the
+      // old unconditional `break` that silently killed background subagents.
+      let sawResultForDrain = false;
+      const liveBackgroundTasks = new Set<string>();
       for await (const event of stream) {
         this.resetRuntimeIdleWatchdog(sessionId, runId);
         if (event.type === "error") {
@@ -3030,6 +3040,21 @@ export class SessionManager {
         if (msg.type === "stream_event") {
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
           continue;
+        }
+
+        // Slice 1 (method A): track Claude background-task lifecycle so the
+        // turn can DRAIN past `result` and finalize only once background work
+        // settles. `task_progress` is a broadcast-only heartbeat — surfaced to
+        // the UI but NOT persisted, to keep resume context precise (mission:
+        // 精准记忆). Unknown/other system subtypes fall through and are
+        // persisted+broadcast as before (never silently dropped).
+        const bgDelta = classifyBackgroundTaskMessage(msg);
+        if (bgDelta) {
+          const { broadcastOnly } = applyBackgroundTaskDelta(liveBackgroundTasks, bgDelta);
+          if (broadcastOnly) {
+            this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
+            continue;
+          }
         }
 
         // Capture last assistant text so callers (e.g. scheme-B subagent) can grab the result.
@@ -3091,10 +3116,14 @@ export class SessionManager {
         });
 
         seq++;
-        // A result message is terminal for this turn. Exit only after the
-        // result has been persisted, usage-accounted, and broadcast so queued
-        // work can drain even if the runtime stream never closes naturally.
-        if (msg.type === "result") break;
+        // A result message ends the *foreground* turn, but Claude background
+        // subagents may still be running (method A). Finalize only once the
+        // result is seen AND no drain-blocking background task remains. If the
+        // SDK closes the stream first, the for-await simply ends and we
+        // finalize gracefully; if a task goes silent past the idle watchdog,
+        // that watchdog aborts the run — so this can never hang indefinitely.
+        if (msg.type === "result") sawResultForDrain = true;
+        if (shouldFinalizeTurn(sawResultForDrain, liveBackgroundTasks)) break;
       }
       this.clearRuntimeIdleWatchdog(sessionId, runId);
 

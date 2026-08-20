@@ -1,6 +1,8 @@
 # Claude 后台任务(background agents)支持 — Slice 0 审计与协议草案
 
-状态:Slice 0(仅审计,不改代码)。等待经理据本文建 GitHub issue、与 Mac 项目组对齐字段/状态/UI 后,再授权 Slice 1 实现。
+状态:Slice 0 审计完成(GitHub #16)。**Slice 1 已实现(Windows 侧核心生命周期,用户直接指令优先落地,不阻塞于跨端对齐)**。Slice 2(专用 UI 面板、恢复路径、macOS 真机)待跟进。
+
+> Slice 1 落地说明:按用户指示先修复 Windows 侧,不再以 Mac 对齐为前置门槛。核心 turn 循环已改为「result 后 DRAIN 到后台任务清空再收尾」,后台事件经既有持久化/广播管线透出;UI 暂以现有泛化 system 行呈现(专用面板归 Slice 2)。跨端字段/状态若 Mac 组在 #16 有异议,再回归调整,不影响本次已验证的 Windows 行为。
 
 方案裁定:方案 A(保留 Claude 后台任务语义,不强制前台降级)。
 
@@ -108,6 +110,26 @@ UI/端到端(Slice 2):
 - UI 表达:任务面板 vs 内联 transcript 的分工;活动计数展示位置。
 - 后台 drain 是否设上限(时间/数量)及默认值。
 - 空闲看门狗对后台任务的处理策略(暂停 vs 独立阈值 + 阈值值)。
+
+## 8b. Slice 1 实现纪要(已落地 · Windows)
+
+新增纯函数模块 `core/src/sessions/backgroundTasks.ts`(可单测,不依赖 turn 循环):
+- `classifyBackgroundTaskMessage(msg)` → add / remove / prune / progress / null。
+- `applyBackgroundTaskDelta(set, delta)` → 维护活动集,返回 `{broadcastOnly}`(仅 task_progress 为 true)。
+- `shouldFinalizeTurn(sawResult, liveTasks)` → `sawResult && liveTasks.size===0`。
+
+接入 `SessionManager.ts` turn 循环(最小改动):
+- result 不再无条件 `break`;改为 `sawResultForDrain=true` 后按 `shouldFinalizeTurn` 判定。
+- `task_progress` 广播-only(不持久化)→ 契合精准记忆,不污染 resume 上下文。
+- 其余后台事件走既有持久化+广播管线(不静默丢弃)。
+
+关键安全保证:
+- **不 hang**:活动集只由「非 ambient 的 task_started」加入;`background_tasks_changed` 只做 prune(移除),绝不新增 → observer 等 ambient(skip_transcript)任务永不进集合。SDK 若在 result 后直接关流,for-await 自然结束 → 优雅收尾(退化为旧行为,不更差)。后台任务静默超空闲阈值 → 空闲看门狗 abort → 有界收尾。
+- **不误标**:result 已置 `sawResult`,DRAIN 期间异常不会被判为 interrupted。
+
+历史归属选型:采用 **(c)**。Claude 侧 resume 依赖 SDK 自身 `session_id`(CLI 会话文件已含后台完成),故后台完成消息虽持久化留档、但不注入 Ensemble 侧 `runtimeHistoryFromCompletedTurns` 重建历史(其按最后一个 result 裁剪,天然排除),避免二次污染。若 Mac 组在 #16 主张 (a)/(b),再回归。
+
+测试:`core/src/sessions/__tests__/background-tasks.test.ts`(18 项);core 全量 30 files / 322 tests 通过;tsc --noEmit clean。
 
 ## 9. 分片与提交约束
 
