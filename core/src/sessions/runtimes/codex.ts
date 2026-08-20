@@ -1080,7 +1080,7 @@ function translateAgentMessageEvent(ev: Record<string, unknown>, synthSessionId:
   };
 }
 
-function translateEvent(
+export function translateEvent(
   ev: unknown,
   synthSessionId: string,
   modelName: string,
@@ -1241,7 +1241,25 @@ function translateItem(
     };
   }
   if (item.type === "error" && isCompleted) {
-    return { errorMessage: typeof item.message === "string" ? item.message : JSON.stringify(item) };
+    // Per @openai/codex-sdk, an `error` *item* (ErrorItem) is explicitly a
+    // NON-FATAL error surfaced inline — codex keeps going and still emits
+    // turn.completed. This is distinct from ThreadErrorEvent (the top-level
+    // `error` *event*), which is unrecoverable and stays routed to
+    // errorMessage in translateEvent. Routing a non-fatal item to
+    // errorMessage used to abort the turn, so benign notices such as
+    // "Skill descriptions were shortened to fit the skills context budget.
+    // Codex can still see every skill…" surfaced in the UI as an interrupted
+    // turn even though nothing was actually interrupted. Surface it as a
+    // labeled informational assistant block instead and let the turn run to
+    // completion (unattended-continuity: never turn a warning into a stop).
+    const text = typeof item.message === "string" ? item.message : JSON.stringify(item);
+    return {
+      assistantMessage: {
+        type: "assistant",
+        session_id: synthSessionId,
+        message: { content: [{ type: "text" as const, text: `[codex] ${text}` }] },
+      },
+    };
   }
   // todo_list and other items: not surfacing in v1; future enhancement.
   void modelName;
