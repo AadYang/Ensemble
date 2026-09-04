@@ -288,7 +288,7 @@ type SendMessageOptions = {
     causalRunId?: string;
     coalescibleSourceOutput?: boolean;
   };
-  autoRecoveryAttempt?: "codex-event-stream-lagged";
+  autoRecoveryAttempt?: "codex-event-stream-lagged" | "codex-thread-writer-conflict";
   suppressUserMessage?: boolean;
   freshnessContinuationForRunId?: string;
   nonInteractive?: boolean;
@@ -328,7 +328,10 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const out: SendMessageOptions = {};
   const autoRecoveryAttempt = (raw as { autoRecoveryAttempt?: unknown }).autoRecoveryAttempt;
-  if (autoRecoveryAttempt === "codex-event-stream-lagged") {
+  if (
+    autoRecoveryAttempt === "codex-event-stream-lagged" ||
+    autoRecoveryAttempt === "codex-thread-writer-conflict"
+  ) {
     out.autoRecoveryAttempt = autoRecoveryAttempt;
   }
   if ((raw as { suppressUserMessage?: unknown }).suppressUserMessage === true) {
@@ -573,6 +576,11 @@ export const isRuntimeCodexEventStreamRecoverySignal = (
   code: unknown,
   recoverable: unknown,
 ): boolean => code === "CODEX_EVENT_STREAM_LAGGED" && recoverable === true;
+
+export const isRuntimeCodexThreadWriterConflictSignal = (
+  code: unknown,
+  recoverable: unknown,
+): boolean => code === "CODEX_THREAD_WRITER_CONFLICT" && recoverable === true;
 
 // Legacy fallback for runtimes/CLI versions that still flatten transport
 // failures to text. New Codex recovery uses RuntimeErrorEvent.code instead.
@@ -3191,7 +3199,17 @@ export class SessionManager {
         runtimeDetails.runtimeCode,
         runtimeDetails.runtimeRecoverable,
       );
-      if (resumeInvalidReasonForRun !== null || staleResume || recoverableResumeFailure || recoverableCodexEventStreamFailure) {
+      const recoverableThreadWriterConflict = isRuntimeCodexThreadWriterConflictSignal(
+        runtimeDetails.runtimeCode,
+        runtimeDetails.runtimeRecoverable,
+      );
+      if (
+        resumeInvalidReasonForRun !== null ||
+        staleResume ||
+        recoverableResumeFailure ||
+        recoverableCodexEventStreamFailure ||
+        recoverableThreadWriterConflict
+      ) {
         persistData.metadata = removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]);
         console.warn(
           `[sendMessage] clearing resume metadata agent=${sessionId.slice(0, 8)} ` +
@@ -3205,6 +3223,14 @@ export class SessionManager {
         !aborted &&
         recoverableCodexEventStreamFailure &&
         opts?.autoRecoveryAttempt !== "codex-event-stream-lagged";
+      // Thread-store writer conflict: the cached thread id is now unusable
+      // (a prior process held/holds its writer). Clear resume (done above) and
+      // auto-continue on a fresh thread from local history — unattended, no
+      // user resend. Guarded by the attempt tag so a repeat conflict can't loop.
+      const shouldAutoRecoverThreadWriterConflict =
+        !aborted &&
+        recoverableThreadWriterConflict &&
+        opts?.autoRecoveryAttempt !== "codex-thread-writer-conflict";
       if (shouldAutoRecoverCodexEventStream) {
         persistData.status = "IDLE";
         autoRecoverAfterRun = {
@@ -3212,6 +3238,16 @@ export class SessionManager {
           opts: {
             ...(opts?.peerOrigin ? { peerOrigin: opts.peerOrigin } : {}),
             autoRecoveryAttempt: "codex-event-stream-lagged",
+            suppressUserMessage: true,
+          },
+        };
+      } else if (shouldAutoRecoverThreadWriterConflict) {
+        persistData.status = "IDLE";
+        autoRecoverAfterRun = {
+          userInput: "continue",
+          opts: {
+            ...(opts?.peerOrigin ? { peerOrigin: opts.peerOrigin } : {}),
+            autoRecoveryAttempt: "codex-thread-writer-conflict",
             suppressUserMessage: true,
           },
         };
@@ -3234,6 +3270,8 @@ export class SessionManager {
               "Cleared cached session id; please send your message again to start fresh."
             : shouldAutoRecoverCodexEventStream
               ? rawMsg + "\n\nThe local Codex event stream fell behind and dropped events. Ensemble saved the interrupted turn, cleared cached Codex resume state, and is automatically continuing from local history."
+            : shouldAutoRecoverThreadWriterConflict
+              ? rawMsg + "\n\nThe cached Codex thread was still locked by a previous process (thread-store writer conflict). Ensemble killed the stale process, cleared the cached thread id, and is automatically continuing on a fresh thread from local history."
             : recoverableResumeFailure
               ? rawMsg + "\n\nCleared cached session state for this agent. Please send your message again; Ensemble will start a fresh runtime session while preserving the local chat history."
             : rawMsg;
@@ -3242,14 +3280,19 @@ export class SessionManager {
             sessionId,
             code: shouldAutoRecoverCodexEventStream
               ? "CODEX_EVENT_STREAM_RECOVERING"
-              : staleResume ? "SESSION_LOST" : "QUERY_FAILED",
+              : shouldAutoRecoverThreadWriterConflict
+                ? "CODEX_THREAD_WRITER_CONFLICT_RECOVERING"
+                : staleResume ? "SESSION_LOST" : "QUERY_FAILED",
             message: friendly,
           });
         }
         this.hub.sendToSession(sessionId, {
           type: "status",
           sessionId,
-          status: aborted || shouldAutoRecoverCodexEventStream ? "idle" : "error",
+          status:
+            aborted || shouldAutoRecoverCodexEventStream || shouldAutoRecoverThreadWriterConflict
+              ? "idle"
+              : "error",
         });
       } else {
         console.log(`[sendMessage] run=${runId.slice(0, 8)} error post-cancel; skipping DB update`);

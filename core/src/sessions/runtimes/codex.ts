@@ -740,6 +740,14 @@ export class CodexCliRuntime implements AgentRuntime {
     let turnStarted = false;
     let turnCompleted = false;
 
+    // Hoisted so the `finally` can guarantee the codex process tree is dead on
+    // EVERY exit path (normal, error, early-return, abort, close-timeout, or
+    // consumer abandoning the generator). A lingering codex process keeps the
+    // thread-store writer lock held, so the next `codex exec resume` on the
+    // same thread fails with "already has an active writer" — the exact
+    // decoupling reported when the window shows "interrupted" but a subprocess
+    // is still alive.
+    let childForCleanup: ChildProcess | null = null;
     try {
       const input = canResumeNative ? buildCurrentTurnPrompt(opts.prompt) : buildPromptWithHistory(opts);
       const child = spawn(codexPath, cliArgs, {
@@ -748,6 +756,7 @@ export class CodexCliRuntime implements AgentRuntime {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
+      childForCleanup = child;
       const stderrChunks: string[] = [];
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
@@ -891,6 +900,10 @@ export class CodexCliRuntime implements AgentRuntime {
         turnCompleted,
       });
     } finally {
+      // Guarantee no codex process (or its grandchild MCP subprocesses)
+      // outlives this turn holding the thread-store writer lock. Idempotent:
+      // killCodexChildTree no-ops if the process already exited cleanly.
+      if (childForCleanup) killCodexChildTree(childForCleanup);
       // Tear down bridge handler entry so a later turn for a different
       // agent can't accidentally inherit this agent's closures.
       unregisterHandlers(opts.sessionId);
@@ -1002,6 +1015,19 @@ export function buildCodexRuntimeErrorEvent(
       resumeScoped: false,
     };
   }
+  if (isCodexThreadWriterConflict(message)) {
+    // A previous codex process for this thread is (or was) still holding the
+    // thread-store writer. Recoverable + resume-scoped: SessionManager clears
+    // the cached thread id and auto-continues on a FRESH thread from local
+    // history, instead of wedging the agent in ERROR.
+    return {
+      type: "error",
+      message,
+      code: "CODEX_THREAD_WRITER_CONFLICT",
+      recoverable: true,
+      resumeScoped: true,
+    };
+  }
   const interruptedNativeResume = opts.usedNativeResume && opts.turnStarted && !opts.turnCompleted;
   if (!interruptedNativeResume || !isNativeResumeTransportFailure(message)) return { type: "error", message };
   return {
@@ -1011,6 +1037,15 @@ export function buildCodexRuntimeErrorEvent(
     recoverable: true,
     resumeScoped: true,
   };
+}
+
+export function isCodexThreadWriterConflict(message: string): boolean {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("already has an active writer") ||
+    msg.includes("thread-store conflict") ||
+    msg.includes("failed to initialize thread persistence")
+  );
 }
 
 export function isNativeResumeTransportFailure(message: string): boolean {
