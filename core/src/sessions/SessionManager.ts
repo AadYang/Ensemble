@@ -217,6 +217,9 @@ interface RunningSession {
   nonInteractive?: boolean;
   blockedFreshnessAction?: FreshnessBlockedAction;
   freshnessContinuationUsed?: boolean;
+  /** How many freshness-continuation turns have already chained to reconcile a
+   *  blocked outbound draft. Bounded by MAX_FRESHNESS_CONTINUATIONS. */
+  freshnessContinuationCount?: number;
   /** Per-turn auto-allow cache, keyed by toolName. User clicking "Allow" on
    *  a permission dialog adds the tool name here; subsequent canUseTool calls
    *  with the same toolName during this turn skip the dialog. Cleared when
@@ -291,6 +294,7 @@ type SendMessageOptions = {
   autoRecoveryAttempt?: "codex-event-stream-lagged" | "codex-thread-writer-conflict";
   suppressUserMessage?: boolean;
   freshnessContinuationForRunId?: string;
+  freshnessContinuationCount?: number;
   nonInteractive?: boolean;
   suppressRuntimeMetadata?: boolean;
 };
@@ -312,7 +316,22 @@ type FreshnessBlockedAction = {
   targetAgentName?: string;
   correlationId?: string;
   replyToCorrelationId?: string;
+  /** Preserved outbound peer_send draft. When a peer_send is freshness-blocked
+   *  the body/mode would otherwise be discarded — recovery then depends on the
+   *  agent reconstructing it from volatile context (silent loss if the context
+   *  was compacted or the agent misjudges). Keeping the exact draft lets the
+   *  automatic freshness-continuation turn re-present it verbatim so the message
+   *  is never dropped; it is delivered once the peer inbox settles. */
+  peerSendDraft?: { body: string; mode: PeerMode };
 };
+
+/** Upper bound on chained freshness-continuation turns. Each continuation
+ *  re-presents the preserved draft alongside any freshly-arrived inbound peer
+ *  messages; if the resend is blocked again by yet-newer inbound, the draft is
+ *  carried into the next continuation. The cap prevents a pathological loop if
+ *  a peer never stops sending, without ever silently discarding the draft
+ *  during normal operation (the inbox settles within a round or two). */
+const MAX_FRESHNESS_CONTINUATIONS = 5;
 
 type DrainQueuedOptions = {
   preferPeerAfterId?: number;
@@ -365,6 +384,10 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
   const freshnessContinuationForRunId = (raw as { freshnessContinuationForRunId?: unknown }).freshnessContinuationForRunId;
   if (typeof freshnessContinuationForRunId === "string") {
     out.freshnessContinuationForRunId = freshnessContinuationForRunId;
+  }
+  const freshnessContinuationCount = (raw as { freshnessContinuationCount?: unknown }).freshnessContinuationCount;
+  if (typeof freshnessContinuationCount === "number" && Number.isFinite(freshnessContinuationCount)) {
+    out.freshnessContinuationCount = freshnessContinuationCount;
   }
   if ((raw as { nonInteractive?: unknown }).nonInteractive === true) {
     out.nonInteractive = true;
@@ -2225,12 +2248,15 @@ export class SessionManager {
       `freshness-blocked: newer inbound peer message(s) are already queued for this agent from ${sources || "peer agents"}.`,
       sendText,
       correlations.length > 0 ? `Related correlation id(s): ${correlations.join(", ")}.` : "",
-      "Process the queued inbound peer message(s) first, then decide whether to cancel, merge, or resend the action with updated context.",
+      action.tool === "peer_send"
+        ? "Your message content is preserved by Ensemble and will be re-presented to you automatically (with the fresh inbox) so it is not lost. Process the queued inbound peer message(s) first, then resend (merging new context) or skip it."
+        : "Process the queued inbound peer message(s) first, then decide whether to cancel, merge, or resend the action with updated context.",
     ].filter(Boolean).join(" ");
   }
 
   private formatFreshnessContinuation(run: RunningSession, rows: DbPendingTurn[]): string {
     const action = run.blockedFreshnessAction;
+    const draft = action?.tool === "peer_send" ? action.peerSendDraft : undefined;
     const lines = [
       "Ensemble freshness check: newer peer message(s) arrived while your previous run was active.",
       action
@@ -2238,9 +2264,24 @@ export class SessionManager {
         : "Reconcile the queued peer input before continuing.",
       "Do not ask the human for input in this reconciliation turn. Cancel, merge, or resend only if still needed.",
       `Original run id: ${run.runId}`,
+    ];
+    if (draft) {
+      const targetLabel = action?.targetAgentName ?? action?.targetAgentId ?? "peer";
+      lines.push(
+        "",
+        `Your earlier peer_send to "${targetLabel}" (mode=${draft.mode}) was blocked and NOT delivered. ` +
+          "Its exact content is preserved below so you do not need to reconstruct it. " +
+          "After reading the fresh inbox, RESEND it with peer_send if it is still valid (merge the new context if helpful), " +
+          "or explicitly skip it only if the fresh input makes it obsolete. If you do nothing it will not be delivered.",
+        `<blocked-outbound-draft tool="peer_send" target="${targetLabel}" mode="${draft.mode}">`,
+        truncateMiddle(draft.body.trim(), 4_000),
+        "</blocked-outbound-draft>",
+      );
+    }
+    lines.push(
       "",
       `<fresh-peer-inbox count="${rows.length}">`,
-    ];
+    );
     rows.forEach((row, idx) => {
       const origin = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
       lines.push(
@@ -2260,10 +2301,21 @@ export class SessionManager {
   private runEndDrainOptions(run: RunningSession): DrainQueuedOptions | undefined {
     const queued = this.queuedPeerTurnsSince(run.id, run.pendingTurnHighWaterId);
     if (queued.length === 0) return undefined;
-    if (run.blockedFreshnessAction && !run.freshnessContinuationUsed && !run.nonInteractive) {
+    // Auto-reconcile whenever a stale peer_send/ask_user was blocked: schedule a
+    // non-interactive continuation that re-presents the preserved draft with the
+    // fresh inbox instead of dropping it. This chains across repeated blocks
+    // (carrying the draft forward via {...run}) so the message survives until the
+    // peer inbox settles — bounded by MAX_FRESHNESS_CONTINUATIONS so a peer that
+    // never stops sending can't spin forever.
+    const continuationCount = run.freshnessContinuationCount ?? 0;
+    if (run.blockedFreshnessAction && continuationCount < MAX_FRESHNESS_CONTINUATIONS) {
       return {
         preferPeerAfterId: run.pendingTurnHighWaterId,
-        freshnessContinuationRun: { ...run, freshnessContinuationUsed: true },
+        freshnessContinuationRun: {
+          ...run,
+          freshnessContinuationUsed: true,
+          freshnessContinuationCount: continuationCount + 1,
+        },
       };
     }
     return { preferPeerAfterId: run.pendingTurnHighWaterId };
@@ -2300,6 +2352,9 @@ export class SessionManager {
     const runOpts = drainOpts.freshnessContinuationRun
       ? {
           freshnessContinuationForRunId: drainOpts.freshnessContinuationRun.runId,
+          ...(typeof drainOpts.freshnessContinuationRun.freshnessContinuationCount === "number"
+            ? { freshnessContinuationCount: drainOpts.freshnessContinuationRun.freshnessContinuationCount }
+            : {}),
           nonInteractive: true,
           suppressRuntimeMetadata: true,
           suppressUserMessage: true,
@@ -2587,6 +2642,9 @@ export class SessionManager {
       pendingTurnHighWaterId,
       autoAllowedTools: new Set<string>(),
       ...(opts?.freshnessContinuationForRunId ? { freshnessContinuationUsed: true } : {}),
+      ...(typeof opts?.freshnessContinuationCount === "number"
+        ? { freshnessContinuationCount: opts.freshnessContinuationCount }
+        : {}),
       ...(opts?.nonInteractive ? { nonInteractive: true } : {}),
     });
 
@@ -3652,6 +3710,7 @@ export class SessionManager {
       tool: "peer_send",
       targetAgentId: targetAgent.id,
       targetAgentName: targetAgent.name,
+      peerSendDraft: { body, mode },
       ...(opts.correlationId ? { correlationId: opts.correlationId } : {}),
       ...(opts.replyToCorrelationId ? { replyToCorrelationId: opts.replyToCorrelationId } : {}),
     };

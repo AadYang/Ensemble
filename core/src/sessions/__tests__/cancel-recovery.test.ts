@@ -574,8 +574,58 @@ describe("SessionManager cancel + stale-session recovery", () => {
 
     expect(result).toContain("freshness-blocked");
     expect(result).toContain("was not sent");
+    // The block message must reassure the agent its content is preserved, not lost.
+    expect(result).toContain("preserved");
     expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
     expect(await prisma.pendingTurn.count({ where: { agentId: source.id } })).toBe(1);
+    // The exact outbound draft (body + mode) must be preserved on the run so the
+    // automatic freshness continuation can re-present it verbatim — never dropped.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const blocked = (sessions as any).running.get(source.id).blockedFreshnessAction;
+    expect(blocked.tool).toBe("peer_send");
+    expect(blocked.targetAgentName).toBe(target.name);
+    expect(blocked.peerSendDraft).toEqual({ body: "what is your decision?", mode: "raw" });
+  });
+
+  it("re-presents the preserved outbound draft (verbatim) in the freshness continuation prompt", async () => {
+    const source = await prisma.agent.create({ data: { name: "draft-source" } });
+    const target = await prisma.agent.create({ data: { name: "draft-target" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const run = {
+      id: source.id,
+      runId: "run-draft",
+      abort: new AbortController(),
+      seq: 0,
+      userInput: "source running",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: 0,
+      autoAllowedTools: new Set<string>(),
+      blockedFreshnessAction: {
+        tool: "peer_send" as const,
+        targetAgentId: target.id,
+        targetAgentName: target.name,
+        peerSendDraft: { body: "commit 03bcb1f fixes the writer conflict", mode: "raw" as const },
+      },
+    };
+    const rows = [
+      {
+        id: 42,
+        agentId: source.id,
+        userInput: "[from draft-target] hold on, plan changed",
+        opts: { peerOrigin: { fromAgentId: target.id, fromAgentName: target.name, mode: "raw" } },
+        createdAt: new Date(),
+      },
+    ];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prompt = (sessions as any).formatFreshnessContinuation(run, rows);
+    expect(prompt).toContain("Ensemble freshness check");
+    expect(prompt).toContain("<blocked-outbound-draft");
+    expect(prompt).toContain("commit 03bcb1f fixes the writer conflict");
+    expect(prompt).toContain('target="draft-target"');
+    expect(prompt).toContain("hold on, plan changed");
   });
 
   it("ask_user returns a freshness result instead of entering human-waiting state when peer inbox is fresh", async () => {
