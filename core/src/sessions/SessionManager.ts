@@ -934,6 +934,11 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
   sandboxMode: readSandboxOverride(row.metadata),
   reasoningEffort: readReasoningEffortOverride(row.metadata),
   teamId: row.teamId,
+  subagentKind: readMetaBool(row.metadata, "backgroundTask")
+    ? "background"
+    : readMetaString(row.metadata, "spawnedAsTaskFor") !== null
+      ? "task"
+      : null,
   forcedSkills: Array.from(readSkillForcelist(row.metadata)),
   disabledSkills: Array.from(readSkillBlocklist(row.metadata)),
   closed: readMetaBool(row.metadata, "closed"),
@@ -2100,6 +2105,11 @@ export class SessionManager {
         systemPrompt: parent.systemPrompt,
         workspace: parent.workspace,
         codexWorkspace: parent.codexWorkspace,
+        // Inherit the parent's team so a team member's subagent nests INSIDE the
+        // team group in the sidebar (nested under the member) instead of falling
+        // to the ungrouped top level — the tree groups by teamId first, then
+        // builds the parent/child nesting within each group.
+        teamId: parent.teamId,
         metadata: {
           taskDepth: parentDepth + 1,
           spawnedAsTaskFor: parentId,

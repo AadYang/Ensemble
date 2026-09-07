@@ -11,9 +11,20 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
   const setActivePane = useStore((s) => s.setActivePane);
   const splitActive = useStore((s) => s.splitActive);
   const closeActive = useStore((s) => s.closeActive);
+  const setActive = useStore((s) => s.setActive);
+  const attachAgentToPane = useStore((s) => s.attachAgentToPane);
   const agent = useStore((s) => (agentId ? s.agents[agentId] : null));
+  const agents = useStore((s) => s.agents);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const t = useT();
+
+  // Background tasks this agent spawned (detached subagents). Derived live from
+  // the store so their status updates in place — no chat-text parsing.
+  const backgroundTasks = agentId
+    ? Object.values(agents).filter(
+        (x) => x.summary.parentId === agentId && x.summary.subagentKind === "background",
+      )
+    : [];
 
   const summary = agent?.summary ?? null;
   const turnCount = agent?.turns.length ?? 0;
@@ -107,6 +118,31 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
           </div>
         </div>
       </div>
+
+      {agentId && backgroundTasks.length > 0 && (
+        <div className="shrink-0 flex items-center gap-1.5 overflow-x-auto border-b border-[var(--border)] px-2 py-1 text-[10px]">
+          <span className="shrink-0 text-[var(--warn)] tracking-wider">
+            {t("pane.bgtasks.label", { n: backgroundTasks.length })}
+          </span>
+          {backgroundTasks.map((bt) => (
+            <button
+              key={bt.summary.id}
+              title={t("pane.bgtasks.open")}
+              onClick={(e) => {
+                e.stopPropagation();
+                setActivePane(paneId);
+                setActive(bt.summary.id);
+                attachAgentToPane(paneId, bt.summary.id);
+              }}
+              className="shrink-0 flex items-center gap-1 px-1.5 py-0.5 border border-[var(--border)] hover:border-[var(--accent)] transition-colors"
+            >
+              <span className={`status-dot ${bt.summary.status}`} />
+              <span className="truncate max-w-[10rem] text-[var(--text)]">{bt.summary.name}</span>
+              <span className={statusColor(bt.summary.status)}>{bt.summary.status}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {agentId ? (
         <ChatPane agentId={agentId} />

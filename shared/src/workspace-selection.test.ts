@@ -128,6 +128,7 @@ const baseAgent = {
   permissionMode: "default",
   sandboxMode: null,
   reasoningEffort: null,
+  subagentKind: null,
   forcedSkills: [],
   disabledSkills: [],
   closed: false,

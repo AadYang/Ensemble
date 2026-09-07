@@ -220,6 +220,7 @@ function TreeRow({
       >
         {depth > 0 && <span className="text-[var(--text-faint)]">└</span>}
         <span className={`status-dot ${a.status}`} />
+        {a.subagentKind && <SubagentBadge kind={a.subagentKind} />}
         <span className={`truncate flex-1 ${bound ? "text-[var(--accent)]" : "text-[var(--text)]"}`}>
           {a.name}
         </span>
@@ -250,5 +251,25 @@ function TreeRow({
         />
       ))}
     </>
+  );
+}
+
+/** Compact pill distinguishing an agent spawned by another agent:
+ *  BG = detached background task, SUB = blocking subagent. Pure CSS (no image
+ *  asset) so it themes with the rest of the UI. */
+function SubagentBadge({ kind }: { kind: "background" | "task" }) {
+  const t = useT();
+  const isBg = kind === "background";
+  return (
+    <span
+      title={isBg ? t("agent.badge.background.tip") : t("agent.badge.task.tip")}
+      className="shrink-0 px-1 text-[9px] leading-none py-[2px] rounded-sm border tracking-wider"
+      style={{
+        color: isBg ? "var(--warn)" : "var(--text-dim)",
+        borderColor: isBg ? "var(--warn)" : "var(--border)",
+      }}
+    >
+      {isBg ? t("agent.badge.background") : t("agent.badge.task")}
+    </span>
   );
 }

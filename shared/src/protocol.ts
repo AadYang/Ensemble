@@ -49,6 +49,12 @@ export interface AgentSummary {
   reasoningEffort: ReasoningEffort | null;
   /** W21: which team this agent belongs to (null = ungrouped). */
   teamId: string | null;
+  /** How this agent was spawned by another agent, if at all. Lets the UI badge
+   *  and group it distinctly from a user-created agent:
+   *    - "background": detached background task (Task/spawn_subagent background=true)
+   *    - "task":       blocking subagent delegation
+   *    - null:         a normal user-created agent (or a team member) */
+  subagentKind: "background" | "task" | null;
   /** Skills this agent has flipped to force-on (always inject regardless of score). */
   forcedSkills: string[];
   /** Skills this agent has explicitly disabled (never auto-activate). */

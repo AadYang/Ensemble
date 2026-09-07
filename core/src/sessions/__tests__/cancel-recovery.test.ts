@@ -30,6 +30,7 @@ let SessionManager: typeof import("../SessionManager.js").SessionManager;
 let isResumeScopedStreamFailure: typeof import("../SessionManager.js").isResumeScopedStreamFailure;
 let isRuntimeResumeRecoverySignal: typeof import("../SessionManager.js").isRuntimeResumeRecoverySignal;
 let runtimeHistoryFromCompletedTurns: typeof import("../SessionManager.js").runtimeHistoryFromCompletedTurns;
+let agentRowToSummary: typeof import("../SessionManager.js").agentRowToSummary;
 
 type Broadcast = Record<string, unknown>;
 
@@ -56,7 +57,7 @@ class StubHub {
 
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
-  ({ SessionManager, isResumeScopedStreamFailure, isRuntimeResumeRecoverySignal, runtimeHistoryFromCompletedTurns } = await import("../SessionManager.js"));
+  ({ SessionManager, isResumeScopedStreamFailure, isRuntimeResumeRecoverySignal, runtimeHistoryFromCompletedTurns, agentRowToSummary } = await import("../SessionManager.js"));
 });
 
 async function ensureCodexCliPath(): Promise<void> {
@@ -3035,5 +3036,101 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(history.length).toBeLessThanOrEqual(28);
     expect(JSON.stringify(history)).toContain("answer 79");
     expect(JSON.stringify(history)).not.toContain("question 0");
+  });
+
+  it("spawns a background subagent detached, inheriting teamId, tagged for the sidebar", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "bg-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "k",
+        models: ["m"],
+      },
+    });
+    const team = await prisma.team.create({ data: { name: "bg-team" } });
+    const parent = await prisma.agent.create({
+      data: { name: "bg-parent", providerId: provider.id, model: "m", teamId: team.id },
+    });
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const runtime: AgentRuntime = {
+      async *query() {
+        started.resolve(undefined);
+        await release.promise; // hold the child "running" so we can assert detachment
+        yield {
+          type: "sdk_message",
+          payload: { type: "result", subtype: "success", session_id: "s" },
+        };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const res = await sessions.spawnTaskSubagent(parent.id, "run build", "compile it", { background: true });
+    // Background spawn returns IMMEDIATELY (does not await the child) …
+    expect(res.background).toBe(true);
+    expect(res.subagentId).toBeTruthy();
+    expect(res.finalText).toBe("");
+    // … even though the child is still running.
+    await withTimeout(started.promise, "bg child started");
+
+    const child = await prisma.agent.findUnique({ where: { id: res.subagentId } });
+    expect(child?.parentId).toBe(parent.id);
+    expect(child?.teamId).toBe(team.id); // inherited → nests inside the team group
+    expect(child?.name.startsWith("bg:")).toBe(true);
+    expect((child?.metadata as Record<string, unknown>)?.backgroundTask).toBe(true);
+    // The summary the sidebar consumes is tagged so it can badge + group it.
+    expect(agentRowToSummary(child!).subagentKind).toBe("background");
+    // agent_created was broadcast so the tree shows it without a refresh.
+    expect(hub.broadcasts.some((b) => b.type === "agent_created")).toBe(true);
+
+    release.resolve(undefined);
+  });
+
+  it("spawns a blocking subagent tagged 'task' and inheriting teamId", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "sub-provider",
+        kind: "openai-compat",
+        baseUrl: "https://api.example.test",
+        apiKey: "k",
+        models: ["m"],
+      },
+    });
+    const team = await prisma.team.create({ data: { name: "sub-team" } });
+    const parent = await prisma.agent.create({
+      data: { name: "sub-parent", providerId: provider.id, model: "m", teamId: team.id },
+    });
+    const runtime: AgentRuntime = {
+      async *query() {
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "assistant",
+            session_id: "s",
+            message: { content: [{ type: "text", text: "sub done" }] },
+          },
+        };
+        yield { type: "sdk_message", payload: { type: "result", subtype: "success", session_id: "s" } };
+      },
+    };
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any, () => runtime);
+
+    const res = await withTimeout(
+      sessions.spawnTaskSubagent(parent.id, "audit diff", "review it"),
+      "foreground subagent",
+      3_000,
+    );
+    expect(res.background).toBeUndefined();
+    expect(res.finalText).toBe("sub done"); // blocking → returns the child's output
+
+    const child = await prisma.agent.findUnique({ where: { id: res.subagentId } });
+    expect(child?.teamId).toBe(team.id);
+    expect(child?.name.startsWith("task:")).toBe(true);
+    expect(agentRowToSummary(child!).subagentKind).toBe("task");
   });
 });

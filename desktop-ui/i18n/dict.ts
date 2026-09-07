@@ -97,6 +97,10 @@ const en: Dict = {
   "agent.empty": "no agents yet",
   "agent.bound.tooltip": "currently attached to a pane",
   "agent.notBound.tooltip": "not on screen",
+  "agent.badge.background": "BG",
+  "agent.badge.background.tip": "background task — a detached subagent spawned by its parent; runs on its own",
+  "agent.badge.task": "SUB",
+  "agent.badge.task.tip": "subagent — spawned by its parent agent to do a delegated subtask",
 
   // teams
   "team.create": "+ team",
@@ -202,6 +206,8 @@ const en: Dict = {
   "pane.label.msg": "{n} msg",
   "pane.label.tool": "{n} tool",
   "pane.label.plan": "plan",
+  "pane.bgtasks.label": "bg tasks ({n}):",
+  "pane.bgtasks.open": "open this background task in the pane",
 
   // permission dialog
   "perm.title": "PERMISSION REQUEST",
@@ -583,6 +589,10 @@ const zh: Dict = {
   "agent.empty": "暂无 agent",
   "agent.bound.tooltip": "已绑定到某个 pane",
   "agent.notBound.tooltip": "未在屏幕上",
+  "agent.badge.background": "后台",
+  "agent.badge.background.tip": "后台任务——父 agent 派生的脱钩子代理，独立后台运行",
+  "agent.badge.task": "子",
+  "agent.badge.task.tip": "子代理——由父 agent 派生，用于完成被委派的子任务",
   "agent.new.title": "新建 agent",
   "agent.new.label.name": "名称",
   "agent.new.label.provider": "供应商",
@@ -640,6 +650,8 @@ const zh: Dict = {
   "pane.label.msg": "{n} 条消息",
   "pane.label.tool": "{n} 次工具",
   "pane.label.plan": "计划",
+  "pane.bgtasks.label": "后台任务（{n}）：",
+  "pane.bgtasks.open": "在此 pane 中打开该后台任务",
 
   // permission dialog
   "perm.title": "工具权限请求",
