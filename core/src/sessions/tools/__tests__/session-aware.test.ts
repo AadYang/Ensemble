@@ -135,6 +135,26 @@ describe("makeTaskTool", () => {
     expect(receivedDescription).toBe("search docs");
     expect(receivedPrompt).toBe("find the relevant section");
   });
+
+  it("forwards the background flag and returns a non-blocking notice with the subagent id", async () => {
+    let receivedBackground: boolean | undefined;
+    const spawn = async (args: { description: string; prompt: string; background?: boolean }) => {
+      receivedBackground = args.background;
+      return { finalText: "", subagentId: "bg-child-01a06b42", background: true };
+    };
+    const tool = makeTaskTool(spawn);
+    const result = await tool.execute({
+      description: "run build",
+      prompt: "compile the desktop app",
+      background: true,
+    });
+    expect(receivedBackground).toBe(true);
+    // Must NOT return empty finalText for a background task — the model needs the
+    // id and a clear "don't block" instruction so it keeps working.
+    expect(result).toContain("Background task started");
+    expect(result).toContain("bg-child");
+    expect(result).toContain("peer_query");
+  });
 });
 
 describe("ExitPlanMode tool", () => {

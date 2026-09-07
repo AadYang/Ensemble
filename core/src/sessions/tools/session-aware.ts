@@ -46,7 +46,8 @@ type AskUserCallback = (args: { question: string; options: string[] }) => Promis
 type SpawnTaskCallback = (args: {
   description: string;
   prompt: string;
-}) => Promise<{ finalText: string; subagentId: string }>;
+  background?: boolean;
+}) => Promise<{ finalText: string; subagentId: string; background?: boolean }>;
 
 type EnsembleHelpCallback = (args: { topic?: string }) => Promise<string>;
 type SkillListCallback = () => Promise<string>;
@@ -216,6 +217,15 @@ export function makeAskUserTool(ask: AskUserCallback): NormalizedTool<typeof ASK
 const TASK_SCHEMA = z.object({
   description: z.string().min(1).describe("Short task summary (3-5 words)."),
   prompt: z.string().min(1).describe("Full task description for the subagent."),
+  background: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true, run the subagent as a detached BACKGROUND TASK: this tool returns " +
+        "its id immediately and you keep working while it runs. If false/omitted, " +
+        "wait for the subagent and return its final response. Either way the " +
+        "subagent appears in the sidebar tree under you.",
+    ),
 });
 
 const ENSEMBLE_HELP_SCHEMA = z.object({
@@ -223,7 +233,7 @@ const ENSEMBLE_HELP_SCHEMA = z.object({
     .string()
     .optional()
     .describe(
-      "Topic name. One of: overview, add_mcp_server, switch_provider, switch_model, create_agent, permissions, sandbox, peer_messaging, slash_commands, data_dir.",
+      "Topic name. One of: overview, add_mcp_server, switch_provider, switch_model, create_agent, permissions, sandbox, peer_messaging, slash_commands, subagents, data_dir.",
     ),
 });
 
@@ -240,7 +250,7 @@ export function makeEnsembleHelpTool(
       "for it. Returns UI paths + HTTP API hints for each topic.",
       "",
       "Topics: overview, add_mcp_server, switch_provider, switch_model,",
-      "create_agent, permissions, sandbox, peer_messaging, slash_commands, data_dir.",
+      "create_agent, permissions, sandbox, peer_messaging, slash_commands, subagents, data_dir.",
       "Call with no topic for the index.",
     ].join("\n"),
     parameters: ENSEMBLE_HELP_SCHEMA,
@@ -299,14 +309,24 @@ export function makeTaskTool(spawn: SpawnTaskCallback): NormalizedTool<typeof TA
   return {
     name: "Task",
     description:
-      "Delegate a subtask to a subagent. The subagent inherits this agent's model + " +
-      "provider but runs in an isolated context. Returns the subagent's final response. " +
-      "Use this for self-contained work that benefits from a clean slate (research, " +
-      "exploration, multi-step decomposition). Subagent depth is capped at 3 levels.",
+      "Delegate a subtask to a subagent. The subagent is a REAL Ensemble agent: it " +
+      "inherits your model + provider, runs in an isolated context, and appears nested " +
+      "under you in the sidebar tree so the user can watch it. " +
+      "Use it for self-contained work that benefits from a clean slate (research, " +
+      "exploration, multi-step decomposition). Set background=true to spawn it as a " +
+      "detached background task (returns its id immediately; you keep working while it " +
+      "runs). Subagent depth is capped at 3 levels.",
     parameters: TASK_SCHEMA,
     async execute(args) {
-      const { finalText } = await spawn(args);
-      return finalText;
+      const result = await spawn(args);
+      if (result.background) {
+        return (
+          `Background task started (subagent id=${result.subagentId.slice(0, 8)}). ` +
+          "It is running detached and is visible in the sidebar under you. " +
+          "Use peer_query on it later to read its progress/result; do not block waiting."
+        );
+      }
+      return result.finalText;
     },
   };
 }

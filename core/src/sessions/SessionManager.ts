@@ -45,6 +45,7 @@ import {
   ASK_USER_MCP_SERVER_NAME,
   ASK_USER_TOOL_NAME,
 } from "../ask-user-mcp.js";
+import { makeSubagentMcpServer, SUBAGENT_MCP_SERVER_NAME, SUBAGENT_TOOL_NAME } from "../subagent-mcp.js";
 import type {
   AgentStatus as ProtoStatus,
   AgentSummary,
@@ -2075,7 +2076,8 @@ export class SessionManager {
     parentId: string,
     description: string,
     prompt: string,
-  ): Promise<{ finalText: string; subagentId: string }> {
+    opts: { background?: boolean } = {},
+  ): Promise<{ finalText: string; subagentId: string; background?: boolean }> {
     const parent = await prisma.agent.findUnique({ where: { id: parentId } });
     if (!parent) throw new Error(`Task: parent agent ${parentId} not found`);
     const parentMeta = (parent.metadata && typeof parent.metadata === "object"
@@ -2088,19 +2090,38 @@ export class SessionManager {
           "Decompose the work at the parent level or finish the current subtree first.",
       );
     }
+    const background = opts.background === true;
     const child = await prisma.agent.create({
       data: {
         parentId,
-        name: `task:${description.slice(0, 32)}`,
+        name: `${background ? "bg" : "task"}:${description.slice(0, 32)}`,
         model: parent.model,
         providerId: parent.providerId,
         systemPrompt: parent.systemPrompt,
         workspace: parent.workspace,
         codexWorkspace: parent.codexWorkspace,
-        metadata: { taskDepth: parentDepth + 1, spawnedAsTaskFor: parentId },
+        metadata: {
+          taskDepth: parentDepth + 1,
+          spawnedAsTaskFor: parentId,
+          ...(background ? { backgroundTask: true } : {}),
+        },
       },
     });
+    // Broadcast so the child immediately appears nested under its parent in the
+    // sidebar tree (the store subscribes on agent_created). This is what makes
+    // both blocking subagents AND background tasks visible in the left list.
     this.hub.broadcast({ type: "agent_created", agent: agentRowToSummary(child) });
+    if (background) {
+      // Fire-and-forget: the child runs detached in its own session/run. The
+      // parent turn is NOT blocked — it gets the child id back immediately and
+      // continues. The child's progress is visible in its own pane + the tree's
+      // live status. Aligns with the unattended-continuous-dev mission: a long
+      // job runs in the background instead of holding the parent hostage.
+      void this.sendMessage(child.id, prompt).catch((err) => {
+        console.error(`[subagent:bg] child ${child.id.slice(0, 8)} failed:`, err);
+      });
+      return { finalText: "", subagentId: child.id, background: true };
+    }
     const result = await this.sendMessage(child.id, prompt);
     return { finalText: result?.finalText ?? "", subagentId: child.id };
   }
@@ -2717,6 +2738,7 @@ export class SessionManager {
     const mcpServers = await this.loadEnabledMcpServers();
     const peerMcp = makePeerMcpServer(this, sessionId);
     const askUserMcp = makeAskUserMcpServer(this, sessionId);
+    const subagentMcp = makeSubagentMcpServer(this, sessionId);
     const helpMcp = makeHelpMcpServer();
     const permissionMode = readPermissionMode(agent.metadata);
     const lastSessionId = readMetaString(agent.metadata, "lastSessionId");
@@ -2786,6 +2808,7 @@ export class SessionManager {
       ...mcpServers,
       [PEER_MCP_SERVER_NAME]: peerMcp,
       [ASK_USER_MCP_SERVER_NAME]: askUserMcp,
+      [SUBAGENT_MCP_SERVER_NAME]: subagentMcp,
       [HELP_MCP_SERVER_NAME]: helpMcp,
       [SKILL_MCP_SERVER_NAME]: skillMcp,
     };
@@ -2976,6 +2999,7 @@ export class SessionManager {
           PEER_QUERY_TOOL_NAME,
           CONVERSATION_SEARCH_TOOL_NAME,
           ASK_USER_TOOL_NAME,
+          SUBAGENT_TOOL_NAME,
           ENSEMBLE_HELP_TOOL_NAME,
           SKILL_INVOKE_TOOL_NAME,
           SKILL_LIST_TOOL_NAME,
@@ -3050,7 +3074,8 @@ export class SessionManager {
         peerQuery: makePeerQueryHandler(this, sessionId),
         conversationSearch: makeConversationSearchHandler(this, sessionId),
         askUser: makeAskUserHandler(this, sessionId),
-        spawnTask: ({ description, prompt }) => this.spawnTaskSubagent(sessionId, description, prompt),
+        spawnTask: ({ description, prompt, background }) =>
+          this.spawnTaskSubagent(sessionId, description, prompt, { background }),
         ensembleHelp: async ({ topic }) => formatEnsembleHelp(topic),
         skillList: async () => {
           const workspaces = skillWorkspace ? [skillWorkspace] : [];

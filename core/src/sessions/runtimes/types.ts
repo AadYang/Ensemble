@@ -111,7 +111,7 @@ export interface RuntimeOptions {
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
-  spawnTask?: (args: { description: string; prompt: string }) => Promise<{ finalText: string; subagentId: string }>;
+  spawnTask?: (args: { description: string; prompt: string; background?: boolean }) => Promise<{ finalText: string; subagentId: string; background?: boolean }>;
   ensembleHelp?: (args: { topic?: string }) => Promise<string>;
   skillList?: () => Promise<string>;
   skillInvoke?: (args: { name: string }) => Promise<string>;

@@ -24,6 +24,12 @@ User-facing surfaces (DO NOT try to script these — point the user to them):
   - chat pane: slash commands + ↑/↓ history walking
   - permission popups: appear in-app when write tools are called
 
+Delegation — you can spawn your OWN subagents / background tasks (see subagents topic):
+  - Claude runtime: spawn_subagent(description, prompt, background?) MCP tool
+  - OpenAI / Codex runtime: Task(description, prompt, background?) tool
+  - Each spawns a REAL Ensemble agent nested under you in the sidebar tree (the
+    user can watch it). background=true runs it detached; omit to wait for the result.
+
 Inter-agent communication (you have these tools):
   - peer_send (push: continue / review / fork / raw modes)
   - peer_query (read-only history pull, doesn't run the peer)
@@ -368,6 +374,53 @@ the agents too, delete each one individually.
 
 Cross-model is a first-class citizen: every member has its own provider /
 model dropdown in the new-team dialog. Use it.
+`,
+
+  subagents: `You can delegate work to subagents you spawn yourself — and run them
+in the BACKGROUND. Every subagent is a REAL Ensemble agent (a DB row), so it shows
+up nested under you in the sidebar tree with its own live status and its own chat
+pane. This is different from a model's internal "thinking" — the user can watch it.
+
+The tool depends on your runtime:
+  - Claude runtime  → spawn_subagent(description, prompt, background?)   [MCP tool]
+  - OpenAI / Codex  → Task(description, prompt, background?)             [function tool]
+Both do the same thing and take the same args.
+
+Args:
+  - description : 3-5 word summary. Becomes the subagent's name in the tree
+                  ("task:<desc>" foreground, "bg:<desc>" background).
+  - prompt      : the full instructions / task for the subagent.
+  - background  : optional boolean.
+      · omitted / false → BLOCKING: you wait; the tool returns the subagent's
+        final response text. Use for a subtask whose result you need right now.
+      · true → BACKGROUND TASK: the tool returns the subagent's id IMMEDIATELY
+        and you keep working. Use for long / parallel jobs (build, test sweep,
+        large research) that should not hold your turn hostage. This is the
+        "background task" capability.
+
+What the subagent inherits:
+  - your model + provider (cross-runtime is possible if provider resolves differently)
+  - your systemPrompt, workspace, and codexWorkspace
+  - a fresh, isolated context (it does NOT see your conversation history)
+
+Depth cap: subagents can spawn subagents up to 3 levels deep. Beyond that the
+tool errors — decompose at a higher level or finish the current subtree first.
+
+Working with a background task after you spawn it:
+  - It appears in the sidebar under you immediately (status updates live).
+  - Read its progress / result WITHOUT running it: peer_query(target=<its id or name>).
+  - Send it more instructions or a cancel request: peer_send(target=<it>, ...).
+  - Do NOT busy-wait. Spawn it, continue your own work, and check back with
+    peer_query when you need the outcome.
+
+Tips:
+  - Prefer spawn_subagent / Task over trying to create agents via create_agent
+    when the goal is "do a piece of work for me" — those subagents are auto-wired
+    as your children and inherit your setup.
+  - Give the subagent a self-contained prompt: it can't see your history, so put
+    every file path, constraint, and acceptance criterion into the prompt.
+  - Foreground for "I need this answer to proceed"; background for "run this while
+    I do other things".
 `,
 
   data_dir: `Ensemble's data directory:

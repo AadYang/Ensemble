@@ -226,7 +226,7 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   );
   mcp.tool(
     "ensemble_help",
-    "Ensemble runtime guidance. Call this BEFORE attempting Ensemble-specific tasks. Topics: overview, add_mcp_server, switch_provider, switch_model, create_agent, permissions, sandbox, peer_messaging, slash_commands, data_dir, skills. No arg -> index.",
+    "Ensemble runtime guidance. Call this BEFORE attempting Ensemble-specific tasks. Topics: overview, add_mcp_server, switch_provider, switch_model, create_agent, permissions, sandbox, peer_messaging, slash_commands, subagents, data_dir, skills. No arg -> index.",
     { topic: z.string().optional() },
     async (args) => ({ content: [{ type: "text", text: await invoke("ensemble_help", args) }] }),
   );
@@ -378,7 +378,7 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const ensembleHelp = handlers.ensembleHelp;
       mcp.tool(
         "ensemble_help",
-        "Ensemble runtime guidance. Call this BEFORE attempting Ensemble-specific tasks (Ensemble source is NOT on this machine). Topics: overview, add_mcp_server, switch_provider, switch_model, create_agent, permissions, sandbox, peer_messaging, slash_commands, data_dir, skills. No arg → index.",
+        "Ensemble runtime guidance. Call this BEFORE attempting Ensemble-specific tasks (Ensemble source is NOT on this machine). Topics: overview, add_mcp_server, switch_provider, switch_model, create_agent, permissions, sandbox, peer_messaging, slash_commands, subagents, data_dir, skills. No arg → index.",
         {
           topic: z.string().optional(),
         },
