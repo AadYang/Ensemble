@@ -497,6 +497,7 @@ const agentSummarySchema = z.object({
   sandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable(),
   reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]).nullable(),
   teamId: z.string().nullable(),
+  subagentKind: z.enum(["background", "task"]).nullable(),
   forcedSkills: z.array(z.string()).max(500),
   disabledSkills: z.array(z.string()).max(500),
   closed: z.boolean(),

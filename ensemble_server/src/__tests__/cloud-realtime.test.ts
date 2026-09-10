@@ -569,6 +569,7 @@ function agentSummaryBase(): AgentSummary {
     sandboxMode: null,
     reasoningEffort: null,
     teamId: null,
+    subagentKind: null,
     forcedSkills: [],
     disabledSkills: [],
     closed: false,
