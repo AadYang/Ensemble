@@ -99,6 +99,13 @@ export class OpenAIAgentRuntime implements AgentRuntime {
       model: opts.model,
       tools: sdkTools,
       mcpServers: mcpInstances,
+      // W24: forward the per-agent reasoning-effort override to OpenAI-compat
+      // reasoning models (DeepSeek flash/v4-pro, GLM, etc.). The SDK maps
+      // modelSettings.reasoning.effort to the chat-completions reasoning
+      // payload; omitting the key keeps the provider default.
+      ...(opts.reasoningEffort
+        ? { modelSettings: { reasoning: { effort: opts.reasoningEffort } } }
+        : {}),
     });
 
     const inputs = buildInputItems(opts);

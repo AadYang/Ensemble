@@ -12,7 +12,7 @@ export interface ModelsProbeFailure {
 const MODEL_PROBE_TIMEOUT_MS = 8000;
 
 export const DEEPSEEK_OFFICIAL_MODELS = [
-  "deepseek-v4-flash",
+  "deepseek-flash",
   "deepseek-v4-pro",
   // Kept for existing agents; new/default selection should prefer the v4 rows above.
   "deepseek-chat",

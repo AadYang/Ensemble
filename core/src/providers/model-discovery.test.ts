@@ -31,7 +31,7 @@ describe("provider model discovery", () => {
   it("recognizes DeepSeek official Anthropic baseUrl as fixed-catalog fallback", () => {
     const fallback = deepSeekOfficialModelsFallback("https://api.deepseek.com/anthropic", "anthropic");
     expect(fallback?.models).toEqual(DEEPSEEK_OFFICIAL_MODELS);
-    expect(fallback?.models[0]).toBe("deepseek-v4-flash");
+    expect(fallback?.models[0]).toBe("deepseek-flash");
   });
 
   it("recognizes DeepSeek official OpenAI baseUrl with or without /v1", () => {

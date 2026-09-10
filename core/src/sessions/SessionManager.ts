@@ -496,7 +496,8 @@ const providerSupportsReasoningEffort = (kind: string | null | undefined): boole
   kind === undefined ||
   kind === "anthropic-local" ||
   kind === "anthropic" ||
-  kind === "openai-codex";
+  kind === "openai-codex" ||
+  kind === "openai-compat";
 
 const planModeNotice = (permissionMode: PermissionMode): string =>
   permissionMode === "plan"
@@ -1473,7 +1474,7 @@ export class SessionManager {
     }
     if (patch.reasoningEffort !== undefined) {
       if (patch.reasoningEffort !== null && !providerSupportsReasoningEffort(targetProvider?.kind)) {
-        throw new Error("reasoningEffort override is only valid for Claude Code or Codex agents");
+        throw new Error("reasoningEffort override is only valid for Claude, Codex, or OpenAI-compat agents");
       }
       const previousReasoningEffort = readReasoningEffortOverride(cur.metadata);
       if (patch.reasoningEffort === null) {

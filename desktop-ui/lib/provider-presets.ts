@@ -43,7 +43,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     label: "DeepSeek (Anthropic)",
     runtime: "claude",
     baseUrl: "https://api.deepseek.com/anthropic",
-    models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+    models: ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
     docsUrl: "https://api-docs.deepseek.com/guides/anthropic_api",
   },
   {
@@ -60,7 +60,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     label: "DeepSeek (OpenAI)",
     runtime: "openai",
     baseUrl: "https://api.deepseek.com",
-    models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+    models: ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
     docsUrl: "https://api-docs.deepseek.com/",
   },
   {

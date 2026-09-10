@@ -35,7 +35,8 @@ import {
 import { execFileSync } from "node:child_process";
 import { mountMcpBridge, setBridgePort } from "./mcp-bridge.js";
 import { startTelemetry } from "./telemetry.js";
-import { getCliSettingsHealth, getCodexCliPath, setManualCliPath } from "./cli-config.js";
+import { getCliSettingsHealth, getClaudeCliPath, getCodexCliPath, setManualCliPath } from "./cli-config.js";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { runCodexStdioMcp } from "./codex-stdio-mcp.js";
 import { currentPlatformKey } from "./platform-key.js";
 import type { PlatformKey } from "@agentorch/shared";
@@ -500,6 +501,55 @@ async function discoverCodexModels(): Promise<string[] | null> {
       .map((m) => m.slug as string);
   } catch {
     return null;
+  }
+}
+
+// W24: discover Claude models by asking the local Claude Code CLI (via the
+// claude-agent-sdk) for its supported model list. Unlike the old hardcoded
+// DEFAULT_ANTHROPIC_MODELS this surfaces whatever the user's currently
+// installed / logged-in Claude Code actually offers — including newly
+// released models. The SDK returns aliases (ModelInfo.value) which is exactly
+// what the CLI accepts when switching models. Falls back to null on any
+// failure so callers can keep the static list as a last resort.
+async function discoverClaudeModels(): Promise<string[] | null> {
+  const abort = new AbortController();
+  // Model refresh is a quick CLI-spawn; don't let a stuck login prompt / slow
+  // start hang the HTTP handler. Aborting also unblocks the SDK's init wait.
+  const timer = setTimeout(() => abort.abort(), 15000);
+
+  let claudeCliPath: string | null = null;
+  try {
+    claudeCliPath = await getClaudeCliPath();
+  } catch {
+    claudeCliPath = null;
+  }
+
+  const stream = query({
+    prompt: "",
+    options: {
+      // In SEA/packaged mode the SDK can't derive the claude.js path; point
+      // it at the real binary when we know it.
+      ...(claudeCliPath ? { pathToClaudeCodeExecutable: claudeCliPath } : {}),
+      abortController: abort,
+    },
+  });
+  try {
+    const infos = await stream.supportedModels();
+    const values = (infos ?? [])
+      .map((m) => m.value)
+      .filter((v): v is string => typeof v === "string" && v.length > 0);
+    return values.length > 0 ? values : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    // End the generator so the SDK runs its cleanup path and releases the
+    // spawned CLI child process (same teardown as a normal turn completing).
+    try {
+      await stream.return(undefined);
+    } catch {
+      // init already failed / aborted — nothing to clean up.
+    }
   }
 }
 
@@ -996,16 +1046,22 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
       discovered: { count: codexModels.length, source: "codex debug models" },
     };
   }
-  // anthropic-local (or anthropic without baseUrl, the legacy default) — fall
-  // back to hardcoded list. There's no remote endpoint to introspect.
+  // anthropic-local (or anthropic without baseUrl, the legacy default) — ask
+  // the local Claude Code CLI for its live supported-model list (aliases), so
+  // newly released models surface on refresh. Fall back to the hardcoded list
+  // only when the CLI is missing / offline / not logged in.
   if (provider.kind === "anthropic-local" || (provider.kind === "anthropic" && !provider.baseUrl && !provider.apiKey)) {
+    const discovered = await discoverClaudeModels();
+    const models = discovered ?? DEFAULT_ANTHROPIC_MODELS;
     const updated = await prisma.provider.update({
       where: { id: provider.id },
-      data: { models: DEFAULT_ANTHROPIC_MODELS },
+      data: { models },
     });
     return {
       ...sanitizeProvider(updated),
-      discovered: { count: DEFAULT_ANTHROPIC_MODELS.length, source: "local-oauth" },
+      discovered: discovered
+        ? { count: discovered.length, source: "claude-cli-supported-models" }
+        : { count: DEFAULT_ANTHROPIC_MODELS.length, source: "local-oauth (static fallback)" },
     };
   }
 
@@ -1022,7 +1078,12 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   }
   const deepSeekFallback = deepSeekOfficialModelsFallback(probeBaseUrl, flavor);
 
-  if (deepSeekFallback) {
+  // DeepSeek's official Anthropic-compat endpoint has no discoverable
+  // /models, so it always uses the (corrected) static catalog. The OpenAI-
+  // compat endpoint DOES expose /models, but only with a valid API key — so
+  // only short-circuit when we can't actually probe. The openai+key DeepSeek
+  // case falls through to the live probe below.
+  if (deepSeekFallback && (flavor === "anthropic" || !provider.apiKey)) {
     const updated = await prisma.provider.update({
       where: { id: provider.id },
       data: { models: deepSeekFallback.models },
@@ -1064,6 +1125,22 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
     return {
       ...sanitizeProvider(updated),
       discovered: { count: result.models.length, source: result.sourceUrl },
+    };
+  }
+
+  if (deepSeekFallback) {
+    // Live /models probe failed for the openai+key DeepSeek case; still return
+    // the corrected official catalog rather than a hard 502.
+    const updated = await prisma.provider.update({
+      where: { id: provider.id },
+      data: { models: deepSeekFallback.models },
+    });
+    return {
+      ...sanitizeProvider(updated),
+      discovered: {
+        count: deepSeekFallback.models.length,
+        source: `${deepSeekFallback.sourceUrl} (live probe failed, static fallback)`,
+      },
     };
   }
 

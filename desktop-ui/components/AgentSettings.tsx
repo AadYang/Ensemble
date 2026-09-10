@@ -180,7 +180,8 @@ export function AgentSettings({
   const supportsThinkingMode =
     selectedProviderKind === "anthropic-local" ||
     selectedProviderKind === "anthropic" ||
-    selectedProviderKind === "openai-codex";
+    selectedProviderKind === "openai-codex" ||
+    selectedProviderKind === "openai-compat";
   // Only the local-OAuth Claude provider (anthropic-local) and the legacy
   // built-in default (kind=anthropic + no baseUrl) get the hardcoded model
   // fallback. For 3rd-party Anthropic-compat providers we MUST show only the
