@@ -1,6 +1,6 @@
 # 会话上下文占比显示 + 关停自动 compact（提案 · 决议版）
 
-> **状态**：📝 设计落盘，待实施（2026-09-11 用户四项决议后定稿）
+> **状态**：✅ 已实施；2026-09-14 修订分子算法（本地 tokenizer 数真实 transcript，见 §2.1）
 > **目标**：关掉「turn 前自动 compact」，改为在 ChatPane 头部实时显示当前会话的上下文占用百分比，≥70% 红色闪烁提醒；compact 只保留手动 `/compact`。
 > **触发动机**：自动 compact 基于「条数 + 字符数」拍脑袋触发，可能正好打断正在处理的代码细节；官方客户端与社区项目已普遍用「上下文占比」替代隐性压缩，用户要求对齐该体验。
 
@@ -76,12 +76,12 @@
 export interface ContextUsage {
   usedTokens: number;
   contextWindow: number;
-  percent: number; // Math.round(usedTokens / contextWindow * 100)，允许 >100
+  percent: number; // Math.min(100, Math.round(usedTokens / contextWindow * 100))，封顶 100
 }
 ```
 
-- `usedTokens = inputTokens + outputTokens + cacheReadInputTokens + cacheCreationInputTokens`
-- `contextWindow`：优先用 result 里 `modelUsage[model].contextWindow`（Claude 实时值），`>0` 才采用；否则查静态表。
+- `usedTokens` = 本地 tokenizer 数真实 transcript（merged systemPrompt + 各 message 可见文本），见 context-usage.ts 头注（2026-09-14 修订：不再用 provider usage 相加 —— DeepSeek anthropic-compat 会上报 `cache_read_input_tokens` 2.83M 超过自身 1M 窗口）
+- `contextWindow`：curated 表优先（第三方/OpenAI 官方窗口）> SDK 上报（Claude 实时值）> 静态表兜底。
 
 ### 2.2 静态 context-window 表
 
@@ -109,13 +109,15 @@ export function resolveContextWindow(model: string, reported?: number): number |
 新文件 `core/src/context-usage.ts`（纯函数，可单测）：
 
 ```ts
-export function contextUsageFromResult(
-  msg: unknown,
-  currentModel: string,
-): ContextUsage | null
+export function reportedContextWindowFromResult(msg: unknown, model: string): number | undefined;
+export function contextUsageFromTranscript(
+  model: string,
+  reportedContextWindow: number | undefined,
+  transcriptTexts: readonly string[],
+): ContextUsage | null;
 ```
 
-逻辑：读 `msg.modelUsage`；选 `modelUsage[currentModel]`，缺则选 `inputTokens+outputTokens` 最大的条目；按 2.1 公式算 `usedTokens`、解析 `contextWindow`；`contextWindow` 未知或 `usedTokens === 0` 返回 `null`。
+逻辑：result 钩子处用 `contextTranscriptTexts` 收集 mergedSystemPrompt + 各 message 可见文本；`contextUsageFromTranscript` 用本地 tokenizer 数 token，解析 `contextWindow`（curated > SDK 上报 > 静态表），percent 封顶 100；窗口未知或计数为 0 返回 `null`。
 
 `SessionManager` 增加：
 
@@ -196,7 +198,7 @@ WS 协议新增（`shared/src/protocol.ts` `ServerMsg`）：
 - 不做侧栏 AgentTree 的上下文徽章（决议：仅 ChatPane 头部）
 - 不做黄色预警分档（决议：仅 ≥70% 红色闪烁）
 - 不做自动 compact 的开关/设置项（决议：直接关）
-- 不做基于真实 Message 文本的本地 tokenizer 重算（v1 用模型上报 usage；OpenAI 侧已有一致口径，Claude 侧用 SDK usage）
+- ~~不做基于真实 Message 文本的本地 tokenizer 重算~~ **2026-09-14 已改**：DeepSeek anthropic-compat 上报的 `cache_read_input_tokens`（2.83M）超过自身 1M 窗口，provider usage 相加不可信；改为本地 tokenizer 数真实 transcript（对齐 LiteLLM / OpenHands / aider）
 - 不把 `contextUsage` 持久化到 DB / 跨重启保留（v1 内存态，重启后下一次 turn 才有值）
 - 不把 `contextWindow` 补进 `UsageEvent` 历史表（与 W17 账单统计的「上下文峰值」未来需求解耦，暂不动 schema）
 - 不做紧凑阈值提醒按钮（`/compact` 已存在；头部闪烁本身即提醒）
@@ -210,6 +212,6 @@ WS 协议新增（`shared/src/protocol.ts` `ServerMsg`）：
 | 静态表数值过时 / 缺新模型 | `resolveContextWindow` 返回 null → UI 不显示；随新模型发布更新 `context-window.ts`（同 `pricing.json` 校准节奏） |
 | Claude SDK 的 `inputTokens` 口径若与「不含 cache」不符 | 已按 `pricing.ts`/`openai.ts` 现有约定统一；单测覆盖 cache 计入公式，若 SDK 行为变化由 3.2 单测暴露 |
 | 多模型 turn 选错 model 条目 | `contextUsageFromResult` 优先 `currentModel`，缺则选最大 usage 条目；单测覆盖 |
-| `percent` 超 100（如上下文已满又输出） | 允许 >100 显示，不做 clamp（真实反映溢出） |
+| `percent` 封顶 | 本地计数可能略超窗口，percent 封顶 100（对齐 OpenHands `min(100,…)`）；`usedTokens` 不 clamp，tooltip 仍显示真实 used/window |
 | 红色闪烁对个别低对比主题可读性 | 用 `var(--err)` 现有错误色，`step-end` 1s 闪烁；三端人眼 review |
 | 关自动 compact 后长会话可能直接触达模型上下文上限 | 这是本次决策的有意取舍；头部占比 ≥70% 闪烁即人工触发 `/compact` 的信号 |

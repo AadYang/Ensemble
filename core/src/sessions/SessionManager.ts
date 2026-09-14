@@ -6,7 +6,7 @@ import { isAbsolute } from "node:path";
 import type { CanUseTool, Options, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { SdkMessage } from "@agentorch/shared";
 import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
-import { contextUsageFromResult } from "../context-usage.js";
+import { contextUsageFromTranscript, reportedContextWindowFromResult } from "../context-usage.js";
 import { chooseRuntime } from "./runtimes/index.js";
 import type { AgentRuntime, RuntimeErrorCode, RuntimeErrorEvent, RuntimeOptions } from "./runtimes/types.js";
 import {
@@ -2475,6 +2475,27 @@ export class SessionManager {
     this.hub.sendToSession(sessionId, { type: "context_usage", sessionId, usage });
   }
 
+  /** Build the plain-text transcript for the LOCAL context-fill count: the
+   *  merged system prompt plus every persisted message's visible text. Provider
+   *  `usage` is deliberately not used for the fill bar — see the context-usage.ts
+   *  header (third-party cache over-report makes provider sums garbage). */
+  private async contextTranscriptTexts(
+    agentId: string,
+    systemPrompt: string | null | undefined,
+  ): Promise<string[]> {
+    const texts: string[] = [];
+    if (systemPrompt && systemPrompt.trim()) texts.push(systemPrompt.trim());
+    const rows = await prisma.message.findMany({
+      where: { agentId },
+      orderBy: { seq: "asc" },
+    });
+    for (const row of rows) {
+      const text = messageRowText(row).trim();
+      if (text) texts.push(text);
+    }
+    return texts;
+  }
+
   private interruptedTurnAlreadyPersisted(sessionId: string, run: RunningSession): boolean {
     if (run.userMessageSeq === undefined) return false;
     const rows = prisma.message.findMany({
@@ -3101,10 +3122,17 @@ export class SessionManager {
             }
           }
 
-          // Refresh the live context-usage indicator from this result. Null
-          // (unknown model window / empty usage) clears the indicator until a
-          // later turn can compute it.
-          this.setContextUsage(sessionId, contextUsageFromResult(msg, agent.model));
+          // Refresh the live context-usage indicator from this result, using a
+          // LOCAL tokenizer count of the real transcript (system prompt + message
+          // text) instead of the provider-reported usage sum. Null (unknown
+          // window / tokenizer unavailable) clears the indicator until a later
+          // turn can compute it.
+          const reportedWindow = reportedContextWindowFromResult(msg, agent.model);
+          const transcriptTexts = await this.contextTranscriptTexts(sessionId, mergedSystemPrompt);
+          this.setContextUsage(
+            sessionId,
+            contextUsageFromTranscript(agent.model, reportedWindow, transcriptTexts),
+          );
         }
 
         this.hub.sendToSession(sessionId, {

@@ -1,87 +1,69 @@
-// Compute a per-turn ContextUsage from a Claude-shaped result SDK message.
+// Compute a per-turn ContextUsage for the agent-pane context-fill indicator.
 //
-// `usedTokens` is the total number of tokens currently occupying the model
-// context window at the end of that turn. Per the project-wide convention
-// (see pricing.ts + runtimes/openai.ts), `inputTokens` is the NON-cached
-// portion of the prompt, with cache reads/creations tracked separately — so
-// the full window occupancy is:
+// The numerator is a LOCAL tokenizer count of the actual conversation text
+// (system prompt + persisted message text), NOT the provider-reported
+// `inputTokens + outputTokens + cacheRead + cacheCreation` sum.
 //
-//   inputTokens + outputTokens + cacheReadInputTokens + cacheCreationInputTokens
+// Why (verified against high-star open-source projects on 2026-09-14):
+//   - LiteLLM counts tokens locally with tiktoken and treats the context window
+//     as static model metadata (model_prices_and_context_window.json).
+//   - OpenHands renders `min(100, per_turn_token / context_window)` where
+//     `per_turn_token` is a backend "tokens in context" metric, not raw
+//     provider usage; unknown windows render as raw counts, not a fake %.
+//   - aider counts real chat + repo-map tokens locally with tiktoken.
+//   None of them sums provider cache fields for a "how full is the window" bar.
+//   Provider `usage` is billing data, and third-party Anthropic-compat upstreams
+//   (DeepSeek) over-report `cache_read_input_tokens` (observed 2.83M on a 1M
+//   window), which makes a provider-sum numerator garbage.
 //
-// Pure function — no DB, no runtime imports — so it's directly unit-testable.
+// The percentage is capped at 100 (OpenHands does `Math.min(100, …)`). The raw
+// `usedTokens` is NOT clamped, so the tooltip can still show a truthful
+// `used/window` when local counting slightly exceeds the window.
+//
+// When the local tokenizer is unavailable (vocab files missing) the count is 0
+// and we return null → the UI shows "unknown" instead of a fabricated number.
 
 import type { ContextUsage } from "@agentorch/shared";
 import { resolveContextWindow } from "./context-window.js";
+import { countTokensMany } from "./local-tokenizer.js";
 
 interface ModelUsageEntry {
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadInputTokens?: number;
-  cacheCreationInputTokens?: number;
   contextWindow?: number;
 }
 
 interface ResultPayload {
   type?: string;
   modelUsage?: Record<string, ModelUsageEntry>;
-  /** OpenAI runtime attaches its LAST response's usage here (tool loops emit
-   *  multiple responses; the accumulated modelUsage would double-count). */
-  contextUsage?: ModelUsageEntry & { model?: string };
 }
 
-function usedTokensOf(u: ModelUsageEntry): number {
-  return (
-    (u.inputTokens ?? 0) +
-    (u.outputTokens ?? 0) +
-    (u.cacheReadInputTokens ?? 0) +
-    (u.cacheCreationInputTokens ?? 0)
-  );
-}
-
-export function contextUsageFromResult(msg: unknown, currentModel: string): ContextUsage | null {
+/** Extract the SDK-reported context window for `model` from a result message,
+ *  when present and positive. The Claude SDK provides an authoritative value;
+ *  OpenAI/Codex write 0 and rely on the curated/static tables. */
+export function reportedContextWindowFromResult(
+  msg: unknown,
+  model: string,
+): number | undefined {
   const payload = msg as ResultPayload | null;
-  if (!payload || payload.type !== "result") return null;
+  if (!payload || payload.type !== "result") return undefined;
+  const w = payload.modelUsage?.[model]?.contextWindow;
+  return typeof w === "number" && w > 0 ? w : undefined;
+}
 
-  // OpenAI: the result carries a separate `contextUsage` for the LAST
-  // response in a tool loop. Use it when present — the accumulated modelUsage
-  // re-sends the full history on every loop iteration and would double-count.
-  if (payload.contextUsage) {
-    const cu = payload.contextUsage;
-    const model = cu.model ?? currentModel;
-    const usedTokens = usedTokensOf(cu);
-    const contextWindow = resolveContextWindow(model);
-    if (usedTokens <= 0 || !contextWindow || contextWindow <= 0) return null;
-    return {
-      usedTokens,
-      contextWindow,
-      percent: Math.round((usedTokens / contextWindow) * 100),
-    };
-  }
+/** Build a ContextUsage from locally-tokenized transcript text. */
+export function contextUsageFromTranscript(
+  model: string,
+  reportedContextWindow: number | undefined,
+  transcriptTexts: readonly string[],
+): ContextUsage | null {
+  const contextWindow = resolveContextWindow(model, reportedContextWindow);
+  if (!contextWindow || contextWindow <= 0) return null;
 
-  if (!payload.modelUsage) return null;
-
-  let model = currentModel;
-  let usage: ModelUsageEntry | undefined = payload.modelUsage[currentModel];
-  if (!usage) {
-    // Multi-model turn (rare): fall back to the entry with the largest
-    // token footprint so the indicator still reflects the dominant model.
-    for (const [name, u] of Object.entries(payload.modelUsage)) {
-      if (!u) continue;
-      if (!usage || usedTokensOf(u) > usedTokensOf(usage)) {
-        model = name;
-        usage = u;
-      }
-    }
-  }
-  if (!usage) return null;
-
-  const usedTokens = usedTokensOf(usage);
-  const contextWindow = resolveContextWindow(model, usage.contextWindow);
-  if (usedTokens <= 0 || !contextWindow || contextWindow <= 0) return null;
+  const usedTokens = countTokensMany(model, transcriptTexts);
+  if (usedTokens <= 0) return null; // tokenizer unavailable → "unknown", not 0%
 
   return {
     usedTokens,
     contextWindow,
-    percent: Math.round((usedTokens / contextWindow) * 100),
+    percent: Math.min(100, Math.round((usedTokens / contextWindow) * 100)),
   };
 }

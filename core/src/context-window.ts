@@ -152,10 +152,29 @@ function lookupModelWindow(model: string): number | null {
   return null;
 }
 
-/** Resolve a model's context window. A positive SDK-reported value wins
- *  (Claude), otherwise fall back to the static table. Returns null when the
- *  model is unknown so callers can hide the indicator instead of guessing. */
+/** Look up a curated (verified-against-docs) window only. Curated covers
+ *  third-party / OpenAI models the app ships; Claude-native models are
+ *  intentionally absent so their SDK-reported window keeps priority. */
+function lookupCuratedWindow(model: string): number | null {
+  const v =
+    CURATED_CONTEXT_WINDOW_TOKENS[model] ??
+    CURATED_CONTEXT_WINDOW_TOKENS[model.toLowerCase()];
+  return typeof v === "number" && v > 0 ? v : null;
+}
+
+/** Resolve a model's context window. Priority:
+ *   1. Curated table (verified third-party/OpenAI windows) — must win over the
+ *      Claude SDK's `contextWindow`, which is a Claude default (≈200k) for
+ *      third-party anthropic-compat models like deepseek-v4-pro / glm / minimax
+ *      and not the real window.
+ *   2. SDK-reported value (authoritative for Claude-native models, which are
+ *      absent from the curated table).
+ *   3. Merged table (LiteLLM snapshot + user overrides) as last resort.
+ *  Returns null when unknown so callers can hide the indicator instead of
+ *  guessing. */
 export function resolveContextWindow(model: string, reported?: number): number | null {
+  const curated = lookupCuratedWindow(model);
+  if (curated) return curated;
   if (reported && reported > 0) return reported;
   return lookupModelWindow(model);
 }
