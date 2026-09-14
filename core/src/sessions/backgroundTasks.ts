@@ -110,3 +110,20 @@ export function applyBackgroundTaskDelta(
 export function shouldFinalizeTurn(sawResult: boolean, liveTasks: Set<string>): boolean {
   return sawResult && liveTasks.size === 0;
 }
+
+/** Build the visible system message emitted when the SDK stream closes while
+ *  drain-blocking background tasks are still unresolved (no terminal
+ *  task_notification arrived). Kept pure so it is unit-testable and so a
+ *  hang/death is NEVER silently swallowed into a `status:"DONE"` turn. */
+export function backgroundTaskInterruptedMessage(taskIds: readonly string[]): Record<string, unknown> {
+  const ids = [...taskIds];
+  return {
+    type: "system",
+    subtype: "background_task_interrupted",
+    task_ids: ids,
+    text:
+      ids.length === 0
+        ? "background task interrupted: no terminal notification before the runtime stream closed"
+        : `background task${ids.length > 1 ? "s" : ""} interrupted: no terminal notification before the runtime stream closed (${ids.join(", ")})`,
+  };
+}

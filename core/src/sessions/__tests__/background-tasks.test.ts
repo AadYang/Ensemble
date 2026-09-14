@@ -3,6 +3,7 @@ import {
   classifyBackgroundTaskMessage,
   applyBackgroundTaskDelta,
   shouldFinalizeTurn,
+  backgroundTaskInterruptedMessage,
 } from "../backgroundTasks.js";
 
 const started = (task_id: string, extra: Record<string, unknown> = {}) => ({
@@ -143,6 +144,23 @@ describe("shouldFinalizeTurn", () => {
     expect(shouldFinalizeTurn(true, set)).toBe(false);
     set.delete("t2");
     expect(shouldFinalizeTurn(true, set)).toBe(true);
+  });
+});
+
+describe("backgroundTaskInterruptedMessage", () => {
+  it("produces a persisted-able system notice naming the unresolved ids", () => {
+    const msg = backgroundTaskInterruptedMessage(["t1", "t2"]);
+    expect(msg.type).toBe("system");
+    expect(msg.subtype).toBe("background_task_interrupted");
+    expect(msg.task_ids).toEqual(["t1", "t2"]);
+    expect(String(msg.text)).toContain("t1, t2");
+    expect(String(msg.text)).toContain("interrupted");
+  });
+
+  it("produces a generic notice when no ids are supplied", () => {
+    const msg = backgroundTaskInterruptedMessage([]);
+    expect(msg.subtype).toBe("background_task_interrupted");
+    expect(String(msg.text)).toContain("interrupted");
   });
 });
 

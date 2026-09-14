@@ -64,6 +64,7 @@ import {
   classifyBackgroundTaskMessage,
   applyBackgroundTaskDelta,
   shouldFinalizeTurn,
+  backgroundTaskInterruptedMessage,
 } from "./backgroundTasks.js";
 import type { Agent as DbAgent, PendingTurn as DbPendingTurn } from "../db.js";
 import { prisma } from "../db.js";
@@ -3153,6 +3154,29 @@ export class SessionManager {
         if (shouldFinalizeTurn(sawResultForDrain, liveBackgroundTasks)) break;
       }
       this.clearRuntimeIdleWatchdog(sessionId, runId);
+
+      // A background task can die/hang without ever emitting a terminal
+      // task_notification, and the SDK can still close the stream. That must
+      // never be silently swallowed into a `status:"DONE"` turn — surface a
+      // visible, persisted error-toned notice (design §6: no silent drops, no
+      // clean completion for an interrupted drain).
+      if (!abort.signal.aborted && sawResultForDrain && liveBackgroundTasks.size > 0) {
+        const unresolved = [...liveBackgroundTasks];
+        console.warn(
+          `[sendMessage] background task(s) unresolved at stream close agent=${sessionId.slice(0, 8)} tasks=[${unresolved.join(",")}]`,
+        );
+        const notice = backgroundTaskInterruptedMessage(unresolved);
+        const persistedNotice = await prisma.message.create({
+          data: { agentId: sessionId, seq, type: "system", payload: notice },
+        });
+        this.hub.sendToSession(sessionId, {
+          type: "message",
+          sessionId,
+          seq: persistedNotice.seq,
+          msg: notice as never,
+        });
+        seq++;
+      }
 
       const persistData: { status: "DONE"; metadata?: object } = { status: "DONE" };
       if (!opts?.suppressRuntimeMetadata) {

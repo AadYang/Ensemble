@@ -937,6 +937,8 @@ function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
   }
 
   const tagColor =
+    t.tone === "error" ? "text-[var(--err)]" :
+    t.tone === "warn" ? "text-[var(--warn)]" :
     t.kind === "user" ? "text-[var(--accent)]" :
     t.kind === "assistant_text" ? "text-[var(--text)]" :
     t.kind === "result" ? "text-[var(--ok)]" :

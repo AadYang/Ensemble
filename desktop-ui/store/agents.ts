@@ -40,6 +40,7 @@ export interface ChatTurn {
   toolInput?: unknown;
   streaming?: boolean;
   peerOrigin?: PeerOrigin;
+  tone?: "error" | "warn";
 }
 
 export interface AgentState {
@@ -197,6 +198,81 @@ function stripPeerHandoff(text: string): string | null {
   return m ? (m[1] ?? null) : null;
 }
 
+// Claude background tasks are delivered as `type:"system"` messages whose
+// meaning lives entirely in the subtype + payload fields. The old generic
+// `system · <subtype>` row hid the description, progress, usage, summary and —
+// most importantly — failure/error. Surface them as perceptible, richly
+// worded turns so a background task that is thinking/executing/failing can be
+// seen at a glance (design doc docs/plans/claude-background-tasks.md §6).
+const formatBackgroundTaskSystem = (
+  msg: SdkMessage,
+): { text: string; tone?: ChatTurn["tone"] } | null => {
+  const subtype = (msg as { subtype?: string }).subtype;
+  const m = msg as Record<string, unknown>;
+  switch (subtype) {
+    case "task_started": {
+      const desc = typeof m.description === "string" && m.description.trim() ? m.description : "";
+      const type = typeof m.task_type === "string" ? m.task_type : typeof m.subagent_type === "string" ? m.subagent_type : "";
+      const parts = [type, desc].filter(Boolean);
+      return {
+        text: `⏳ background task started${parts.length ? ` · ${parts.join(" · ")}` : ""}`,
+        tone: "warn",
+      };
+    }
+    case "task_progress": {
+      const desc = typeof m.description === "string" && m.description.trim() ? m.description : "";
+      const u = (m.usage ?? {}) as Record<string, unknown>;
+      const parts: string[] = [];
+      if (typeof m.last_tool_name === "string" && m.last_tool_name) parts.push(`tool ${m.last_tool_name}`);
+      if (typeof u.total_tokens === "number") parts.push(`${u.total_tokens} tok`);
+      if (typeof u.tool_uses === "number") parts.push(`${u.tool_uses} tool calls`);
+      if (typeof u.duration_ms === "number") parts.push(`${Math.round(u.duration_ms / 1000)}s`);
+      if (typeof m.summary === "string" && m.summary.trim()) parts.push(m.summary);
+      return {
+        text: `⏳ background task progress${desc ? ` · ${desc}` : ""}${parts.length ? ` · ${parts.join(" · ")}` : ""}`,
+        tone: "warn",
+      };
+    }
+    case "task_updated": {
+      const patch = (m.patch ?? {}) as Record<string, unknown>;
+      const status = typeof patch.status === "string" ? patch.status : "";
+      const error = typeof patch.error === "string" ? patch.error : "";
+      if (status === "failed" || error) {
+        return { text: `⚠ background task failed${error ? ` · ${error}` : ""}`, tone: "error" };
+      }
+      if (status === "killed") return { text: `✕ background task killed`, tone: "error" };
+      if (status === "completed") return { text: `✓ background task completed` };
+      return { text: `background task ${status || "updated"}` };
+    }
+    case "task_notification": {
+      const status = typeof m.status === "string" ? m.status : "";
+      const summary = typeof m.summary === "string" && m.summary.trim() ? m.summary : "";
+      const tail = summary ? ` · ${summary}` : "";
+      if (status === "failed") return { text: `⚠ background task failed${tail}`, tone: "error" };
+      if (status === "stopped") return { text: `■ background task stopped${tail}`, tone: "warn" };
+      return { text: `✓ background task completed${tail}` };
+    }
+    case "background_tasks_changed": {
+      const tasks = (Array.isArray(m.tasks) ? m.tasks : []) as Array<Record<string, unknown>>;
+      if (tasks.length === 0) return { text: "background tasks: none running" };
+      const list = tasks
+        .map((t) => {
+          const type = typeof t.task_type === "string" ? t.task_type : "task";
+          const desc = typeof t.description === "string" && t.description.trim() ? t.description : "";
+          return desc ? `${type} · ${desc}` : type;
+        })
+        .join("  /  ");
+      return { text: `⏳ background tasks running (${tasks.length}): ${list}`, tone: "warn" };
+    }
+    case "background_task_interrupted": {
+      const text = typeof m.text === "string" && m.text.trim() ? m.text : "background task interrupted: no terminal notification before the runtime stream closed";
+      return { text: `⚠ ${text}`, tone: "error" };
+    }
+    default:
+      return null;
+  }
+};
+
 const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   switch (msg.type) {
     case "assistant": {
@@ -231,6 +307,8 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
       ) {
         return { seq, kind: "system", text: systemText };
       }
+      const bg = formatBackgroundTaskSystem(msg);
+      if (bg) return { seq, kind: "system", text: bg.text, ...(bg.tone ? { tone: bg.tone } : {}) };
       return { seq, kind: "system", text: `system · ${(msg as { subtype?: string }).subtype ?? ""}` };
     case "stream_event":
     case "rate_limit_event":
