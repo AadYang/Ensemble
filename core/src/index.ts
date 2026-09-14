@@ -43,6 +43,7 @@ import type { PlatformKey } from "@agentorch/shared";
 import {
   deepSeekOfficialModelsFallback,
   probeModels,
+  type ModelsProbeFailure,
   type ProbeFlavor,
 } from "./providers/model-discovery.js";
 import { DEFAULT_ANTHROPIC_MODELS } from "./providers/default-models.js";
@@ -1078,12 +1079,33 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   }
   const deepSeekFallback = deepSeekOfficialModelsFallback(probeBaseUrl, flavor);
 
-  // DeepSeek's official Anthropic-compat endpoint has no discoverable
-  // /models, so it always uses the (corrected) static catalog. The OpenAI-
-  // compat endpoint DOES expose /models, but only with a valid API key — so
-  // only short-circuit when we can't actually probe. The openai+key DeepSeek
-  // case falls through to the live probe below.
-  if (deepSeekFallback && (flavor === "anthropic" || !provider.apiKey)) {
+  // Live probing is always the first option, for every provider. OpenAI-compat
+  // endpoints can't be probed without a key (OpenAI /v1/models requires
+  // `Authorization: Bearer`), so only that case skips straight to the static
+  // fallback / explicit error below. Anthropic-compat is probed even without a
+  // key — several proxies expose /models anonymously, and DeepSeek's static
+  // catalog is only the last-resort fallback when the probe 404s.
+  const canProbe = flavor === "anthropic" || Boolean(provider.apiKey);
+
+  let probeFailure: ModelsProbeFailure | null = null;
+  if (canProbe) {
+    const result = await probeModels(probeBaseUrl, provider.apiKey, flavor);
+    if ("models" in result) {
+      const updated = await prisma.provider.update({
+        where: { id: provider.id },
+        data: { models: result.models },
+      });
+      return {
+        ...sanitizeProvider(updated),
+        discovered: { count: result.models.length, source: result.sourceUrl },
+      };
+    }
+    probeFailure = result;
+  }
+
+  // Static catalog is the fallback of last resort — only after a live probe
+  // failed, or couldn't even be attempted because OpenAI needs a key.
+  if (deepSeekFallback) {
     const updated = await prisma.provider.update({
       where: { id: provider.id },
       data: { models: deepSeekFallback.models },
@@ -1092,15 +1114,14 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
       ...sanitizeProvider(updated),
       discovered: {
         count: deepSeekFallback.models.length,
-        source:
-          flavor === "openai" && !provider.apiKey
-            ? `${deepSeekFallback.sourceUrl}; API key required for requests`
-            : deepSeekFallback.sourceUrl,
+        source: probeFailure
+          ? `${deepSeekFallback.sourceUrl} (live probe failed, static fallback)`
+          : `${deepSeekFallback.sourceUrl} (no API key for live discovery)`,
       },
     };
   }
 
-  if (flavor === "openai" && !provider.apiKey) {
+  if (!canProbe) {
     // OpenAI's /v1/models requires `Authorization: Bearer sk-...`. There is
     // no OAuth-for-API path; codex CLI's ChatGPT login lives on a separate
     // chatgpt.com backend that @openai/agents doesn't speak. Explicit error
@@ -1116,34 +1137,6 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
     };
   }
 
-  const result = await probeModels(probeBaseUrl, provider.apiKey, flavor);
-  if ("models" in result) {
-    const updated = await prisma.provider.update({
-      where: { id: provider.id },
-      data: { models: result.models },
-    });
-    return {
-      ...sanitizeProvider(updated),
-      discovered: { count: result.models.length, source: result.sourceUrl },
-    };
-  }
-
-  if (deepSeekFallback) {
-    // Live /models probe failed for the openai+key DeepSeek case; still return
-    // the corrected official catalog rather than a hard 502.
-    const updated = await prisma.provider.update({
-      where: { id: provider.id },
-      data: { models: deepSeekFallback.models },
-    });
-    return {
-      ...sanitizeProvider(updated),
-      discovered: {
-        count: deepSeekFallback.models.length,
-        source: `${deepSeekFallback.sourceUrl} (live probe failed, static fallback)`,
-      },
-    };
-  }
-
   // No URL returned models. Surface every URL we tried so the user can debug.
   reply.code(502);
   const hint =
@@ -1155,7 +1148,7 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   return {
     error: "no_models_discovered",
     message: `could not auto-discover models from the configured baseUrl. ${hint}`,
-    tried: result.tried,
+    tried: probeFailure!.tried,
   };
 });
 

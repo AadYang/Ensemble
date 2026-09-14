@@ -34,10 +34,10 @@ export const candidateModelsUrls = (base: string): string[] => {
   return [`${trimmed}/v1/models`, `${trimmed}/models`];
 };
 
-/** DeepSeek documents fixed model ids but its official Anthropic-compatible
- * baseUrl does not expose the `/models` paths Ensemble probes for generic
- * compat providers. Treat the official DeepSeek baseUrls as a known catalog
- * source instead of telling the user their baseUrl is wrong.
+/** DeepSeek documents fixed model ids and its official baseUrls historically
+ * expose no (or partial) `/models` discovery. Callers probe first and only use
+ * this known catalog as a last-resort fallback when the live probe fails or
+ * can't run (e.g. OpenAI-compat without an API key).
  */
 export function deepSeekOfficialModelsFallback(
   baseUrl: string,
@@ -58,7 +58,7 @@ export function deepSeekOfficialModelsFallback(
 
   return {
     models: DEEPSEEK_OFFICIAL_MODELS,
-    sourceUrl: "DeepSeek official model list (models endpoint not discoverable)",
+    sourceUrl: "DeepSeek official model catalog",
   };
 }
 
