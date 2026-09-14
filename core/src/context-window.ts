@@ -3,12 +3,42 @@
 // authoritative contextWindow via the SDK, so this table is only consulted when
 // a result carries 0 / no value.
 //
-// Values are per-model, NOT a single default — a 1M model and a 200K model must
-// not share a window or the header percentage will be wrong. Every non-legacy
-// value below was verified against the provider's official docs on 2026-09-11
-// (sources inlined per section). Keys are matched case-insensitively.
+// Resolution order (highest priority first):
+//   1. SDK-reported `contextWindow` (Claude) — authoritative.
+//   2. Curated `CURATED_CONTEXT_WINDOW_TOKENS` — verified against provider docs
+//      on 2026-09-11 for the models the app actually ships / newest families.
+//   3. `context-windows.json` — a filtered LiteLLM snapshot (653 models) for
+//      the long tail, refreshed via scripts/update-context-windows.mjs.
+//   4. Per-user `context-window-overrides.json` in the app data dir — mirrors
+//      the pricing.ts "built-in + override" pattern so users with third-party
+//      model ids can fill in exact values without waiting for a release.
+//
+// Unknown models resolve to null so callers can hide the indicator instead of
+// guessing. Keys are matched case-insensitively.
 
-export const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import builtInContextWindows from "./context-windows.json" with { type: "json" };
+import { ensureDataDir } from "./paths.js";
+
+export interface ModelContextWindow {
+  /** Context window size (input tokens). */
+  maxInputTokens: number;
+  /** Max output tokens. Not used for the % bar, kept for completeness. */
+  maxOutputTokens?: number;
+  _source?: string;
+}
+
+export interface ContextWindowTable {
+  version: string;
+  note?: string;
+  models: Record<string, ModelContextWindow>;
+}
+
+/** Curated windows for the models the app ships by default and the newest
+ *  families. These override the LiteLLM snapshot because they were verified
+ *  against provider docs more recently than the snapshot's refresh cadence. */
+export const CURATED_CONTEXT_WINDOW_TOKENS: Record<string, number> = {
   // ── OpenAI ──────────────────────────────────────────────────────────────
   // Source: https://platform.openai.com/docs/models/<id> ("context window")
   "gpt-5": 400_000,
@@ -61,10 +91,71 @@ export const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
   "glm-4.5-x": 128_000,
 };
 
+const BUILT_IN: ContextWindowTable = builtInContextWindows as ContextWindowTable;
+
+let cached: ContextWindowTable | null = null;
+
+export function contextWindowOverridesPath(): string {
+  return join(ensureDataDir(), "context-window-overrides.json");
+}
+
+/** Merge the LiteLLM snapshot, the curated table, and the user's
+ *  `context-window-overrides.json`. Priority: user > curated > snapshot.
+ *  Memoized; call `_resetContextWindowCache` in tests. */
+export function loadContextWindowTable(): ContextWindowTable {
+  if (cached) return cached;
+  const overridesPath = contextWindowOverridesPath();
+  const models: Record<string, ModelContextWindow> = { ...BUILT_IN.models };
+
+  for (const [model, maxInputTokens] of Object.entries(CURATED_CONTEXT_WINDOW_TOKENS)) {
+    models[model] = { ...models[model], maxInputTokens };
+  }
+
+  const merged: ContextWindowTable = {
+    version: BUILT_IN.version,
+    note: BUILT_IN.note,
+    models,
+  };
+
+  if (existsSync(overridesPath)) {
+    try {
+      const raw = readFileSync(overridesPath, "utf8");
+      const overrides = JSON.parse(raw) as Partial<ContextWindowTable>;
+      if (overrides.models && typeof overrides.models === "object") {
+        merged.models = { ...merged.models, ...overrides.models };
+      }
+      if (typeof overrides.version === "string") {
+        merged.version = `${BUILT_IN.version}+overrides@${overrides.version}`;
+      }
+    } catch (err) {
+      // Malformed override must not crash the run — log and use built-ins.
+      console.warn(`[context-window] failed to read ${overridesPath}: ${(err as Error).message}`);
+    }
+  }
+
+  cached = merged;
+  return cached;
+}
+
+/** Test hook: drop the memoized table so the next call re-reads from disk. */
+export function _resetContextWindowCache(): void {
+  cached = null;
+}
+
+function lookupModelWindow(model: string): number | null {
+  const entry =
+    loadContextWindowTable().models[model] ??
+    loadContextWindowTable().models[model.toLowerCase()];
+  if (entry && typeof entry.maxInputTokens === "number" && entry.maxInputTokens > 0) {
+    return entry.maxInputTokens;
+  }
+  return null;
+}
+
 /** Resolve a model's context window. A positive SDK-reported value wins
  *  (Claude), otherwise fall back to the static table. Returns null when the
  *  model is unknown so callers can hide the indicator instead of guessing. */
 export function resolveContextWindow(model: string, reported?: number): number | null {
   if (reported && reported > 0) return reported;
-  return CONTEXT_WINDOW_TOKENS[model.toLowerCase()] ?? null;
+  return lookupModelWindow(model);
 }

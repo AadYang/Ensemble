@@ -24,6 +24,9 @@ interface ModelUsageEntry {
 interface ResultPayload {
   type?: string;
   modelUsage?: Record<string, ModelUsageEntry>;
+  /** OpenAI runtime attaches its LAST response's usage here (tool loops emit
+   *  multiple responses; the accumulated modelUsage would double-count). */
+  contextUsage?: ModelUsageEntry & { model?: string };
 }
 
 function usedTokensOf(u: ModelUsageEntry): number {
@@ -37,7 +40,25 @@ function usedTokensOf(u: ModelUsageEntry): number {
 
 export function contextUsageFromResult(msg: unknown, currentModel: string): ContextUsage | null {
   const payload = msg as ResultPayload | null;
-  if (!payload || payload.type !== "result" || !payload.modelUsage) return null;
+  if (!payload || payload.type !== "result") return null;
+
+  // OpenAI: the result carries a separate `contextUsage` for the LAST
+  // response in a tool loop. Use it when present — the accumulated modelUsage
+  // re-sends the full history on every loop iteration and would double-count.
+  if (payload.contextUsage) {
+    const cu = payload.contextUsage;
+    const model = cu.model ?? currentModel;
+    const usedTokens = usedTokensOf(cu);
+    const contextWindow = resolveContextWindow(model);
+    if (usedTokens <= 0 || !contextWindow || contextWindow <= 0) return null;
+    return {
+      usedTokens,
+      contextWindow,
+      percent: Math.round((usedTokens / contextWindow) * 100),
+    };
+  }
+
+  if (!payload.modelUsage) return null;
 
   let model = currentModel;
   let usage: ModelUsageEntry | undefined = payload.modelUsage[currentModel];

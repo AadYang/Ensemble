@@ -206,6 +206,9 @@ const en: Dict = {
   "pane.label.msg": "{n} msg",
   "pane.label.tool": "{n} tool",
   "pane.label.plan": "plan",
+  "pane.context.unknown": "context: unknown",
+  "pane.context.unknownTip": "unknown model — add its window size to context-window-overrides.json",
+  "pane.context.tip": "context usage: {used} / {window} tokens ({percent}%)",
   "pane.bgtasks.label": "bg tasks ({n}):",
   "pane.bgtasks.open": "open this background task in the pane",
 
@@ -650,6 +653,9 @@ const zh: Dict = {
   "pane.label.msg": "{n} 条消息",
   "pane.label.tool": "{n} 次工具",
   "pane.label.plan": "计划",
+  "pane.context.unknown": "上下文：未知",
+  "pane.context.unknownTip": "未知模型 —— 可在 context-window-overrides.json 补充窗口大小",
+  "pane.context.tip": "上下文占用：{used} / {window} tokens（{percent}%）",
   "pane.bgtasks.label": "后台任务（{n}）：",
   "pane.bgtasks.open": "在此 pane 中打开该后台任务",
 

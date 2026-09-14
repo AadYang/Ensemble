@@ -64,6 +64,13 @@ describe("buildEnsemblePrimer", () => {
     expect(p).toContain("conversation_search");
   });
 
+  it("guides subagent usage without encouraging overuse", () => {
+    const p = buildEnsemblePrimer();
+    expect(p).toMatch(/subagent/i);
+    expect(p).toContain("parallelizable");
+    expect(p).toMatch(/do NOT spawn a subagent for a trivial/i);
+  });
+
   it("documents conversation_search in peer_messaging help", () => {
     const out = formatEnsembleHelp("peer_messaging");
     expect(out).toContain("conversation_search");

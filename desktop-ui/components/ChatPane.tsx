@@ -18,6 +18,7 @@ import { useStore, type ChatTurn } from "@/store/agents";
 import { useT, type TranslateFn } from "@/i18n/useT";
 import { ToolCard } from "./ToolCard";
 import { PeerSendPopover } from "./PeerSendPopover";
+import { ContextBar } from "./ContextBar";
 
 // /model and /provider open a picker when invoked with no args (CLI-parity).
 // Typed args bypass the picker (kept for muscle memory / scripting).
@@ -780,18 +781,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
         <span className={`status-dot ${summary.status}`} />
         <span className="font-bold">{summary.name}</span>
         <span className="text-[var(--text-dim)]">{summary.model}</span>
-        {contextUsage && (
-          <span
-            className={
-              contextUsage.percent >= 70
-                ? "ctx-flash tabular-nums"
-                : "text-[var(--text-dim)] tabular-nums"
-            }
-            title={`${contextUsage.usedTokens.toLocaleString()} / ${contextUsage.contextWindow.toLocaleString()} tokens`}
-          >
-            · ctx {contextUsage.percent}%
-          </span>
-        )}
+        {contextUsage && <ContextBar context={contextUsage} />}
         <span className="text-[var(--text-dim)]">· {summary.status}</span>
         {summary.closed && (
           <span className="px-1.5 py-0.5 border border-[var(--warn)] text-[var(--warn)] text-[10px] tracking-wider">

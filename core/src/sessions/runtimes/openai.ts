@@ -161,6 +161,12 @@ export class OpenAIAgentRuntime implements AgentRuntime {
       cacheCreationInputTokens: number;
     }> = {};
 
+    // W22: the LAST response's usage (not accumulated) for the context bar.
+    // Each tool-loop response resends the full history, so `usageAccum`
+    // double-counts for "current context usage" purposes; only the final
+    // response reflects the true current window occupancy.
+    let lastUsage: ReturnType<typeof readResponseUsage> = null;
+
     try {
       // Slice 4.2 interrupt-resume loop. Each iteration runs the agent until
       // the SDK pauses for tool approval (or completes). When interruptions
@@ -207,7 +213,12 @@ export class OpenAIAgentRuntime implements AgentRuntime {
               // populated only at completion; tool-loop runs surface multiple
               // response_done events per turn, so accumulate per model rather
               // than overwrite.
-              accumulateUsage(usageAccum, data.response, opts.model);
+              const rec = readResponseUsage(data.response, opts.model);
+              if (rec) {
+                _accumulateUsageForTest(usageAccum, data.response, opts.model);
+                // W22: keep the final response's usage for the context bar.
+                lastUsage = rec;
+              }
             }
           } else if (event.type === "run_item_stream_event" && event.name === "message_output_created") {
             const text = extractItemText(event.item) || finalText;
@@ -329,6 +340,9 @@ export class OpenAIAgentRuntime implements AgentRuntime {
           subtype: "success",
           session_id: synthSessionId,
           modelUsage,
+          // W22: last response usage for the context bar. Kept separate from
+          // modelUsage (which is accumulated across the tool loop).
+          contextUsage: lastUsage ?? undefined,
         },
       };
     } catch (err) {
@@ -379,16 +393,16 @@ function extractUserText(msg: { message?: unknown }): string {
  *  for the top-level shape; `prompt_tokens_details.cached_tokens` snake when
  *  it falls through to the OpenAI SDK shape). Best-effort: if the SDK
  *  reshuffles names, we end up under-counting rather than crashing. */
-export function _accumulateUsageForTest(
-  accum: Record<string, {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadInputTokens: number;
-    cacheCreationInputTokens: number;
-  }>,
+export function readResponseUsage(
   response: unknown,
   fallbackModel: string,
-): void {
+): {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+} | null {
   const r = response as {
     model?: string;
     usage?: {
@@ -400,7 +414,7 @@ export function _accumulateUsageForTest(
       prompt_tokens_details?: { cached_tokens?: number };
     };
   };
-  if (!r?.usage) return;
+  if (!r?.usage) return null;
   const u = r.usage;
   const model = r.model || fallbackModel;
   const reportedInputTokens = u.inputTokens ?? u.input_tokens ?? 0;
@@ -414,19 +428,32 @@ export function _accumulateUsageForTest(
   // OpenAI's prompt-caching only reports reads; creation is implicit in input
   // count (first send pays input price, subsequent reads pay cache_read).
   // We leave cacheCreationInputTokens=0 — there's no separate counter.
-  const slot = accum[model] ?? {
+  return { model, inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens: 0 };
+}
+
+export function _accumulateUsageForTest(
+  accum: Record<string, {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+  }>,
+  response: unknown,
+  fallbackModel: string,
+): void {
+  const rec = readResponseUsage(response, fallbackModel);
+  if (!rec) return;
+  const slot = accum[rec.model] ?? {
     inputTokens: 0,
     outputTokens: 0,
     cacheReadInputTokens: 0,
     cacheCreationInputTokens: 0,
   };
-  slot.inputTokens += inputTokens;
-  slot.outputTokens += outputTokens;
-  slot.cacheReadInputTokens += cacheReadInputTokens;
-  accum[model] = slot;
+  slot.inputTokens += rec.inputTokens;
+  slot.outputTokens += rec.outputTokens;
+  slot.cacheReadInputTokens += rec.cacheReadInputTokens;
+  accum[rec.model] = slot;
 }
-
-const accumulateUsage = _accumulateUsageForTest;
 
 function extractItemText(item: unknown): string {
   // RunItem shape: see runner/items. message_output_created carries a

@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepSeek Harness vs Ensemble — Agent Coding 工具对比分析</title>
+<style>
+  :root{
+    --bg:#0f1115; --bg2:#161a21; --bg3:#1d222b; --line:#2a313d;
+    --fg:#e4e8ef; --fg2:#a8b2c1; --fg3:#6f7b8c;
+    --dsh:#7aa2f7; --ens:#f7a76c; --ok:#79d68a; --warn:#e8c56a; --bad:#f07a7a;
+    --mono:"JetBrains Mono",Consolas,"SF Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
+  .wrap{display:grid;grid-template-columns:265px minmax(0,1fr);max-width:1500px;margin:0 auto;}
+  /* ---- TOC ---- */
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+    padding:28px 18px 60px;border-right:1px solid var(--line);background:var(--bg);}
+  nav .brand{font-size:13px;font-weight:700;letter-spacing:.08em;color:var(--fg3);text-transform:uppercase;margin-bottom:16px}
+  nav a{display:block;color:var(--fg2);text-decoration:none;font-size:13.5px;padding:5px 10px;border-radius:6px;border-left:2px solid transparent}
+  nav a:hover{background:var(--bg2);color:var(--fg)}
+  nav a.sub{padding-left:24px;font-size:12.5px;color:var(--fg3)}
+  nav .grp{margin-top:14px;font-size:11px;letter-spacing:.1em;color:var(--fg3);text-transform:uppercase;padding-left:10px}
+  main{padding:44px 52px 120px;min-width:0}
+  /* ---- typography ---- */
+  h1{font-size:34px;line-height:1.25;margin:0 0 10px;letter-spacing:-.5px}
+  h2{font-size:25px;margin:64px 0 18px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  h3{font-size:18.5px;margin:38px 0 12px;color:#fff}
+  h4{font-size:15.5px;margin:26px 0 8px;color:var(--fg)}
+  p{margin:12px 0}
+  code{font-family:var(--mono);font-size:.87em;background:var(--bg3);padding:2px 6px;border-radius:4px;color:#cfe3ff}
+  pre{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:12.8px;line-height:1.65;color:#cdd6e4}
+  pre code{background:none;padding:0;color:inherit}
+  ul,ol{padding-left:24px}
+  li{margin:7px 0}
+  a{color:var(--dsh)}
+  .lead{font-size:17px;color:var(--fg2);max-width:80ch}
+  .sub{color:var(--fg3);font-size:13.5px}
+  hr{border:0;border-top:1px solid var(--line);margin:40px 0}
+  /* ---- tables ---- */
+  table{width:100%;border-collapse:collapse;margin:18px 0;font-size:13.6px}
+  th,td{text-align:left;padding:10px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--bg2);color:var(--fg);font-weight:600;font-size:12.5px;letter-spacing:.03em;text-transform:uppercase;position:sticky;top:0}
+  tr:hover td{background:rgba(255,255,255,.022)}
+  td code{font-size:.85em}
+  .col-dsh{color:var(--dsh)} .col-ens{color:var(--ens)}
+  /* ---- cards / callouts ---- */
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:22px 0}
+  .card{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+  .card.dsh{border-top:3px solid var(--dsh)} .card.ens{border-top:3px solid var(--ens)}
+  .card h4{margin-top:0}
+  .card ul{padding-left:20px;margin:8px 0 0}
+  .card li{font-size:13.6px;color:var(--fg2)}
+  .box{border-left:3px solid var(--dsh);background:var(--bg2);padding:14px 18px;border-radius:0 10px 10px 0;margin:20px 0}
+  .box.warn{border-color:var(--warn)} .box.bad{border-color:var(--bad)} .box.ok{border-color:var(--ok)}
+  .box .t{font-weight:700;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--fg3);margin-bottom:6px}
+  /* ---- badges ---- */
+  .b{display:inline-block;font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:20px;font-weight:600;letter-spacing:.03em;white-space:nowrap}
+  .b.p0{background:#4a1d22;color:#ff9b9b;border:1px solid #7a2f38}
+  .b.p1{background:#4a3d1a;color:#ffdc8a;border:1px solid #7a6526}
+  .b.p2{background:#1d3a4a;color:#8fd0f0;border:1px solid #2c5a75}
+  .b.no{background:#2a2f38;color:#94a0b2;border:1px solid #3a4250}
+  .y{color:var(--ok);font-weight:600}
+  .n{color:var(--bad);font-weight:600}
+  .m{color:var(--warn);font-weight:600}
+  /* ---- header ---- */
+  header{background:linear-gradient(150deg,#1a2030 0%,#161a21 55%,#1f1a16 100%);
+    border:1px solid var(--line);border-radius:16px;padding:34px 38px;margin-bottom:12px}
+  .meta{display:flex;gap:26px;flex-wrap:wrap;margin-top:20px;font-size:12.5px;color:var(--fg3);font-family:var(--mono)}
+  .vs{display:flex;align-items:center;gap:18px;margin-top:22px;flex-wrap:wrap}
+  .vs .n1{color:var(--dsh);font-weight:700;font-size:17px}
+  .vs .n2{color:var(--ens);font-weight:700;font-size:17px}
+  .vs .x{color:var(--fg3);font-family:var(--mono);font-size:14px}
+  /* misc */
+  .num{font-family:var(--mono);color:#9fd6ff}
+  .path{font-family:var(--mono);font-size:12px;color:var(--fg3)}
+  .tag{font-family:var(--mono);font-size:11px;color:var(--fg3);border:1px solid var(--line);padding:1px 7px;border-radius:4px;margin-right:6px}
+  @media(max-width:1000px){.wrap{grid-template-columns:1fr}nav{display:none}main{padding:24px 20px 80px}.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav>
+  <div class="brand">目录</div>
+  <a href="#tldr">0 · 执行摘要</a>
+  <div class="grp">定位与架构</div>
+  <a href="#pos">1 · 产品定位差异</a>
+  <a href="#arch">2 · 架构对比</a>
+  <a href="#loop">3 · Agent Loop 归属</a>
+  <div class="grp">核心：上下文管理</div>
+  <a href="#ctx">4 · 上下文管理总览</a>
+  <a href="#ctx-assemble" class="sub">4.1 上下文装配</a>
+  <a href="#ctx-token" class="sub">4.2 Token 计量</a>
+  <a href="#ctx-compact" class="sub">4.3 压缩 Compaction</a>
+  <a href="#ctx-spill" class="sub">4.4 Spill 外溢</a>
+  <a href="#ctx-trunc" class="sub">4.5 工具输出裁剪</a>
+  <a href="#ctx-cache" class="sub">4.6 Prompt Cache</a>
+  <a href="#ctx-offload" class="sub">4.7 状态外置</a>
+  <a href="#ctx-query" class="sub">4.8 历史可查询</a>
+  <a href="#ctx-sub" class="sub">4.9 子代理隔离</a>
+  <a href="#ctx-score" class="sub">4.10 打分卡</a>
+  <div class="grp">其他维度</div>
+  <a href="#tools">5 · 工具体系</a>
+  <a href="#perm">6 · 权限与沙箱</a>
+  <a href="#multi">7 · 多 Agent 编排</a>
+  <a href="#ext">8 · 扩展性</a>
+  <a href="#eng">9 · 工程质量</a>
+  <div class="grp">结论</div>
+  <a href="#proscons">10 · 优缺点总账</a>
+  <a href="#learn">11 · Ensemble 该学什么</a>
+  <a href="#notlearn">12 · 不该学什么</a>
+  <a href="#roadmap">13 · 落地路线图</a>
+  <div class="grp">附录</div>
+  <a href="#verify">A · 事实核验记录</a>
+</nav>
+
+<main>
+
+<header>
+  <h1>DeepSeek Harness vs Ensemble</h1>
+  <p class="lead">作为 Agent Coding 工具的架构对比、优缺点分析，以及 Ensemble 的可借鉴项 —— 重点在上下文管理。</p>
+  <div class="vs">
+    <span class="n1">deepseek-harness (dsh)</span>
+    <span class="x">— 对比 —</span>
+    <span class="n2">Ensemble</span>
+  </div>
+  <div class="meta">
+    <span>基于源码实读</span>
+    <span>D:\WorkSpace\deepseek-harness @ 0.1.0-rc.5</span>
+    <span>D:\WorkSpace\Ensemble</span>
+    <span>2026-08-14</span>
+  </div>
+</header>
+
+<div class="box">
+  <div class="t">阅读提示</div>
+  本文所有结论均来自对两个仓库源码的直接阅读，关键数字（阈值、上限、比例）均标注了出处文件路径。<strong>第 4 章是全文重点</strong>，第 11 章是可直接落地的行动清单。
+</div>
+
+<div class="box ok">
+  <div class="t">代码同步与事实核验（2026-08-14 复核）</div>
+  两仓库均执行 <code>git fetch --all --prune --tags</code> + <code>git pull --ff-only</code>，结果 <strong><code>Already up to date.</code></strong>：
+  <ul style="margin:8px 0">
+    <li><strong>Ensemble</strong> — HEAD <code>8188146</code>（2026-05-26），待拉取 <span class="num">0</span> 个提交。<span class="sub">注：master 已停更约 2.5 个月，活跃开发在独立仓库 EnsembleV2（HEAD 2026-06-26）。</span></li>
+    <li><strong>deepseek-harness</strong> — HEAD <code>47f9438</code>（2026-08-13，<code>0.1.0-rc.5</code>），待拉取 <span class="num">0</span> 个提交。</li>
+  </ul>
+  代码无变化，故结论不变。但本次对文中<strong>载荷性事实断言做了逐条源码复核</strong>，并据此修正了 2 处数字、补入 3 条<strong>比原文更强的新证据</strong>（见 <a href="#verify">附录 A</a>）。所有硬编码常量、CI 缺失、测试数量均已确认属实。
+</div>
+
+<!-- ============================ 0 ============================ -->
+<h2 id="tldr">0 · 执行摘要</h2>
+
+<p>两者<strong>不是同一层的产品</strong>，这是理解一切差异的前提：</p>
+
+<div class="cards">
+  <div class="card dsh">
+    <h4 class="col-dsh">dsh = Harness（引擎）</h4>
+    <p class="sub" style="margin-top:4px">自己就是 agent 本体。它拥有 agent loop、工具注册表、会话日志、模型适配器、压缩引擎。它要解决的是"<strong>如何让一个 agent 跑得又久又准</strong>"。</p>
+    <ul>
+      <li>~50 个 packages，Cordis 插件树，"一切皆插件"</li>
+      <li>自研 LLM 适配、自研 schema DSL、自研 RPC（Typert）</li>
+      <li>跨平台原生沙箱（bwrap/Landlock/Seatbelt/Win-ACL）</li>
+      <li>上下文管理是<strong>一等公民</strong>：独立的 context / compaction / spill / token-meter / session-query 包</li>
+    </ul>
+  </div>
+  <div class="card ens">
+    <h4 class="col-ens">Ensemble = Control Plane（控制面）</h4>
+    <p class="sub" style="margin-top:4px">自己不是 agent，是<strong>指挥多个厂商 agent 的工作台</strong>。它拥有进程编排、权限 UI、持久化、计费、跨 agent 消息。它要解决的是"<strong>如何让多个 agent 协同</strong>"。</p>
+    <ul>
+      <li>~21.8k LOC 业务代码（core 10.6k / shared 0.9k / UI 10.3k，不含测试），Tauri + Node sidecar + Next.js</li>
+      <li>Agent loop 委托给 claude CLI / codex CLI / @openai/agents</li>
+      <li>独有能力：多 pane 布局、peer 消息（continue/review/fork）、Team、跨 runtime 统一渲染、成本核算</li>
+      <li>上下文管理<strong>几乎为零</strong>：无预算、无自动压缩、无溢出检测</li>
+    </ul>
+  </div>
+</div>
+
+<h3>五句话结论</h3>
+<ol>
+  <li><strong>dsh 的上下文管理是可以直接抄的成熟工程</strong>：0.8 触发 / 0.16 保留的比例化压缩、cache-对齐的摘要请求、耐久化的压缩锁、tool-result 先廉价剪枝后昂贵摘要的分层策略、大输出 spill 到磁盘换 handle。</li>
+  <li><strong>Ensemble 当前最大的风险不是功能缺失，而是"静默撞墙"</strong>：OpenAI-compat 路径每轮全量重放 DB 历史且无任何上限，用户只会看到一个泛化的 <code>QUERY_FAILED</code>。</li>
+  <li><strong>Ensemble 有两个真正领先的点</strong>：跨 agent 的<em>有界</em>上下文传递（peer_send 8000 / peer_query 12000 字符硬上限），以及三 runtime 统一的成本/token 核算（dsh 只有 OTel 遥测，没有面向用户的计费视图）。</li>
+  <li><strong>结构性困境</strong>：Claude/Codex 的上下文在厂商 CLI 的 session 文件里，Ensemble 看不见也管不了 —— 所以 Ensemble 不该去抄 dsh 的 compaction 引擎本体，而该抄<strong>可观测性 + 分层裁剪 + spill</strong> 这些在控制面这一层就能做的部分。</li>
+  <li><strong>dsh 明显弱于 Ensemble 的地方</strong>：权限模型只有 one-shot <code>ask</code>/<code>never</code>（无"永久允许"）、无 TUI、MCP 只做 client 不做 server、无面向用户的成本视图、概念负担极重。</li>
+</ol>
+
+<!-- ============================ 1 ============================ -->
+<h2 id="pos">1 · 产品定位差异</h2>
+
+<table>
+<thead><tr><th style="width:22%">维度</th><th style="width:39%" class="col-dsh">deepseek-harness</th><th style="width:39%" class="col-ens">Ensemble</th></tr></thead>
+<tbody>
+<tr><td>产品层次</td><td>Agent harness / 引擎</td><td>Agent 编排器 / 控制面</td></tr>
+<tr><td>一句话</td><td>"一个可被任意重组的 agent 运行时"</td><td>"一个窗口里指挥多个厂商 agent"</td></tr>
+<tr><td>主交互面</td><td>Web UI（Vite+React SPA）+ headless one-shot + ACP + SDK<br><span class="sub">无一等公民 TUI</span></td><td>原生桌面窗口（Tauri WebView）+ 多 pane tmux 式布局</td></tr>
+<tr><td>模型接入</td><td>自研适配器：<code>llm-deepseek</code>（直连 SSE）+ <code>llm-pi-ai</code>（OpenAI/Anthropic/Bedrock/Vertex/Azure 等）</td><td>不接模型，接<strong>厂商 agent</strong>：claude CLI / codex CLI / @openai/agents</td></tr>
+<tr><td>谁拥有 agent loop</td><td class="y">自己</td><td class="n">厂商 CLI（OpenAI 路径部分自持）</td></tr>
+<tr><td>核心差异化</td><td>可替换性（seam 抽象）、Code Mode、原生沙箱、上下文工程</td><td>多 agent 协同、跨 runtime 统一体验、成本可见、桌面原生</td></tr>
+<tr><td>代码规模</td><td>~50 packages + vendor 框架 + native addon + python SDK</td><td>4 workspace，~21.8k LOC（不含测试）</td></tr>
+<tr><td>目标用户</td><td>要定制/嵌入 agent 引擎的开发者与研究者</td><td>日常同时跑多个 coding agent 的工程师</td></tr>
+</tbody>
+</table>
+
+<div class="box ok">
+  <div class="t">重要判断</div>
+  这两个产品<strong>可以叠起来用</strong>而不是互相取代。dsh 的 <code>packages/subagent</code> 里已经有 <code>subagent-claude-code</code> 和 <code>subagent-codex</code> —— 它把竞品当子代理后端调用。反过来，Ensemble 完全可以把 <code>dsh</code> 作为第四个 runtime 接进来（它有 stdio JSON-RPC SDK 和 <code>--profile headless "task"</code> 一次性模式）。
+</div>
+
+<!-- ============================ 2 ============================ -->
+<h2 id="arch">2 · 架构对比</h2>
+
+<h3>2.1 dsh：Cordis 插件树</h3>
+<p>dsh 把 Cordis（一个 DI/插件框架）<strong>vendor 进仓库</strong>（<span class="path">vendor/cordis, vendor/schemastery, vendor/loader, vendor/hmr…</span>），并 rescope 成 <code>@deepseek-ai/*</code>。<span class="path">vendor/README.md</span> 明说这是为了"完全拥有框架层（可审计、可打补丁、可锁版本）"，并记录了约 18 处对上游的本地修补（fiber 生命周期、Loader 事务化 reconcile、精确路径 HMR）。</p>
+
+<p><span class="path">docs/architecture.md</span> 的原话：<em>"每一个部分都是插件，包括模型适配器、工具注册表、会话日志，以及 agent loop 本身……没有一个特权 core 需要打补丁。"</em></p>
+
+<pre><code>启动时的插件树 = 分层 patch 叠加：
+  profile (web | headless | 自定义)   $DSH_HOME/profiles/&lt;name&gt;
+    └─ bundles              packages/bundle/{base,web-app,headless}
+       └─ profile 自身 cordis.patch.yml
+          └─ home 级 patch
+             └─ --patch 覆盖层
+  每层按 config row id 定位，可替换或插入
+  dsh --profile web --dump-config  ← 打印真实组合结果</code></pre>
+
+<h4>Seam 三段式（这是 dsh 最值钱的架构约定）</h4>
+<p>每个能力拆成 <strong>Service Definition</strong>（抽象接口 + ctx key）/ <strong>Provider</strong>（具体实现）/ <strong>Consumer</strong>（面向模型的工具）。收益是实打实的：<code>packages/e2b</code> 只替换了 <code>ctx.fs</code> 和 <code>ctx.subprocess</code> 两个 provider，Bash、PTY、LSP 三个工具<strong>零改动</strong>就整体搬到了远程沙箱里。</p>
+
+<h3>2.2 Ensemble：三进程 + 一个 seam</h3>
+<pre><code>Ensemble.exe (Tauri Rust, ~11MB) ── 窗口/托盘/sidecar 生命周期，无业务逻辑
+  ├─ WebView2 / WKWebView → http://127.0.0.1:&lt;auto-port&gt;
+  └─ ensemble-core(.exe)  (Node 22 SEA, ~100MB)
+       ├─ Fastify: 静态前端 + /api/* REST + /ws WebSocket
+       ├─ node:sqlite (WAL, 手写 repo shim, 无 ORM)
+       │    Provider/Agent/Message/Permission/McpServer/Team/Workspace/AppSetting/UsageEvent
+       └─ AgentRuntime seam ── query(opts): AsyncIterable&lt;RuntimeEvent&gt;
+            ├─ claude.ts  (~60 行) → @anthropic-ai/claude-agent-sdk → 子进程 claude CLI
+            ├─ openai.ts          → @openai/agents 进程内
+            └─ codex.ts  (~1000 行) → 子进程 codex exec --json，隔离 CODEX_HOME</code></pre>
+
+<p>端口交接是个不错的工程细节：sidecar 自选空闲端口，用 <code>fs.writeSync(1, "ENSEMBLE_LISTENING &lt;port&gt;")</code> 同步写 stdout（所有日志强制走 stderr 保证 stdout 干净）+ <code>.port</code> 哨兵文件双通道，Rust 侧用 <code>AtomicBool</code> CAS 竞速，12s watchdog 兜底。<strong>没有用 Tauri 的 invoke IPC</strong> —— 全部走 HTTP/WS，这样 sidecar 能独立 headless 运行。</p>
+
+<h3>2.3 抽象粒度对比</h3>
+<table>
+<thead><tr><th>项</th><th class="col-dsh">dsh</th><th class="col-ens">Ensemble</th></tr></thead>
+<tbody>
+<tr><td>可替换 seam 数量</td><td>数十个（fs / subprocess / shell / pty / lsp / llm / sandbox / approval / spill / compaction / skills / subagents / persistence…）</td><td>一个（<code>AgentRuntime</code>）</td></tr>
+<tr><td>扩展新能力的方式</td><td>挂一个插件到文档化的 extension point</td><td>改 <code>SessionManager</code> + <strong>三个 runtime adapter 都要改</strong></td></tr>
+<tr><td>约束来源</td><td><span class="path">AGENTS.md</span>："新行为走扩展点；改 agent-loop 必须同步更新 architecture.md"</td><td><span class="path">CLAUDE.md</span> §3.7："能力必须落到三个 runtime，否则是 silent fallback bug"</td></tr>
+<tr><td>代价</td><td>概念负担重，处处是 event/service key/disposer</td><td>加功能要三处同改，容易漏</td></tr>
+</tbody>
+</table>
+
+<!-- ============================ 3 ============================ -->
+<h2 id="loop">3 · Agent Loop 归属 —— 一切上下文差异的根源</h2>
+
+<h3>3.1 dsh 的 loop</h3>
+<p>在 <span class="path">packages/core/agent-loop</span>（<code>AgentLoop</code> 服务），文档称"整个 harness 里唯一含具体 loop 逻辑的包"。抽象契约在 <span class="path">packages/core/agent</span>（<code>ctx.agents</code>），对 loop 零依赖 —— 所以 UI/hooks/ACP 都面向接口编程，loop 可整体替换。</p>
+
+<pre><code>turn/start → 从 inbox 领取输入 → 装配 prompt+tools → agent/pre-step (可 reject|enter)
+  → step/start → agent/request → llm/stream → assistant/chunk* → assistant/message
+  → tool/call* → tools/pre-execute → tools/execute → tools/post-execute → tool/result*
+  → step/end → (还有未偿还的工作? 回到 step/start) → agent/turn-stopping → turn/end</code></pre>
+
+<p>关键设计：</p>
+<ul>
+  <li><strong>step = 一次模型请求 + 它的工具调用；turn = 零或多个 step</strong>。</li>
+  <li><code>turn/*</code>、<code>step/*</code>、<code>user/message</code>、<code>assistant/*</code>、<code>tool/*</code> 是<strong>耐久 session 事件</strong>；<code>agent/pre-step</code>、<code>tools/*</code> 是活跃 waterfall（协作式中间件，listener 必须调 <code>next()</code>）。</li>
+  <li>输入通过<strong>一个 inbox、三种投递原语</strong>：<code>followup()</code>（下一 turn FIFO + 唤醒）、<code>steer()</code>（下一 step + 唤醒）、<code>inject()</code>（下一 step，不唤醒）。每次 inbox 变更都记日志。</li>
+  <li>工具并发：按 <code>exclusive</code> / <code>parallel-safe</code> 分类，有界滚动池，<code>maxParallelToolCalls</code> 默认 <span class="num">10</span>。</li>
+  <li>取消收敛：<code>agent.cancel()</code> 后未派发的 tool call 会补一个合成的 <code>ABORTED_BEFORE_DISPATCH</code> 结果，保证历史一致。</li>
+</ul>
+
+<div class="box">
+  <div class="t">值得单独指出的原则</div>
+  <span class="path">docs/architecture.md</span>：<strong>"Model-visible means logged"</strong> —— 凡是模型能看到的输入，必须能从 session 日志完整重建。所以 dsh 把运行时上下文（cwd/时间/tmux）做成一条<strong>耐久的 user-role 快照消息</strong>，而不是塞进 system prompt。这条原则是 dsh 一切上下文可审计性的地基。
+</div>
+
+<h3>3.2 Ensemble 的 loop：委托</h3>
+<table>
+<thead><tr><th>Runtime</th><th>Loop 归属</th><th>模型侧记忆归属</th><th>Ensemble 每轮做什么</th></tr></thead>
+<tbody>
+<tr><td>Claude</td><td class="n">claude CLI 子进程</td><td>CLI 的 session 文件 <code>~/.claude/projects/&lt;cwd&gt;/</code></td><td>传 systemPrompt / mcpServers / canUseTool / <code>resume</code> 指针，然后原样转发消息流</td></tr>
+<tr><td>OpenAI-compat</td><td class="m">@openai/agents 的 Runner（Ensemble 自持外层）</td><td class="n">无 SDK 侧 session —— <strong>Ensemble 每轮从 DB 全量重建</strong></td><td><code>buildInputItems()</code> 取出该 agent 全部 user/assistant Message 行 → <code>AgentInputItem[]</code></td></tr>
+<tr><td>Codex</td><td class="n">codex CLI 子进程</td><td>Codex 自己的 thread（UUIDv7）</td><td>能原生 resume 就传 id；否则 <code>buildPromptWithHistory()</code> 把整个历史拍平成一大坨文本</td></tr>
+</tbody>
+</table>
+
+<div class="box bad">
+  <div class="t">这里就是 Ensemble 的核心上下文债务 —— 复核后证据比预想更强</div>
+  <p style="margin:6px 0">OpenAI-compat 与 Codex 路径都是<strong>每轮全量重放、无窗口、无裁剪、无摘要</strong>。请求体随轮次单调增长，直到上游返回 context-length 错误。而 Claude/Codex 的正常路径又<strong>完全不可观测</strong>（上下文在 CLI 的文件里）。于是"这个 agent 现在用了多少上下文"<strong>没有任何统一答案</strong>，只有事后的 token/成本统计。</p>
+  <p style="margin:10px 0 4px"><strong>本次源码复核补充的三条硬证据：</strong></p>
+  <ol style="margin:4px 0">
+    <li><strong>取历史确实无任何上限。</strong><span class="path">SessionManager.ts:1171</span> —— <code>prisma.message.findMany({ where:{agentId}, orderBy:{seq:'asc'} })</code>，<strong>没有 <code>take</code>、没有 <code>skip</code>、没有任何窗口</strong>。而且守卫条件是 <code>isOpenAIKind</code>，其定义（<span class="path">:1165-1168</span>）<strong>包含 <code>isCodexKind</code></strong> —— 所以这条无界重放路径<strong>不止影响 OpenAI-compat，也影响 Codex</strong>，比原文表述的范围更大。</li>
+    <li><strong>重放不仅无界，还有损。</strong><span class="path">openai.ts:329-346 buildInputItems</span> 只保留 <code>type==='text'</code> 的内容块，<strong><code>tool_use</code> / <code>tool_result</code> 块被整体丢弃</strong>。即：agent 重放历史时<strong>看不见自己此前做过哪些工具调用、拿到过什么结果</strong>，只剩纯文本对话。这是一个独立于"上下文过大"的<strong>正确性问题</strong> —— 长会话中 agent 会重复已做过的操作。</li>
+    <li><strong>上下文窗口字段是硬编码的 0，且有注释自认。</strong><span class="path">openai.ts:285</span> <code>contextWindow: 0, // OpenAI SDK doesn't surface this consistently</code>，<span class="path">codex.ts:722</span> 同样为 <code>0</code>。<strong>字段位置已经预留好了，只是从没被填过</strong> —— 这也说明 §11 的 P0 ContextMeter 改动面比预想更小。</li>
+  </ol>
+</div>
+
+<!-- ============================ 4 ============================ -->
+<h2 id="ctx">4 · 上下文管理（核心章节）</h2>
+
+<p>dsh 的上下文管理<strong>不是一个模块，而是一条由独立包组成的、通过 Cordis 事件组合的流水线</strong>。<span class="path">docs/architecture.md</span> 明确：<em>"Compaction 是一项可选能力，不属于 agent-loop 骨干。"</em></p>
+
+<table>
+<thead><tr><th style="width:24%">机制</th><th style="width:30%">dsh 实现</th><th style="width:30%">Ensemble 现状</th><th style="width:16%">差距</th></tr></thead>
+<tbody>
+<tr><td>上下文装配抽象</td><td><code>ctx.systemPrompt</code>：sections / contexts / toolProviders / variables 四注册表 + order 约定 + assemble waterfall</td><td>字符串拼接：primer + plan notice + skills + team block</td><td class="n">大</td></tr>
+<tr><td>项目记忆（AGENTS.md）</td><td><code>packages/context/agent-instructions</code>：向上遍历至 git root，<code>*.local.md</code> 覆盖层，单文件 1MB 上限，SHA-1 去重</td><td>无（依赖厂商 CLI 自己读）</td><td class="m">中（可接受）</td></tr>
+<tr><td>Token 计量</td><td><code>ctx.tokenMeter</code>：provider usage 优先 + 启发式兜底，标注 <code>'usage'</code>/<code>'estimated'</code></td><td><code>local-tokenizer.ts</code>：仅 OpenAI 路径，明说 ±10-30% 误差，<strong>只用于账单审计</strong></td><td class="n">大</td></tr>
+<tr><td>自动压缩</td><td>0.8 阈值触发 + 溢出错误触发，模型摘要，耐久锁，防抖</td><td class="n">无自动；仅手动 <code>/compact</code></td><td class="n">大</td></tr>
+<tr><td>大输出外溢</td><td><code>packages/spill</code>：落盘 + 头尾预览 + locator + 检索提示</td><td class="n">无</td><td class="n">大</td></tr>
+<tr><td>工具输出裁剪</td><td><code>packages/util/output-retention</code>：head/tail/headTail，UTF-8 边界安全，中立的 omitted 说明</td><td class="n">无（消息原样入库+广播）</td><td class="n">大</td></tr>
+<tr><td>Prompt cache 对齐</td><td>摘要请求复用原请求前缀；Code Mode 生成确定性 SDK</td><td>systemPromptHash 变更即弃 resume（是 cache 失效控制，不是 cache 优化）</td><td class="m">中</td></tr>
+<tr><td>状态外置</td><td><code>todo</code>/<code>goal</code>/<code>plan</code>/<code>schedule</code> 四个包，状态在 session 日志不在 transcript</td><td>plan mode notice；无 todo/goal 服务</td><td class="m">中</td></tr>
+<tr><td>历史可查询</td><td><code>session-query</code> + <code>tool-session-query</code>：模型可全文检索自己的历史</td><td><code>conversation_search</code>（仅跨 agent，只读 DB，非 agent 自查主用途）</td><td class="m">中（已有半个）</td></tr>
+<tr><td>子代理隔离</td><td>两种模式（全新 / fork 已完成 turn），只回传 <code>output</code></td><td>Task 子 agent，depth≤3，<code>${PARENT_CONTEXT_HINT}</code> 模板</td><td class="m">小</td></tr>
+<tr><td>跨 agent 有界传递</td><td>无对应物（subagent 之外没有 peer 概念）</td><td class="y">peer_send 8000 / peer_query 12000 / skill body 4000 硬上限</td><td class="y">Ensemble 领先</td></tr>
+<tr><td>成本/用量可见</td><td>仅 OTel 遥测 + feedback，无用户视图</td><td class="y">UsageEvent 表 + pricing.json + UsageStatsDialog</td><td class="y">Ensemble 领先</td></tr>
+</tbody>
+</table>
+
+<!-- 4.1 -->
+<h3 id="ctx-assemble">4.1 上下文装配：从"拼字符串"到"注册表 + waterfall"</h3>
+
+<h4 class="col-dsh">dsh</h4>
+<p><code>SystemPrompt</code>（<span class="path">packages/core/system-prompt/src/index.ts</span>，ctx key <code>systemPrompt</code>）按 scope 维护四个独立注册表：</p>
+<ul>
+  <li><strong>sections</strong> —— 有序的静态/动态散文块</li>
+  <li><strong>contexts</strong> —— 动态运行时快照</li>
+  <li><strong>toolProviders</strong> —— schema 贡献者</li>
+  <li><strong>variables</strong> —— <code>{{name}}</code> 插值</li>
+</ul>
+
+<p>order 约定形成了一个可预测的分层：</p>
+<pre><code>-100   harness:identity          harness 身份
+   0   deployment:persona        部署/人格（PERSONA_ORDER）
+100-199 工具指导                  e.g. tool-subagent 在 116.5
+</code></pre>
+
+<p><code>SystemPrompt.assemble()</code> 跑一个协作式 <code>system-prompt/assemble</code> waterfall，插件可以<strong>整体改写 PromptAssembly</strong>；然后 <code>renderPrompt()</code> / <code>renderContextSnapshot()</code> 做插值和拼接。工具 schema 顺序由 <code>Config.toolOrder</code> 控制，带一个保留标记 <code>TOOL_ORDER_REST</code>，其余按字典序。</p>
+
+<p>项目记忆是独立包 <span class="path">packages/context/agent-instructions</span>：从 cwd 向上走到 <code>.git</code> 标记的项目根，收集 <code>AGENTS.md</code>/<code>CLAUDE.md</code> 及 <code>*.local.md</code> 覆盖层，加上 harness-home 的全局文件；单文件上限 <code>maxSourceBytes</code> 默认 <span class="num">1,048,576</span> 字节，整批渲染结果受一个<strong>必填</strong>的 <code>maxBytes</code> 约束；按 trimmed SHA-1 逐目录去重（<span class="path">digest.ts</span>）。</p>
+
+<h4 class="col-ens">Ensemble</h4>
+<p><code>SessionManager.sendMessage</code> 每轮拼：<code>buildEnsemblePrimer()</code>（静态帮助文本）+ plan-mode 通知 + <code>formatActiveSkills()</code>（自动激活的 skill 正文）+ team context 块或 agent 自己的 systemPrompt。然后 <strong>sha1 整个装配结果存为 <code>systemPromptHash</code>，一旦哈希变化就强制丢弃 CLI 的 resume 指针</strong> —— 这样改 prompt/team 配置能真正生效，而不被陈旧的 resumed session 掩盖。</p>
+
+<div class="box ok">
+  <div class="t">Ensemble 这个 hash-invalidation 是好设计</div>
+  它解决的是一个真实且隐蔽的问题（resume 让 prompt 变更失效）。dsh 因为自己管 session，不存在这个问题。<strong>保留它。</strong>但它不是上下文管理，只是缓存一致性。
+</div>
+
+<div class="box warn">
+  <div class="t">Ensemble 的改进点</div>
+  当前是命令式字符串拼接，无序、无预算、无去重、无优先级。当 primer + 3 个 skill body（3×4000）+ team block 同时出现时，system prompt 可能已经几千 token，而<strong>没有任何地方知道总量</strong>。建议引入一个极简版 sections 注册表（见 §11 L1）。
+</div>
+
+<!-- 4.2 -->
+<h3 id="ctx-token">4.2 Token 计量：单一权威 + 双模标注</h3>
+
+<h4 class="col-dsh">dsh</h4>
+<p><span class="path">packages/llm/token-meter</span> 是<strong>唯一测量权威</strong>（<code>ctx.tokenMeter</code>）。核心巧思在 <code>TokenMeasurement.baseline.kind</code>：</p>
+<ul>
+  <li>当"最近一次成功调用的 canonical request envelope"与当前匹配、<strong>且</strong>其上报总量不低于启发式锚点时 → <code>'usage'</code>（用真实 provider 数字）</li>
+  <li>否则 → <code>'estimated'</code>（用启发式）</li>
+</ul>
+<p>启发式（<span class="path">estimate.ts</span>）非常朴素但够用，且<strong>递归处理嵌套 tool-result 内容</strong>：</p>
+<pre><code>CHARS_PER_TOKEN = 4     // 每 4 字符 1 token
+BLOCK_OVERHEAD  = 4     // 每个 content block
+ROLE_OVERHEAD   = 4     // 每条 message</code></pre>
+<p>DeepSeek 适配器（<span class="path">llm-deepseek/src/translate.ts</span>）从 <code>prompt_tokens</code> 中<strong>减去</strong> <code>prompt_cache_hit_tokens</code>/<code>cached_tokens</code>，保证 <code>inputTokens</code> 与 <code>cacheReadTokens</code> 互斥不重复计。</p>
+<p>溢出不做客户端硬切，而是让它成为 <code>CONTEXT_WINDOW_EXCEEDED_CODE</code> 错误，喂给 compaction 的 overflow 触发器。</p>
+
+<h4 class="col-ens">Ensemble</h4>
+<p><code>local-tokenizer.ts</code> 用 <code>js-tiktoken/lite</code> + <code>cl100k_base</code>/<code>o200k_base</code> 词表（作为 Tauri 外部资源发货，刻意不打进 SEA 以避免杀软误报）。但它的<strong>用途是账单审计，不是上下文预算</strong>：只统计 OpenAI-compat 轮次（Claude/Codex 子进程的真实 wire bytes 看不到，这两条路径 <code>inputTokensLocal</code>/<code>outputTokensLocal</code> 恒为 0），文档明确承认非 OpenAI tokenizer 有 ±10-30% 漂移，目的是"标记上游明显的超报"。</p>
+<p>计费侧倒是相当扎实：每条 <code>result</code> 型消息（三个 runtime 都合成这个形状）转成 <code>UsageEvent</code> 行 —— <code>inputTokens</code>/<code>outputTokens</code>/<code>cacheReadTokens</code>/<code>cacheCreationTokens</code> + 本地计数，成本按 <code>pricing.json</code> + 用户 <code>pricing-overrides.json</code> 计算，打 <code>billingModel: usage|subscription</code> 标（Codex/ChatGPT 订阅轮次边际成本 $0）。粒度：per turn / model / agent（子 agent 向父 rollup）/ provider / day，出现在 <code>UsageStatsDialog</code> 和 <code>/api/usage/summary</code>。与 Message 生命周期解耦 —— 删 agent 不擦成本历史。</p>
+
+<div class="box bad">
+  <div class="t">最刺眼的一处不对称</div>
+  Ensemble 唯一的 token 计数机制，<strong>恰好只覆盖它三条 runtime 中的少数派</strong>。而 Claude/Codex 这两条主力路径的上下文占用，Ensemble 完全无感。dsh 的 <code>baseline.kind</code> 双模思路正好是解药：<strong>能拿到 usage 就用 usage（三个 runtime 的 result 消息里都有），拿不到就用 4-字符启发式估，并且把"这是估的"这件事显式标出来。</strong>
+</div>
+
+<!-- 4.3 -->
+<h3 id="ctx-compact">4.3 压缩（Compaction）—— dsh 最值得抄的一章</h3>
+
+<p>三包分工：Service Definition <span class="path">packages/compaction/compaction</span>（<code>ctx.compaction: CompactionEngine</code>）/ 后端 <span class="path">compaction-basic</span>（<code>BasicCompactionEngine</code>）/ 人机入口 <span class="path">command-compact</span>（<code>/compact</code>）。</p>
+
+<h4>触发</h4>
+<p><code>compactIfNeeded(agent, trigger, signal)</code>，<code>trigger: 'pressure' | 'context-overflow'</code>：</p>
+<ul>
+  <li><strong>pressure</strong>：在<strong>每一个</strong> <code>agent/pre-step</code> 上检查（serial waterfall，在请求装配之前）。</li>
+  <li><strong>context-overflow</strong>：从 <code>agent/request-error</code> 触发，条件是 LLM 错误码为 <code>CONTEXT_WINDOW_EXCEEDED_CODE</code>（<span class="path">packages/llm/llm/src/error.ts</span>）。</li>
+</ul>
+
+<h4>阈值（<span class="path">compaction-basic/src/config.ts</span>）</h4>
+<table>
+<thead><tr><th>常量</th><th>默认值</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>DEFAULT_THRESHOLD_RATIO</code></td><td class="num">0.8</td><td><code>thresholdTokens = floor(contextWindow × 0.8)</code>，超过就压</td></tr>
+<tr><td><code>DEFAULT_RETAIN_RATIO</code></td><td class="num">0.16</td><td><code>retainTokens = floor(contextWindow × 0.16)</code>，尾部保留量</td></tr>
+<tr><td><code>maxTokens</code>（摘要调用）</td><td class="num">8192</td><td>摘要生成的输出上限</td></tr>
+<tr><td><code>compactionRetries</code></td><td class="num">1</td><td>压完还超阈值时的重试次数</td></tr>
+<tr><td><code>maxOverflowRetries</code></td><td class="num">1</td><td>每 agent 的溢出重试上限（WeakMap 记录）</td></tr>
+</tbody>
+</table>
+<p>全部可按 <strong>provider/model 精确路由</strong>在 <code>modelPolicies[]</code> 里覆盖，并强制校验 <code>retainTokens &lt; thresholdTokens</code>。</p>
+
+<h4>范围选择（<span class="path">region.ts: selectCompactableRange</span>）</h4>
+<p>从尾向头遍历"已计价表面"累加 token，直到覆盖 <code>retainTokens</code>；然后把切点<strong>吸附到最近的 <code>toolPairingBalancedBefore/After</code> 成立的边界</strong> —— 即<strong>绝不把 assistant 的 tool-call 与它的 tool-result 切开</strong>（但允许在一个超大 turn 内部切，"一个超大 turn 的早期已闭合 step 可以独立被压"）。</p>
+
+<h4>算法（<span class="path">summarizer.ts: summarizeWithLlm</span>）—— 关键巧思</h4>
+<p>不是"另起一个摘要请求"，而是：<strong>把被压区间自己的 <code>system</code>、<code>tools</code>、派生 <code>messages</code> 原样重放为前缀</strong>，然后追加一条合成的 user 消息，内容是固定的 Markdown 清单 <code>COMPACTION_INSTRUCTION</code>：</p>
+<pre><code>Primary Request and Intent   主要请求与意图
+Key Technical Concepts       关键技术概念
+Files and Code               涉及的文件与代码
+Errors and Fixes             遇到的错误与修复
+Pending Jobs                 未完成的工作
+Current Work                 当前正在做的事
+Next Step                    下一步
+Critical Context             关键上下文</code></pre>
+<p>为什么这么做？源码注释说得很直接：<em>"逐字重现上一次路由请求的 system prompt、tools 和前导消息……复用 provider 的热前缀缓存。"</em> —— <strong>摘要调用本身就命中 prompt cache</strong>，几乎不额外花钱。</p>
+<p>产出被 <code>frameSummary</code> 包成 <code>&lt;compacted-summary&gt;…&lt;/compacted-summary&gt;</code>，前面加 <code>CHECKPOINT_PREAMBLE</code>，作为一条<strong>替换型</strong> <code>user/message</code> 追加，携带 <code>surfaceOp: { op:'replace', start, end }</code>。选定区间之外的一切都不动；区间内除了产出的摘要文本全部丢弃（摘要里出现图片会抛 <code>UNSUPPORTED_CONTENT</code>）。</p>
+
+<h4>检查点与锁</h4>
+<pre><code>compaction/start  ← 这就是锁
+  → summarize
+  → compaction/summary
+  → user/message (replace)
+compaction/end</code></pre>
+<p>五个事件全是耐久的、只写日志的 <code>SessionEventMap</code> 事件（在 <span class="path">compaction/src/index.ts</span> 用 <code>declare module</code> 声明）。<strong>中途崩溃会留下一个有 start 无 end 的孤儿记录，是可检测的</strong>。<code>assertNoActiveCompaction</code> 拒绝并发压缩（返回 <code>busy</code>）。针对"压缩期间新 turn 到达"的竞态，有两个不同严格度的稳定性检查：自动路径用 <code>assertWholeSurfaceUnchanged</code>（整表面不变），手动路径用 <code>assertSelectedSpanStable</code>（只要选定区间稳定，容忍区间外的注入）。</p>
+
+<h4>防抖</h4>
+<p>摘要后用 <code>ctx.tokenMeter</code> 重新测量，循环至多 <code>compactionRetries</code> 次，仍超阈值就抛错。溢出重试按 agent 计数并在 <code>agent/status === 'idle'</code> 或一次成功的 <code>assistant/message</code> 后<strong>归零</strong>。</p>
+
+<h4>模型无关的前置廉价通道 ★</h4>
+<p>在选区间之前，可选的 <code>ctx.toolResultPruner</code>（<span class="path">compaction-tool-result-pruner</span>）先做<strong>确定性的头/中/尾 Unicode code-point 剪枝</strong>，专门砍表面上已有的超大 tool-result，然后重新测量 —— <strong>如果这一步就降到阈值以下，那次昂贵的摘要调用就完全省掉了</strong>。</p>
+
+<h4 class="col-ens">Ensemble 的 /compact</h4>
+<p><code>SessionManager.compactAgent()</code>：拉出全部 Message 行 → 渲染成纯文本 transcript（超过 <code>MAX_TRANSCRIPT_CHARS = </code><span class="num">60000</span> 就头尾截断）→ 用 <code>quickQuery</code>（旁路调用：不持久化、无工具、不 resume）要一段 5-12 句摘要 → <strong>删除全部旧 Message 行</strong>，插入一条 <code>system</code>/<code>compact</code> 行装摘要 → 清 <code>lastSessionId</code>，下一轮以全新 runtime session 起步，历史只有那段摘要。<code>/clear</code> 是无摘要的粗暴版。</p>
+<p><strong>"无自动触发"已被复核证实</strong>：<code>compactAgent</code>（<span class="path">SessionManager.ts:728</span>）在整个代码库里<strong>只有一个调用点</strong> —— <span class="path">core/src/index.ts:1299</span> 的 REST 端点 <code>POST /agents/:id/compact</code>。<code>sendMessage</code> 派发前<strong>没有任何压力检查</strong>，全库也搜不到 <code>compactIfNeeded</code>/<code>autoCompact</code>/<code>context_length</code> 一类的溢出识别逻辑。</p>
+
+<table>
+<thead><tr><th>对比项</th><th class="col-dsh">dsh</th><th class="col-ens">Ensemble</th></tr></thead>
+<tbody>
+<tr><td>触发</td><td>自动（0.8 压力 + 溢出错误）+ 手动</td><td class="n">仅手动</td></tr>
+<tr><td>保留策略</td><td>比例化保留尾部 16%，按 tool-pairing 边界对齐</td><td class="n">全删，只留摘要（尾部 turn 也不留）</td></tr>
+<tr><td>摘要请求</td><td>复用原请求前缀 → 命中 prompt cache；固定 8 段清单</td><td class="n">独立 quickQuery，45s 硬 abort，无重试，无质量校验</td></tr>
+<tr><td>原子性</td><td>start/end 耐久锁，崩溃可检测，并发被拒</td><td class="n">直接 DELETE + INSERT，无锁、无 undo</td></tr>
+<tr><td>前置廉价剪枝</td><td class="y">有（tool-result pruner）</td><td class="n">无</td></tr>
+<tr><td>防抖</td><td>重试计数 + idle 归零</td><td>不适用（手动）</td></tr>
+<tr><td>可配置</td><td>per provider/model 路由覆盖</td><td class="n">硬编码 60000</td></tr>
+</tbody>
+</table>
+
+<div class="box bad">
+  <div class="t">Ensemble /compact 的三个具体风险</div>
+  <ol style="margin:6px 0">
+    <li><strong>不可逆且无兜底</strong>：模型返回空/差摘要，那段差摘要就<strong>永久替换</strong>了已被删除的 transcript。</li>
+    <li><strong>丢弃最近上下文</strong>：dsh 保留尾部 16%（正在做的事），Ensemble 连当前正在进行的工作细节也一起摘要掉了 —— 压缩后 agent 常常"忘了自己刚在改哪个文件"。</li>
+    <li><strong>不解决 Claude/Codex</strong>：它清掉 <code>lastSessionId</code> 让 CLI 开新 session，等价于让厂商 CLI 从零开始 —— 这其实是唯一可行的手段，但意味着<strong>Ensemble 的 /compact 对 CLI 路径是"重启"，不是"压缩"</strong>。这一点应该在 UI 上对用户说清楚。</li>
+  </ol>
+</div>
+
+<!-- 4.4 -->
+<h3 id="ctx-spill">4.4 Spill：把大输出换成磁盘 handle</h3>
+
+<p><span class="path">packages/spill</span> 不是压缩机制，而是一个 <code>tools/post-execute</code> 策略（<code>spill-policy</code>）。当<strong>单个纯文本 tool result</strong> 超过 <code>maxInlineBytes</code>（config 门控，不配就整体禁用）时：</p>
+<ol>
+  <li>全文通过 <code>ctx.spillStore.saveText()</code>（抽象 seam）持久化到 <code>dsh-spill-local</code> 的私有库：<code>&lt;root&gt;/session-&lt;hash&gt;/&lt;random&gt;-&lt;safeName&gt;</code></li>
+  <li>目录权限 <span class="num">0700</span>，按 <code>sha256(sessionId)</code> 分片；文件用<strong>独占 <code>open(path,'wx',0o600)</code></strong> 写入以挫败符号链接竞态</li>
+  <li>模型看到的结果被替换为：<strong>头/尾预览</strong>（<code>TextRetainer</code>，字节预算 50/50 对分）+ 一个不透明的 <code>SpillLocator</code> + 后端提供的 <code>retrievalHint</code>（例如"对该路径用 <code>read</code> 或 <code>grep</code>"）</li>
+  <li>通知文本自身的体积<strong>算在 cap 之内</strong>，所以替换结果永不超过 <code>maxInlineBytes</code></li>
+</ol>
+
+<p>三个细节体现成熟度：</p>
+<ul>
+  <li><code>read</code> 调用被豁免模型可见侧的 spill，避免 read→spill→再 read 的死循环；但一个并行的 <code>tools/code-dispatch-log</code> 分支仍然对耐久日志副本同样限界（覆盖 <code>run_code</code> 的嵌套子调用）。</li>
+  <li><strong>失败即降级</strong>：存储出错就保留 inline 结果，绝不把成功变成 <code>isError</code>。</li>
+  <li>fork 出的 session 继承已被引用的 locator，<strong>不重复拷贝</strong>。</li>
+</ul>
+
+<div class="box ok">
+  <div class="t">为什么 Ensemble 特别适合抄 spill</div>
+  Spill 是一个<strong>纯粹的"工具结果后处理"</strong>，不需要拥有 agent loop 就能做。Ensemble 完全看得见每条 tool_result 事件（它要入库、要广播给 UI）。在入库/转发前挂一个 spill 策略，对三个 runtime <strong>一次性生效</strong>，而且顺手解决了另一个现存问题：当前 SDK 消息 payload 是<strong>原样</strong>入 SQLite 并原样 WS 广播的，一次 <code>cat</code> 大文件就能把 DB 撑肥、把 WebView 卡住。
+</div>
+
+<!-- 4.5 -->
+<h3 id="ctx-trunc">4.5 工具输出裁剪</h3>
+
+<h4 class="col-dsh">dsh</h4>
+<p><span class="path">packages/util/output-retention</span> 是共享库：<code>ItemRetainer</code>（仅头）、<code>TextRetainer</code>（head / tail / headTail，<strong>UTF-8 边界安全</strong>）。设计上有个讲究：<strong>它自己从不写"恢复建议"文案</strong> —— <code>formatRetentionNotice</code>/<code>describeOmitted</code> 只产出中立的 "Omitted N bytes."，由每个工具（bash / grep / glob / web_fetch）自己追加符合自身语义的恢复措辞。</p>
+
+<h4 class="col-ens">Ensemble</h4>
+<p>常规轮次<strong>零裁剪</strong>：SDK 消息 payload 原样写 <code>Message</code> 表、原样 WS 广播。裁剪只出现在<strong>跨 agent / 跨消费者</strong>的有界 helper 里：</p>
+<table>
+<thead><tr><th>位置</th><th>上限</th><th>保护对象</th></tr></thead>
+<tbody>
+<tr><td><code>fetchLastAssistantText</code>（喂 peer_send 的 source-output）</td><td class="num">8,000 字符</td><td>接收方 agent 的窗口</td></tr>
+<tr><td><code>fetchPeerHistory</code>（喂 peer_query）</td><td class="num">12,000 字符</td><td>调用方 agent 的窗口</td></tr>
+<tr><td><code>compactAgent</code> 的 transcript</td><td class="num">60,000 字符</td><td>摘要模型的窗口</td></tr>
+<tr><td><code>PER_SKILL_BODY_CAP</code></td><td class="num">4,000 字符/skill</td><td>system prompt 体积</td></tr>
+<tr><td><code>subagent-suggest</code> 的历史</td><td class="num">200 字符/条 × 10 条</td><td>建议调用的成本</td></tr>
+<tr><td>Message 分页</td><td class="num">200 默认 / 500 上限</td><td>UI 首屏</td></tr>
+</tbody>
+</table>
+
+<div class="box warn">
+  <div class="t">诊断</div>
+  Ensemble 已经<strong>懂</strong>有界传递（这 6 个 cap 都很合理），但它只在"把上下文送给别人"时守界，<strong>对自己的 agent 从不守界</strong>。这正好是需要补的一课：把这套 cap 思路从 peer 通道推广到 tool result 主通道。
+</div>
+
+<!-- 4.6 -->
+<h3 id="ctx-cache">4.6 Prompt Cache 策略</h3>
+<p>dsh 在三处显式为 prefix cache 做设计：</p>
+<ol>
+  <li><strong>Compaction 摘要请求 = 原请求的真前缀</strong>（§4.3），所以摘要调用本身命中缓存。</li>
+  <li><strong>Code Mode 的 SDK 是确定性生成的</strong>（<span class="path">packages/code-runtime</span>）：<code>tools.mode: code</code> 时只暴露一个保留的 <code>run_code</code> 传输工具，注册表生成一份确定性的、<strong>prefix-cache 友好</strong>的 TypeScript/Python SDK，把每个可见工具变成有类型的 async 绑定。<em>只有程序打印/return 的输出会重新进入模型上下文 —— 中间的 tool 返回值永不进入。</em>这同时是 token 成本设计和 cache 设计。</li>
+  <li><strong>Token 计量区分 cacheRead</strong>（§4.2），使 cache 命中在计量上可见。</li>
+</ol>
+<p>Ensemble 侧：<code>systemPromptHash</code> 变更即弃 resume 是<em>缓存失效控制</em>（保证正确性），方向与 cache 优化相反但同样必要。真正的 cache 优化（稳定前缀排序、cache breakpoint 放置）由厂商 CLI 内部处理，Ensemble 能做的有限 —— 但它至少可以<strong>不要每轮改变 system prompt 的可变部分顺序</strong>（当前 skill 自动激活会随消息内容变化而增删 skill body，这会持续打破前缀稳定性）。</p>
+
+<div class="box warn">
+  <div class="t">一个具体的隐性成本</div>
+  Ensemble 的 skill 自动激活（<code>scoreSkillMatch</code>，阈值 0.18，最多 3 个，每个正文最多 4000 字符）<strong>每轮都可能改变 system prompt 内容</strong>。对 Claude 这类靠稳定前缀吃 cache 的 provider，这意味着 skill 命中变化的那一轮会<strong>整体 cache miss</strong>。改法：把 skill body 从 system prompt 移到<strong>第一条 user 消息之后的注入</strong>，或者干脆只走 <code>skill_invoke</code> 按需拉取（Ensemble 已经有这条路径了）。
+</div>
+
+<!-- 4.7 -->
+<h3 id="ctx-offload">4.7 状态外置：让工作状态不占 transcript</h3>
+<p>dsh 有四个专门把状态从对话里挪走的包：</p>
+<table>
+<thead><tr><th>包</th><th>作用</th><th>关键约束</th></tr></thead>
+<tbody>
+<tr><td><code>packages/todo</code></td><td>单个不可插拔的 <code>todo_write</code> 工具，一个 session 一份清单</td><td>刻意不做 provider 抽象（"不需要"）</td></tr>
+<tr><td><code>packages/goal</code></td><td>耐久的同 session 目标状态 + 续跑驱动器 <code>goal-round-driver</code></td><td><code>defaultMaxGoalRounds = </code><span class="num">256</span></td></tr>
+<tr><td><code>packages/plan</code></td><td>plan mode 作为<strong>有日志的、per-agent 协作状态</strong>（不是通用 "mode" 注册表）</td><td>含 guidance/commands/review 流程</td></tr>
+<tr><td><code>packages/schedule</code></td><td>session 局部的定时跟进/提醒</td><td class="y"><strong>刻意没有外部通知通道、没有公开可变服务</strong> —— 耐久状态就存在 session 日志里，等 session 再次活跃时通过普通 followup 队列送回</td></tr>
+</tbody>
+</table>
+<p>再加上 <code>packages/skill</code> 的<strong>真·渐进披露</strong>：基于 rank 的目录 + 惰性正文加载（<code>tool-skill</code>）—— 在被显式加载前，上下文里只有一行简短目录条目。</p>
+
+<h4 class="col-ens">Ensemble</h4>
+<p>Skill 这块 Ensemble <strong>做得不错，接近 dsh</strong>：<span class="path">core/src/skills/{loader,activate}.ts</span> + <code>skill-mcp.ts</code>。发现阶段合并 4 个来源（<code>project</code> &gt; ensemble DATA_DIR &gt; <code>~/.claude/skills</code> &gt; <code>~/.codex/skills</code>），30s 缓存。两条路径并存：</p>
+<ul>
+  <li><strong>自动激活</strong>：便宜的分词重叠打分（<code>scoreSkillMatch</code>，阈值 0.18，最多 3 个，要求消息≥3 个 token），把最多 3 个完整 skill 正文（各 ≤4000 字符）注入 system prompt。</li>
+  <li><strong>按需</strong>：<code>skill_list</code>/<code>skill_invoke</code> MCP 工具让模型只看到 name+description，自行决定拉取某个正文。</li>
+</ul>
+<p>即"目录常驻可见，正文惰性或廉价启发式加载"，不是一次性全塞。<strong>这是 Ensemble 在上下文管理上做得最好的一块。</strong></p>
+<p>缺的是 todo / goal / schedule 这三类外置状态。Ensemble 只有一个 plan-mode notice。</p>
+
+<!-- 4.8 -->
+<h3 id="ctx-query">4.8 历史可查询：压缩的替代方案</h3>
+<p><span class="path">session-persistence-jsonl</span>：一行 header + 每事件一行，默认 zstd 压缩（<code>DEFAULT_COMPRESSION = 'zstd'</code>，后缀 <code>.jsonl.zstd</code>），带 chunk-run 解码的截断修复。</p>
+<p><span class="path">session-query</span>（<code>ctx.sessionQuery</code>）暴露过滤、全文检索、血缘追踪、<code>readEvent</code>/<code>traceEvent</code> 有界窗口。配合 <code>tool-session-query</code>，<strong>agent 可以"查"自己的历史，而不必把它一直扛在 prompt 里</strong> —— 这是对冷事实的真正替代方案，比压缩更优雅：压缩是有损的，查询是无损+按需的。</p>
+
+<div class="box ok">
+  <div class="t">Ensemble 已经有半个了</div>
+  <code>conversation_search</code>（<span class="path">core/src/peer-mcp.ts</span>）已经是"只读 DB 关键词检索"，默认 scope 是 team，可 <code>scope='self'</code>。<strong>差的只是把它定位为"agent 自查记忆"并在 prompt 里明确告诉模型"你不需要记住旧细节，可以搜"。</strong>这是投入产出比极高的一改 —— 基础设施已经建好了，缺的是引导语和一点点 UX。
+</div>
+
+<!-- 4.9 -->
+<h3 id="ctx-sub">4.9 子代理上下文隔离</h3>
+<p>dsh 的 <code>ctx.subagents.start()</code>/<code>startContinuable()</code>，按 provider 能力 <code>inheritsParentContext</code> 分两种隔离：</p>
+<ul>
+  <li><strong>全新子代理</strong>：父对话一点不给，必须收到自包含的 <code>prompt</code></li>
+  <li><strong>fork 子代理</strong>：用父的<strong>已完成 turn</strong> 播种（不含进行中的那个 turn）</li>
+</ul>
+<p>无论哪种，<span class="path">tool-subagent/src/index.ts</span> 写着：<em>"你收到它的结果，而不是它的中间步骤。"</em>父只拿回 <code>SubagentResult.output</code> —— 于是<strong>一个任意深的子代理调查，对父的上下文成本是固定的、很小的一个结果</strong>。<code>maxDepth</code> 默认 <span class="num">3</span> 限制递归。可续跑的子代理持久化一个带版本的 <code>subagent/descriptor</code> 事件（<code>SUBAGENT_DESCRIPTOR_VERSION = 2</code>），支持独立于父进程的冷恢复。</p>
+<p>Ensemble 的 Task 子 agent 也是 depth ≤ 3、只回传结果，方向一致。<code>subagent-catalog.ts</code> 是一份 8 条的策展目录（Reviewer/Tester/Debugger/Planner/Refactorer/Security-Auditor/Doc-Writer/API-Designer），systemPrompt 模板里带 <code>${PARENT_CONTEXT_HINT}</code> 占位符；<code>subagent-suggest.ts</code> 用便宜的 prompt（最近 10 条消息、每条头部截 200 字符）让模型挑 3 个目录 key + 短提示（JSON），<strong>然后由服务端本地把完整 prompt 灌起来，而不是让模型生成 prompt</strong> —— 刻意做便宜（~100 输出 token）且鲁棒（容错的 JSON 花括号提取，模型/解析失败时退回静态默认）。这个设计很务实，是 Ensemble 的一个亮点。</p>
+
+<!-- 4.10 -->
+<h3 id="ctx-score">4.10 上下文管理打分卡</h3>
+<table>
+<thead><tr><th style="width:34%">能力</th><th style="width:10%">dsh</th><th style="width:10%">Ensemble</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>知道自己用了多少上下文</td><td class="y">10</td><td class="n">1</td><td>Ensemble 只有事后 usage，且本地计数只覆盖 OpenAI 路径</td></tr>
+<tr><td>自动压缩</td><td class="y">9</td><td class="n">0</td><td>Ensemble 全靠用户手动</td></tr>
+<tr><td>压缩质量（保留策略）</td><td class="y">9</td><td class="m">4</td><td>dsh 留尾 16% + 8 段结构化清单；Ensemble 全删+5-12 句</td></tr>
+<tr><td>压缩原子性/可恢复</td><td class="y">9</td><td class="n">2</td><td>dsh 有耐久锁；Ensemble 直接 DELETE 无 undo</td></tr>
+<tr><td>大输出处理（spill）</td><td class="y">9</td><td class="n">0</td><td>—</td></tr>
+<tr><td>工具输出裁剪</td><td class="y">9</td><td class="n">2</td><td>Ensemble 仅在跨 agent 通道裁剪</td></tr>
+<tr><td>Prompt cache 友好</td><td class="y">9</td><td class="m">3</td><td>Ensemble 的 skill 自动激活反而在破坏前缀稳定性</td></tr>
+<tr><td>状态外置（todo/goal）</td><td class="y">8</td><td class="m">3</td><td>Ensemble 只有 plan notice</td></tr>
+<tr><td>历史可检索（替代压缩）</td><td class="y">8</td><td class="m">5</td><td>Ensemble 有 conversation_search，缺定位与引导</td></tr>
+<tr><td>渐进披露（skills）</td><td class="y">9</td><td class="y">8</td><td><strong>Ensemble 这块基本追平</strong></td></tr>
+<tr><td>子代理上下文隔离</td><td class="y">9</td><td class="y">7</td><td>思路一致，dsh 多了 fork 模式与冷恢复</td></tr>
+<tr><td>跨 agent 有界上下文传递</td><td class="m">3</td><td class="y">9</td><td class="y"><strong>Ensemble 领先</strong>：peer_send/query/search 三件套 + 硬 cap</td></tr>
+<tr><td>成本/用量对用户可见</td><td class="m">3</td><td class="y">9</td><td class="y"><strong>Ensemble 领先</strong>：UsageEvent + pricing + 订阅/用量区分</td></tr>
+<tr><td>上下文可审计（model-visible=logged）</td><td class="y">10</td><td class="m">5</td><td>Ensemble 的 Message 表是 UI 真相，但 Claude/Codex 的模型侧真相在 CLI 文件里，两者可能漂移</td></tr>
+</tbody>
+</table>
+
+<!-- ============================ 5 ============================ -->
+<h2 id="tools">5 · 工具体系</h2>
+
+<h3 class="col-dsh">dsh</h3>
+<p>注册表在 <span class="path">packages/core/tools</span>（<code>ToolRuntime</code>）。Schema 用<strong>自研 DSL</strong>（<code>ParameterSchemaSpec</code>/<code>ValueSchemaSpec</code>），刻意不用 Zod —— 决策记录在 <span class="path">.agents/notes/archived/architecture/2026-06-11-custom-schema-dsl.md</span>。<code>defineTool()</code> 校验模型参数、从<strong>强制的</strong> <code>output.schema</code> 反推 TS 返回类型、违规抛 <code>ToolArgsError('INVALID_ARGS')</code>。</p>
+<p>执行流水线是一串 waterfall：<code>tools/pre-execute</code>（allow/deny/ask）→ 单调的 <code>ctx.tools.guard()</code> → <code>tools/execute</code>（环绕式：超时/重试/指标）→ <code>tools/post-execute</code>（替换内容/值、阻断、附加上下文）→ 定义方的 <code>finalizeContent</code> → 只观察的 <code>tools/result</code>。</p>
+<table>
+<thead><tr><th>族</th><th>包</th><th>亮点</th></tr></thead>
+<tbody>
+<tr><td>文件系统</td><td><code>fs</code> / <code>fs-local</code> / <code>fs-sandbox</code> / <code>fs-e2b</code> / <code>fs-observation-policy</code> / <code>tool-fs</code> / <code>tool-fs-search</code></td><td><code>fs-observation-policy</code> 强制 read-before-edit + 版本守卫写入；搜索用捆绑的 <code>@vscode/ripgrep</code>，<strong>刻意不放进 FS provider 契约</strong>；文件 IO <strong>不设超时</strong>（OS 工作会活过 deadline）</td></tr>
+<tr><td>Shell</td><td><code>bash-local</code> / <code>bash-sandbox</code> / <code>pwsh-local</code></td><td>PowerShell 一等公民</td></tr>
+<tr><td>PTY</td><td><code>packages/terminal</code></td><td>owner-scoped 持久会话，<strong>6 个工具</strong>专门服务有状态/交互式流程，与一次性 bash 明确区分</td></tr>
+<tr><td>LSP</td><td><code>lsp</code> / <code>lsp-stdio</code> / <code>tool-lsp</code></td><td><strong>只暴露 4 个语义操作</strong>（goToDefinition/findReferences/goToImplementation/hover），<strong>没有裸 JSON-RPC 逃生口</strong> —— 克制得体</td></tr>
+<tr><td>Code Mode ★</td><td><code>code-runtime</code></td><td>见下</td></tr>
+<tr><td>远程沙箱</td><td><code>packages/e2b</code></td><td>自标 POC；只换 fs+subprocess 两个 provider</td></tr>
+</tbody>
+</table>
+
+<div class="box">
+  <div class="t">Code Mode —— dsh 最具原创性的设计</div>
+  <code>tools.mode: code</code> 时，不再暴露 N 个 function-calling 工具，而是暴露<strong>一个</strong>保留的 <code>run_code</code> 传输工具。注册表生成一份确定性的、prefix-cache 友好的 SDK（TS 走 <code>code-runtime-worker-thread</code>，或 Python），把每个可见工具变成有类型的 async 绑定。模型写一段程序，<strong>只有程序打印/return 的内容重新进入上下文，中间的 tool 返回值永不进入</strong>。<br><br>
+  <strong>这对上下文是量级级别的优化</strong>：一个"读 20 个文件、grep 三轮、汇总出 5 行结论"的任务，传统 function calling 要把 20 个文件内容全塞进 context，Code Mode 只塞 5 行。
+</div>
+
+<h3 class="col-ens">Ensemble</h3>
+<p>Ensemble <strong>不定义工具</strong> —— 工具来自厂商 CLI（Read/Write/Bash/Grep…）。它只通过 MCP 注入自己的横向能力：<code>peer_send</code>/<code>peer_query</code>/<code>conversation_search</code>/<code>skill_list</code>/<code>skill_invoke</code>/<code>ensemble_help</code>/<code>ask_user</code>。三个 runtime 用三种传输暴露同一套工具：</p>
+<ul>
+  <li>Claude → 进程内 <code>createSdkMcpServer</code>（<span class="path">peer-mcp.ts</span>）</li>
+  <li>OpenAI → <code>NormalizedTool</code> 闭包（<span class="path">sessions/tools/session-aware.ts</span>）</li>
+  <li>Codex → loopback HTTP MCP 桥（<span class="path">mcp-bridge.ts</span>），因为 Codex CLI 无法消费进程内 JS MCP server</li>
+</ul>
+<p>三者都按 <code>fromAgentId</code> 闭包绑定，所以自我排除和归属标注行为一致。这个"一套语义、三种传输"的工程量不小，做得也干净。</p>
+
+<!-- ============================ 6 ============================ -->
+<h2 id="perm">6 · 权限与沙箱 —— Ensemble 反而更强</h2>
+
+<h3 class="col-dsh">dsh：三层</h3>
+<ul>
+  <li><strong><code>packages/sandbox</code></strong>（进程约束，<code>ctx.sandbox</code>）：Linux 优先 <code>bwrap</code>，退到 Landlock（自研 native addon <code>@deepseek-ai/node-addon-landlock-run</code>，源码在 <span class="path">native/landlock-run</span>）；macOS 用 Seatbelt（<code>sandbox-exec</code>，allow-default profile 拒 <code>file-write*</code>，白名单 workspace/tmp）；Windows 用 ACL 受限令牌（per-session write SID + 可撤销 ACE）。<strong>fail-closed</strong>：runner 不可用就返回 <code>SANDBOX_UNAVAILABLE</code>，绝不"降级为不受限"。文档还诚实记录了 Windows 侧的部分强制局限（继承 Everyone-writable 对象、NTFS 硬链接）。</li>
+  <li><strong><code>packages/interaction</code></strong>：<code>user-approval</code>（<code>ctx.approval</code>，<strong>one-shot</strong>：<code>allowed-once</code>/<code>rejected</code>/<code>cancelled</code>/<code>unavailable</code>，用 <code>approval/asked</code>+<code>approval/decided</code> 审计，无人应答时 fail-closed）、<code>permission-presets</code>（默认 <code>workspace-write</code> = workspace-write 沙箱 + ask；<code>danger-full-access</code> = 全权 + never-ask）。</li>
+  <li><strong><code>packages/guard</code></strong>：<code>repeat-tool-reminder</code>（重复调用的忠告式提醒）、<code>timeout-policy</code>（按调用武装 deadline）。</li>
+</ul>
+
+<div class="box bad">
+  <div class="t">dsh 的明确短板（它自己列在 Known Limitations 里）</div>
+  <code>ApprovalPolicy</code> <strong>只有 <code>ask</code> 和 <code>never</code></strong> —— 没有 per-tool 白名单、没有"记住这个规则"、没有撤销。<code>ask</code> 模式下每次都要重新问，<code>never</code> 模式下整个 session 放开。原文："Only one-shot grants exist."<strong>这在实际使用中相当难受，Ensemble 的 per-turn <code>autoAllowedTools</code> 缓存反而更实用。</strong>
+</div>
+
+<h3 class="col-ens">Ensemble</h3>
+<p>刻意二态（<span class="path">CLAUDE.md</span> §准则2："不是规则引擎"），但按 runtime 差异化落地（§3.7 表）：Claude 走 <code>canUseTool</code> → WS <code>permission_request</code>/<code>permission_response</code> 往返 + <strong>per-turn <code>autoAllowedTools</code> 缓存</strong>（点一次 Allow，本轮该工具不再问 —— 这正是 dsh 缺的）；OpenAI 走 Agents SDK 的 <code>needsApproval</code> 中断-恢复循环；<strong>Codex 完全没有 per-call 门</strong>，唯一边界是 <code>sandboxMode</code>（<code>read-only</code>/<code>workspace-write</code>/<code>danger-full-access</code>）烧进隔离 <code>CODEX_HOME/config.toml</code>，并显式设 <code>approval_policy = "never"</code>（非交互 CLI 无法被询问）。</p>
+
+<table>
+<thead><tr><th>项</th><th class="col-dsh">dsh</th><th class="col-ens">Ensemble</th></tr></thead>
+<tbody>
+<tr><td>沙箱强度</td><td class="y">原生内核级三平台</td><td class="m">仅 Codex 侧（借 Codex 自己的沙箱）；Claude/OpenAI 无 OS 级约束</td></tr>
+<tr><td>批准粒度</td><td class="n">仅 one-shot ask/never</td><td class="y">per-tool + per-turn 缓存</td></tr>
+<tr><td>审批 UI</td><td>Web UI</td><td class="y">原生弹窗，多 agent 并发时按 pane 归属</td></tr>
+<tr><td>fail-closed</td><td class="y">是（SANDBOX_UNAVAILABLE）</td><td class="m">未见等价机制</td></tr>
+<tr><td>session 固定策略</td><td class="y">preset/sandbox/approval 在创建时钉死，后续改默认值不追溯</td><td class="m">metadata 可变</td></tr>
+</tbody>
+</table>
+
+<!-- ============================ 7 ============================ -->
+<h2 id="multi">7 · 多 Agent 编排</h2>
+
+<h3 class="col-dsh">dsh：垂直的委托栈</h3>
+<table>
+<thead><tr><th>包</th><th>能力</th></tr></thead>
+<tbody>
+<tr><td><code>subagent</code></td><td>委托 seam，<strong>可同时注册多个具名 provider</strong>：<code>spawn-in-process</code>（全新）/ <code>fork-in-process</code>（从父已完成历史 fork）/ <code>acp</code>（跨进程 ACP）/ <code>codex</code>（真 Codex app-server 子进程）/ <code>claude-code</code>（官方 Claude Agent SDK 子进程）/ <code>dsh-sdk</code>（跨进程 dsh 子进程）</td></tr>
+<tr><td><code>workflow</code></td><td>模型编写的编排脚本，跑在 worker thread（<strong>明确说明不是安全边界</strong>）；<code>tool-ralph</code> 是固定的 fresh-agent Ralph 模式</td></tr>
+<tr><td><code>jobs</code></td><td>通用后台任务注册表（owner 隔离的 observe/cancel/wait/complete）—— 长时工具调用、subagent 都挂在这个底座上</td></tr>
+<tr><td><code>schedule</code></td><td>session 局部定时跟进，无外部通知通道（见 §4.7）</td></tr>
+<tr><td><code>goal</code>/<code>plan</code>/<code>todo</code></td><td>session 范围的目标/计划/清单状态</td></tr>
+</tbody>
+</table>
+<div class="box ok">
+  <div class="t">值得注意</div>
+  dsh 的 subagent <strong>不局限于"再起一个自己"</strong> —— 它可以是完全不同厂商的 agent 产品（Claude Code、Codex）。这是很有远见的抽象。
+</div>
+
+<h3 class="col-ens">Ensemble：水平的协同面</h3>
+<ul>
+  <li><strong>两套正交结构</strong>：<code>Agent.parentId</code> 树（Task 子 agent，depth ≤ 3）+ <code>Team</code> 分组（W21）。</li>
+  <li><strong>Team context 注入</strong>：<code>buildTeamContext</code> 生成一个重度工程化的 "TEAM CONTEXT" system-prompt 块 —— 逐字角色 + 团队使命 + 队友名册 + <strong>一份命令式清单，强迫模型真的去调 <code>peer_send</code> 而不是输出无效的 @提及</strong>（作者们与这个失败模式反复搏斗过，代码注释有记录）。</li>
+  <li><strong>Peer 模式</strong>：<code>continue</code>（交接进行中的工作）/ <code>review</code>（二次意见审计）/ <code>fork</code>（刻意走不同路径，明确警告不要复现来源路径）/ <code>raw</code>（纯转发）。都是模板化的指令注入 + 有界 source-output 嵌入。</li>
+  <li><strong>UI 面</strong>：<code>AgentTree</code> 侧栏 + 二叉树 <code>LayoutRenderer</code>（pane 分割），布局持久化在 <code>Workspace</code> 表（<span class="path">shared/src/layout.ts</span>，<span class="path">CLAUDE.md</span> 要求 100% 单测覆盖）。</li>
+</ul>
+
+<div class="box warn">
+  <div class="t">Ensemble 多 agent 的结构性弱点</div>
+  跨 agent 协同的<strong>正确性目前依赖 prompt 遵从，而不是协议保证</strong>。那份"强迫调 peer_send"的巨型命令式清单本身就是症状 —— 模型可以无视它。dsh 在这点上是靠 <code>ctx.jobs</code> + subagent 的<strong>结构化返回值</strong>保证的：父不是"希望"子回报，而是 <code>await</code> 一个 <code>SubagentResult</code>。<br><br>
+  可借鉴：为 <code>peer_send</code> 增加一个可选的<strong>同步/等待模式</strong>（返回接收方的结论，而不只是 "delivered"），让编排从"喊话"变成"调用"。
+</div>
+
+<!-- ============================ 8 ============================ -->
+<h2 id="ext">8 · 扩展性</h2>
+<table>
+<thead><tr><th style="width:16%">扩展点</th><th style="width:42%" class="col-dsh">dsh</th><th style="width:42%" class="col-ens">Ensemble</th></tr></thead>
+<tbody>
+<tr><td>MCP</td><td><strong>仅 client</strong>（<code>mcp-client</code>：一 server 一插件，发现工具后 <code>ctx.tools.register()</code>）。<span class="n">没有 MCP server 包</span> —— dsh 消费 MCP 工具但不把自己暴露成 MCP server</td><td class="y">既是 <strong>host</strong>（为 Claude 用进程内 SDK server、为 OpenAI 用原生传输），又为 Codex 跑 <strong>HTTP bridge</strong>。MCP 配置全局（非 per-agent）</td></tr>
+<tr><td>Skills</td><td><code>skill</code>（<code>ctx.skills</code> 目录+加载器 seam）+ <code>skill-filesystem</code> + <code>tool-skill</code>；刻意放在"核心控制骨干"之外</td><td>4 来源合并（project/ensemble/~.claude/~.codex），30s 缓存，自动激活 + <code>skill_invoke</code> 双路径</td></tr>
+<tr><td>Hooks</td><td>正规扩展面就是普通 Cordis 插件；<strong><code>hooks-claude-code</code> 和 <code>hooks-codex</code> 是桥</strong> —— 把 Claude Code / Codex 的外部 shell hook JSON 协议翻译到同一个面上，<strong>即你现有的 <code>hooks.json</code> 可以不改照跑</strong></td><td class="n">无 hooks 系统</td></tr>
+<tr><td>Presets</td><td><code>agent-presets</code>（<code>ctx.agentPresets</code>）：一个 preset 是含 <code>agent.cordis.yml</code> 的目录，挂进单个 agent 的 scope context —— <strong>一个进程内跑多个不同装配的 agent</strong>；内置 <code>{minimal,standard,code,cordis}</code>；<code>persona</code> 包让 preset 能换身份而不只换工具</td><td><code>subagent-catalog</code> 的 8 条策展模板</td></tr>
+<tr><td>自我修改 ★</td><td><code>extensions/tool-cordis</code>：模型可以<strong>检视活的插件/服务图，并定义+运行+撤回自己写的动态包</strong>（<code>node:vm</code> 沙箱），<code>ui-cordis</code> 在浏览器里暴露这个能力</td><td class="n">无</td></tr>
+<tr><td>Bundles</td><td><code>bundle/{base,web-app,headless}</code> 作为 <code>--profile</code> 的可安装 patch 层；仓外 bundle 用 <code>dsh plugin --profile &lt;n&gt; add &lt;pkg&gt;</code> 装</td><td>无插件体系（功能内建）</td></tr>
+</tbody>
+</table>
+
+<div class="box ok">
+  <div class="t">两处 Ensemble 可以直接受益的 dsh 做法</div>
+  <strong>(a) Hooks 桥</strong>：Ensemble 已经在跑 claude / codex CLI，这两家的 hook 协议是外部 shell 约定 —— Ensemble 天然处在能拦截/注入 hook 配置的位置，成本远低于 dsh（dsh 要自己实现 hook 面再翻译）。加上它就能让用户已有的 <code>hooks.json</code> 在 Ensemble 里生效，是很实的兼容性卖点。<br>
+  <strong>(b) MCP per-agent</strong>：dsh 的 preset 是 per-agent scope。Ensemble 当前 MCP 是全局的（<span class="path">CLAUDE.md</span> §准则2 明确的取舍），但在多 agent 工作台里"这个 agent 只该看到这套工具"是很自然的诉求，且直接影响上下文体积（工具 schema 也占 token）。
+</div>
+
+<!-- ============================ 9 ============================ -->
+<h2 id="eng">9 · 工程质量</h2>
+<table>
+<thead><tr><th style="width:16%">维度</th><th style="width:42%" class="col-dsh">dsh</th><th style="width:42%" class="col-ens">Ensemble</th></tr></thead>
+<tbody>
+<tr><td>测试</td><td>Vitest 多配置（unit / e2e / snapshot / web / web-perf / web-stress）+ pytest。<strong><code>test:coverage</code> 是 CI 门禁，要求 <code>packages/*/*/src</code> per-file 100% 覆盖</strong>。<code>test:snapshot</code> 做<strong>无密钥的 ACP/headless 回放</strong>，<span class="path">AGENTS.md</span> 规定任何模型/用户可见行为变更都必须配 snapshot</td><td>22 个测试文件（layout ops、usage 聚合、peer-mcp 闭包、codex TOML 渲染、skill 激活…）。<span class="path">CLAUDE.md</span> 只对 layout 引擎强制 100%，其余"合理覆盖"。<span class="n">desktop-ui 零测试（复核确认：<code>*.test.ts(x)</code>/<code>*.spec.ts(x)</code> 匹配数 = 0）</span></td></tr>
+<tr><td>静态检查</td><td><code>oxlint</code>（含 staged 快速档）+ <code>knip</code>（<code>--treat-config-hints-as-errors</code>）+ <code>jscpd</code> 克隆检测 + <code>publint</code> + 自研 <code>verify-node-next-types</code> + <strong>数十个 <code>verify-*</code> 脚本</strong>（文档链接、mermaid 校验、模块图新鲜度、包不变量、README "Model Experience" 段落强制）</td><td>TS strict；无 lint 门禁脚本</td></tr>
+<tr><td>CI</td><td><code>.github/workflows/ci.yml</code> + e2b e2e + pi-ai provider e2e + landlock native 矩阵 + python release + docs pages + issue 生命周期自动化；Node 22.19/24/26 矩阵；<code>scripts/run-gates.ts</code> 集中定义门禁</td><td class="n"><strong><code>.github/workflows</code> 不存在</strong> —— 打包/签名/公证/DMG 两阶段构建全部是文档化的手工 pnpm 脚本，Win 和 Mac 各由人肉执行</td></tr>
+<tr><td>i18n</td><td>每篇文档中英双语（<code>X.md</code>/<code>X.zh.md</code>/<code>X.i18n.yaml</code> 三件套），<strong>用自定义 git merge driver（<code>dsh-translation-pairing</code>）强制配对</strong></td><td>中文为主</td></tr>
+<tr><td>文档</td><td><code>website/</code> VitePress 投影（<code>website:build</code> 兼作死链检查）；生成式目录体系（config catalog / tool catalog / module graph / event producer-consumer map / cookbook）；<strong><code>.agents/notes/</code> 是一份按日期归档的架构决策语料</strong>（proposed/implemented/rejected/archived 分类）</td><td><code>docs/plans/</code> 15 篇设计文档 + <code>development-log.md</code> + <code>architecture.md</code> + HANDBOOK —— 对单人项目而言相当扎实</td></tr>
+<tr><td>发布</td><td><code>packages/boot</code> + <code>native/landlock-run</code>（独立三包 npm 族 + 平台矩阵）+ <code>python/sdk-runtime</code>（各平台捆绑运行时二进制）；<strong>无 SEA</strong>，走 npm 包 + 平台原生二进制</td><td class="y">Node <strong>SEA</strong> sidecar + Tauri NSIS/MSI/DMG，双平台并行维护，自建 manifest 轮询更新（未用 Tauri updater 插件，手写 per-platform 资产解析）</td></tr>
+<tr><td>遥测</td><td><code>session-telemetry(-otel)</code>：OpenTelemetry，三态 <code>FULL</code>/<code>FEEDBACK_ONLY</code>/<code>DISABLED</code> + 脱敏；<code>packages/feedback</code> 区分不可变的 log-only 备注（<code>/feedback</code>）与可编辑的 per-message 评分侧车，<strong>两者都不回流进模型上下文</strong></td><td><span class="path">telemetry.ts</span>：无 env 即静默禁用；匿名 device-id 心跳 30min + 每日 token 用量汇总，best-effort 永不阻塞</td></tr>
+</tbody>
+</table>
+
+<div class="box">
+  <div class="t">公允地说</div>
+  拿一个 DeepSeek 官方团队的 ~50 包 monorepo 去比一个单人桌面项目的工程门禁，不太公平。<strong>但 "没有任何 CI"、"前端零测试"、"双平台发布靠人肉" 这三条对一个已经在分发安装包的产品来说是真实风险</strong>，而且是投入很小就能显著改善的部分（一个 GitHub Actions 跑 <code>tsc --noEmit</code> + 现有 22 个测试，就能挡住绝大多数回归）。
+</div>
+
+<!-- ============================ 10 ============================ -->
+<h2 id="proscons">10 · 优缺点总账</h2>
+
+<div class="cards">
+  <div class="card dsh">
+    <h4 class="col-dsh">dsh 优势</h4>
+    <ul>
+      <li><strong>Seam 纪律真的兑现了</strong>：E2B POC 只换两个 provider 就让 bash/PTY/LSP 整体搬迁，这是架构红利不是营销</li>
+      <li><strong>上下文工程是一等公民</strong>：独立包、明确阈值、耐久锁、分层降本</li>
+      <li><strong>Code Mode</strong> 是有原创性且想得很透的设计（token 成本 + prefix cache 双收益）</li>
+      <li><strong>多 agent 后端的开放性</strong>：subagent 可以是 Claude Code / Codex，而不只是自己的克隆</li>
+      <li><strong>跨平台原生沙箱</strong>，且诚实记录局限而非过度宣称</li>
+      <li>100% per-file 覆盖门禁、强制 snapshot 回放、数十个 verify 脚本 —— 对 "developer preview" 而言纪律惊人</li>
+      <li>中英双语文档 + Agent Notes 决策档案</li>
+      <li>Hook 协议兼容 Claude Code / Codex 现有 <code>hooks.json</code></li>
+    </ul>
+  </div>
+  <div class="card dsh" style="border-top-color:var(--bad)">
+    <h4 style="color:var(--bad)">dsh 劣势</h4>
+    <ul>
+      <li><strong>批准模型不成熟</strong>：只有 one-shot <code>ask</code>/<code>never</code>，无"永久允许"/无规则/无撤销（自己列为已知局限）</li>
+      <li><strong>无一等公民 TUI</strong>；CLI README 里的 <code>--profile tui</code> 只是假设性例子</li>
+      <li><strong>MCP 只做 client</strong>，不能把自己暴露成 MCP server</li>
+      <li>E2B 自标 POC；workflow 的 worker-thread 隔离<strong>明确不是安全边界</strong></li>
+      <li>loop 本身<strong>没有 turn 预算 / 跑飞上限</strong>，要靠 <code>agent/turn-stopping</code> 自行组合</li>
+      <li>全线 developer preview，<strong>明示不保证兼容</strong>（SQLite schema、session 格式无承诺）</li>
+      <li>OAuth 类 provider（需存储/刷新 token）在通用 pi-ai 适配器里<strong>不支持</strong> —— "带上你的 Anthropic/OpenAI 订阅登录"这条路没有</li>
+      <li><strong>概念负担极重</strong>：插件-事件-seam-disposer 处处皆是，上手成本高</li>
+      <li>无面向用户的成本/用量视图（只有 OTel）</li>
+    </ul>
+  </div>
+  <div class="card ens">
+    <h4 class="col-ens">Ensemble 优势</h4>
+    <ul>
+      <li><strong>定位清晰且不重复造轮子</strong>：不重实现 agent loop = 不继承 loop 的正确性风险</li>
+      <li><strong>三 runtime 统一体验</strong>：所有消息都规整成 Claude SDK 形状，前端零 runtime 分支</li>
+      <li><strong>成本可见性优于 dsh</strong>：UsageEvent + pricing.json + 用户覆盖 + <code>billingModel: usage|subscription</code> 区分订阅 vs 计量，多维度聚合，与 Message 生命周期解耦</li>
+      <li><strong>跨 agent 有界上下文传递</strong>：peer_send/peer_query/conversation_search 三件套，每条通道都有硬 cap</li>
+      <li><strong>批准 UX 优于 dsh</strong>：per-tool + per-turn 缓存 + 原生弹窗</li>
+      <li><strong>Skills 渐进披露基本追平 dsh</strong>：4 来源合并、目录常驻、正文惰性</li>
+      <li><code>systemPromptHash</code> 失效 resume —— 解决了一个隐蔽的真实 bug</li>
+      <li><code>subagent-suggest</code> 的"模型只挑 key、服务端灌 prompt"很务实</li>
+      <li>桌面原生分发（SEA + NSIS/MSI/DMG），端口交接、stdout/stderr 分离等细节工程扎实</li>
+    </ul>
+  </div>
+  <div class="card ens" style="border-top-color:var(--bad)">
+    <h4 style="color:var(--bad)">Ensemble 劣势</h4>
+    <ul>
+      <li><strong>零上下文窗口意识</strong>：无预算检查、无自动压缩、无溢出预警。用户不知道要敲 <code>/compact</code> 就会撞墙，只看到泛化 <code>QUERY_FAILED</code></li>
+      <li><strong>OpenAI-compat 每轮全量重放 DB 历史且无上限</strong> —— 结构性的成本与失败双风险</li>
+      <li><strong>上下文处理跨 runtime 不一致</strong>：Claude/Codex 在 CLI 文件里（不可见），OpenAI 在 DB（无界）；没有统一的"这个 agent 现在用了多少"</li>
+      <li><strong><code>/compact</code> 粗糙</strong>：单次 quickQuery、45s 硬 abort、无重试、无质量校验、不留尾部、DELETE 后无 undo</li>
+      <li><strong>本地 tokenizer 只覆盖少数派 runtime</strong>，且自认 ±10-30% 误差</li>
+      <li><strong>tool result 零裁剪</strong>：原样入 SQLite + 原样 WS 广播，大输出能撑肥 DB、卡住 WebView</li>
+      <li><strong>无 CI、前端零测试、双平台发布靠人肉</strong></li>
+      <li><strong>加功能要三处同改</strong>（三个 runtime adapter），<span class="path">CLAUDE.md</span> 靠纪律约束而非类型强制</li>
+      <li>跨 agent 协同<strong>靠 prompt 遵从而非协议保证</strong>（那份巨型命令式清单就是症状）</li>
+      <li>Codex 的 HTTP MCP 桥是"委托厂商 CLI"架构的结构性代价（本地回环 + bearer token 已算合理，但仍是攻击面）</li>
+      <li>Skill 自动激活每轮改变 system prompt，<strong>持续破坏 prefix cache</strong></li>
+      <li>无 hooks 体系；MCP 只能全局不能 per-agent</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================ 11 ============================ -->
+<h2 id="learn">11 · Ensemble 该学什么（可落地清单）</h2>
+
+<p>排序原则：<strong>在"控制面"这一层就能做到的优先</strong>；需要拥有 agent loop 才能做的，降级或改造。</p>
+
+<h3><span class="b p0">P0</span> 上下文可观测性 —— 从"完全无感"到"有仪表盘"</h3>
+<p><strong>借鉴</strong>：dsh <code>token-meter</code> 的 <code>baseline.kind: 'usage' | 'estimated'</code> 双模思路。</p>
+<ul>
+  <li>建一个 <code>ContextMeter</code>，为<strong>每个 agent</strong>维护一个"当前上下文估算占用"。数据来源分优先级：
+    <ol>
+      <li>该 agent 最近一条 <code>result</code> 消息里的上游 <code>inputTokens + cacheReadTokens + cacheCreationTokens</code>（三个 runtime 都合成 result 形状，<strong>所以这条对 Claude/Codex 也有效</strong>）—— 标 <code>usage</code>；</li>
+      <li>拿不到就用 dsh 的启发式（<code>CHARS_PER_TOKEN=4</code>、<code>BLOCK_OVERHEAD=4</code>、<code>ROLE_OVERHEAD=4</code>，递归进 tool_result）对 Message 表估 —— 标 <code>estimated</code>。</li>
+    </ol>
+  </li>
+  <li>把 model → contextWindow 的映射补进 <code>pricing.json</code> 旁边（当前 <code>contextWindow</code> 字段是合成的、恒为 0）。</li>
+  <li><strong>UI</strong>：每个 pane 标题栏一个细进度条 —— &lt;60% 灰、60-80% 黄、&gt;80% 红，hover 显示 "≈128k / 200k（估算）"。</li>
+</ul>
+<div class="box ok"><div class="t">为什么这是 P0</div>这一改把 Ensemble 最大的缺陷（静默撞墙）变成可预见的事件，而且<strong>不需要拥有 agent loop</strong> —— 纯粹是对已有 UsageEvent 数据的再利用。改动面小，用户价值极高。</div>
+
+<h3><span class="b p0">P0</span> 溢出错误的专门处理路径</h3>
+<p><strong>借鉴</strong>：dsh 的 <code>CONTEXT_WINDOW_EXCEEDED_CODE</code> → <code>agent/request-error</code> → overflow 触发 compaction。</p>
+<ul>
+  <li>Ensemble 已有一条"陈旧 resume"的自愈路径（CLI 报 "No conversation found with session ID" → 清 <code>lastSessionId</code> 并提示重发）。<strong>照同样的模式加第二条</strong>：识别各 runtime 的 context-length 错误特征（Anthropic 的 <code>context_length_exceeded</code>、OpenAI 的同名 code、Codex 的 stderr 模式）。</li>
+  <li>命中时不要报泛化 <code>QUERY_FAILED</code>，而是发一个明确的 <code>CONTEXT_OVERFLOW</code> 状态 + 一个"立即压缩并重试"的按钮（甚至可配置为自动执行）。</li>
+  <li>为 overflow 自动压缩加上 dsh 的<strong>防抖</strong>：per-agent 重试计数（<code>maxOverflowRetries = 1</code>），在 agent 回到 idle 或成功产出一条 assistant 消息后归零。</li>
+</ul>
+
+<h3><span class="b p0">P0</span> Tool result 裁剪 + Spill</h3>
+<p><strong>借鉴</strong>：dsh <code>packages/util/output-retention</code> + <code>packages/spill</code>。这是<strong>最适合 Ensemble 抄的一块</strong> —— 纯粹的工具结果后处理，不需要 agent loop。</p>
+<ul>
+  <li>在 SDK 消息入 <code>Message</code> 表 / WS 广播<strong>之前</strong>挂一个策略：单条 tool_result 文本超过 <code>maxInlineBytes</code>（建议 32KB 起）时落盘到 <code>DATA_DIR/spill/session-&lt;sha256(agentId)&gt;/</code>，模型/UI 看到的是<strong>头尾各半的预览 + 文件路径 + 检索提示</strong>（"用 Read/Grep 读该路径获取全文"）。</li>
+  <li>照抄 dsh 的三个安全细节：目录 <code>0700</code>、文件 <code>open(path,'wx',0o600)</code> 独占创建、<strong>存储失败就保留 inline 而不是把成功变成错误</strong>。</li>
+  <li>照抄"<strong>通知文本自身算在 cap 内</strong>"，保证替换后一定不超预算。</li>
+  <li>照抄 <code>read</code> 豁免（避免 read→spill→再 read 死循环）。</li>
+  <li>裁剪库本身做成共享 util（head/tail/headTail，<strong>UTF-8 边界安全</strong>），中立的 "已省略 N 字节" 文案由调用方补充恢复措辞。</li>
+</ul>
+<div class="box ok"><div class="t">顺带收益</div>这一改同时解决三件事：模型上下文膨胀、SQLite 膨胀、WebView 卡顿。对三个 runtime <strong>一次性生效</strong>，因为它作用在统一的 <code>RuntimeEvent</code> 出口。</div>
+
+<h3><span class="b p0">P0</span> 修复重放丢弃工具调用（本次复核新增）</h3>
+<p><strong>这一项与上下文管理正交，是独立的正确性缺陷</strong>，但因为同在重放路径上，适合与 P0 一并处理。</p>
+<ul>
+  <li><strong>现状</strong>：<span class="path">openai.ts:329-346</span> 的 <code>buildInputItems</code> 只保留 <code>type === 'text'</code> 的内容块，<code>tool_use</code> / <code>tool_result</code> 被整体丢弃。且上游取历史时（<span class="path">SessionManager.ts:1174-1175</span>）已先按 <code>type === 'user' || 'assistant'</code> 过滤，工具调用信息在两道关卡都被削掉。</li>
+  <li><strong>后果</strong>：OpenAI-compat 与 Codex fallback 路径的 agent，重放历史时<strong>看不见自己此前调用过哪些工具、拿到过什么结果</strong>。长会话中会重复执行已完成的操作（重复读同一文件、重复跑同一条命令），也会在被追问时声称"我没有做过"。</li>
+  <li><strong>改法</strong>：把 <code>tool_use</code>/<code>tool_result</code> 块映射成 <code>@openai/agents</code> 对应的 input item 类型（function call + function call output 配对），<strong>并保持配对完整性</strong> —— 这正好与 P0 的 spill/裁剪 协同：spill 之后 tool_result 已经是有界的预览文本，重放它们的成本可控。若暂时不映射，至少应<strong>降级为一行文本摘要</strong>（如 <code>[已调用 Read(src/a.ts)，返回 1.2KB]</code>）而不是完全静默丢弃。</li>
+  <li><strong>验收</strong>：长会话中让 agent 回答"你刚才读过哪些文件"，应能正确列出而非否认。</li>
+</ul>
+
+<h3><span class="b p1">P1</span> 重做 /compact：留尾 + 结构化 + 原子</h3>
+<p><strong>借鉴</strong>：dsh <code>compaction-basic</code> 的三个核心决策。</p>
+<table>
+<thead><tr><th>抄什么</th><th>具体做法</th></tr></thead>
+<tbody>
+<tr><td><strong>比例化留尾</strong></td><td>不再全删。按 <code>retainRatio = 0.16</code> 从尾部保留最近消息，切点吸附到 <strong>tool_use / tool_result 配对边界</strong>（绝不切开一对）。这直接治好"压缩后 agent 忘了自己刚在改哪个文件"。</td></tr>
+<tr><td><strong>结构化摘要清单</strong></td><td>把 "5-12 句" 换成 dsh 的 8 段清单：主要请求与意图 / 关键技术概念 / 涉及文件与代码 / 错误与修复 / 未完成工作 / 当前工作 / 下一步 / 关键上下文。这是<strong>零成本改动，纯 prompt 替换，收益立竿见影</strong>。</td></tr>
+<tr><td><strong>原子性</strong></td><td>不再直接 DELETE。写一条 <code>compact_start</code> 标记行 → 生成摘要 → 插入摘要行 → 写 <code>compact_end</code> → <strong>把旧消息标记为 <code>archived</code> 而不是删除</strong>（新增 <code>Message.archived</code> 列，查询默认过滤）。这样既有 dsh 的崩溃可检测性（孤儿 start），又免费得到 <strong>undo</strong> 能力。</td></tr>
+<tr><td><strong>前置廉价剪枝</strong></td><td>在调用摘要模型之前，先对表面上已有的超大 tool_result 做确定性头/尾剪枝并重新估算 —— <strong>如果这一步就降到阈值以下，整个摘要调用省掉</strong>。（如果 P0 的 spill 已上线，这一步大部分已被前置解决。）</td></tr>
+<tr><td><strong>可配置</strong></td><td><code>MAX_TRANSCRIPT_CHARS = 60000</code> 这类硬编码改成 per-provider/model 可覆盖，参考 dsh 的 <code>modelPolicies[]</code>（并校验 <code>retain &lt; threshold</code>）。</td></tr>
+</tbody>
+</table>
+<div class="box warn"><div class="t">但要诚实标注一件事</div>对 Claude/Codex 路径，Ensemble 的 <code>/compact</code> 本质是<strong>"带摘要的重启"</strong>（清 <code>lastSessionId</code>，让 CLI 开新 session），不是真正的原地压缩 —— 因为上下文不在 Ensemble 手里。<strong>UI 上应该把这件事说清楚</strong>（例如按钮文案 "压缩并重启会话"），否则用户会误以为语义与 <code>claude</code> 内建的 <code>/compact</code> 相同。</div>
+
+<h3><span class="b p1">P1</span> 自动压缩（阈值触发）</h3>
+<ul>
+  <li>P0 的 ContextMeter 上线后，在 <code>sendMessage</code> 派发<strong>之前</strong>检查一次（对应 dsh 的 <code>agent/pre-step</code> pressure 检查点）。</li>
+  <li>阈值直接用 dsh 的默认值起步：<code>thresholdRatio = 0.8</code>、<code>retainRatio = 0.16</code>。</li>
+  <li><strong>但默认设为"提示"而非"自动执行"</strong>：Ensemble 是有人在看着的桌面工具，且它的压缩会重启 CLI session（副作用比 dsh 大）。给一个 per-agent 的 <code>autoCompact: off | prompt | on</code> 设置，默认 <code>prompt</code>。</li>
+</ul>
+
+<h3><span class="b p1">P1</span> 把 conversation_search 提升为"agent 自查记忆"</h3>
+<p><strong>借鉴</strong>：dsh <code>session-query</code> + <code>tool-session-query</code> —— <strong>可检索的历史是比压缩更优的方案</strong>（压缩有损，检索无损且按需）。</p>
+<ul>
+  <li>基础设施 Ensemble <strong>已经有了</strong>（<code>conversation_search</code>，默认 scope=team，支持 <code>scope='self'</code>）。缺的是定位和引导。</li>
+  <li>在 <code>buildEnsemblePrimer()</code> 里明确告诉模型：<em>"你不需要在上下文里保留旧的细节。用 <code>conversation_search(scope='self')</code> 检索你自己的历史。"</em></li>
+  <li>压缩摘要里主动写入一行指针，例如 <em>"更早的细节可用 conversation_search 检索（覆盖 seq 1-847）"</em> —— 这让有损压缩变成"有损 + 可回溯"。</li>
+  <li>加一个 <code>readMessage(seq)</code> 之类的有界精读工具（对应 dsh 的 <code>readEvent</code>/<code>traceEvent</code>）。</li>
+</ul>
+<div class="box ok"><div class="t">最高投入产出比的一项</div>几乎不用写新代码，主要是 prompt 引导 + 一个小工具。<strong>但它把 Ensemble 的 Message 表从"UI 的显示数据"升级成"agent 的外部记忆"</strong>，这是定位上的质变，也正好利用了 Ensemble 相对厂商 CLI 的独特优势 —— <strong>它有一个统一的、跨 runtime 的、可 SQL 查询的完整 transcript，而厂商 CLI 各自的 session 文件没有这个。</strong></div>
+
+<h3><span class="b p1">P1</span> 修掉 skill 自动激活对 prompt cache 的破坏</h3>
+<ul>
+  <li>现状：<code>scoreSkillMatch</code> 每轮按消息内容决定注入哪些 skill 正文（≤3 个 × ≤4000 字符）到 <strong>system prompt</strong>，命中变化即整体 cache miss。</li>
+  <li>改法（择一）：(a) 把 skill 正文移出 system prompt，作为首条 user 消息后的注入内容；(b) 只保留 <code>skill_list</code>/<code>skill_invoke</code> 按需路径（Ensemble 已有），把自动激活降级为"在消息里附一行提示：检测到相关 skill X，可用 skill_invoke 加载"。</li>
+  <li>(b) 更符合 dsh 的渐进披露哲学，且顺带省下每轮最多 12000 字符的固定开销。</li>
+</ul>
+
+<h3><span class="b p2">P2</span> peer_send 增加同步模式</h3>
+<p><strong>借鉴</strong>：dsh subagent 的<strong>结构化返回值</strong>（父 <code>await</code> 一个 <code>SubagentResult</code>，而不是"喊话"）。</p>
+<ul>
+  <li>给 <code>peer_send</code> 加可选的 <code>wait: true</code>：阻塞到接收方产出结论，返回其结论文本（复用现有的 8000 字符 cap）。</li>
+  <li>这让 <code>review</code> 模式从"希望对方会回复"变成"拿到审计结果"，把跨 agent 协同的正确性从<strong>prompt 遵从</strong>推向<strong>协议保证</strong> —— 直接缓解 §7 指出的结构性弱点，也能让那份巨型命令式 TEAM CONTEXT 清单瘦身。</li>
+</ul>
+
+<h3><span class="b p2">P2</span> 状态外置：todo / goal</h3>
+<ul>
+  <li>加一个 Ensemble 级的 <code>todo_write</code> MCP 工具（对应 dsh <code>packages/todo</code>：一个 session 一份清单，<strong>刻意不做 provider 抽象</strong>）。清单存 DB、显示在 pane 侧边，<strong>不占 transcript</strong>。</li>
+  <li>对 Ensemble 尤其有价值：多 agent 场景下，一份<strong>共享的、team 可见的</strong> todo 清单同时是编排状态和上下文减压手段 —— 这是 dsh（单 agent 视角）想不到的组合。</li>
+  <li>参考 dsh <code>packages/schedule</code> 的克制：<strong>不做外部通知通道，耐久状态就在日志/DB 里</strong>，等 agent 活跃时通过普通 followup 送回。</li>
+</ul>
+
+<h3><span class="b p2">P2</span> Hooks 桥</h3>
+<ul>
+  <li>dsh 的 <code>hooks-claude-code</code>/<code>hooks-codex</code> 把两家的外部 shell hook JSON 协议翻译到统一面上。<strong>Ensemble 做这件事的成本比 dsh 低得多</strong> —— 它本来就在 spawn 这两个 CLI，处在能拦截/注入 hook 配置的位置（Codex 已有隔离 <code>CODEX_HOME</code> + 合成 <code>config.toml</code> 的先例）。</li>
+  <li>价值：用户现有的 <code>hooks.json</code> 在 Ensemble 里直接生效，是很实的迁移友好性卖点。</li>
+</ul>
+
+<h3><span class="b p2">P2</span> 工程门禁（与上下文无关但风险最实）</h3>
+<ul>
+  <li>一个 GitHub Actions：<code>tsc --noEmit</code> + 现有 22 个测试 + 前端 build。挡住绝大多数回归。</li>
+  <li>desktop-ui 至少给 store / hooks 加测试（当前 0 个）。</li>
+  <li>参考 dsh 的 <code>test:snapshot</code>：录一组<strong>无密钥的</strong> WS 事件流回放（create→message→permission→result），作为跨 runtime 行为的回归网 —— 这对"三个 adapter 必须行为一致"的硬约束是最合适的验证手段。</li>
+</ul>
+
+<h3>P2 · Code Mode（长期观察项）</h3>
+<p>dsh 的 Code Mode 是本次对比里对上下文影响最大的单项设计（中间 tool 返回值永不进入上下文）。<strong>但 Ensemble 不拥有工具注册表，无法直接实现</strong> —— 工具来自厂商 CLI。可行的近似：Ensemble 可以提供一个 <code>run_script</code> MCP 工具，让 agent 写脚本调用 Ensemble 自己的横向能力（peer/search/skill/todo）并只返回最终输出。价值有限但方向正确，且随着 Ensemble 自有工具增多而增值。</p>
+
+<!-- ============================ 12 ============================ -->
+<h2 id="notlearn">12 · 不该学什么（保持定位）</h2>
+
+<table>
+<thead><tr><th style="width:26%">dsh 的做法</th><th>Ensemble 不该学的理由</th></tr></thead>
+<tbody>
+<tr><td><strong>Cordis 全插件化 + vendor 框架</strong></td><td>Ensemble ~24k LOC、单人维护。dsh 的插件树是为"~50 包 + 多前端 + 第三方生态"付的税。<strong>Ensemble 该做的是把 <code>AgentRuntime</code> 这一个 seam 做扎实</strong>（例如用类型强制新能力必须实现三个 adapter，替代 <span class="path">CLAUDE.md</span> 的纪律约束），而不是引入插件框架。</td></tr>
+<tr><td><strong>自研 schema DSL / 自研 RPC (Typert)</strong></td><td>纯粹的规模驱动决策。Ensemble 用现成方案是对的。</td></tr>
+<tr><td><strong>自己实现 agent loop</strong></td><td>这是 Ensemble 最重要的战略选择，<span class="path">CLAUDE.md</span> §2.1 明确禁止（"永不用 <code>claude -p</code> 替代 SDK"）。<strong>不重实现 = 不继承 loop 的正确性风险，自动跟随厂商升级。</strong>坚持。</td></tr>
+<tr><td><strong>原生沙箱（bwrap/Landlock/Seatbelt/Win-ACL）</strong></td><td>工作量巨大且平台特异。Ensemble 该继续借用 Codex 自带沙箱，并推动厂商 CLI 补齐 —— 而不是自己写 native addon。</td></tr>
+<tr><td><strong>one-shot 批准模型</strong></td><td>这是 dsh 的短板，Ensemble 现有的 per-turn <code>autoAllowedTools</code> 缓存已经更好用。<strong>别倒退。</strong></td></tr>
+<tr><td><strong><code>tool-cordis</code> 自我修改</strong></td><td>让模型定义并运行动态插件（<code>node:vm</code>）对研究 harness 很酷，对一个分发给用户的桌面产品是安全负债。</td></tr>
+<tr><td><strong>100% per-file 覆盖门禁</strong></td><td>对单人项目会直接压垮迭代速度。Ensemble 现有的分级策略（layout 引擎 100%、其余合理覆盖）是对的 —— 只是需要一个 <strong>CI 去执行它</strong>。</td></tr>
+<tr><td><strong>"developer preview，不保证兼容"</strong></td><td>Ensemble 已经在分发安装包给真实用户，DB schema 的 <code>ALTER TABLE ADD COLUMN</code> 幂等演进策略是合适的选择。别学 dsh 的破坏性态度。</td></tr>
+</tbody>
+</table>
+
+<!-- ============================ 13 ============================ -->
+<h2 id="roadmap">13 · 落地路线图</h2>
+
+<table>
+<thead><tr><th style="width:9%">阶段</th><th style="width:31%">交付</th><th style="width:26%">主要触及文件</th><th style="width:34%">验收标准</th></tr></thead>
+<tbody>
+<tr>
+  <td><span class="b p0">S1</span></td>
+  <td><strong>看得见</strong><br>ContextMeter（usage 优先 + 4-字符启发式兜底，双模标注）+ pane 标题栏进度条 + model→contextWindow 映射</td>
+  <td><code>core/src/usage-extract.ts</code>、<code>local-tokenizer.ts</code>、新增 <code>context-meter.ts</code>、<code>pricing.json</code>、<code>desktop-ui/components/ChatPane</code></td>
+  <td>三个 runtime 都能显示占用估算；<code>usage</code> vs <code>estimated</code> 在 hover 中区分；&gt;80% 变红</td>
+</tr>
+<tr>
+  <td><span class="b p0">S2</span></td>
+  <td><strong>撞不死</strong><br>context-overflow 错误识别 + <code>CONTEXT_OVERFLOW</code> 状态 + "压缩并重试"按钮 + per-agent 防抖计数</td>
+  <td><code>core/src/sessions/</code>（sendMessage catch 分支，仿现有 stale-resume 自愈路径）、三个 runtime adapter 的错误特征识别</td>
+  <td>人为造溢出时，UI 给出明确可操作提示而非 <code>QUERY_FAILED</code>；重试次数受限并在 idle 后归零</td>
+</tr>
+<tr>
+  <td><span class="b p0">S2.5</span></td>
+  <td><strong>不失忆</strong><br>重放保留 <code>tool_use</code>/<code>tool_result</code> 配对（或降级为一行摘要），修复 agent 遗忘自身工具操作</td>
+  <td><code>core/src/sessions/runtimes/openai.ts</code>（<code>buildInputItems</code>）、<code>SessionManager.ts:1174</code>（放宽 type 过滤）</td>
+  <td>长会话中 agent 能正确回答"你读过哪些文件"；不再重复执行已完成的工具操作</td>
+</tr>
+<tr>
+  <td><span class="b p0">S3</span></td>
+  <td><strong>不膨胀</strong><br>output-retention 共享库 + spill 策略（落盘 + 头尾预览 + locator + 检索提示）</td>
+  <td>新增 <code>core/src/output-retention.ts</code>、<code>core/src/spill.ts</code>，挂在 <code>RuntimeEvent</code> 入库/广播前</td>
+  <td>单条 tool_result &gt;32KB 时落盘，模型看到预览+路径；DB 增长曲线明显放缓；<code>read</code> 被豁免；存储失败不产生 isError</td>
+</tr>
+<tr>
+  <td><span class="b p1">S4</span></td>
+  <td><strong>压得好</strong><br>/compact 重做：留尾 16% + tool-pair 边界对齐 + 8 段结构化清单 + archived 软删除 + start/end 标记</td>
+  <td><code>core/src/sessions/</code>（<code>compactAgent</code>）、<code>db.ts</code>（新增 <code>Message.archived</code> 列）</td>
+  <td>压缩后 agent 仍知道"当前在做什么"；压缩可 undo；中断留下可检测的孤儿 start</td>
+</tr>
+<tr>
+  <td><span class="b p1">S5</span></td>
+  <td><strong>自动化</strong><br>0.8 阈值 pressure 检查 + per-agent <code>autoCompact: off|prompt|on</code>（默认 prompt）</td>
+  <td><code>core/src/sessions/</code>（sendMessage 派发前）、Agent metadata、Settings 对话框</td>
+  <td>越过 80% 时按配置提示或自动执行；不抖动</td>
+</tr>
+<tr>
+  <td><span class="b p1">S6</span></td>
+  <td><strong>外部记忆</strong><br>conversation_search 提升为自查记忆（primer 引导 + 摘要内嵌指针 + <code>readMessage(seq)</code> 有界精读）</td>
+  <td><code>core/src/peer-mcp.ts</code>、<code>core/src/help/</code>（primer）、compact 摘要模板</td>
+  <td>agent 在被问及压缩前的细节时，主动调用检索而不是回答"我不记得"</td>
+</tr>
+<tr>
+  <td><span class="b p1">S7</span></td>
+  <td><strong>省钱</strong><br>skill 注入改为按需/消息级，恢复 system prompt 前缀稳定性</td>
+  <td><code>core/src/skills/activate.ts</code>、<code>skill-mcp.ts</code>、systemPrompt 装配</td>
+  <td>连续多轮同一 agent 的 cacheReadTokens 占比显著上升（用现有 UsageEvent 数据即可验证）</td>
+</tr>
+<tr>
+  <td><span class="b p2">S8</span></td>
+  <td><strong>协议化 + 工程网</strong><br>peer_send <code>wait</code> 模式、todo_write、hooks 桥、GitHub Actions + WS 事件流 snapshot 回放</td>
+  <td><code>peer-mcp.ts</code>、新增 <code>todo-mcp.ts</code>、runtime adapter hook 注入、<code>.github/workflows/</code></td>
+  <td>review 模式能拿到结论；TEAM CONTEXT 清单可瘦身；CI 绿；三 adapter 行为一致性有回归网</td>
+</tr>
+</tbody>
+</table>
+
+<div class="box ok" style="margin-top:34px">
+  <div class="t">一句话收尾</div>
+  Ensemble 不应该试图变成 dsh —— 它的"不重实现 agent loop"是优势不是缺陷。但 <strong>dsh 已经把"上下文管理"这门工程做成了可抄的具体数字和具体模式</strong>（0.8 / 0.16、tool-pair 边界、cache 对齐的摘要请求、耐久压缩锁、先廉价剪枝后昂贵摘要、spill 换 handle、可检索历史优于有损压缩）。<strong>Ensemble 只需要把其中"在控制面这一层就能做"的部分（S1-S3、S6）落地，就能从"零上下文意识"跨到"比厂商 CLI 更透明"</strong> —— 因为它手里握着一个厂商 CLI 都没有的东西：<strong>一个统一的、跨 runtime 的、可 SQL 查询的完整 transcript。</strong>那才是 Ensemble 在上下文管理上真正的差异化机会。
+</div>
+
+<h2 id="verify">附录 A · 事实核验记录（2026-08-14）</h2>
+
+<p>两仓库 <code>git pull --ff-only</code> 均返回 <code>Already up to date.</code>，代码无变化。以下是对文中载荷性断言的逐条源码复核，<strong>全部针对 Ensemble HEAD <code>8188146</code> 的工作树</strong>（工作树与 HEAD 一致，唯一改动是构建产物 <code>src-tauri/binaries/ensemble-core-*.exe</code>）。</p>
+
+<table>
+<thead><tr><th style="width:30%">文中断言</th><th style="width:34%">核验方式与出处</th><th style="width:22%">结果</th><th style="width:14%">处理</th></tr></thead>
+<tbody>
+<tr><td><code>MAX_TRANSCRIPT_CHARS = 60000</code></td><td><span class="path">SessionManager.ts:757</span></td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>peer_send source-output 上限 8000</td><td><span class="path">SessionManager.ts:1642</span> <code>MAX_REVIEW_CHARS = 8000</code></td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>peer_query 上限 12000</td><td><span class="path">SessionManager.ts:1684</span> <code>MAX_QUERY_CHARS = 12000</code></td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>skill 正文上限 4000 / 激活阈值 0.18</td><td><span class="path">skills/activate.ts:83</span> <code>PER_SKILL_BODY_CAP = 4000</code>；<span class="path">:50</span> <code>DEFAULT_THRESHOLD = 0.18</code></td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>"Ensemble 只在跨 agent 通道守界，对自己不守界"</td><td><span class="path">SessionManager.ts:1639</span> 注释原文：<em>"…to avoid blowing the <strong>recipient's</strong> context window"</em></td><td class="y">属实，注释自证</td><td>保留</td></tr>
+<tr><td>无自动压缩</td><td><code>compactAgent</code> 全库唯一调用点 <span class="path">index.ts:1299</span>（REST 端点）；无 <code>compactIfNeeded</code>/<code>autoCompact</code>/<code>context_length</code></td><td class="y">属实</td><td class="col-ens">补入证据</td></tr>
+<tr><td>OpenAI 路径每轮全量重放 DB 历史</td><td><span class="path">SessionManager.ts:1171</span> <code>findMany</code> 无 <code>take</code>/<code>skip</code></td><td class="y">属实，<strong>且范围更大</strong>：守卫 <code>isOpenAIKind</code> 含 <code>isCodexKind</code></td><td class="col-ens">强化</td></tr>
+<tr><td>（原文未提）重放的保真度</td><td><span class="path">openai.ts:329-346</span> <code>buildInputItems</code> 仅保留 text 块，丢弃 <code>tool_use</code>/<code>tool_result</code></td><td class="m"><strong>新发现</strong>：重放不仅无界，还有损</td><td class="col-ens">新增</td></tr>
+<tr><td>（原文称 contextWindow 字段"合成且恒为 0"）</td><td><span class="path">openai.ts:285</span> <code>contextWindow: 0, // OpenAI SDK doesn't surface this consistently</code>；<span class="path">codex.ts:722</span> 同</td><td class="y">属实，<strong>且字段位已预留</strong></td><td class="col-ens">强化</td></tr>
+<tr><td>无 CI</td><td><code>.github/workflows</code> 目录不存在</td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>desktop-ui 零测试</td><td><code>*.test.ts(x)</code>/<code>*.spec.ts(x)</code> 匹配数 = <span class="num">0</span></td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>core 测试文件 22 个</td><td><code>core/src/**/__tests__</code> + <code>*.test.ts</code></td><td class="y">属实</td><td>保留</td></tr>
+<tr><td>代码规模 "~24k LOC"</td><td>实测：core/src <span class="num">10,606</span>（不含测试）/ shared <span class="num">933</span> / desktop-ui <span class="num">10,279</span></td><td class="m">原数字含测试代码，口径不一</td><td class="col-ens">修正为 ~21.8k</td></tr>
+</tbody>
+</table>
+
+<div class="box warn">
+  <div class="t">复核对结论的影响</div>
+  <strong>没有推翻任何结论，反而加固了核心论点。</strong>两处值得注意的变化：<br>
+  <strong>(1)</strong> 无界重放的影响范围从"OpenAI-compat"扩大到"<strong>OpenAI-compat + Codex</strong>"，意味着 §11 的 <span class="b p0">P0</span> spill/裁剪 与 <span class="b p1">P1</span> 自动压缩的收益面比原估更大。<br>
+  <strong>(2)</strong> 新发现的 <code>buildInputItems</code> 丢弃工具调用块，是一个<strong>此前未被识别的正确性缺陷</strong>（不只是上下文体积问题）—— 长会话中 agent 会遗忘自己做过的工具操作并重复执行。<strong>建议将其提升为独立的 P0 修复项</strong>，且它与上下文管理正交：即使不做任何压缩改造，这条也该修。
+</div>
+
+<div class="box bad">
+  <div class="t">关于本文档的时效性</div>
+  Ensemble master 最后提交为 <strong>2026-05-26</strong>，距今约 2.5 个月无更新；活跃开发已转移至独立仓库 <strong>EnsembleV2</strong>（HEAD <code>51b3cc8</code>，2026-06-26）。<strong>本文第 11 章的可学习清单与第 13 章的路线图，其文件路径全部指向 Ensemble v1 的代码结构</strong>（<code>core/src/sessions/SessionManager.ts</code>、<code>local-tokenizer.ts</code>、<code>peer-mcp.ts</code> 等）。若 V2 已重构这些位置，落地建议需要重新映射到 V2 的结构后才能直接执行。
+</div>
+
+<hr>
+<p class="sub">本文档基于 2026-08-14 的源码状态。dsh 处于 developer preview（0.1.0-rc.5）且明示会有破坏性变更，其阈值与包结构可能变化；引用的常量与文件路径均以当时仓库内容为准。</p>
+
+</main>
+</div>
+</body>
+</html>

@@ -46,6 +46,15 @@ Skills (SKILL.md files for pre-packaged task instructions — Claude Code/Codex 
   - skill_invoke <name>  → load a specific skill's body on demand when
     auto-activation missed it, or when the user names a skill explicitly.
 
+Subagents (Task / delegation tool):
+  - Prefer your subagent tool when work is genuinely independent and
+    parallelizable (reading several files, separate research threads) or when
+    an isolated context helps. Do NOT spawn a subagent for a trivial one-file
+    lookup — read it directly.
+  - A subagent runs to completion in its own context and returns its final
+    result. It does not see your in-progress edits unless you describe them in
+    the prompt.
+
 For ENSEMBLE-SPECIFIC tasks (add an MCP server, change provider/model, manage
 sandbox, write a skill, inspect data dir, etc.), call ensemble_help <topic>
 for an exact step-by-step. Topics: ${HELP_TOPIC_NAMES.join(", ")}. Calling

@@ -108,6 +108,31 @@ describe("contextUsageFromResult", () => {
     expect(usage).toEqual({ usedTokens: 1000, contextWindow: 100_000, percent: 1 });
   });
 
+  it("prefers OpenAI's last-response contextUsage over the accumulated modelUsage", () => {
+    const usage = contextUsageFromResult(
+      {
+        type: "result",
+        modelUsage: {
+          "gpt-4o": {
+            inputTokens: 90_000, // accumulated across the tool loop
+            outputTokens: 5_000,
+            contextWindow: 0,
+          },
+        },
+        contextUsage: {
+          model: "gpt-4o",
+          inputTokens: 30_000, // last response only
+          outputTokens: 500,
+          cacheReadInputTokens: 500,
+        },
+      },
+      "gpt-4o",
+    );
+
+    // Last response: input (non-cached) + output + cache read = 31_000.
+    expect(usage).toEqual({ usedTokens: 31_000, contextWindow: 128_000, percent: 24 });
+  });
+
   it("returns null when the turn produced no tokens", () => {
     const usage = contextUsageFromResult(
       {

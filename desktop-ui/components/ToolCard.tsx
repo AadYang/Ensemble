@@ -14,6 +14,12 @@ export function ToolCard({
   status?: ToolCardStatus;
 }) {
   const displayName = displayToolName(name);
+  const isSubagent =
+    displayName === "Task" || displayName === "Subagent" || displayName === "spawn_subagent";
+  const subagentDescription =
+    isSubagent && input !== null && typeof input === "object"
+      ? (input as { description?: unknown }).description
+      : undefined;
   const statusTone = (s: ToolCardStatus | undefined): string => {
     switch (s) {
       case "pending": return "text-[var(--warn)]";
@@ -29,12 +35,18 @@ export function ToolCard({
       <div className="flex items-center gap-2 mb-1">
         <span className="text-[var(--warn)]">⌬</span>
         <span className="text-[var(--text)] font-bold tracking-wider">{displayName}</span>
+        {isSubagent && (
+          <span className="text-[10px] text-[var(--accent)] tracking-wider">[subagent]</span>
+        )}
         {status && (
           <span className={`text-[10px] tracking-wider ${statusTone(status)}`}>
             [{status}]
           </span>
         )}
       </div>
+      {typeof subagentDescription === "string" && subagentDescription.trim().length > 0 && (
+        <div className="text-[var(--text-dim)] mb-1">→ {subagentDescription}</div>
+      )}
       {input !== undefined && input !== null && (
         <pre className="text-[var(--text-dim)] overflow-x-auto whitespace-pre-wrap break-words leading-snug">
           {JSON.stringify(input, null, 2)}

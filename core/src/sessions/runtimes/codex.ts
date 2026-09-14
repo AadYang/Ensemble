@@ -1146,7 +1146,7 @@ export function translateEvent(
   }
 }
 
-function translateItem(
+export function translateItem(
   item: unknown,
   synthSessionId: string,
   modelName: string,
@@ -1237,6 +1237,42 @@ function translateItem(
               id: typeof item.id === "string" ? item.id : randomUUID(),
               name: `mcp__${server}__${tool}`,
               input: item.arguments,
+            },
+          ],
+        },
+      },
+    };
+  }
+  if (item.type === "collab_tool_call" && isCompleted) {
+    // codex 0.154: native subagent collaboration surfaces in the PARENT
+    // thread's JSONL as `collab_tool_call` items. The subagent's own
+    // intermediate messages are NOT inlined here (they run in separate
+    // threads and come back merged into the final agent_message), so the
+    // most we can honestly surface is "native subagent activity happened"
+    // plus whatever metadata codex included. `tool` is the collaboration
+    // primitive ("wait"/"spawn"/"notify"/...); observed samples have empty
+    // receiver_thread_ids and null prompt, so only include them when set.
+    const input: Record<string, unknown> = {
+      tool: typeof item.tool === "string" ? item.tool : "unknown",
+      status: typeof item.status === "string" ? item.status : "completed",
+    };
+    if (Array.isArray(item.receiver_thread_ids) && item.receiver_thread_ids.length > 0) {
+      input.receiver_thread_ids = item.receiver_thread_ids;
+    }
+    if (typeof item.prompt === "string" && item.prompt.trim().length > 0) {
+      input.prompt = item.prompt;
+    }
+    return {
+      assistantMessage: {
+        type: "assistant",
+        session_id: synthSessionId,
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: typeof item.id === "string" ? item.id : randomUUID(),
+              name: "Subagent",
+              input,
             },
           ],
         },
