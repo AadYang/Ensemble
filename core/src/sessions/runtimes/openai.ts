@@ -54,9 +54,11 @@ export class OpenAIAgentRuntime implements AgentRuntime {
     const provider = new OpenAIProvider({
       apiKey: opts.provider.apiKey,
       baseURL: opts.provider.baseUrl,
-      // Force chat-completions transport for compat upstreams; the Responses
-      // API (default) is OpenAI-only and 404s on DeepSeek / GLM / etc.
-      useResponses: false,
+      // Chat-completions is the safe default for compat upstreams (most only
+      // implement /chat/completions). Some, however, MUST use the Responses
+      // API — see compatProviderNeedsResponses for the DeepSeek thinking-mode
+      // contract that chat-completions cannot satisfy.
+      useResponses: compatProviderNeedsResponses(opts.provider.baseUrl),
     });
     const runner = new Runner({ modelProvider: provider });
     // Slice 3.4 / 4.3 / 5.1: register built-in NormalizedTools + session-aware
@@ -357,6 +359,30 @@ export class OpenAIAgentRuntime implements AgentRuntime {
       await closeAll(mcpInstances);
     }
   }
+}
+
+/** W25: compat upstreams that must be driven over the Responses API.
+ *
+ * DeepSeek's thinking mode rejects a chat-completions request whose assistant
+ * tool-call turn also carries visible text unless the CoT is echoed back as
+ * `reasoning_content`. @openai/agents splits "narrate, then call a tool" into
+ * two adjacent assistant messages, which DeepSeek merges back into exactly that
+ * shape — and its chat-completions converter never captures `reasoning_content`
+ * (it only knows the non-standard `reasoning` field), so the tool loop 400s:
+ *   "The `reasoning_content` in the thinking mode must be passed back to the API."
+ * The Responses transport serializes reasoning as a first-class item instead,
+ * which DeepSeek accepts, so routing these hosts through /responses sidesteps
+ * the gap. Verified against api.deepseek.com for deepseek-flash,
+ * deepseek-v4-pro, deepseek-chat and deepseek-reasoner. */
+export function compatProviderNeedsResponses(baseUrl: string | null | undefined): boolean {
+  if (!baseUrl) return false;
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return host === "api.deepseek.com";
 }
 
 function buildInputItems(opts: RuntimeOptions): AgentInputItem[] {
