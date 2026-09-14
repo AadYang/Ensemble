@@ -1,4 +1,4 @@
-import type { AgentSummary, PermissionMode, ReasoningEffort, SandboxMode } from "@agentorch/shared";
+import type { AgentSummary, ContextUsage, PermissionMode, ReasoningEffort, SandboxMode } from "@agentorch/shared";
 
 export interface AgentPatch {
   name?: string;
@@ -106,6 +106,7 @@ export interface AgentStatusReport {
   closed: boolean;
   messages: number;
   enabledMcpServers: number;
+  contextUsage: ContextUsage | null;
 }
 
 export async function getAgentStatusReport(id: string): Promise<AgentStatusReport> {

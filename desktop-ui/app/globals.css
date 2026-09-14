@@ -221,3 +221,14 @@ html, body {
 .prefix-active {
   animation: prefix-pulse 0.9s ease-in-out infinite;
 }
+
+/* ----- context usage indicator ----- */
+
+@keyframes ctx-flash {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.ctx-flash {
+  color: var(--err);
+  animation: ctx-flash 1s step-end infinite;
+}

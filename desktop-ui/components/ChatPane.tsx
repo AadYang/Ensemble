@@ -377,7 +377,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
     );
   }
 
-  const { summary, turns } = agent;
+  const { summary, turns, contextUsage } = agent;
 
   const handleSlash = async (raw: string): Promise<void> => {
     // raw includes leading "/"
@@ -780,6 +780,18 @@ export function ChatPane({ agentId }: { agentId: string }) {
         <span className={`status-dot ${summary.status}`} />
         <span className="font-bold">{summary.name}</span>
         <span className="text-[var(--text-dim)]">{summary.model}</span>
+        {contextUsage && (
+          <span
+            className={
+              contextUsage.percent >= 70
+                ? "ctx-flash tabular-nums"
+                : "text-[var(--text-dim)] tabular-nums"
+            }
+            title={`${contextUsage.usedTokens.toLocaleString()} / ${contextUsage.contextWindow.toLocaleString()} tokens`}
+          >
+            · ctx {contextUsage.percent}%
+          </span>
+        )}
         <span className="text-[var(--text-dim)]">· {summary.status}</span>
         {summary.closed && (
           <span className="px-1.5 py-0.5 border border-[var(--warn)] text-[var(--warn)] text-[10px] tracking-wider">

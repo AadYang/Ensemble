@@ -64,6 +64,16 @@ export interface AgentSummary {
   createdAt: string;
 }
 
+/** Live per-agent context usage for the ChatPane header indicator.
+ *  `usedTokens` is the total tokens currently occupying the model context
+ *  window (regular input + cache read/write + output); `contextWindow` is the
+ *  model's window size; `percent` is the rounded ratio (may exceed 100). */
+export interface ContextUsage {
+  usedTokens: number;
+  contextWindow: number;
+  percent: number;
+}
+
 // ---- permission ----
 
 export type PermissionDecision =
@@ -135,6 +145,7 @@ export type ServerMsg =
   | { type: "team_updated"; team: TeamSummary }
   | { type: "team_deleted"; teamId: string }
   | { type: "status"; sessionId: string; status: AgentStatus }
+  | { type: "context_usage"; sessionId: string; usage: ContextUsage | null }
   | { type: "message"; sessionId: string; seq: number; msg: SdkMessage }
   | { type: "permission_request"; sessionId: string; reqId: string; toolName: string; input: unknown }
   | {

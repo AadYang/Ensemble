@@ -83,6 +83,7 @@ export default function Page() {
   const setConnected = useStore((s) => s.setConnected);
   const upsertAgent = useStore((s) => s.upsertAgent);
   const setStatus = useStore((s) => s.setStatus);
+  const setContextUsage = useStore((s) => s.setContextUsage);
   const ingestSdkMessage = useStore((s) => s.ingestSdkMessage);
   const appendError = useStore((s) => s.appendError);
   const agents = useStore((s) => s.agents);
@@ -368,6 +369,9 @@ export default function Page() {
         case "status":
           setStatus(msg.sessionId, msg.status);
           break;
+        case "context_usage":
+          setContextUsage(msg.sessionId, msg.usage);
+          break;
         case "message":
           ingestSdkMessage(msg.sessionId, msg.seq, msg.msg);
           break;
@@ -404,6 +408,7 @@ export default function Page() {
     setConnected,
     upsertAgent,
     setStatus,
+    setContextUsage,
     ingestSdkMessage,
     addPermissionRequest,
     addUserQuestion,

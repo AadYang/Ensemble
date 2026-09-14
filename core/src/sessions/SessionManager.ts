@@ -6,6 +6,7 @@ import { isAbsolute } from "node:path";
 import type { CanUseTool, Options, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { SdkMessage } from "@agentorch/shared";
 import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
+import { contextUsageFromResult } from "../context-usage.js";
 import { chooseRuntime } from "./runtimes/index.js";
 import type { AgentRuntime, RuntimeErrorCode, RuntimeErrorEvent, RuntimeOptions } from "./runtimes/types.js";
 import {
@@ -49,6 +50,7 @@ import { makeSubagentMcpServer, SUBAGENT_MCP_SERVER_NAME, SUBAGENT_TOOL_NAME } f
 import type {
   AgentStatus as ProtoStatus,
   AgentSummary,
+  ContextUsage,
   PeerCorrelationKind,
   PeerIncludeSource,
   PeerMode,
@@ -64,7 +66,7 @@ import {
   shouldFinalizeTurn,
 } from "./backgroundTasks.js";
 import type { Agent as DbAgent, PendingTurn as DbPendingTurn } from "../db.js";
-import { prisma, sqliteDb } from "../db.js";
+import { prisma } from "../db.js";
 import type { WebSocket } from "@fastify/websocket";
 import type { WSHub } from "../ws/hub.js";
 import { CLI_INSTALL_INFO, getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
@@ -92,10 +94,6 @@ const INTERRUPTED_PARTIAL_MAX_CHARS = 6_000;
 const PEER_SOURCE_OUTPUT_MAX_CHARS = 5_000;
 const PEER_SOURCE_REQUEST_MAX_CHARS = 1_200;
 const PEER_SOURCE_PARTIAL_MAX_CHARS = 3_600;
-const AUTO_COMPACT_MIN_MESSAGES = 40;
-const AUTO_COMPACT_TRIGGER_CHARS = 28_000;
-const AUTO_COMPACT_KEEP_MESSAGES = 16;
-const AUTO_COMPACT_SUMMARY_MAX_CHARS = 40_000;
 const COMPACT_START_TEXT = "Compacting conversation context...";
 const COMPACT_FAILURE_PREFIX = "Context compact failed:";
 const RUNTIME_IDLE_TIMEOUT_DEFAULT_MS = 20 * 60 * 1000;
@@ -767,25 +765,6 @@ function transcriptLinesFromRows(rows: Array<{ type: string; payload: unknown }>
   return lines;
 }
 
-function truncateTranscript(transcript: string, maxChars: number): string {
-  if (transcript.length <= maxChars) return transcript;
-  const half = Math.floor(maxChars / 2) - 80;
-  return `${transcript.slice(0, half)}\n\n[... truncated ${transcript.length - half * 2} chars ...]\n\n${transcript.slice(-half)}`;
-}
-
-function compactPromptFromTranscript(transcript: string): string {
-  return [
-    "Summarize the following conversation transcript in 5-12 sentences.",
-    "Focus on: what the user asked for, key decisions, what's been done, what's still pending.",
-    "Treat any prior agent identity, role, team membership, or system prompt as historical context only.",
-    "Do not write old agent identity or role text as instructions for future turns; current identity will be injected separately from active settings.",
-    "Output plain text only - no markdown headers, no bullet markup.",
-    "",
-    "Transcript:",
-    transcript,
-  ].join("\n");
-}
-
 export function trimRuntimeHistory(messages: SdkMessage[]): SdkMessage[] {
   const normalized = messages.map(clampRuntimeHistoryMessage);
   if (normalized.length <= RUNTIME_HISTORY_MAX_MESSAGES) {
@@ -955,6 +934,7 @@ export class SessionManager {
   private liveTranscripts = new Map<string, LiveTranscript>();
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
+  private contextUsageByAgent = new Map<string, ContextUsage>();
 
   constructor(
     private hub: WSHub,
@@ -1652,6 +1632,7 @@ export class SessionManager {
       data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
     });
     this.hub.broadcast({ type: "agent_history_reset", sessionId: id, reason: "clear" });
+    this.setContextUsage(id, null);
     return true;
   }
 
@@ -1774,89 +1755,11 @@ export class SessionManager {
       reason: "compact",
       summary,
     });
+    this.setContextUsage(id, null);
     return { summary };
   }
 
   /** /status — runtime-agnostic snapshot of an agent's current state. */
-  private async maybeAutoCompactBeforeTurn(
-    agent: DbAgent,
-    shouldContinue?: () => boolean,
-  ): Promise<"skipped" | "compacted" | "failed" | "cancelled"> {
-    const rows = await prisma.message.findMany({
-      where: { agentId: agent.id },
-      orderBy: { seq: "asc" },
-    });
-    if (rows.length < AUTO_COMPACT_MIN_MESSAGES) return "skipped";
-
-    const totalChars = rows.reduce((sum, row) => sum + messageRowText(row).length, 0);
-    if (totalChars < AUTO_COMPACT_TRIGGER_CHARS) return "skipped";
-
-    const keepStart = Math.max(0, rows.length - AUTO_COMPACT_KEEP_MESSAGES);
-    const rowsToSummarize = rows.slice(0, keepStart);
-    const rowsToKeep = rows.slice(keepStart);
-    const lines = transcriptLinesFromRows(rowsToSummarize);
-    if (lines.length === 0) return "skipped";
-
-    await this.appendCompactStatusMessage(agent.id, COMPACT_START_TEXT);
-    await this.updateAgentStatus(agent.id, "RUNNING", "running");
-    await flushVisibleState();
-    if (shouldContinue && !shouldContinue()) {
-      return "cancelled";
-    }
-
-    const transcript = truncateTranscript(lines.join("\n\n"), AUTO_COMPACT_SUMMARY_MAX_CHARS);
-    let summary = "";
-    try {
-      summary = (await this.quickQuery(agent.id, compactPromptFromTranscript(transcript), 45_000)).trim();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.appendCompactStatusMessage(agent.id, `${COMPACT_FAILURE_PREFIX} ${message}`);
-      return "failed";
-    }
-    if (!summary) {
-      await this.appendCompactStatusMessage(agent.id, `${COMPACT_FAILURE_PREFIX} model returned empty summary`);
-      return "failed";
-    }
-    if (shouldContinue && !shouldContinue()) {
-      return "cancelled";
-    }
-
-    this.replaceMessageHistory(agent.id, summary, rowsToKeep);
-    await prisma.agent.update({
-      where: { id: agent.id },
-      data: { metadata: removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]) },
-    });
-    this.hub.sendToSession(agent.id, {
-      type: "message",
-      sessionId: agent.id,
-      seq: 0,
-      msg: { type: "system", subtype: "compact", text: summary } as never,
-    });
-    return "compacted";
-  }
-
-  private replaceMessageHistory(
-    agentId: string,
-    summary: string,
-    rowsToKeep: Array<{ type: string; payload: unknown }>,
-  ): void {
-    sqliteDb.exec("BEGIN IMMEDIATE");
-    try {
-      sqliteDb.prepare("DELETE FROM Message WHERE agentId = ?").run(agentId);
-      const insert = sqliteDb.prepare("INSERT INTO Message (agentId, seq, type, payload) VALUES (?, ?, ?, ?)");
-      insert.run(agentId, 0, "system", JSON.stringify({ type: "system", subtype: "compact", text: summary }));
-      let seq = 1;
-      for (const row of rowsToKeep) {
-        insert.run(agentId, seq, row.type, JSON.stringify(row.payload));
-        seq++;
-      }
-      sqliteDb.exec("COMMIT");
-    } catch (err) {
-      try { sqliteDb.exec("ROLLBACK"); } catch { /* ignore rollback failure */ }
-      throw err;
-    }
-  }
-
   async getStatusReport(id: string): Promise<{
     name: string;
     providerId: string | null;
@@ -1882,6 +1785,7 @@ export class SessionManager {
     closed: boolean;
     messages: number;
     enabledMcpServers: number;
+    contextUsage: ContextUsage | null;
   } | null> {
     const a = await prisma.agent.findUnique({ where: { id } });
     if (!a) return null;
@@ -1947,6 +1851,7 @@ export class SessionManager {
       closed: readMetaBool(a.metadata, "closed"),
       messages: msgCount,
       enabledMcpServers: mcpRows.length,
+      contextUsage: this.contextUsageByAgent.get(id) ?? null,
     };
   }
 
@@ -2557,6 +2462,19 @@ export class SessionManager {
     return row.seq;
   }
 
+  /** Update (or clear) the live context-usage indicator for one agent and push
+   *  it to that agent's subscribers. Used after every turn result, and reset to
+   *  null on /clear and /compact (the billing UsageEvent table is deliberately
+   *  NOT the source here — it survives those resets). */
+  private setContextUsage(sessionId: string, usage: ContextUsage | null): void {
+    if (usage) {
+      this.contextUsageByAgent.set(sessionId, usage);
+    } else {
+      this.contextUsageByAgent.delete(sessionId);
+    }
+    this.hub.sendToSession(sessionId, { type: "context_usage", sessionId, usage });
+  }
+
   private interruptedTurnAlreadyPersisted(sessionId: string, run: RunningSession): boolean {
     if (run.userMessageSeq === undefined) return false;
     const rows = prisma.message.findMany({
@@ -2683,32 +2601,6 @@ export class SessionManager {
     try {
     console.log(`[sendMessage] start agent=${sessionId.slice(0, 8)} run=${runId.slice(0, 8)} text="${userInput.slice(0, 40)}"`);
 
-    if (!opts?.nonInteractive) {
-      try {
-        const compactResult = await this.maybeAutoCompactBeforeTurn(agent, () => this.isRunOwner(sessionId, runId));
-        if (compactResult === "cancelled" || !this.isRunOwner(sessionId, runId)) {
-          return null;
-        }
-        const refreshedAgent = await prisma.agent.findUnique({ where: { id: sessionId } });
-        if (!refreshedAgent) {
-          this.hub.sendToSession(sessionId, { type: "error", sessionId, code: "NOT_FOUND", message: "agent not found" });
-          return null;
-        }
-        agent = refreshedAgent;
-        const refreshedLastMsg = await prisma.message.findFirst({
-          where: { agentId: sessionId },
-          orderBy: { seq: "desc" },
-        });
-        seq = (refreshedLastMsg?.seq ?? -1) + 1;
-        const activeRunAfterCompact = this.running.get(sessionId);
-        if (activeRunAfterCompact?.runId === runId) {
-          activeRunAfterCompact.seq = seq;
-          activeRunAfterCompact.startedSeq = seq;
-        }
-      } catch (err) {
-        console.warn(`[auto-compact] skipped agent=${sessionId.slice(0, 8)}: ${(err as Error).message}`);
-      }
-    }
     await this.updateAgentStatus(sessionId, "RUNNING", "running");
 
     // Persist + broadcast the user input itself. SDK doesn't echo user prompts back
@@ -3208,6 +3100,11 @@ export class SessionManager {
               console.warn(`[usage] failed to persist UsageEvent: ${(err as Error).message}`);
             }
           }
+
+          // Refresh the live context-usage indicator from this result. Null
+          // (unknown model window / empty usage) clears the indicator until a
+          // later turn can compute it.
+          this.setContextUsage(sessionId, contextUsageFromResult(msg, agent.model));
         }
 
         this.hub.sendToSession(sessionId, {

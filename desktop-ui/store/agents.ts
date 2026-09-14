@@ -11,6 +11,7 @@ import {
   splitPane,
   type AgentStatus,
   type AgentSummary,
+  type ContextUsage,
   type FocusDirection,
   type LayoutNode,
   type LayoutWindow,
@@ -44,6 +45,7 @@ export interface ChatTurn {
 export interface AgentState {
   summary: AgentSummary;
   turns: ChatTurn[];
+  contextUsage: ContextUsage | null;
 }
 
 export interface PendingPermission {
@@ -118,6 +120,7 @@ interface Store {
   upsertAgent: (a: AgentSummary) => void;
   removeAgent: (id: string) => void;
   setStatus: (id: string, status: AgentStatus) => void;
+  setContextUsage: (id: string, usage: ContextUsage | null) => void;
   appendUserTurn: (id: string, text: string, peerOrigin?: PeerOrigin) => void;
   appendNotice: (id: string, text: string) => void;
   ingestSdkMessage: (id: string, seq: number, msg: SdkMessage) => void;
@@ -445,7 +448,10 @@ export const useStore = create<Store>((set) => ({
         return nextRoot === w.root ? w : { ...w, root: nextRoot };
       });
       return {
-        agents: { ...s.agents, [a.id]: { summary: a, turns } },
+        agents: {
+          ...s.agents,
+          [a.id]: { summary: a, turns, contextUsage: existing?.contextUsage ?? null },
+        },
         activeId: s.activeId ?? a.id,
         ...(result ?? {}),
       };
@@ -478,6 +484,13 @@ export const useStore = create<Store>((set) => ({
       const ag = s.agents[id];
       if (!ag) return s;
       return { agents: { ...s.agents, [id]: { ...ag, summary: { ...ag.summary, status } } } };
+    }),
+
+  setContextUsage: (id, usage) =>
+    set((s) => {
+      const ag = s.agents[id];
+      if (!ag) return s;
+      return { agents: { ...s.agents, [id]: { ...ag, contextUsage: usage } } };
     }),
 
   appendUserTurn: (id, text, peerOrigin) =>
@@ -706,6 +719,7 @@ export const useStore = create<Store>((set) => ({
           [id]: {
             ...ag,
             turns,
+            contextUsage: null,
             summary: { ...ag.summary, status: summaryStatus, hasResumeInfo: false },
           },
         },
