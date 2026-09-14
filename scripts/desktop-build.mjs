@@ -11,7 +11,11 @@ const targetTriple = process.env.TAURI_TARGET_TRIPLE;
 // harmless either way for our arg shapes (no shell-metacharacters).
 function run(command, args, options = {}) {
   execFileSync(command, args, {
-    stdio: "inherit",
+    // Ignore stdin instead of inheriting it. Under `pnpm run desktop:build`
+    // the inherited stdin can be a broken pipe, and on Windows a grandchild
+    // node process (scripts/prep-sidecar.mjs) intermittently fails to start
+    // with STATUS_DLL_INIT_FAILED (0xC0000142) when it inherits that handle.
+    stdio: ["ignore", "inherit", "inherit"],
     shell: true,
     env: { ...process.env, ...options.env },
   });
