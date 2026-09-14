@@ -3,8 +3,15 @@
 import { useState } from "react";
 import { selectActiveWindow, useStore } from "@/store/agents";
 import { useT } from "@/i18n/useT";
+import { deleteAgent } from "@/lib/agent-api";
+import { getDialog } from "@/lib/dialog";
 import { ChatPane } from "./ChatPane";
 import { AgentSettings } from "./AgentSettings";
+
+/** A background child in one of these states is finished — dismissing it just
+ *  cleans up, so it takes a single click. Anything else is still working and
+ *  deleting it would kill it mid-flight, so that path asks first. */
+const TERMINAL_STATUSES = new Set(["done", "error", "idle"]);
 
 export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string | null }) {
   const isActive = useStore((s) => selectActiveWindow(s)?.activePaneId === paneId);
@@ -12,6 +19,7 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
   const splitActive = useStore((s) => s.splitActive);
   const closeActive = useStore((s) => s.closeActive);
   const setActive = useStore((s) => s.setActive);
+  const appendError = useStore((s) => s.appendError);
   const attachAgentToPane = useStore((s) => s.attachAgentToPane);
   const agent = useStore((s) => (agentId ? s.agents[agentId] : null));
   const agents = useStore((s) => s.agents);
@@ -124,23 +132,54 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
           <span className="shrink-0 text-[var(--warn)] tracking-wider">
             {t("pane.bgtasks.label", { n: backgroundTasks.length })}
           </span>
-          {backgroundTasks.map((bt) => (
-            <button
-              key={bt.summary.id}
-              title={t("pane.bgtasks.open")}
-              onClick={(e) => {
-                e.stopPropagation();
-                setActivePane(paneId);
-                setActive(bt.summary.id);
-                attachAgentToPane(paneId, bt.summary.id);
-              }}
-              className="shrink-0 flex items-center gap-1 px-1.5 py-0.5 border border-[var(--border)] hover:border-[var(--accent)] transition-colors"
-            >
-              <span className={`status-dot ${bt.summary.status}`} />
-              <span className="truncate max-w-[10rem] text-[var(--text)]">{bt.summary.name}</span>
-              <span className={statusColor(bt.summary.status)}>{bt.summary.status}</span>
-            </button>
-          ))}
+          {backgroundTasks.map((bt) => {
+            const dismiss = async () => {
+              if (!TERMINAL_STATUSES.has(bt.summary.status)) {
+                const ok = await getDialog().confirm({
+                  title: t("pane.bgtasks.dismiss.title", { name: bt.summary.name }),
+                  message: t("pane.bgtasks.dismiss.running", { status: bt.summary.status }),
+                  danger: true,
+                });
+                if (!ok) return;
+              }
+              try {
+                await deleteAgent(bt.summary.id);
+              } catch (err) {
+                appendError(agentId, "BG_TASK_DISMISS_FAILED", (err as Error).message);
+              }
+            };
+            return (
+              <span
+                key={bt.summary.id}
+                className="shrink-0 flex items-center border border-[var(--border)] hover:border-[var(--accent)] transition-colors"
+              >
+                <button
+                  title={t("pane.bgtasks.open")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActivePane(paneId);
+                    setActive(bt.summary.id);
+                    attachAgentToPane(paneId, bt.summary.id);
+                  }}
+                  className="flex items-center gap-1 px-1.5 py-0.5"
+                >
+                  <span className={`status-dot ${bt.summary.status}`} />
+                  <span className="truncate max-w-[10rem] text-[var(--text)]">{bt.summary.name}</span>
+                  <span className={statusColor(bt.summary.status)}>{bt.summary.status}</span>
+                </button>
+                <button
+                  title={t("pane.bgtasks.dismiss")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void dismiss();
+                  }}
+                  className="px-1 py-0.5 text-[var(--text-faint)] hover:text-[var(--err)] transition-colors"
+                >
+                  ×
+                </button>
+              </span>
+            );
+          })}
         </div>
       )}
 

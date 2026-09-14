@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionManager } from "./sessions/SessionManager.js";
+import { backgroundSubagentStartedText } from "./sessions/subagentFinish.js";
 
 export const SUBAGENT_MCP_SERVER_NAME = "agentorch-subagent";
 export const SUBAGENT_TOOL_NAME = `mcp__${SUBAGENT_MCP_SERVER_NAME}__spawn_subagent`;
@@ -41,9 +42,9 @@ export function makeSubagentMcpServer(
       "The subagent inherits your model + provider and runs in an isolated context. " +
       "Prefer this over the native Task tool so the user can watch the work. " +
       "Set background=true to spawn a detached BACKGROUND TASK: the tool returns the " +
-      "subagent's id immediately and you keep working while it runs (read its progress " +
-      "later with peer_query). Omit background to wait and receive the final response. " +
-      "Subagent depth is capped at 3 levels.",
+      "subagent's id immediately and you keep working while it runs; you will be sent a " +
+      "`subagent-finished` message when it reaches a terminal state. Omit background to " +
+      "wait and receive the final response. Subagent depth is capped at 3 levels.",
     {
       description: z.string().min(1).describe("Short task summary (3-5 words); becomes the subagent's name."),
       prompt: z.string().min(1).describe("Full task description / instructions for the subagent."),
@@ -58,9 +59,7 @@ export function makeSubagentMcpServer(
     async (args) => {
       const result = await handler(args);
       const text = result.background
-        ? `Background task started (subagent id=${result.subagentId.slice(0, 8)}). ` +
-          "It is running detached and is visible in the sidebar under you. " +
-          "Use peer_query on it later to read its progress/result; do not block waiting."
+        ? backgroundSubagentStartedText(result.subagentId)
         : result.finalText;
       return { content: [{ type: "text" as const, text }] };
     },

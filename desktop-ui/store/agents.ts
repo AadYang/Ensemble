@@ -41,6 +41,10 @@ export interface ChatTurn {
   streaming?: boolean;
   peerOrigin?: PeerOrigin;
   tone?: "error" | "warn";
+  /** Heartbeat rows (task_progress / tool_progress) update ONE line in place
+   *  instead of appending a new one every 30 seconds — keyed by task id so two
+   *  concurrent tasks each keep their own live line. */
+  liveKey?: string;
 }
 
 export interface AgentState {
@@ -206,31 +210,59 @@ function stripPeerHandoff(text: string): string | null {
 // seen at a glance (design doc docs/plans/claude-background-tasks.md §6).
 const formatBackgroundTaskSystem = (
   msg: SdkMessage,
-): { text: string; tone?: ChatTurn["tone"] } | null => {
-  const subtype = (msg as { subtype?: string }).subtype;
+): { text: string; tone?: ChatTurn["tone"]; liveKey?: string } | null => {
   const m = msg as Record<string, unknown>;
+  // `tool_progress` is a TOP-LEVEL message type, not a system subtype — treat it
+  // as its own key so a plain long tool call renders as a live command line
+  // instead of falling through to a `[tool_progress]` raw row every 30s.
+  const subtype =
+    (msg as { subtype?: string }).subtype ?? (msg.type === "tool_progress" ? "tool_progress" : undefined);
+  // Claude Code emits task_started/task_notification for ANY long-running Bash
+  // call, foreground included (measured: a 2s `git push` produced a pair with no
+  // background_tasks_changed). Core tags each message with `detached` — true
+  // only for a task the SDK tracks in its background live set — so a plain
+  // command is never labelled a "background task".
+  const noun =
+    m.detached === true ? "background task" : m.detached === false ? "command" : "task";
+  // One live row per tool call / background task. All three of task_started,
+  // task_progress and task_notification carry the SAME `tool_use_id` (measured:
+  // `call_00_jSJXlZSffL20AVAGK2NO9930`), and `tool_progress` carries it as
+  // `parent_tool_use_id` (`<tool_use_id>-heartbeat-0` is its own id), so they all
+  // collapse onto one row that ends in its real outcome.
+  const liveKey =
+    (typeof m.tool_use_id === "string" && m.tool_use_id) ||
+    (typeof m.parent_tool_use_id === "string" && m.parent_tool_use_id) ||
+    (typeof m.task_id === "string" && m.task_id) ||
+    undefined;
+  const withKey = liveKey ? { liveKey } : {};
   switch (subtype) {
     case "task_started": {
       const desc = typeof m.description === "string" && m.description.trim() ? m.description : "";
       const type = typeof m.task_type === "string" ? m.task_type : typeof m.subagent_type === "string" ? m.subagent_type : "";
       const parts = [type, desc].filter(Boolean);
+      const head = m.detached === true ? `⏳ ${noun} started` : `▶ ${noun} running`;
       return {
-        text: `⏳ background task started${parts.length ? ` · ${parts.join(" · ")}` : ""}`,
-        tone: "warn",
+        text: `${head}${parts.length ? ` · ${parts.join(" · ")}` : ""}`,
+        ...(m.detached === true ? { tone: "warn" as const } : {}),
+        ...withKey,
       };
     }
-    case "task_progress": {
+    case "task_progress":
+    case "tool_progress": {
       const desc = typeof m.description === "string" && m.description.trim() ? m.description : "";
       const u = (m.usage ?? {}) as Record<string, unknown>;
       const parts: string[] = [];
-      if (typeof m.last_tool_name === "string" && m.last_tool_name) parts.push(`tool ${m.last_tool_name}`);
+      const toolName = typeof m.last_tool_name === "string" ? m.last_tool_name : typeof m.tool_name === "string" ? m.tool_name : "";
+      if (toolName) parts.push(`tool ${toolName}`);
       if (typeof u.total_tokens === "number") parts.push(`${u.total_tokens} tok`);
       if (typeof u.tool_uses === "number") parts.push(`${u.tool_uses} tool calls`);
-      if (typeof u.duration_ms === "number") parts.push(`${Math.round(u.duration_ms / 1000)}s`);
+      if (typeof m.elapsed_time_seconds === "number") parts.push(`${m.elapsed_time_seconds}s`);
+      else if (typeof u.duration_ms === "number") parts.push(`${Math.round(u.duration_ms / 1000)}s`);
       if (typeof m.summary === "string" && m.summary.trim()) parts.push(m.summary);
       return {
-        text: `⏳ background task progress${desc ? ` · ${desc}` : ""}${parts.length ? ` · ${parts.join(" · ")}` : ""}`,
-        tone: "warn",
+        text: `▶ ${subtype === "tool_progress" ? "command" : noun} running${desc ? ` · ${desc}` : ""}${parts.length ? ` · ${parts.join(" · ")}` : ""}`,
+        ...(m.detached === true || subtype === "task_progress" ? { tone: "warn" as const } : {}),
+        ...withKey,
       };
     }
     case "task_updated": {
@@ -238,39 +270,77 @@ const formatBackgroundTaskSystem = (
       const status = typeof patch.status === "string" ? patch.status : "";
       const error = typeof patch.error === "string" ? patch.error : "";
       if (status === "failed" || error) {
-        return { text: `⚠ background task failed${error ? ` · ${error}` : ""}`, tone: "error" };
+        return { text: `⚠ ${noun} failed${error ? ` · ${error}` : ""}`, tone: "error", ...withKey };
       }
-      if (status === "killed") return { text: `✕ background task killed`, tone: "error" };
-      if (status === "completed") return { text: `✓ background task completed` };
-      return { text: `background task ${status || "updated"}` };
+      if (status === "killed") return { text: `✕ ${noun} killed`, tone: "error", ...withKey };
+      if (status === "completed") return { text: `✓ ${noun} completed`, ...withKey };
+      // running / paused / anything else: the live heartbeat line already says
+      // this, and rendering it would CLOBBER that line with less information.
+      return null;
     }
     case "task_notification": {
       const status = typeof m.status === "string" ? m.status : "";
       const summary = typeof m.summary === "string" && m.summary.trim() ? m.summary : "";
       const tail = summary ? ` · ${summary}` : "";
-      if (status === "failed") return { text: `⚠ background task failed${tail}`, tone: "error" };
-      if (status === "stopped") return { text: `■ background task stopped${tail}`, tone: "warn" };
-      return { text: `✓ background task completed${tail}` };
+      // Same liveKey as its own task_started / heartbeats → the terminal line
+      // REPLACES the live "running" line, so one task reads as exactly one row
+      // that ends in its real outcome.
+      if (status === "failed") return { text: `⚠ ${noun} failed${tail}`, tone: "error", ...withKey };
+      if (status === "stopped") return { text: `■ ${noun} stopped${tail}`, tone: "warn", ...withKey };
+      return { text: `✓ ${noun} completed${tail}`, ...withKey };
     }
-    case "background_tasks_changed": {
-      const tasks = (Array.isArray(m.tasks) ? m.tasks : []) as Array<Record<string, unknown>>;
-      if (tasks.length === 0) return { text: "background tasks: none running" };
-      const list = tasks
-        .map((t) => {
-          const type = typeof t.task_type === "string" ? t.task_type : "task";
-          const desc = typeof t.description === "string" && t.description.trim() ? t.description : "";
-          return desc ? `${type} · ${desc}` : type;
-        })
-        .join("  /  ");
-      return { text: `⏳ background tasks running (${tasks.length}): ${list}`, tone: "warn" };
-    }
-    case "background_task_interrupted": {
-      const text = typeof m.text === "string" && m.text.trim() ? m.text : "background task interrupted: no terminal notification before the runtime stream closed";
+    case "background_tasks_changed":
+      // Live-set bookkeeping, not transcript. It is always emitted immediately
+      // BEFORE the task_started that actually names the work (measured seq
+      // 622→623, 1318→1319) and again as `[]` at turn end, so rendering it added
+      // two meaningless rows per task ("running (1): …" / "none running"). Core
+      // no longer persists it either — it stays broadcast-only.
+      return null;
+    case "background_task_interrupted":
+    case "background_task_orphaned": {
+      const fallback =
+        subtype === "background_task_orphaned"
+          ? "background task orphaned: the turn was aborted while it was still running"
+          : "background task interrupted: no terminal notification before the runtime stream closed";
+      const text = typeof m.text === "string" && m.text.trim() ? m.text : fallback;
       return { text: `⚠ ${text}`, tone: "error" };
+    }
+    // Core writes this durable row when a DETACHED subagent reaches a terminal
+    // state, so the parent's transcript shows the child's fate even if the
+    // model-facing notice is never consumed.
+    case "background_subagent_finished": {
+      const name =
+        typeof m.subagent_name === "string" && m.subagent_name.trim() ? m.subagent_name.trim() : "subagent";
+      const status = typeof m.status === "string" ? m.status : "";
+      const desc = typeof m.description === "string" && m.description.trim() ? m.description : "";
+      const err = typeof m.error === "string" && m.error.trim() ? m.error : "";
+      const label = desc ? `${name} · ${desc}` : name;
+      if (status === "ERROR") {
+        return { text: `⚠ subagent failed · ${label}${err ? ` · ${err}` : ""}`, tone: "error" };
+      }
+      if (status === "IDLE") {
+        return { text: `■ subagent interrupted · ${label}`, tone: "warn" };
+      }
+      return { text: `✓ subagent finished · ${label}` };
     }
     default:
       return null;
   }
+};
+
+/** Render a background-task/tool message as a turn. Carries `liveKey` through so
+ *  the store can keep ONE line per task/tool call instead of appending a row for
+ *  every 30s heartbeat. */
+const backgroundTaskTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
+  const bg = formatBackgroundTaskSystem(msg);
+  if (!bg) return null;
+  return {
+    seq,
+    kind: "system",
+    text: bg.text,
+    ...(bg.tone ? { tone: bg.tone } : {}),
+    ...(bg.liveKey ? { liveKey: bg.liveKey } : {}),
+  };
 };
 
 const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
@@ -307,9 +377,16 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
       ) {
         return { seq, kind: "system", text: systemText };
       }
-      const bg = formatBackgroundTaskSystem(msg);
-      if (bg) return { seq, kind: "system", text: bg.text, ...(bg.tone ? { tone: bg.tone } : {}) };
-      return { seq, kind: "system", text: `system · ${(msg as { subtype?: string }).subtype ?? ""}` };
+      return (
+        backgroundTaskTurn(seq, msg) ?? {
+          seq,
+          kind: "system",
+          text: `system · ${(msg as { subtype?: string }).subtype ?? ""}`,
+        }
+      );
+    // Top-level heartbeat for a long-running plain tool call (no subtype).
+    case "tool_progress":
+      return backgroundTaskTurn(seq, msg);
     case "stream_event":
     case "rate_limit_event":
     case "user":
@@ -711,6 +788,17 @@ export const useStore = create<Store>((set) => ({
 
       const turn = sdkMessageToTurn(seq, msg);
       if (!turn) return s;
+      // A live line (heartbeat or the terminal that closes one) updates its own
+      // row in place, keeping the original seq so nothing reorders.
+      if (turn.liveKey) {
+        const turns = ag.turns.slice();
+        for (let i = turns.length - 1; i >= 0; i--) {
+          if (turns[i]!.liveKey === turn.liveKey) {
+            turns[i] = { ...turn, seq: turns[i]!.seq };
+            return { agents: { ...s.agents, [id]: { ...ag, turns } } };
+          }
+        }
+      }
       return { agents: { ...s.agents, [id]: { ...ag, turns: [...ag.turns, turn] } } };
     }),
 

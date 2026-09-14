@@ -65,7 +65,14 @@ import {
   applyBackgroundTaskDelta,
   shouldFinalizeTurn,
   backgroundTaskInterruptedMessage,
+  backgroundTaskOrphanedMessage,
+  type BackgroundTaskInfo,
 } from "./backgroundTasks.js";
+import {
+  formatSubagentFinishedNotice,
+  subagentFinishedSystemPayload,
+  type SubagentTerminalOutcome,
+} from "./subagentFinish.js";
 import type { Agent as DbAgent, PendingTurn as DbPendingTurn } from "../db.js";
 import { prisma } from "../db.js";
 import type { WebSocket } from "@fastify/websocket";
@@ -86,6 +93,9 @@ const CODEX_DEFAULT_SANDBOX: SandboxMode = "danger-full-access";
 const CODEX_RESUME_SIGNATURE_KEY = "codexResumeSignature";
 const CODEX_RESUME_SIGNATURE_VERSION = 1;
 const RESUME_METADATA_KEYS = ["lastSessionId", "codexUsageSnapshot", CODEX_RESUME_SIGNATURE_KEY] as const;
+/** Set on a detached subagent once its terminal state has been reported to the
+ *  parent — makes the notification idempotent across runs and restarts. */
+const SUBAGENT_SETTLED_KEY = "subagentTerminalNotified";
 const RUNTIME_HISTORY_MAX_MESSAGES = 28;
 const RUNTIME_HISTORY_MAX_CHARS = 18_000;
 const RUNTIME_HISTORY_SINGLE_MESSAGE_MAX_CHARS = 6_000;
@@ -98,19 +108,31 @@ const PEER_SOURCE_PARTIAL_MAX_CHARS = 3_600;
 const COMPACT_START_TEXT = "Compacting conversation context...";
 const COMPACT_FAILURE_PREFIX = "Context compact failed:";
 const RUNTIME_IDLE_TIMEOUT_DEFAULT_MS = 20 * 60 * 1000;
+// A DETACHED background subagent has nobody watching it: the parent already
+// moved on, so a wedged runtime would otherwise sit at "running" for the full
+// 20 minutes before the parent hears anything. Detect the wedge sooner.
+const BACKGROUND_SUBAGENT_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60 * 1000;
 
 const flushVisibleState = (): Promise<void> =>
   new Promise((resolve) => {
     setImmediate(resolve);
   });
 
-function readRuntimeIdleTimeoutMs(): number {
-  const raw = process.env.ENSEMBLE_RUNTIME_IDLE_TIMEOUT_MS;
-  if (!raw) return RUNTIME_IDLE_TIMEOUT_DEFAULT_MS;
+function readPositiveMs(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0
-    ? Math.floor(parsed)
-    : RUNTIME_IDLE_TIMEOUT_DEFAULT_MS;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function readRuntimeIdleTimeoutMs(): number {
+  return readPositiveMs(process.env.ENSEMBLE_RUNTIME_IDLE_TIMEOUT_MS, RUNTIME_IDLE_TIMEOUT_DEFAULT_MS);
+}
+
+function readBackgroundSubagentIdleTimeoutMs(): number {
+  return readPositiveMs(
+    process.env.ENSEMBLE_BG_TASK_IDLE_TIMEOUT_MS,
+    BACKGROUND_SUBAGENT_IDLE_TIMEOUT_DEFAULT_MS,
+  );
 }
 
 function formatRuntimeIdleTimeout(timeoutMs: number): string {
@@ -214,6 +236,10 @@ interface RunningSession {
   interruptedPersisted?: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
   idleWatchdogPaused?: boolean;
+  /** Per-run idle timeout. Set for a detached background subagent so a wedged
+   *  runtime is detected (and reported to the parent) much sooner than the
+   *  20-minute global default. */
+  idleTimeoutMs?: number;
   nonInteractive?: boolean;
   blockedFreshnessAction?: FreshnessBlockedAction;
   freshnessContinuationUsed?: boolean;
@@ -291,6 +317,12 @@ type SendMessageOptions = {
     causalRunId?: string;
     coalescibleSourceOutput?: boolean;
   };
+  /** Marks a turn that carries an automatic "your detached subagent reached a
+   *  terminal state" notice. Same delivery semantics as `peerOrigin` (run now
+   *  when idle, queue when busy) but WITHOUT the peer freshness/correlation
+   *  machinery — a terminal notification must never be deferred or dropped.
+   *  Consecutive notices are coalesced into one turn. */
+  subagentOrigin?: { childId: string; childName: string };
   autoRecoveryAttempt?: "codex-event-stream-lagged" | "codex-thread-writer-conflict";
   suppressUserMessage?: boolean;
   freshnessContinuationForRunId?: string;
@@ -355,6 +387,13 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
   }
   if ((raw as { suppressUserMessage?: unknown }).suppressUserMessage === true) {
     out.suppressUserMessage = true;
+  }
+  const subagentOrigin = (raw as { subagentOrigin?: unknown }).subagentOrigin;
+  if (subagentOrigin && typeof subagentOrigin === "object") {
+    const s = subagentOrigin as Record<string, unknown>;
+    if (typeof s.childId === "string" && typeof s.childName === "string") {
+      out.subagentOrigin = { childId: s.childId, childName: s.childName };
+    }
   }
   const peerOrigin = (raw as { peerOrigin?: unknown }).peerOrigin;
   if (peerOrigin && typeof peerOrigin === "object") {
@@ -942,7 +981,11 @@ export class SessionManager {
     private runtimeResolver: (kind: string) => AgentRuntime = chooseRuntime,
   ) {}
 
-  private getRuntimeIdleTimeoutMs(): number {
+  private getRuntimeIdleTimeoutMs(sessionId?: string): number {
+    if (sessionId) {
+      const override = this.running.get(sessionId)?.idleTimeoutMs;
+      if (override) return override;
+    }
     return readRuntimeIdleTimeoutMs();
   }
 
@@ -959,7 +1002,7 @@ export class SessionManager {
     const running = this.running.get(sessionId);
     if (!running || running.runId !== expectedRunId || running.idleWatchdogPaused) return;
     this.clearRuntimeIdleWatchdog(sessionId, expectedRunId);
-    const timeoutMs = this.getRuntimeIdleTimeoutMs();
+    const timeoutMs = this.getRuntimeIdleTimeoutMs(sessionId);
     const timer = setTimeout(() => {
       void this.handleRuntimeIdleTimeout(sessionId, expectedRunId, timeoutMs);
     }, timeoutMs);
@@ -992,7 +1035,7 @@ export class SessionManager {
   private async handleRuntimeIdleTimeout(
     sessionId: string,
     expectedRunId: string,
-    timeoutMs = this.getRuntimeIdleTimeoutMs(),
+    timeoutMs = this.getRuntimeIdleTimeoutMs(sessionId),
   ): Promise<boolean> {
     const running = this.running.get(sessionId);
     if (!running || running.runId !== expectedRunId || running.idleWatchdogPaused) return false;
@@ -2020,6 +2063,9 @@ export class SessionManager {
         metadata: {
           taskDepth: parentDepth + 1,
           spawnedAsTaskFor: parentId,
+          // Kept so the terminal notification can name the real work rather
+          // than the truncated agent name.
+          backgroundTaskDescription: description,
           ...(background ? { backgroundTask: true } : {}),
         },
       },
@@ -2036,11 +2082,62 @@ export class SessionManager {
       // job runs in the background instead of holding the parent hostage.
       void this.sendMessage(child.id, prompt).catch((err) => {
         console.error(`[subagent:bg] child ${child.id.slice(0, 8)} failed:`, err);
+        // The child never reached runMessageNow's terminal paths, so the parent
+        // would otherwise never hear about a background task that failed to
+        // start. settleBackgroundSubagent is idempotent.
+        void this.settleBackgroundSubagent(child.id, parentId, {
+          status: "ERROR",
+          error: err instanceof Error ? err.message : String(err),
+        }).catch(() => { /* already logged above */ });
       });
       return { finalText: "", subagentId: child.id, background: true };
     }
     const result = await this.sendMessage(child.id, prompt);
     return { finalText: result?.finalText ?? "", subagentId: child.id };
+  }
+
+  /** Report a detached subagent's terminal state to its parent.
+   *
+   *  Delivery is peer_send-shaped: the parent runs a new turn immediately when
+   *  idle and gets the notice queued (coalesced with any sibling notice) when
+   *  busy — never an interrupt. That queued prompt is the only channel that
+   *  reaches the model on all three runtimes: Claude resumes its own CLI
+   *  session, Codex gets a fresh `codex exec` prompt, OpenAI replays DB history,
+   *  so a DB-only system row reaches none of them reliably. The system row is
+   *  still written, because the USER should see the outcome immediately even
+   *  while the parent is wedged. Idempotent via SUBAGENT_SETTLED_KEY. */
+  private async settleBackgroundSubagent(
+    childId: string,
+    parentId: string,
+    outcome: SubagentTerminalOutcome,
+  ): Promise<void> {
+    const child = await prisma.agent.findUnique({ where: { id: childId } });
+    if (!child) return;
+    if (readMetaBool(child.metadata, SUBAGENT_SETTLED_KEY)) return;
+    const description = readMetaString(child.metadata, "backgroundTaskDescription") ?? undefined;
+    // Claim the notification BEFORE delivering anything, so two terminal paths
+    // racing (abort + error) can't both notify the parent.
+    const claimed = await prisma.agent.update({
+      where: { id: childId },
+      data: { metadata: mergeMetadata(child.metadata, { [SUBAGENT_SETTLED_KEY]: true }) },
+    });
+    const parent = await prisma.agent.findUnique({ where: { id: parentId } });
+    if (!parent) return;
+    const identity = { id: child.id, name: child.name };
+    const full: SubagentTerminalOutcome = { ...outcome, ...(description ? { description } : {}) };
+    // 1) Durable record + immediate UI visibility in the parent's transcript.
+    await this.appendBackgroundTaskNotice(parentId, subagentFinishedSystemPayload(identity, full));
+    if (readMetaBool(parent.metadata, "closed")) return;
+    this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(claimed) });
+    // 2) The channel the model actually reads on its next turn.
+    void this.sendMessage(parentId, formatSubagentFinishedNotice(identity, full), {
+      subagentOrigin: { childId, childName: child.name },
+    }).catch((err) => {
+      console.error(
+        `[subagent:bg] notify parent ${parentId.slice(0, 8)} about ${childId.slice(0, 8)} failed:`,
+        err,
+      );
+    });
   }
 
   private enqueueTurn(
@@ -2051,7 +2148,25 @@ export class SessionManager {
     return new Promise((resolve) => {
       const peerOrigin = opts?.peerOrigin;
       let row: { id: number };
-      if (peerOrigin) {
+      if (opts?.subagentOrigin) {
+        // Coalesce: several detached subagents reaching terminal while the
+        // parent is busy must not queue several wake-up turns. The first queued
+        // notice absorbs the rest (text appended) so the parent is woken once
+        // with every result already at hand.
+        const existing = this.findQueuedSubagentFinishedTurn(sessionId);
+        if (existing) {
+          prisma.pendingTurn.update({
+            where: { id: existing.id },
+            data: { userInput: `${existing.userInput}\n\n${userInput}` },
+          });
+          this.queuedTurns.get(sessionId)?.get(existing.id)?.(null);
+          row = existing;
+        } else {
+          row = prisma.pendingTurn.create({
+            data: { agentId: sessionId, userInput, opts: opts ?? {} },
+          });
+        }
+      } else if (peerOrigin) {
         const existing =
           this.findQueuedPeerHandoff(sessionId, peerOrigin) ??
           this.findQueuedPeerCorrelationDuplicate(sessionId, peerOrigin);
@@ -2084,6 +2199,24 @@ export class SessionManager {
         status: "running",
       });
     });
+  }
+
+  /** First queued turn carrying a detached-subagent terminal notice, if any.
+   *  Same role as findQueuedPeerHandoff, minus the freshness semantics: a
+   *  terminal notification is never superseded, only merged. */
+  private findQueuedSubagentFinishedTurn(
+    sessionId: string,
+  ): { id: number; userInput: string } | null {
+    const rows = prisma.pendingTurn.findMany({
+      where: { agentId: sessionId },
+      orderBy: { id: "asc" },
+    });
+    for (const row of rows) {
+      if (normalizeQueuedTurnOpts(row.opts)?.subagentOrigin) {
+        return { id: row.id, userInput: row.userInput };
+      }
+    }
+    return null;
   }
 
   private findQueuedPeerHandoff(
@@ -2444,6 +2577,27 @@ export class SessionManager {
     return this.running.get(sessionId)?.runId === runId;
   }
 
+  /** Persist + broadcast a background-task lifecycle notice (interrupted /
+   *  orphaned) on `sessionId`. Uses its own DB-derived seq rather than the turn
+   *  loop's local counter — the counter can be stale after an abort — and
+   *  returns it so an in-loop caller can resync. Never silently dropped: this is
+   *  the only durable trace of a task whose terminal notification never came. */
+  private async appendBackgroundTaskNotice(
+    sessionId: string,
+    payload: Record<string, unknown>,
+  ): Promise<number> {
+    const row = await prisma.message.create({
+      data: { agentId: sessionId, seq: this.nextMessageSeq(sessionId), type: "system", payload },
+    });
+    this.hub.sendToSession(sessionId, {
+      type: "message",
+      sessionId,
+      seq: row.seq,
+      msg: payload as never,
+    });
+    return row.seq;
+  }
+
   private async appendCompactStatusMessage(sessionId: string, text: string): Promise<number> {
     const payload = { type: "system" as const, subtype: "compact_status", text };
     const row = await prisma.message.create({
@@ -2588,6 +2742,15 @@ export class SessionManager {
       return null;
     }
 
+    // A detached background subagent owes its parent a terminal notification
+    // once this run ends (see settleBackgroundSubagent). Read once — the spawn
+    // metadata is immutable for the life of the child.
+    const backgroundParentId = readMetaBool(agent.metadata, "backgroundTask")
+      ? readMetaString(agent.metadata, "spawnedAsTaskFor")
+      : null;
+    let subagentTerminalStatus: SubagentTerminalOutcome["status"] | null = null;
+    let subagentTerminalError: string | null = null;
+
     const lastMsg = await prisma.message.findFirst({
       where: { agentId: sessionId },
       orderBy: { seq: "desc" },
@@ -2602,6 +2765,9 @@ export class SessionManager {
     let resumeInvalidReasonForRun: string | null = null;
     let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
     let autoRecoveryPromise: Promise<{ finalText: string } | null> | null = null;
+    // Declared outside the try so the detached-subagent notification in the
+    // `finally` block can read the child's final output.
+    let finalText = "";
     this.running.set(sessionId, {
       id: sessionId,
       runId,
@@ -2613,6 +2779,7 @@ export class SessionManager {
       startedAt: new Date().toISOString(),
       pendingTurnHighWaterId,
       autoAllowedTools: new Set<string>(),
+      ...(backgroundParentId ? { idleTimeoutMs: readBackgroundSubagentIdleTimeoutMs() } : {}),
       ...(opts?.freshnessContinuationForRunId ? { freshnessContinuationUsed: true } : {}),
       ...(typeof opts?.freshnessContinuationCount === "number"
         ? { freshnessContinuationCount: opts.freshnessContinuationCount }
@@ -2669,7 +2836,6 @@ export class SessionManager {
     const lastSessionId = readMetaString(agent.metadata, "lastSessionId");
     let capturedSessionId: string | null = lastSessionId;
     let latestCodexUsageSnapshot: CodexUsageSnapshot | null = null;
-    let finalText = "";
     // Resolve provider env. anthropic-local (no baseUrl/apiKey) inherits process.env.
     // W16: openai-compat is now handled by OpenAIAgentRuntime (Slice 2+); during
     // Slice 1 we still route everything through the Claude SDK path. The
@@ -3027,7 +3193,14 @@ export class SessionManager {
       // drain-blocking Claude background task reports terminal, instead of the
       // old unconditional `break` that silently killed background subagents.
       let sawResultForDrain = false;
-      const liveBackgroundTasks = new Set<string>();
+      const liveBackgroundTasks = new Map<string, BackgroundTaskInfo>();
+      // Ids the SDK currently reports as live background tasks, plus the subset
+      // that is genuinely DETACHED. Claude Code emits `task_started` for a
+      // long-running FOREGROUND Bash call too (measured: a 2s `git push` gets
+      // one, with no `background_tasks_changed`), which is why the UI used to
+      // label foreground commands as "background task started".
+      let liveBackgroundTaskIds = new Set<string>();
+      const detachedBackgroundTaskIds = new Set<string>();
       for await (const event of stream) {
         this.resetRuntimeIdleWatchdog(sessionId, runId);
         if (event.type === "error") {
@@ -3066,7 +3239,41 @@ export class SessionManager {
         // persisted+broadcast as before (never silently dropped).
         const bgDelta = classifyBackgroundTaskMessage(msg);
         if (bgDelta) {
-          const { broadcastOnly } = applyBackgroundTaskDelta(liveBackgroundTasks, bgDelta);
+          if (bgDelta.kind === "prune") liveBackgroundTaskIds = bgDelta.liveIds;
+          // Tag each message with the detach-ness of the task it belongs to so
+          // the UI can word a foreground command as a command. The SDK emits
+          // `background_tasks_changed` immediately BEFORE the matching
+          // `task_started` (measured: seq 622→623 and 1318→1319), so the live
+          // set as it stands right now is authoritative for this task.
+          if (bgDelta.kind === "add") {
+            const isDetached = liveBackgroundTaskIds.has(bgDelta.task.taskId);
+            (msg as { detached?: boolean }).detached = isDetached;
+            if (isDetached) detachedBackgroundTaskIds.add(bgDelta.task.taskId);
+          } else {
+            const taskId = (msg as { task_id?: unknown }).task_id;
+            if (
+              typeof taskId === "string" &&
+              (detachedBackgroundTaskIds.has(taskId) || liveBackgroundTaskIds.has(taskId))
+            ) {
+              (msg as { detached?: boolean }).detached = true;
+            }
+          }
+          const { broadcastOnly, lost } = applyBackgroundTaskDelta(liveBackgroundTasks, bgDelta);
+          // A tracked task that leaves the live set without ever reporting
+          // terminal must be surfaced NOW: pruned silently, a dead background
+          // build reads as a clean DONE and its fate only shows up at the top
+          // of the next turn (measured: seq 645 vs 647).
+          if (lost.length > 0) {
+            console.warn(
+              `[sendMessage] background task(s) lost from live set agent=${sessionId.slice(0, 8)} tasks=[${lost.map((t) => t.taskId).join(",")}]`,
+            );
+            for (const task of lost) detachedBackgroundTaskIds.delete(task.taskId);
+            seq =
+              (await this.appendBackgroundTaskNotice(
+                sessionId,
+                backgroundTaskInterruptedMessage(lost, "live_set_dropped"),
+              )) + 1;
+          }
           if (broadcastOnly) {
             this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
             continue;
@@ -3160,25 +3367,31 @@ export class SessionManager {
       // never be silently swallowed into a `status:"DONE"` turn — surface a
       // visible, persisted error-toned notice (design §6: no silent drops, no
       // clean completion for an interrupted drain).
-      if (!abort.signal.aborted && sawResultForDrain && liveBackgroundTasks.size > 0) {
-        const unresolved = [...liveBackgroundTasks];
+      const unresolvedAtClose = [...liveBackgroundTasks.values()];
+      if (abort.signal.aborted && unresolvedAtClose.length > 0) {
+        // The turn was cancelled (user stop / idle watchdog / peer interrupt)
+        // while background work was live. The old `!abort.signal.aborted` guard
+        // skipped the notice entirely here, so a cancelled turn orphaned those
+        // shells in silence — surface them as detached-from-supervision.
         console.warn(
-          `[sendMessage] background task(s) unresolved at stream close agent=${sessionId.slice(0, 8)} tasks=[${unresolved.join(",")}]`,
+          `[sendMessage] turn aborted with live background task(s) agent=${sessionId.slice(0, 8)} tasks=[${unresolvedAtClose.map((t) => t.taskId).join(",")}]`,
         );
-        const notice = backgroundTaskInterruptedMessage(unresolved);
-        const persistedNotice = await prisma.message.create({
-          data: { agentId: sessionId, seq, type: "system", payload: notice },
-        });
-        this.hub.sendToSession(sessionId, {
-          type: "message",
+        await this.appendBackgroundTaskNotice(
           sessionId,
-          seq: persistedNotice.seq,
-          msg: notice as never,
-        });
-        seq++;
+          backgroundTaskOrphanedMessage(unresolvedAtClose, "turn_aborted"),
+        );
+      } else if (sawResultForDrain && unresolvedAtClose.length > 0) {
+        console.warn(
+          `[sendMessage] background task(s) unresolved at stream close agent=${sessionId.slice(0, 8)} tasks=[${unresolvedAtClose.map((t) => t.taskId).join(",")}]`,
+        );
+        await this.appendBackgroundTaskNotice(
+          sessionId,
+          backgroundTaskInterruptedMessage(unresolvedAtClose, "stream_closed"),
+        );
       }
 
       const persistData: { status: "DONE"; metadata?: object } = { status: "DONE" };
+      subagentTerminalStatus = "DONE";
       if (!opts?.suppressRuntimeMetadata) {
         const metaPatch: Record<string, unknown> = {};
         if (capturedSessionId && capturedSessionId !== effectiveLastSessionId) {
@@ -3295,6 +3508,14 @@ export class SessionManager {
           },
         };
       }
+      // Auto-recovery keeps the run alive on a fresh thread/session, so it is
+      // NOT a terminal state — the retry run settles the child instead.
+      if (!shouldAutoRecoverCodexEventStream && !shouldAutoRecoverThreadWriterConflict) {
+        // A cancelled child is reported as INTERRUPTED, not failed: the parent
+        // must not treat a deliberate stop as a broken task.
+        subagentTerminalStatus = aborted ? "IDLE" : persistData.status;
+        subagentTerminalError = aborted ? "the run was cancelled before it completed" : rawMsg;
+      }
       // Same guard as the success path. cancel() owns the canonical IDLE state
       // once it's removed this run from the map.
       if (this.running.get(sessionId)?.runId === runId) {
@@ -3368,6 +3589,27 @@ export class SessionManager {
         } else {
           this.drainQueuedTurns(sessionId, freshnessDrainOpts);
         }
+      }
+
+      // Deliberately OUTSIDE the owner guard: cancel() deletes the running
+      // entry synchronously, so a cancelled run fails that guard — and a
+      // cancelled background child is exactly the case where the parent used to
+      // be left in the dark forever. settleBackgroundSubagent is idempotent and
+      // writes its durable record before it queues anything, so a superseded run
+      // racing the new owner can't double-notify.
+      if (backgroundParentId && subagentTerminalStatus) {
+        // Fire-and-forget: notifying the parent must never delay this run's
+        // teardown or the queue drain.
+        void this.settleBackgroundSubagent(sessionId, backgroundParentId, {
+          status: subagentTerminalStatus,
+          ...(subagentTerminalError ? { error: subagentTerminalError } : {}),
+          ...(finalText.trim() ? { finalText } : {}),
+        }).catch((err) => {
+          console.error(
+            `[subagent:bg] failed to notify parent ${backgroundParentId.slice(0, 8)} about ${sessionId.slice(0, 8)}:`,
+            err,
+          );
+        });
       }
     }
     return autoRecoveryPromise ? await autoRecoveryPromise : null;

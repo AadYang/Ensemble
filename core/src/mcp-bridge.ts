@@ -21,6 +21,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
 import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs, type ConversationSearchScope } from "./conversation-search.js";
+import { backgroundSubagentStartedText } from "./sessions/subagentFinish.js";
 
 export const BRIDGE_TOKEN = randomUUID();
 // The internal Fastify route. Other API routes in core/src/index.ts are
@@ -82,9 +83,19 @@ export interface BridgeHandlers {
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
-  spawnTask?: (args: { description: string; prompt: string }) => Promise<{
+  spawnTask?: (args: {
+    description: string;
+    prompt: string;
+    /** Detach the subagent (it returns its id immediately and the parent is
+     *  notified on terminal — see SessionManager.settleBackgroundSubagent).
+     *  Codex used to be unable to request this: the bridge schema and the
+     *  forwarder both dropped the flag, so `Task(background=true)` silently
+     *  became a blocking call for every codex agent. */
+    background?: boolean;
+  }) => Promise<{
     finalText: string;
     subagentId: string;
+    background?: boolean;
   }>;
   /** Stateless help — always available; agent-id closure not needed. */
   ensembleHelp?: (args: { topic?: string }) => Promise<string>;
@@ -179,6 +190,7 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
         await handlers.spawnTask({
           description: String(args.description ?? ""),
           prompt: String(args.prompt ?? ""),
+          background: args.background === true,
         }),
       );
   }
@@ -250,8 +262,10 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   );
   mcp.tool(
     "Task",
-    "Delegate a subtask to a subagent. The subagent runs to completion and returns its final text.",
-    { description: z.string().min(1), prompt: z.string().min(1) },
+    "Delegate a subtask to a subagent. The subagent runs to completion and returns its final text. " +
+      "Set background=true to run it detached: the call returns the subagent id immediately, you keep " +
+      "working, and you are sent a `subagent-finished` message when it reaches a terminal state.",
+    { description: z.string().min(1), prompt: z.string().min(1), background: z.boolean().optional() },
     async (args) => ({ content: [{ type: "text", text: await invoke("Task", args) }] }),
   );
   return mcp;
@@ -425,10 +439,13 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const spawnTask = handlers.spawnTask;
       mcp.tool(
         "Task",
-        "Delegate a subtask to a subagent. The subagent runs to completion and returns its final text. Use for parallelizable scoped work.",
+        "Delegate a subtask to a subagent. The subagent runs to completion and returns its final text. " +
+          "Set background=true to run it detached (returns the subagent id immediately; you are sent a " +
+          "`subagent-finished` message when it ends). Use for parallelizable scoped work.",
         {
           description: z.string().min(1),
           prompt: z.string().min(1),
+          background: z.boolean().optional(),
         },
         async (args) => {
           const out = await spawnTask(args);
@@ -436,7 +453,9 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
             content: [
               {
                 type: "text",
-                text: JSON.stringify({ finalText: out.finalText, subagentId: out.subagentId }),
+                text: out.background
+                  ? backgroundSubagentStartedText(out.subagentId)
+                  : JSON.stringify({ finalText: out.finalText, subagentId: out.subagentId }),
               },
             ],
           };

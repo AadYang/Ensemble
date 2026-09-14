@@ -18,6 +18,7 @@
 
 import { z } from "zod";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
+import { backgroundSubagentStartedText } from "../subagentFinish.js";
 import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs } from "../../conversation-search.js";
 import type { NormalizedTool } from "./types.js";
 
@@ -315,16 +316,13 @@ export function makeTaskTool(spawn: SpawnTaskCallback): NormalizedTool<typeof TA
       "Use it for self-contained work that benefits from a clean slate (research, " +
       "exploration, multi-step decomposition). Set background=true to spawn it as a " +
       "detached background task (returns its id immediately; you keep working while it " +
-      "runs). Subagent depth is capped at 3 levels.",
+      "runs, and you are sent a `subagent-finished` message when it ends — never poll). " +
+      "Subagent depth is capped at 3 levels.",
     parameters: TASK_SCHEMA,
     async execute(args) {
       const result = await spawn(args);
       if (result.background) {
-        return (
-          `Background task started (subagent id=${result.subagentId.slice(0, 8)}). ` +
-          "It is running detached and is visible in the sidebar under you. " +
-          "Use peer_query on it later to read its progress/result; do not block waiting."
-        );
+        return backgroundSubagentStartedText(result.subagentId);
       }
       return result.finalText;
     },

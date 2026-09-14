@@ -150,10 +150,12 @@ describe("makeTaskTool", () => {
     });
     expect(receivedBackground).toBe(true);
     // Must NOT return empty finalText for a background task — the model needs the
-    // id and a clear "don't block" instruction so it keeps working.
+    // id, a clear "don't block" instruction, and the delivery contract: the
+    // parent is PUSHED a `subagent-finished` notice, so it must not poll.
     expect(result).toContain("Background task started");
     expect(result).toContain("bg-child");
-    expect(result).toContain("peer_query");
+    expect(result).toContain("subagent-finished");
+    expect(result).toContain("do not poll");
   });
 });
 

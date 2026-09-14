@@ -94,17 +94,21 @@ describe("SessionManager sdk_message passthrough", () => {
     const after = await prisma.agent.findUnique({ where: { id: agent.id } });
     expect(after?.status).not.toBe("ERROR");
 
-    // Unknown top-level types are persisted (passthrough); thinking_tokens is not.
+    // Unknown top-level types are persisted (passthrough); thinking_tokens is
+    // filtered, and `tool_progress` is broadcast-only — it is a 30s heartbeat,
+    // so persisting it would put a useless row in context (~40 rows/hour).
     const persistedTypes = (
       await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } })
     ).map((r) => r.type);
     expect(persistedTypes).toContain("rate_limit_event");
-    expect(persistedTypes).toContain("tool_progress");
+    expect(persistedTypes).not.toContain("tool_progress");
     expect(persistedTypes).toContain("assistant");
     expect(persistedTypes).toContain("result");
     expect(persistedTypes).not.toContain("system");
 
-    // Unknown types are also broadcast to the session; thinking_tokens is filtered.
+    // Unknown types are also broadcast to the session; thinking_tokens is
+    // filtered, but the heartbeat still reaches the UI (which updates one live
+    // row in place instead of appending).
     const broadcastMsgTypes = hub.events
       .filter((e) => e.kind === "session" && e.msg.type === "message")
       .map((e) => (e.msg.msg as { type?: string })?.type);

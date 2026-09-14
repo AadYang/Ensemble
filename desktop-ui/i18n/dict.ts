@@ -211,6 +211,9 @@ const en: Dict = {
   "pane.context.tip": "context usage: {used} / {window} tokens ({percent}%)",
   "pane.bgtasks.label": "bg tasks ({n}):",
   "pane.bgtasks.open": "open this background task in the pane",
+  "pane.bgtasks.dismiss": "dismiss this finished background task (deletes the child agent)",
+  "pane.bgtasks.dismiss.title": `delete background task "{name}"?`,
+  "pane.bgtasks.dismiss.running": "it is still {status} — deleting it stops it immediately.",
 
   // permission dialog
   "perm.title": "PERMISSION REQUEST",
@@ -658,6 +661,9 @@ const zh: Dict = {
   "pane.context.tip": "上下文占用：{used} / {window} tokens（{percent}%）",
   "pane.bgtasks.label": "后台任务（{n}）：",
   "pane.bgtasks.open": "在此 pane 中打开该后台任务",
+  "pane.bgtasks.dismiss": "清除已结束的后台任务（删除子 agent）",
+  "pane.bgtasks.dismiss.title": `删除后台任务 "{name}" ？`,
+  "pane.bgtasks.dismiss.running": "它仍处于 {status} 状态 —— 删除会立即终止它。",
 
   // permission dialog
   "perm.title": "工具权限请求",

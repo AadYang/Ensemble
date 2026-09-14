@@ -163,6 +163,18 @@ export type ServerMsg =
  */
 export type SdkMessage =
   | { type: "system"; subtype?: string; [k: string]: unknown }
+  // Claude Code emits this as a TOP-LEVEL type (NOT a `system` subtype): one
+  // heartbeat every 30s for a long-running tool call. Core broadcasts it
+  // without persisting it (no context bloat) — see sessions/backgroundTasks.ts.
+  | {
+      type: "tool_progress";
+      tool_use_id?: string;
+      tool_name?: string;
+      parent_tool_use_id?: string;
+      elapsed_time_seconds?: number;
+      heartbeat?: boolean;
+      [k: string]: unknown;
+    }
   | { type: "rate_limit_event"; [k: string]: unknown }
   | { type: "stream_event"; [k: string]: unknown }
   | {
