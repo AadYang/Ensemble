@@ -289,13 +289,6 @@ const formatBackgroundTaskSystem = (
       if (status === "stopped") return { text: `■ ${noun} stopped${tail}`, tone: "warn", ...withKey };
       return { text: `✓ ${noun} completed${tail}`, ...withKey };
     }
-    case "background_tasks_changed":
-      // Live-set bookkeeping, not transcript. It is always emitted immediately
-      // BEFORE the task_started that actually names the work (measured seq
-      // 622→623, 1318→1319) and again as `[]` at turn end, so rendering it added
-      // two meaningless rows per task ("running (1): …" / "none running"). Core
-      // no longer persists it either — it stays broadcast-only.
-      return null;
     case "background_task_interrupted":
     case "background_task_orphaned": {
       const fallback =
@@ -327,6 +320,16 @@ const formatBackgroundTaskSystem = (
       return null;
   }
 };
+
+/** System subtypes that must render as NOTHING when the formatter declines them.
+ *  Falling back to `system · <subtype>` would put a raw, meaningless row in the
+ *  transcript for something the live per-task line already says. */
+const SILENT_SYSTEM_SUBTYPES = new Set([
+  "background_tasks_changed",
+  "task_progress",
+  "tool_progress",
+  "task_updated",
+]);
 
 /** Render a background-task/tool message as a turn. Carries `liveKey` through so
  *  the store can keep ONE line per task/tool call instead of appending a row for
@@ -368,22 +371,22 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
       const subtype = (msg as { subtype?: string }).subtype ?? "";
       return { seq, kind: "result", text: `result · ${subtype}` };
     }
-    case "system":
-      if ((msg as { subtype?: string }).subtype === "thinking_tokens") return null;
+    case "system": {
+      const st = (msg as { subtype?: string }).subtype;
+      if (st === "thinking_tokens") return null;
       const systemText = (msg as { text?: unknown }).text;
-      if (
-        (msg as { subtype?: string }).subtype === "compact_status" &&
-        typeof systemText === "string"
-      ) {
+      if (st === "compact_status" && typeof systemText === "string") {
         return { seq, kind: "system", text: systemText };
       }
-      return (
-        backgroundTaskTurn(seq, msg) ?? {
-          seq,
-          kind: "system",
-          text: `system · ${(msg as { subtype?: string }).subtype ?? ""}`,
-        }
-      );
+      const bg = backgroundTaskTurn(seq, msg);
+      if (bg) return bg;
+      // Lifecycle heartbeats the formatter deliberately declined to render (a
+      // non-terminal task_updated, a live-set bookkeeping message, …). They must
+      // not fall through to a bare `system · <subtype>` row: whatever they said
+      // is already on the live line that tracks the same task.
+      if (st && SILENT_SYSTEM_SUBTYPES.has(st)) return null;
+      return { seq, kind: "system", text: `system · ${st ?? ""}` };
+    }
     // Top-level heartbeat for a long-running plain tool call (no subtype).
     case "tool_progress":
       return backgroundTaskTurn(seq, msg);
