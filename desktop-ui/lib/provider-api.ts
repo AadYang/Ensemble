@@ -130,7 +130,14 @@ export async function migrateDeprecatedProvider(
 }
 
 export interface RefreshResult extends ProviderDTO {
-  discovered?: { count: number; source: string };
+  discovered?: {
+    count: number;
+    source: string;
+    /** Present when a live probe was attempted but fell back to a static
+     *  catalog — carries the per-URL status + body head so the UI can show
+     *  exactly why discovery failed (401 vs 404 vs timeout). */
+    tried?: Array<{ url: string; status: number; bodyHead?: string }>;
+  };
 }
 
 export async function refreshProviderModels(id: string): Promise<RefreshResult> {

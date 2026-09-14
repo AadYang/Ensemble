@@ -1110,13 +1110,29 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
       where: { id: provider.id },
       data: { models: deepSeekFallback.models },
     });
+    // Every candidate URL 404ing means the upstream (e.g. DeepSeek's
+    // /anthropic endpoint) simply has no /models route — that's the normal,
+    // expected path for fixed-catalog providers, not a failure worth alarming
+    // about. Anything else (401 bad key, timeout, non-JSON, 0 models) is a
+    // real probe failure and keeps the original wording.
+    const endpointMissing =
+      !!probeFailure &&
+      probeFailure.tried.length > 0 &&
+      probeFailure.tried.every((t) => t.status === 404);
+    const source = probeFailure
+      ? endpointMissing
+        ? `${deepSeekFallback.sourceUrl} (no /models endpoint; static catalog)`
+        : `${deepSeekFallback.sourceUrl} (live probe failed, static fallback)`
+      : `${deepSeekFallback.sourceUrl} (no API key for live discovery)`;
     return {
       ...sanitizeProvider(updated),
       discovered: {
         count: deepSeekFallback.models.length,
-        source: probeFailure
-          ? `${deepSeekFallback.sourceUrl} (live probe failed, static fallback)`
-          : `${deepSeekFallback.sourceUrl} (no API key for live discovery)`,
+        source,
+        // Surface the real failure (status + body) instead of the generic
+        // "live probe failed" string. Without this the user can't tell a
+        // 401 bad-key from a 404 missing-endpoint from a timeout.
+        tried: probeFailure?.tried ?? [],
       },
     };
   }

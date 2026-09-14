@@ -230,7 +230,11 @@ export function ProviderPanel() {
       const r = await refreshProviderModels(p.id);
       const count = r.discovered?.count ?? r.models.length;
       const src = r.discovered?.source ?? "default";
-      setRefreshFlash({ id: p.id, ok: true, msg: `${count} models · ${src}` });
+      const tried =
+        r.discovered?.tried
+          ?.map((t) => `\n  • ${t.url} → ${t.status}${t.bodyHead ? `\n    ${t.bodyHead}` : ""}`)
+          .join("") ?? "";
+      setRefreshFlash({ id: p.id, ok: true, msg: `${count} models · ${src}${tried}` });
       await refresh();
     } catch (err) {
       setRefreshFlash({ id: p.id, ok: false, msg: (err as Error).message });
