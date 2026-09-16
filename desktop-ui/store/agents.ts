@@ -402,25 +402,38 @@ const backgroundTaskTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   };
 };
 
+type AssistantBlock = { type: string; text?: string; name?: string; input?: unknown };
+
+const assistantBlocks = (msg: SdkMessage): AssistantBlock[] =>
+  (msg as { message?: { content?: AssistantBlock[] } }).message?.content ?? [];
+
+const assistantTextOf = (blocks: AssistantBlock[]): string =>
+  blocks
+    .filter((b) => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text!)
+    .join("");
+
+const toolUseTurns = (seq: number, blocks: AssistantBlock[]): ChatTurn[] =>
+  blocks
+    .filter((b) => b.type === "tool_use")
+    .map((b) => ({
+      seq,
+      kind: "tool_use" as const,
+      text: `${b.name ?? "tool"}(...)`,
+      toolName: b.name,
+      toolInput: b.input,
+    }));
+
 const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   switch (msg.type) {
     case "assistant": {
-      const blocks = (msg as { message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> } }).message?.content ?? [];
-      const text = blocks
-        .filter((b) => b.type === "text" && typeof b.text === "string")
-        .map((b) => b.text!)
-        .join("");
-      const toolUse = blocks.find((b) => b.type === "tool_use");
+      const blocks = assistantBlocks(msg);
+      const text = assistantTextOf(blocks);
+      const tools = toolUseTurns(seq, blocks);
+      // Text used to win and drop co-located tool_use, which is how openai-compat
+      // cards vanished after a model switch: one assistant payload carried both.
       if (text) return { seq, kind: "assistant_text", text };
-      if (toolUse) {
-        return {
-          seq,
-          kind: "tool_use",
-          text: `${toolUse.name ?? "tool"}(...)`,
-          toolName: toolUse.name as string | undefined,
-          toolInput: toolUse.input,
-        };
-      }
+      if (tools[0]) return tools[0];
       return { seq, kind: "raw", text: `[assistant]` };
     }
     case "result": {
@@ -811,22 +824,21 @@ export const useStore = create<Store>((set) => ({
       }
 
       if (msg.type === "assistant") {
-        const blocks =
-          (msg as { message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> } })
-            .message?.content ?? [];
-        const text = blocks
-          .filter((b) => b.type === "text" && typeof b.text === "string")
-          .map((b) => b.text!)
-          .join("");
-        if (text) {
+        const blocks = assistantBlocks(msg);
+        const text = assistantTextOf(blocks);
+        const tools = toolUseTurns(seq, blocks);
+        if (text || tools.length > 0) {
           const turns = ag.turns.slice();
-          const last = turns[turns.length - 1];
-          const finalized: ChatTurn = { seq, kind: "assistant_text", text };
-          if (last && last.kind === "assistant_text" && last.streaming) {
-            turns[turns.length - 1] = finalized;
-          } else {
-            turns.push(finalized);
+          if (text) {
+            const last = turns[turns.length - 1];
+            const finalized: ChatTurn = { seq, kind: "assistant_text", text };
+            if (last && last.kind === "assistant_text" && last.streaming) {
+              turns[turns.length - 1] = finalized;
+            } else {
+              turns.push(finalized);
+            }
           }
+          turns.push(...tools);
           return { agents: { ...s.agents, [id]: { ...ag, turns } } };
         }
       }

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   capabilityView,
+  countSubagentStartsThisTurn,
   formatCapabilityFieldLines,
   measureChatInputHeight,
   type RunPlanStatusView,
@@ -25,6 +26,8 @@ import { useT, type TranslateFn } from "@/i18n/useT";
 import { ToolCard } from "./ToolCard";
 import { PeerSendPopover } from "./PeerSendPopover";
 import { ContextBar } from "./ContextBar";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 // /model and /provider open a picker when invoked with no args (CLI-parity).
 // Typed args bypass the picker (kept for muscle memory / scripting).
@@ -322,6 +325,10 @@ export function ChatPane({ agentId }: { agentId: string }) {
     ? makeScrollFollowSignal(agent.turns, agent.summary.status)
     : "missing";
   const scrollObserverReady = agent !== undefined;
+  const subagentStarts = useMemo(
+    () => (agent ? countSubagentStartsThisTurn(agent.turns) : 0),
+    [agent],
+  );
 
   // Reset history pointer + next-step hint when switching agents.
   useEffect(() => {
@@ -1020,12 +1027,18 @@ export function ChatPane({ agentId }: { agentId: string }) {
             {liveness.state}
           </span>
         )}
-        {/* Always rendered. `null` is a real state (nothing has run yet, or the
-            server has not reported since we subscribed) and `contextBarView`
-            renders it as "context: unknown" plus the plan's own limits — the
-            alternative was for the whole readout, plan half included, to
-            disappear and tell the user nothing. */}
+        {/* Occupancy bar: glyph + percent + used/window. `null` is a real
+            state (nothing has run yet, or the server has not reported since
+            we subscribed). */}
         <ContextBar context={contextUsage} capability={capability} />
+        {subagentStarts > 0 && (
+          <span
+            className="text-[var(--accent)]"
+            title={t("chat.subagents.tip", { n: subagentStarts })}
+          >
+            {t("chat.subagents.count", { n: subagentStarts })}
+          </span>
+        )}
         <span className="text-[var(--text-dim)]">· {summary.status}</span>
         {summary.closed && (
           <span className="px-1.5 py-0.5 border border-[var(--warn)] text-[var(--warn)] text-[10px] tracking-wider">
@@ -1182,16 +1195,22 @@ function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
     return <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} />;
   }
 
+  if (t.kind === "assistant_text") {
+    return (
+      <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{t.text}</ReactMarkdown>
+      </div>
+    );
+  }
+
   const tagColor =
     t.tone === "error" ? "text-[var(--err)]" :
     t.tone === "warn" ? "text-[var(--warn)]" :
     t.kind === "user" ? "text-[var(--accent)]" :
-    t.kind === "assistant_text" ? "text-[var(--text)]" :
     t.kind === "result" ? "text-[var(--ok)]" :
     "text-[var(--text-dim)]";
   const prefix =
     t.kind === "user" ? "> " :
-    t.kind === "assistant_text" ? "" :
     t.kind === "result" ? "✓ " :
     "· ";
 
