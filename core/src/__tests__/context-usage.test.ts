@@ -2,10 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   contextUsageFromTranscript,
   contextUsageFromUsedTokens,
+  LIVE_CONTEXT_MIN_EMIT_MS,
+  liveOccupancy,
+  occupancyDeltaFromStreamEvent,
+  occupancyTokensFromLastCall,
+  occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
   promptTokensFromLastCall,
   promptTokensFromResultContextUsage,
   reportedContextWindowFromResult,
+  shouldPublishLiveContext,
 } from "../context-usage.js";
 import { snapshotContextWindow } from "../context-window.js";
 
@@ -372,6 +378,120 @@ describe("promptTokensFromResultContextUsage", () => {
       promptTokensFromResultContextUsage({ type: "result", contextUsage: { outputTokens: 12 } }),
     ).toBeNull();
     expect(promptTokensFromResultContextUsage({ type: "assistant" })).toBeNull();
+  });
+});
+
+describe("occupancyTokensFromLastCall", () => {
+  it("adds output to the anthropic prompt (input + cache)", () => {
+    const rows = [
+      assistantWithUsage({
+        input_tokens: 209,
+        cache_read_input_tokens: 165_632,
+        output_tokens: 40,
+      }),
+    ];
+    expect(occupancyTokensFromLastCall(rows)).toBe(165_881);
+  });
+
+  it("adds completion_tokens to the chat-completions prompt", () => {
+    const rows = [assistantWithUsage({ prompt_tokens: 50_000, completion_tokens: 12 })];
+    expect(occupancyTokensFromLastCall(rows)).toBe(50_012);
+  });
+});
+
+describe("occupancyTokensFromResultContextUsage", () => {
+  it("adds outputTokens to the last-response prompt", () => {
+    expect(
+      occupancyTokensFromResultContextUsage({
+        type: "result",
+        contextUsage: {
+          inputTokens: 4_120,
+          outputTokens: 88,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      }),
+    ).toBe(4_208);
+  });
+
+  it("returns null when there is no prompt size", () => {
+    expect(
+      occupancyTokensFromResultContextUsage({ type: "result", contextUsage: { outputTokens: 12 } }),
+    ).toBeNull();
+  });
+});
+
+describe("live occupancy helpers", () => {
+  it("sums prompt and streamed output", () => {
+    expect(liveOccupancy(100, 7)).toBe(107);
+    expect(liveOccupancy(-1, 5)).toBe(5);
+  });
+
+  it("throttles unchanged or too-frequent live publishes", () => {
+    expect(
+      shouldPublishLiveContext({
+        force: true,
+        now: 1_000,
+        lastEmitAt: 0,
+        lastUsed: 0,
+        nextUsed: 40,
+      }),
+    ).toBe(true);
+    expect(
+      shouldPublishLiveContext({
+        force: false,
+        now: 1_000 + LIVE_CONTEXT_MIN_EMIT_MS - 1,
+        lastEmitAt: 1_000,
+        lastUsed: 40,
+        nextUsed: 41,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPublishLiveContext({
+        force: false,
+        now: 1_000 + LIVE_CONTEXT_MIN_EMIT_MS,
+        lastEmitAt: 1_000,
+        lastUsed: 40,
+        nextUsed: 41,
+      }),
+    ).toBe(true);
+    expect(
+      shouldPublishLiveContext({
+        force: true,
+        now: 1_001,
+        lastEmitAt: 1_000,
+        lastUsed: 40,
+        nextUsed: 40,
+      }),
+    ).toBe(false);
+  });
+
+  it("reads text, thinking, and partial tool JSON from stream events", () => {
+    expect(
+      occupancyDeltaFromStreamEvent({
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text: "hi" } },
+      }),
+    ).toBe("hi");
+    expect(
+      occupancyDeltaFromStreamEvent({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "thinking_delta", thinking: "hmm" },
+        },
+      }),
+    ).toBe("hmm");
+    expect(
+      occupancyDeltaFromStreamEvent({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "input_json_delta", partial_json: "{\"q\":" },
+        },
+      }),
+    ).toBe("{\"q\":");
+    expect(occupancyDeltaFromStreamEvent({ type: "assistant" })).toBeNull();
   });
 });
 

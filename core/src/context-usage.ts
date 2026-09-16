@@ -56,6 +56,7 @@ interface ModelUsageEntry {
  *  cached prefix is already subtracted from `inputTokens` there. */
 interface ResultContextUsage {
   inputTokens?: number;
+  outputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
 }
@@ -130,6 +131,80 @@ export function promptTokensFromLastCall(rows: readonly Row[]): number | null {
   return null;
 }
 
+/** Occupancy of the last completed API call: prompt + that call's output.
+ *  The bar's numerator during/after a turn is how full the window is, not
+ *  how large the next request's prefix will be. */
+export function occupancyTokensFromLastCall(rows: readonly Row[]): number | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (row.type !== "assistant") continue;
+    const usage = (row.payload as { message?: { usage?: Record<string, unknown> } } | null)
+      ?.message?.usage;
+    if (!usage || typeof usage !== "object") continue;
+    const promptTokens = num(usage.prompt_tokens);
+    if (promptTokens > 0) return promptTokens + num(usage.completion_tokens);
+    const anthropic =
+      num(usage.input_tokens) +
+      num(usage.cache_read_input_tokens) +
+      num(usage.cache_creation_input_tokens);
+    if (anthropic > 0) return anthropic + num(usage.output_tokens);
+  }
+  return null;
+}
+
+export const LIVE_CONTEXT_MIN_EMIT_MS = 200;
+
+export function liveOccupancy(promptTokens: number, streamedTokens: number): number {
+  return Math.max(0, promptTokens) + Math.max(0, streamedTokens);
+}
+
+export function shouldPublishLiveContext(opts: {
+  force: boolean;
+  now: number;
+  lastEmitAt: number;
+  lastUsed: number;
+  nextUsed: number;
+}): boolean {
+  if (opts.nextUsed <= 0) return false;
+  if (opts.force) return opts.lastEmitAt === 0 || opts.nextUsed !== opts.lastUsed;
+  if (opts.nextUsed === opts.lastUsed) return false;
+  return opts.now - opts.lastEmitAt >= LIVE_CONTEXT_MIN_EMIT_MS;
+}
+
+/** Streamed tokens that occupy the window right now: visible text, thinking,
+ *  and partial tool-call JSON. Peer live-transcript stays text-only. */
+export function occupancyDeltaFromStreamEvent(msg: unknown): string | null {
+  if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "stream_event") {
+    return null;
+  }
+  const event = (
+    msg as {
+      event?: {
+        type?: unknown;
+        delta?: { type?: unknown; text?: unknown; thinking?: unknown; partial_json?: unknown };
+      };
+    }
+  ).event;
+  if (event?.type !== "content_block_delta") return null;
+  const delta = event.delta;
+  if (!delta || typeof delta !== "object") return null;
+  if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+    return delta.text;
+  }
+  if (delta.type === "thinking_delta") {
+    if (typeof delta.thinking === "string" && delta.thinking.length > 0) return delta.thinking;
+    if (typeof delta.text === "string" && delta.text.length > 0) return delta.text;
+  }
+  if (
+    delta.type === "input_json_delta" &&
+    typeof delta.partial_json === "string" &&
+    delta.partial_json.length > 0
+  ) {
+    return delta.partial_json;
+  }
+  return null;
+}
+
 /** Provider-reported prompt size of the last response, read from the OpenAI
  *  runtime's own result payload (`contextUsage`, W22). That runtime's assistant
  *  rows carry no usage, so this is its only provider-side number.
@@ -149,7 +224,14 @@ export function promptTokensFromResultContextUsage(msg: unknown): number | null 
   return tokens > 0 ? tokens : null;
 }
 
-/** Text of one history message as the model receives it: user content (string
+export function occupancyTokensFromResultContextUsage(msg: unknown): number | null {
+  const prompt = promptTokensFromResultContextUsage(msg);
+  if (prompt === null) return null;
+  const usage = (msg as ResultPayload).contextUsage;
+  return prompt + num(usage?.outputTokens);
+}
+
+/** Text of one history message as the model receives it: user content (string)
  *  or block array, including tool_results and their nested content), assistant
  *  text + tool_use arguments, and OpenAI-style tool_calls. Used only for the
  *  local-context fallback — `messageRowText` in SessionManager deliberately
