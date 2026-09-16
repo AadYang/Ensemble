@@ -14,6 +14,7 @@ import {
 } from "@/lib/skill-api";
 import { useT } from "@/i18n/useT";
 import { getDialog } from "@/lib/dialog";
+import { CollapsibleSection, PANEL_OPEN_KEYS } from "./CollapsibleSection";
 
 const SOURCE_BADGE: Record<SkillSource, { label: string; color: string }> = {
   project: { label: "project", color: "var(--accent)" },
@@ -29,7 +30,6 @@ export function SkillPanel({ agentId }: { agentId?: string | null } = {}) {
    *  from /status — the SAME source the turn used (plan.skills + agent
    *  metadata), so this panel is a view and never a second state. */
   const [agentState, setAgentState] = useState<AgentSkillState | null>(null);
-  const [open, setOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -157,17 +157,8 @@ export function SkillPanel({ agentId }: { agentId?: string | null } = {}) {
   };
 
   return (
-    <div className="border-b border-[var(--border)]">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="w-full text-left px-3 py-2 flex items-center gap-2 text-xs hover:bg-[var(--bg-pane)]"
-      >
-        <span className="text-[var(--text-faint)]">{open ? "▾" : "▸"}</span>
-        <span className="text-[var(--text-dim)] tracking-wider">{t("skill.label")}</span>
-        <span className="text-[var(--text-faint)] ml-auto">{skills.length}</span>
-      </button>
-      {open && (
-        <div className="px-2 pb-2 flex flex-col gap-1 text-[11px]">
+    <CollapsibleSection storageKey={PANEL_OPEN_KEYS.skills} label={t("skill.label")} badge={skills.length}>
+      <div className="flex flex-col gap-1">
           <div className="flex gap-1 mb-1">
             <button
               onClick={() => {
@@ -347,8 +338,7 @@ export function SkillPanel({ agentId }: { agentId?: string | null } = {}) {
               </div>
             </div>
           )}
-        </div>
-      )}
-    </div>
+      </div>
+    </CollapsibleSection>
   );
 }

@@ -11,6 +11,7 @@ import {
 } from "@/lib/mcp-api";
 import { useT } from "@/i18n/useT";
 import { getDialog } from "@/lib/dialog";
+import { CollapsibleSection, PANEL_OPEN_KEYS } from "./CollapsibleSection";
 
 const STDIO_TEMPLATE = `{
   "command": "node",
@@ -24,7 +25,6 @@ const HTTP_TEMPLATE = `{
 
 export function McpServerPanel() {
   const [servers, setServers] = useState<McpServerDTO[]>([]);
-  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [transport, setTransport] = useState<McpTransport>("stdio");
@@ -103,19 +103,12 @@ export function McpServerPanel() {
   };
 
   return (
-    <div className="border-b border-[var(--border)]">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="w-full text-left px-3 py-2 flex items-center gap-2 text-xs hover:bg-[var(--bg-pane)]"
-      >
-        <span className="text-[var(--text-faint)]">{open ? "▾" : "▸"}</span>
-        <span className="text-[var(--text-dim)] tracking-wider">{t("mcp.label")}</span>
-        <span className="text-[var(--text-faint)] ml-auto">
-          {servers.filter((s) => s.enabled).length}/{servers.length}
-        </span>
-      </button>
-      {open && (
-        <div className="px-2 pb-2 flex flex-col gap-1 text-[11px]">
+    <CollapsibleSection
+      storageKey={PANEL_OPEN_KEYS.mcp}
+      label={t("mcp.label")}
+      badge={`${servers.filter((s) => s.enabled).length}/${servers.length}`}
+    >
+      <div className="flex flex-col gap-1">
           {servers.length === 0 && (
             <div className="px-2 py-1 text-[var(--text-faint)]">{t("mcp.empty")}</div>
           )}
@@ -195,8 +188,7 @@ export function McpServerPanel() {
               {t("mcp.add")}
             </button>
           )}
-        </div>
-      )}
-    </div>
+      </div>
+    </CollapsibleSection>
   );
 }

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type {
+  CapabilityFieldView,
   CapabilityViewModel,
   PermissionMode,
   RunPlanSettingField,
@@ -14,6 +15,7 @@ import type {
 } from "@agentorch/shared";
 import {
   capabilityView,
+  formatCapabilityFieldLines,
   isReasoningToken,
   REASONING_HINTS,
   REASONING_SYNTAX_RULE,
@@ -52,15 +54,29 @@ const PERMISSION_MODES: PermissionMode[] = [
 // levels this list does not know (`ultra`), so the field accepts a typed token.
 const REASONING_OPTION_ID = "reasoning-effort-options";
 
-/** The plan's settings surface: one row per field, read verbatim from the
- *  shared `CapabilityViewModel`, plus the identity the plan ran under and EVERY
- *  diagnostic.
- *
- *  Display-only, and deliberately so: the rows say what the plan resolved and
- *  why, and the controls that change a value are the fields above. Nothing here
- *  decides whether a field applies — `editable`, `disabledReason`, `options` and
- *  `rejectedChoices` were all decided once, in `shared/src/capability-view.ts`,
- *  which is also what the `/status` text and the context bar read. */
+function planFieldLabel(t: TranslateFn, field: string): string {
+  const key = `settings.plan.field.${field}`;
+  const label = t(key);
+  return label === key ? field : label;
+}
+
+function protocolLabel(t: TranslateFn, transport: string): string {
+  const key = `settings.transport.${transport}`;
+  const label = t(key);
+  return label === key ? transport : label;
+}
+
+function reasoningOptionLabel(t: TranslateFn, level: string): string {
+  const key = `settings.reasoningEffort.option.${level}`;
+  const label = t(key);
+  return label === key ? level : label;
+}
+
+function fieldByName(capability: CapabilityViewModel, field: RunPlanSettingField): CapabilityFieldView | null {
+  return capability.fields.find((r) => r.field === field) ?? null;
+}
+
+/** Same rows `/status` prints — collapsed under diagnostics so the form stays a form. */
 function PlanStatusSection({
   capability,
   t,
@@ -68,6 +84,7 @@ function PlanStatusSection({
   capability: CapabilityViewModel;
   t: TranslateFn;
 }) {
+  const [copied, setCopied] = useState(false);
   const plan = capability.planView;
   const header = capability.header;
   if (!plan || !header) {
@@ -77,15 +94,48 @@ function PlanStatusSection({
       </span>
     );
   }
+  const copy = async () => {
+    const lines = [
+      t("settings.plan.header", {
+        source: capability.runPlanSource,
+        hash: header.planHash,
+        at: header.resolvedAt,
+      }),
+      t("settings.plan.identity", {
+        providerScope: header.providerScope,
+        runtime: header.runtime,
+        version: header.runtimeVersion ?? "—",
+        transport: header.transport,
+        model: header.modelId,
+      }),
+      ...formatCapabilityFieldLines(capability.fields),
+    ];
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* the dump is still on screen */
+    }
+  };
   return (
     <div className="flex flex-col gap-1">
-      <span className="text-[10px] text-[var(--text-dim)] leading-tight">
-        {t("settings.plan.header", {
-          source: capability.runPlanSource,
-          hash: header.planHash.slice(0, 12),
-          at: header.resolvedAt,
-        })}
-      </span>
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] text-[var(--text-dim)] leading-tight">
+          {t("settings.plan.header", {
+            source: capability.runPlanSource,
+            hash: header.planHash.slice(0, 12),
+            at: header.resolvedAt,
+          })}
+        </span>
+        <button
+          type="button"
+          onClick={() => void copy()}
+          className="ml-auto px-1.5 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)]"
+        >
+          {copied ? t("settings.plan.copied") : t("settings.plan.copy")}
+        </button>
+      </div>
       <span className="text-[10px] text-[var(--text-faint)] leading-tight break-all">
         {t("settings.plan.identity", {
           providerScope: header.providerScope,
@@ -101,31 +151,21 @@ function PlanStatusSection({
           className="flex flex-col gap-0.5 border border-[var(--border)] px-1.5 py-1"
         >
           <div className="flex items-center gap-1">
-            <span className={row.editable ? "" : "text-[var(--text-faint)] line-through"}>
-              {row.field}
+            <span className={row.editable ? "" : "text-[var(--text-faint)]"}>
+              {planFieldLabel(t, row.field)}
             </span>
-            <span className="text-[10px] text-[var(--text-faint)]">{row.path}</span>
             <span className="ml-auto">
               {row.requested ?? "—"} → {row.resolved ?? "—"}
             </span>
           </div>
-          <div className="text-[10px] text-[var(--text-dim)]">
-            {t("settings.plan.row", {
-              outcome: row.outcome,
-              source: row.source,
-              confidence: row.confidence,
-            })}
-          </div>
-          {/* The server's sentence. A row that cannot be edited says why here
-              rather than leaving a disabled control unexplained — and the
-              reason comes from the view-model, not from this component deciding
-              that a disabled row probably wants one. */}
-          <div className={row.editable ? "text-[10px] text-[var(--text-faint)]" : "text-[10px] text-[var(--warn)]"}>
-            {row.disabledReason ?? row.reason}
-          </div>
-          {/* The value the route refused, shown AS-IS so the user can see what
-              they asked for. The control for this field stays enabled: the fix
-              is another value, not a locked field. */}
+          {!row.editable && (
+            <div className="text-[10px] text-[var(--text-faint)]">{t("settings.plan.na")}</div>
+          )}
+          {(row.rejection !== null || row.outcome === "rejected" || row.outcome === "unknown" || !row.editable) && (
+            <div className={row.editable ? "text-[10px] text-[var(--text-faint)]" : "text-[10px] text-[var(--warn)]"}>
+              {row.disabledReason ?? row.reason}
+            </div>
+          )}
           {row.rejection !== null && (
             <div className="text-[10px] text-[var(--warn)]">
               {t("settings.plan.rejectedValue", { value: row.rejection.value, code: row.rejection.code })}
@@ -138,16 +178,15 @@ function PlanStatusSection({
           ))}
         </div>
       ))}
-      <span className="text-[10px] text-[var(--text-dim)]">
-        {t("settings.plan.diagnostics", {
-          summary: (Object.entries(plan.diagnosticCounts) as [string, number][])
-            .map(([k, v]) => `${k}:${v}`)
-            .join(" "),
-        })}
-      </span>
-      {/* Every diagnostic, including the ones no other surface prints: a
-          diagnostic nobody renders is a fact the plan holds and the user cannot
-          see. */}
+      {plan.diagnostics.length > 0 && (
+        <span className="text-[10px] text-[var(--text-dim)]">
+          {t("settings.plan.diagnostics", {
+            summary: (Object.entries(plan.diagnosticCounts) as [string, number][])
+              .map(([k, v]) => `${k}:${v}`)
+              .join(" "),
+          })}
+        </span>
+      )}
       {plan.diagnostics.map((d, i) => (
         <span key={`${d.field}-${i}`} className="text-[10px] text-[var(--text-faint)] leading-tight">
           {t("settings.plan.diagnostic", {
@@ -157,16 +196,6 @@ function PlanStatusSection({
             confidence: d.confidence,
             detail: d.detail,
           })}
-        </span>
-      ))}
-      {plan.preferences.map((p) => (
-        <span key={p.field} className="text-[10px] text-[var(--text-faint)] leading-tight">
-          {t("settings.plan.preference", {
-            field: p.field,
-            requested: String(p.requested),
-            outcome: p.outcome,
-          })}
-          {p.rejection ? ` — ${p.rejection.code}: ${p.rejection.detail}` : ""}
         </span>
       ))}
     </div>
@@ -446,10 +475,20 @@ export function AgentSettings({
   // `planView.settings` here instead was a second read of the same contract: it
   // did not know about `disabledReason`, so "uneditable" and "why" could only be
   // reconnected by hand.
-  const planRow = (field: RunPlanSettingField) =>
-    capability.fields.find((r) => r.field === field) ?? null;
-  const reasoningPlanReason = planRow("reasoning")?.disabledReason ?? null;
-  const projectPlanReason = planRow("project")?.disabledReason ?? null;
+  const liveReasoning = fieldByName(capability, "reasoning");
+  const liveProject = fieldByName(capability, "project");
+  const draftReasoning = fieldByName(draftCapability, "reasoning");
+  const draftProject = fieldByName(draftCapability, "project");
+  const reasoningRow = draftReasoning ?? liveReasoning;
+  const projectRow = draftProject ?? liveProject;
+  const reasoningPlanReason = reasoningRow?.disabledReason ?? null;
+  const projectPlanReason = projectRow?.disabledReason ?? null;
+  const reasoningRejection = reasoningRow?.rejection ?? null;
+  const projectRejection = projectRow?.rejection ?? null;
+  const reasoningLadder = reasoningRow?.options ?? null;
+  const transportHeader = draftCapability.header ?? capability.header;
+  const transportName = transportHeader?.transport ?? null;
+  const showTransportBadge = transportName !== null && transportName !== "native-cli";
   const roleWeak = !effectiveTeamId && !effectiveSystemPrompt;
   const dirty =
     name.trim() !== summary.name ||
@@ -711,6 +750,13 @@ export function AgentSettings({
             </span>
           )}
         </label>
+        {showTransportBadge && transportName && (
+          <div className="text-[10px] text-[var(--text-faint)] leading-tight">
+            {t("settings.transport.badge", { protocol: protocolLabel(t, transportName) })}
+            {" · "}
+            {t("settings.transport.changeInProvider")}
+          </div>
+        )}
         <label className="flex flex-col gap-1">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
             {t("settings.label.systemPrompt")}
@@ -773,52 +819,81 @@ export function AgentSettings({
           </label>
         )}
         {supportsThinkingMode && (
-          <>
-            <label className="flex flex-col gap-1">
-              <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
-                {t("settings.label.reasoningEffort")}
-              </span>
-              {/* A text field with the common levels as suggestions, not a
-                  dropdown: a model may have a level this build has no hint for
-                  (`ultra`), and the stored value must stay visible and editable
-                  rather than being replaced by the nearest known option. */}
-              <input
-                list={REASONING_OPTION_ID}
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+              {t("settings.label.reasoningEffort")}
+            </span>
+            {reasoningLadder !== null ? (
+              <select
                 value={reasoningEffort}
                 onChange={(e) => setReasoningEffort(e.target.value)}
-                placeholder={t("settings.reasoningEffort.inherit")}
-                spellCheck={false}
-                autoComplete="off"
                 disabled={reasoningPlanReason !== null}
                 title={reasoningPlanReason ?? undefined}
                 className={
                   "bg-[var(--bg-pane)] border px-1.5 py-1 outline-none focus:border-[var(--accent)] " +
-                  (reasoningEffortInvalid ? "border-[var(--err)]" : "border-[var(--border)]")
+                  (reasoningEffortInvalid || reasoningRejection ? "border-[var(--err)]" : "border-[var(--border)]")
                 }
-              />
-              <datalist id={REASONING_OPTION_ID}>
-                {REASONING_HINTS.map((effort) => (
-                  <option key={effort} value={effort} />
+              >
+                <option value="">{t("settings.reasoningEffort.inherit")}</option>
+                {[
+                  ...reasoningLadder,
+                  ...(reasoningEffort.trim() && !reasoningLadder.includes(reasoningEffort)
+                    ? [reasoningEffort]
+                    : []),
+                ].map((level) => (
+                  <option key={level} value={level}>
+                    {reasoningOptionLabel(t, level)}
+                  </option>
                 ))}
-              </datalist>
+              </select>
+            ) : (
+              <>
+                <input
+                  list={REASONING_OPTION_ID}
+                  value={reasoningEffort}
+                  onChange={(e) => setReasoningEffort(e.target.value)}
+                  placeholder={t("settings.reasoningEffort.inherit")}
+                  spellCheck={false}
+                  autoComplete="off"
+                  disabled={reasoningPlanReason !== null}
+                  title={reasoningPlanReason ?? undefined}
+                  className={
+                    "bg-[var(--bg-pane)] border px-1.5 py-1 outline-none focus:border-[var(--accent)] " +
+                    (reasoningEffortInvalid ? "border-[var(--err)]" : "border-[var(--border)]")
+                  }
+                />
+                <datalist id={REASONING_OPTION_ID}>
+                  {REASONING_HINTS.map((effort) => (
+                    <option key={effort} value={effort} />
+                  ))}
+                </datalist>
+              </>
+            )}
+            {(reasoningPlanReason !== null ||
+              reasoningEffortInvalid ||
+              reasoningRejection !== null ||
+              (reasoningLadder === null && capability.planView != null)) && (
               <span
                 className={
                   "text-[10px] leading-tight " +
-                  (reasoningEffortInvalid ? "text-[var(--err)]" : "text-[var(--text-faint)]")
+                  (reasoningEffortInvalid || reasoningRejection
+                    ? "text-[var(--err)]"
+                    : "text-[var(--text-faint)]")
                 }
               >
                 {reasoningPlanReason !== null
                   ? reasoningPlanReason
                   : reasoningEffortInvalid
-                  ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE })
-                  : reasoningEffort.trim() === ""
-                    ? t("settings.reasoningEffort.hint.inherit")
-                    : REASONING_HINTS.includes(reasoningEffort)
-                      ? t(`settings.reasoningEffort.hint.${reasoningEffort}`)
-                      : t("settings.reasoningEffort.hint.custom")}
+                    ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE })
+                    : reasoningRejection !== null
+                      ? t("settings.plan.rejectedValue", {
+                          value: reasoningRejection.value,
+                          code: reasoningRejection.code,
+                        })
+                      : t("settings.reasoningEffort.unknownLadder")}
               </span>
-            </label>
-          </>
+            )}
+          </label>
         )}
         {sandboxSupported && (
           <>
@@ -854,57 +929,39 @@ export function AgentSettings({
             placeholder={t("project.placeholder")}
             disabled={projectPlanReason !== null}
             title={projectPlanReason ?? undefined}
-            className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
-          />
-          <span
             className={
-              "text-[10px] leading-tight " +
-              (projectPlanReason !== null ? "text-[var(--warn)]" : "text-[var(--text-faint)]")
+              "bg-[var(--bg-pane)] border px-1.5 py-1 outline-none focus:border-[var(--accent)] " +
+              (projectPlanReason !== null || projectRejection !== null
+                ? "border-[var(--err)]"
+                : "border-[var(--border)]")
             }
-          >
-            {projectPlanReason !== null
-              ? projectPlanReason
-              : projectRoot.trim()
-                ? projectRoot.trim()
-                : `${t("project.unbound")} — ${t("project.unbound.hint")}`}
-          </span>
+          />
+          {(projectPlanReason !== null || projectRejection !== null || !projectRoot.trim()) && (
+            <span
+              className={
+                "text-[10px] leading-tight " +
+                (projectPlanReason !== null || projectRejection !== null
+                  ? "text-[var(--warn)]"
+                  : "text-[var(--text-faint)]")
+              }
+            >
+              {projectPlanReason !== null
+                ? projectPlanReason
+                : projectRejection !== null
+                  ? t("settings.plan.rejectedValue", {
+                      value: projectRejection.value,
+                      code: projectRejection.code,
+                    })
+                  : `${t("project.unbound")} — ${t("project.unbound.hint")}`}
+            </span>
+          )}
         </label>
         {error && <div className="text-[var(--err)] text-[10px]">{error}</div>}
-        <div className="flex gap-2">
-          <button
-            onClick={onApply}
-            disabled={!dirty || busy || reasoningEffortInvalid}
-            title={reasoningEffortInvalid ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE }) : undefined}
-            className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
-          >
-            {t("settings.apply")}
-          </button>
-          <button
-            onClick={onClose}
-            className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)]"
-          >
-            {t("settings.cancel")}
-          </button>
-        </div>
-
-        <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
-          <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
-            {t("settings.plan.title")}
-          </span>
-          <PlanStatusSection capability={capability} t={t} />
-        </div>
-
-        {/* The DRAFT's plan, when there is one. Rendered from the same view-model
-            as everything above (a different plan, the same projection), so the
-            rows cannot disagree with the ones the write will produce. */}
-        {draftRequest !== null && (
-          <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
-            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
-              {t("settings.preview.title")}
-            </span>
-            {/* A proposal the API would REFUSE is shown as a refusal, with the
-                code the write would answer with — not discovered by submitting
-                and reading a 400. */}
+        {(draftPreview?.rejection ||
+          draftPreviewError !== null ||
+          draftPreview?.resolutionError != null ||
+          (draftPreview?.invalidated.length ?? 0) > 0) && (
+          <div className="flex flex-col gap-1 border-l-2 border-[var(--warn)] pl-2">
             {draftPreview?.rejection && (
               <span className="text-[10px] text-[var(--err)] leading-tight">
                 {t("settings.preview.rejected", {
@@ -921,9 +978,46 @@ export function AgentSettings({
                 {t("settings.invalidate.unresolved", { reason: draftPreview.resolutionError })}
               </span>
             )}
-            <PlanStatusSection capability={draftCapability} t={t} />
+            {(draftPreview?.invalidated.length ?? 0) > 0 && (
+              <span className="text-[10px] text-[var(--warn)] leading-tight">
+                {t("settings.preview.invalidated", { n: draftPreview!.invalidated.length })}
+              </span>
+            )}
           </div>
         )}
+        <div className="flex gap-2">
+          <button
+            onClick={onApply}
+            disabled={!dirty || busy || reasoningEffortInvalid || draftPreview?.rejection != null}
+            title={reasoningEffortInvalid ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE }) : undefined}
+            className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+          >
+            {t("settings.apply")}
+          </button>
+          <button
+            onClick={onClose}
+            className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)]"
+          >
+            {t("settings.cancel")}
+          </button>
+        </div>
+
+        <details className="border-t border-[var(--border)] pt-3">
+          <summary className="text-[10px] tracking-wider text-[var(--text-faint)] cursor-pointer select-none">
+            {t("settings.plan.title")}
+          </summary>
+          <div className="mt-2 flex flex-col gap-2">
+            <PlanStatusSection capability={capability} t={t} />
+            {draftRequest !== null && (
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+                  {t("settings.preview.title")}
+                </span>
+                <PlanStatusSection capability={draftCapability} t={t} />
+              </div>
+            )}
+          </div>
+        </details>
 
         <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.lifecycle")}</span>

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import type { TransportPreference } from "@agentorch/shared";
 import {
   createProvider,
   deleteProvider,
@@ -16,6 +17,7 @@ import { PROVIDER_PRESETS } from "@/lib/provider-presets";
 import { useT } from "@/i18n/useT";
 import { getDialog } from "@/lib/dialog";
 import { getCliSettings, type CliSettingsHealth } from "@/lib/settings-api";
+import { CollapsibleSection, PANEL_OPEN_KEYS } from "./CollapsibleSection";
 
 // W16 Slice 1.3 + W20 Slice 5.4: form models a runtime+entry decision tree
 // rather than the raw provider kind enum, mapping to kind on submit:
@@ -67,7 +69,6 @@ const kindFromRuntimeEntry = (runtime: Runtime, entry: Entry): ProviderKind => {
 export function ProviderPanel() {
   const t = useT();
   const [providers, setProviders] = useState<ProviderDTO[]>([]);
-  const [open, setOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -82,6 +83,7 @@ export function ProviderPanel() {
   // Commercial default for Codex provider creation. Users can still override
   // per provider or per agent.
   const [sandboxMode, setSandboxMode] = useState<SandboxMode | "">("danger-full-access");
+  const [transport, setTransport] = useState<TransportPreference>("auto");
   const [cliHealth, setCliHealth] = useState<CliSettingsHealth | null>(null);
 
   const refresh = async () => {
@@ -108,6 +110,7 @@ export function ProviderPanel() {
     setApiKey("");
     setManualModels("");
     setSandboxMode("danger-full-access");
+    setTransport("auto");
     setError(null);
   };
 
@@ -166,6 +169,7 @@ export function ProviderPanel() {
         apiKey: isLocal || isCodex ? null : apiKey.trim() || null,
         ...(manualParsed.length > 0 && !isLocal && !isCodex ? { models: manualParsed } : {}),
         ...(isCodex && sandboxMode ? { defaultSandbox: sandboxMode } : {}),
+        ...((kind === "openai-local" || kind === "openai-compat") ? { transport } : {}),
       });
       resetForm();
       setAdding(false);
@@ -211,6 +215,7 @@ export function ProviderPanel() {
               baseUrl: normalizedBaseUrl,
               apiKey: apiKey.trim() || undefined,
               ...(manualParsed.length > 0 ? { models: manualParsed } : {}),
+              ...((kind === "openai-local" || kind === "openai-compat") ? { transport } : {}),
             }),
       });
       setEditingId(null);
@@ -285,6 +290,7 @@ export function ProviderPanel() {
     setApiKey("");
     setManualModels(p.models.join("\n"));
     setSandboxMode((p.defaultSandbox as SandboxMode | null) ?? "");
+    setTransport(p.transport ?? "auto");
     setError(null);
   };
 
@@ -301,17 +307,12 @@ export function ProviderPanel() {
   const deprecatedCount = providers.filter((p) => p.disabled).length;
 
   return (
-    <div className="border-b border-[var(--border)]">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="w-full text-left px-3 py-2 flex items-center gap-2 text-xs hover:bg-[var(--bg-pane)]"
-      >
-        <span className="text-[var(--text-faint)]">{open ? "▾" : "▸"}</span>
-        <span className="text-[var(--text-dim)] tracking-wider">{t("provider.label")}</span>
-        <span className="text-[var(--text-faint)] ml-auto">{providers.length}</span>
-      </button>
-      {open && (
-        <div className="px-2 pb-2 flex flex-col gap-1 text-[11px]">
+    <CollapsibleSection
+      storageKey={PANEL_OPEN_KEYS.providers}
+      label={t("provider.label")}
+      badge={providers.length}
+    >
+      <div className="flex flex-col gap-1">
           {/* W16: deprecation banner — surfaces auto-disabled bedrock/vertex/autoManaged
                rows from the v0.0.2 migration. Per-row migrate button reuses the
                original baseUrl + apiKey to mint a fresh openai-compat provider.
@@ -347,6 +348,8 @@ export function ProviderPanel() {
                 setManualModels={setManualModels}
                 sandboxMode={sandboxMode}
                 setSandboxMode={setSandboxMode}
+                transport={transport}
+                setTransport={setTransport}
                 codexHealth={cliHealth?.codex ?? null}
                 codexRuntime={p.currentRuntime ?? null}
                 applyPreset={applyPreset}
@@ -413,6 +416,9 @@ export function ProviderPanel() {
                     ? `${p.deprecatedReason ?? "deprecated"} · ${t("provider.modelsCount", { n: p.models.length })}`
                     : t("provider.modelsCount", { n: p.models.length })}
                   {p.hasApiKey ? ` · ${t("provider.hasKey")}` : ""}
+                  {(p.kind === "openai-local" || p.kind === "openai-compat") && p.transport
+                    ? ` · ${p.transport}`
+                    : ""}
                 </div>
                 {refreshFlash?.id === p.id && (
                   <pre
@@ -500,6 +506,8 @@ export function ProviderPanel() {
               setManualModels={setManualModels}
               sandboxMode={sandboxMode}
               setSandboxMode={setSandboxMode}
+              transport={transport}
+              setTransport={setTransport}
               codexHealth={cliHealth?.codex ?? null}
               codexRuntime={null}
               applyPreset={applyPreset}
@@ -523,9 +531,8 @@ export function ProviderPanel() {
               {t("provider.add")}
             </button>
           )}
-        </div>
-      )}
-    </div>
+      </div>
+    </CollapsibleSection>
   );
 }
 
@@ -547,6 +554,8 @@ function ProviderForm({
   setManualModels,
   sandboxMode,
   setSandboxMode,
+  transport,
+  setTransport,
   codexHealth,
   codexRuntime,
   applyPreset,
@@ -572,6 +581,8 @@ function ProviderForm({
   setManualModels: (s: string) => void;
   sandboxMode: SandboxMode | "";
   setSandboxMode: (s: SandboxMode | "") => void;
+  transport: TransportPreference;
+  setTransport: (s: TransportPreference) => void;
   codexHealth: CliSettingsHealth["codex"] | null;
   codexRuntime: ProviderDTO["currentRuntime"] | null;
   applyPreset: (id: string) => void;
@@ -709,6 +720,27 @@ function ProviderForm({
           <div className="text-[10px] text-[var(--text-faint)] leading-snug">
             {t("provider.form.modelsHint")}
           </div>
+          {runtime === "openai" && (
+            <>
+              <div className="text-[10px] tracking-wider text-[var(--text-faint)] mt-1">
+                {t("provider.form.transport")}
+              </div>
+              <select
+                className="bg-[var(--bg)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)]"
+                value={transport}
+                onChange={(e) => setTransport(e.target.value as TransportPreference)}
+              >
+                <option value="auto">{t("provider.form.transport.auto")}</option>
+                <option value="responses">{t("provider.form.transport.responses")}</option>
+                <option value="chat-completions">{t("provider.form.transport.chat-completions")}</option>
+              </select>
+              <div className="text-[10px] text-[var(--text-faint)] leading-snug">
+                {isOpenaiOfficial && transport === "auto"
+                  ? t("provider.form.transport.hint.official")
+                  : t(`provider.form.transport.hint.${transport}`)}
+              </div>
+            </>
+          )}
         </>
       )}
       {error && <div className="text-[var(--err)] text-[10px]">{error}</div>}

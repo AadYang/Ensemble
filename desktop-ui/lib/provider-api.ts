@@ -1,5 +1,5 @@
 import { apiError, apiFetch } from "@/lib/api";
-import type { PlatformKey } from "@agentorch/shared";
+import type { PlatformKey, TransportPreference } from "@agentorch/shared";
 
 export type ProviderKind =
   | "anthropic-local"
@@ -66,6 +66,8 @@ export interface ProviderDTO {
   codexCliMinSupportedVersion?: string;
   /** W20: openai-codex per-provider default sandbox mode. */
   defaultSandbox?: SandboxMode | null;
+  /** OpenAI-shape HTTP protocol preference. `null` = not chosen. */
+  transport?: TransportPreference | null;
   createdAt: string;
 }
 
@@ -84,6 +86,7 @@ export async function createProvider(input: {
   models?: string[];
   /** W20: openai-codex providers seed defaultSandbox at creation. */
   defaultSandbox?: SandboxMode | null;
+  transport?: TransportPreference | null;
 }): Promise<ProviderDTO> {
   const res = await apiFetch("/api/providers", {
     method: "POST",
@@ -104,6 +107,7 @@ export async function patchProvider(
     models?: string[];
     /** W20: openai-codex providers can update defaultSandbox. */
     defaultSandbox?: SandboxMode | null;
+    transport?: TransportPreference | null;
   },
 ): Promise<ProviderDTO> {
   const res = await apiFetch(`/api/providers/${id}`, {

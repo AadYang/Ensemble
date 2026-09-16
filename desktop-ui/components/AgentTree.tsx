@@ -98,11 +98,19 @@ export function AgentTree({
         return (
           <div key={team.id} className="border-b border-[var(--border)]">
             <div
-              className="group w-full text-left px-2 py-1.5 flex items-center gap-2 bg-[var(--bg-pane)]/40 hover:bg-[var(--bg-pane)] cursor-pointer"
+              className="group w-full text-left px-2 py-1.5 flex items-center gap-2 bg-[var(--bg-pane)]/40 hover:bg-[var(--bg-pane)] cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)]"
+              role="button"
+              tabIndex={0}
+              aria-expanded={!collapsed}
               onClick={() => setCollapsedTeams((p) => ({ ...p, [team.id]: !collapsed }))}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                setCollapsedTeams((p) => ({ ...p, [team.id]: !collapsed }));
+              }}
               title={team.description ?? team.name}
             >
-              <span className="text-[var(--text-faint)]">{collapsed ? "▸" : "▾"}</span>
+              <span className="text-[var(--text)] group-hover:text-[var(--accent)]">{collapsed ? "▸" : "▾"}</span>
               <span className="text-[var(--accent)] text-[10px] tracking-wider uppercase">team</span>
               <span className="font-bold text-[var(--text)] truncate flex-1">{team.name}</span>
               <span className="text-[var(--text-faint)] text-[10px]">{nodes.length}</span>
