@@ -1,4 +1,5 @@
-import type { AgentStatus, AgentSummary, PermissionMode, ReasoningEffort, SandboxMode, SdkMessage } from "./protocol";
+import type { AgentStatus, AgentSummary, PermissionMode, SandboxMode, SdkMessage } from "./protocol";
+import type { ReasoningEffort } from "./reasoning";
 
 export type CloudRealtimeRole = "desktop" | "web";
 
@@ -10,6 +11,9 @@ export interface CloudAgentConfigPatch {
   permissionMode?: PermissionMode;
   sandboxMode?: SandboxMode | null;
   reasoningEffort?: ReasoningEffort | null;
+  /** The canonical project root; `null` unbinds the agent. */
+  projectRoot?: string | null;
+  /** Legacy alias of `projectRoot`, accepted for an older web client. */
   codexWorkspace?: string | null;
   teamId?: string | null;
   closed?: boolean;

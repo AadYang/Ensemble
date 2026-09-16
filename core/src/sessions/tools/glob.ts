@@ -9,10 +9,12 @@ import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import type { NormalizedTool } from "./types.js";
+import { finalizeLineSearch, lineList, openToolOutputSpool } from "./tool-output.js";
 
 const GLOB_SCHEMA = z.object({
   pattern: z.string().min(1).describe("Glob pattern (e.g. 'src/**/*.ts')."),
-  path: z.string().optional().describe("Root directory; defaults to cwd."),
+  path: z.string().optional().describe("Root directory; defaults to the agent's project root."),
+  head_limit: z.number().int().min(1).optional().describe("Limit paths returned."),
 });
 
 function globToRegex(g: string): RegExp {
@@ -59,20 +61,49 @@ async function* walk(dir: string): AsyncGenerator<string> {
 export const globTool: NormalizedTool<typeof GLOB_SCHEMA> = {
   name: "Glob",
   description:
-    "Find files matching a glob pattern. Returns absolute paths, sorted. Skips node_modules / .git. " +
-    "Supports *, **, ? wildcards.",
+    "Find files matching a glob pattern. Returns absolute paths in the directory walk's own order " +
+    "(stable for a given tree). Skips node_modules / .git. Supports *, **, ? wildcards. A match set " +
+    "too large to hand over whole is stored as an artifact and returned as a preview plus its " +
+    "id/sha256/byte size.",
   parameters: GLOB_SCHEMA,
-  async execute({ pattern, path }) {
-    const root = resolve(path ?? ".");
+  async execute({ pattern, path, head_limit }, ctx) {
+    // A relative root is resolved against the agent's project root, not
+    // against the sidecar's process directory.
+    const root = path ? resolve(ctx.projectRoot, path) : ctx.projectRoot;
     const re = globToRegex(pattern);
-    const results: string[] = [];
-    for await (const f of walk(root)) {
-      // Compare both against the absolute path and against the path relative
-      // to the root, since users often write patterns relative to the root.
-      const rel = f.slice(root.length + 1);
-      if (re.test(rel) || re.test(f)) results.push(f);
+    // Paths are written into the spool as the walk finds them, so a `**/*` over a
+    // large tree costs the turn's result budget in memory instead of the size of
+    // the match set. That is also why the set is no longer sorted: sorting needs
+    // every path in hand at once, which is the accumulation this removes. The
+    // walk order is stable for a given tree, so the artifact of a match set (and
+    // of the next run over the same tree) is byte-identical either way.
+    const spool = openToolOutputSpool(ctx, "glob");
+    try {
+      let matched = 0;
+      const push = lineList(spool);
+      for await (const f of walk(root)) {
+        // Compare both against the absolute path and against the path relative
+        // to the root, since users often write patterns relative to the root.
+        const rel = f.slice(root.length + 1);
+        if (re.test(rel) || re.test(f)) {
+          matched++;
+          push(f);
+        }
+      }
+      // An unbounded match set used to be the whole answer here: `**/*` over a
+      // large tree produced tens of thousands of paths in one tool result, with
+      // nothing saying how many were left. It now goes through the same rule Grep
+      // uses — bounded and labelled, or stored whole as an artifact.
+      return finalizeLineSearch({
+        ctx,
+        tool: "Glob",
+        source: spool,
+        matched,
+        headLimit: head_limit ?? null,
+        narrowing: 'narrow the pattern (e.g. "src/**/*.ts") or search a subdirectory with path=',
+      });
+    } finally {
+      spool.dispose();
     }
-    results.sort();
-    return results.join("\n");
   },
 };

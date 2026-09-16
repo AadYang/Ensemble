@@ -17,7 +17,7 @@ export function NewAgentDialog({
     name: string;
     providerId: string | null;
     model: string | null;
-    codexWorkspace: string | null;
+    projectRoot: string | null;
   }) => void;
 }) {
   const t = useT();
@@ -26,6 +26,10 @@ export function NewAgentDialog({
   const [providers, setProviders] = useState<ProviderDTO[]>([]);
   const [providerId, setProviderId] = useState<string | null>(null);
   const [model, setModel] = useState("");
+  // Empty string = "unbound project", which is the honest default: a new agent
+  // has no directory until the user names one, and guessing one (home dir, the
+  // app's own dir, the last agent's) would decide it for them.
+  const [projectRoot, setProjectRoot] = useState("");
   const nameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -90,7 +94,7 @@ export function NewAgentDialog({
       name: trimmed,
       providerId: providerId ?? null,
       model: model || null,
-      codexWorkspace: null,
+      projectRoot: projectRoot.trim() || null,
     });
     onClose();
   };
@@ -171,6 +175,26 @@ export function NewAgentDialog({
                 <option key={m} value={m}>{m}</option>
               ))}
             </select>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+              {t("project.label")}
+            </span>
+            <input
+              value={projectRoot}
+              onChange={(e) => setProjectRoot(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  onConfirm();
+                }
+              }}
+              placeholder={t("project.placeholder")}
+              className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+            />
+            <span className="text-[10px] text-[var(--text-faint)]">
+              {projectRoot.trim() ? projectRoot.trim() : t("project.unbound.hint")}
+            </span>
           </label>
           <div className="flex gap-2 pt-1">
             <button

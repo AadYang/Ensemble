@@ -1,4 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { RuntimeOptions } from "../runtimes/types.js";
 import { __setSkillsForTest, type SkillEntry } from "../../skills/index.js";
 
@@ -6,7 +9,11 @@ process.env.AGENTORCH_DB_PATH = ":memory:";
 
 const capturedRuntimeOptions: RuntimeOptions[] = [];
 
-vi.mock("../runtimes/index.js", () => ({
+// Only `chooseRuntime` is replaced: the module's other exports (the
+// kind→scope table the run plan is keyed by) have to be the REAL ones, or the
+// test would assert against a scope no production caller ever sees.
+vi.mock("../runtimes/index.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runtimes/index.js")>()),
   chooseRuntime: () => ({
     async *query(opts: RuntimeOptions) {
       capturedRuntimeOptions.push(opts);
@@ -34,6 +41,8 @@ vi.mock("../../cli-config.js", () => ({
 let prisma: typeof import("../../db.js").prisma;
 let SessionManager: typeof import("../SessionManager.js").SessionManager;
 let runtimeHistoryFromCompletedTurns: typeof import("../SessionManager.js").runtimeHistoryFromCompletedTurns;
+let isReasoningRejection: typeof import("../SessionManager.js").isReasoningRejection;
+type ReasoningRejectionDetail = import("../SessionManager.js").ReasoningRejectionDetail;
 
 class StubHub {
   events: Array<{ kind: "session" | "broadcast"; msg: Record<string, unknown> }> = [];
@@ -74,7 +83,9 @@ function deferred<T = void>(): {
 
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
-  ({ SessionManager, runtimeHistoryFromCompletedTurns } = await import("../SessionManager.js"));
+  ({ SessionManager, runtimeHistoryFromCompletedTurns, isReasoningRejection } = await import(
+    "../SessionManager.js"
+  ));
 });
 
 beforeEach(() => {
@@ -87,12 +98,18 @@ describe("reasoning effort flow", () => {
     ["anthropic-local", "high"],
     ["openai-codex", "xhigh"],
     ["openai-codex", "max"],
+    // `openai-local` is not excluded by a provider-kind whitelist: the kind
+    // decides whether the ADAPTER can express the setting (it can), never which
+    // levels a model supports.
+    ["openai-local", "high"],
   ] as const)("passes patched reasoning effort to %s runtime", async (kind, effort) => {
     const provider = await prisma.provider.create({
       data: {
         name: `reasoning-${kind}-${effort}`,
         kind,
         models: ["test-model"],
+        // Only the HTTP kinds need one; the local CLI kinds carry their own auth.
+        apiKey: kind === "openai-local" ? "sk-test" : null,
         metadata: kind === "openai-codex" ? { defaultSandbox: "danger-full-access" } : {},
       },
     });
@@ -115,8 +132,16 @@ describe("reasoning effort flow", () => {
     expect(capturedRuntimeOptions).toHaveLength(1);
     const opts = capturedRuntimeOptions[0]!;
     expect(opts.provider.kind).toBe(kind);
-    expect(opts.reasoningEffort).toBe(effort);
+    // Read from the plan the runtime was handed: the SDK parameter and the
+    // `/status` report are the same field of the same snapshot.
+    expect(opts.runPlan.execution.reasoningEffort).toBe(effort);
     expect(opts.resume).toBeUndefined();
+    // ...and the report says the same value for the same turn: the SDK
+    // parameter is `runPlan.execution.reasoningEffort`, which is exactly what
+    // `resolved` reports — not a second resolution that could disagree.
+    const status = await sessions.getStatusReport(agent.id);
+    expect(status?.runPlan?.reasoning.resolved).toBe(effort);
+    expect(status?.runPlanSource).toBe("last-turn");
   });
 
   it("passes null reasoning effort after clearing the override", async () => {
@@ -146,7 +171,9 @@ describe("reasoning effort flow", () => {
 
     expect(capturedRuntimeOptions).toHaveLength(1);
     const opts = capturedRuntimeOptions[0]!;
-    expect(opts.reasoningEffort).toBeNull();
+    // `inherit`: the plan carries NO value, which is how every runtime knows
+    // to omit the parameter. `null` and the literal "inherit" both land here.
+    expect(opts.runPlan.execution.reasoningEffort).toBeUndefined();
     expect(opts.resume).toBeUndefined();
   });
 
@@ -223,7 +250,7 @@ describe("reasoning effort flow", () => {
     const opts = capturedRuntimeOptions[0]!;
     expect(opts.resume).toBeUndefined();
     expect(opts.model).toBe("gpt-5.5");
-    expect(opts.reasoningEffort).toBe("xhigh");
+    expect(opts.runPlan.execution.reasoningEffort).toBe("xhigh");
     expect((opts.agentMetadata as Record<string, unknown>).sandboxMode).toBe("danger-full-access");
     const historyText = JSON.stringify(opts.history);
     expect(historyText).toContain("compact summary before model switch");
@@ -294,12 +321,31 @@ describe("reasoning effort flow", () => {
   });
 
   it("passes active skill bodies in the current prompt on native resume without changing the stored user message", async () => {
+    // A REAL file: `readSkillByName` re-reads the body from `path` on every load
+    // on purpose (a skill deleted after discovery must not keep steering the
+    // agent from a stale cache), so a fixture that only registers a body in
+    // memory would be testing a read path production never takes.
+    const skillDir = mkdtempSync(join(tmpdir(), "resume-skill-"));
+    const skillPath = join(skillDir, "SKILL.md");
+    writeFileSync(
+      skillPath,
+      [
+        "---",
+        "name: resume-skill",
+        "description: Use when handling resume skill workflow requests",
+        "---",
+        "",
+        "RESUME SKILL BODY: follow the current-turn skill instructions.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
     const skill: SkillEntry = {
       name: "resume-skill",
       description: "Use when handling resume skill workflow requests",
       body: "RESUME SKILL BODY: follow the current-turn skill instructions.",
       source: "ensemble",
-      path: "/tmp/resume-skill/SKILL.md",
+      path: skillPath,
     };
     __setSkillsForTest([skill]);
     const provider = await prisma.provider.create({
@@ -669,8 +715,31 @@ describe("reasoning effort flow", () => {
     expect(meta.codexUsageSnapshot).toBeUndefined();
     expect(meta.codexResumeSignature).toBeUndefined();
     const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
+    // One ACTIVE row: the summary. The originals are not gone — they moved to
+    // the archive in the same transaction, which the assertions below check.
     expect(rows).toHaveLength(1);
     expect(JSON.stringify(rows[0]?.payload)).toContain("summary after compact");
+    // The summary is verifiable: it names the generation, the seq range it
+    // stands for, the contract version and the hash of the originals.
+    const payload = rows[0]?.payload as Record<string, unknown>;
+    expect(payload.subtype).toBe("compact");
+    expect(typeof payload.generation).toBe("number");
+    expect(payload.summaryVersion).toBe(1);
+    const range = payload.messageRange as { fromSeq: number; toSeq: number; count: number };
+    expect(range.count).toBe(3);
+    expect(typeof payload.sourceHash).toBe("string");
+    // ...and the archive reproduces that hash from the raw records, so a reader
+    // never has to trust the summary's own claim.
+    const archived = await sessions.readArchivedGeneration(agent.id, payload.generation as number, null);
+    expect(archived?.records).toHaveLength(3);
+    expect(archived?.sourceHash).toBe(payload.sourceHash);
+    expect(archived?.records.map((r) => r.originalSeq)).toEqual([...archived!.records.map((r) => r.originalSeq)].sort((a, b) => a - b));
+    expect(archived?.text).toContain("old answer");
+    // A second compact does not renumber or collide: generations are monotonic.
+    const next = await sessions.compactAgent(agent.id);
+    expect(next).not.toBeNull();
+    const generations = await sessions.listArchivedGenerations(agent.id);
+    expect(generations.map((g) => g.generation)).toEqual([1, 2]);
   });
 
   it("marks compact summaries as background in runtime history", () => {
@@ -747,12 +816,144 @@ describe("reasoning effort flow", () => {
     expect(status?.effectiveSandboxMode).toBe("workspace-write");
     expect(status?.sandboxSource).toBe("provider");
     expect(status?.reasoningEffort).toBe("high");
-    expect(status?.runtimeCwd.length).toBeGreaterThan(0);
+    // ...and the plan half of the report says the SAME thing, with where the
+    // value came from. `resolved` is the field the runtime reads, so a status
+    // that disagreed with it would be the "two answers in one turn" bug.
+    expect(status?.runPlan?.reasoning.requested).toBe("high");
+    expect(status?.runPlan?.reasoning.resolved).toBe("high");
+    expect(status?.runPlan?.reasoning.outcome).toBe("applied");
+    // `test-model` is in no catalog, so the ladder is honestly unknown — the
+    // value went through as user-declared and is NOT reported as supported.
+    expect(status?.runPlan?.reasoning.levels).toBeNull();
+    expect(status?.runPlan?.reasoning.levelsOrigin).toBe("unknown");
+    expect(status?.runPlan?.reasoning.rejection).toBeNull();
+    // The turn's directory comes from the plan; this agent is unbound, so it is
+    // the scratch dir (never the process's own cwd, which is why the value is
+    // asserted against the resolved plan rather than merely "non-empty").
+    expect(status?.runtimeCwd).toBe(status?.projectRootState?.value);
+    expect(status?.projectRootState?.source).toBe("scratch");
+    expect(status?.projectRootState?.state).toBe("unbound");
+    expect(status?.runtimeCwd ?? "").not.toBe(process.cwd());
     expect(status?.systemPromptHash).toMatch(/^[0-9a-f]{16}$/);
     expect(status?.storedSystemPromptHash).toBe("old-hash");
     expect(status?.systemPromptHashMatchesStored).toBe(false);
     expect(status?.hasResumeInfo).toBe(true);
     expect(status?.hasCodexResumeSignature).toBe(true);
     expect(status?.hasCodexUsageSnapshot).toBe(true);
+  });
+});
+
+// ── the refusal / unknown / unreadable-value contracts ─────────────────────
+//
+// Three states that must not be confused with one another:
+//   • the model's ladder is known and excludes the value → refused, nothing written
+//   • the model's ladder is unknown → the value goes through as user-declared
+//   • the STORED value is not a usable token  → nothing sent, nothing rewritten,
+//     and the report says so instead of showing it as a deliberate "inherit"
+describe("reasoning overrides against a known ladder", () => {
+  it("refuses a level the model's own ladder excludes, before writing anything", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "reasoning-ladder-codex",
+        kind: "openai-codex",
+        models: ["gpt-5.5"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "agent-ladder-codex",
+        providerId: provider.id,
+        model: "gpt-5.5",
+        metadata: { reasoningEffort: "high" },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    // `max` is a legal token and a level gpt-5.5's ladder does not have. The
+    // refusal has to be structured (which model, which levels, whose authority)
+    // and it has to happen BEFORE the write: the previously stored `high` must
+    // still be there, not replaced by a value the plan refused.
+    let thrown: unknown;
+    try {
+      await sessions.patchAgent(agent.id, { reasoningEffort: "max" });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(isReasoningRejection(thrown)).toBe(true);
+    const detail = (thrown as { detail: ReasoningRejectionDetail }).detail;
+    expect(detail.code).toBe("REASONING_EFFORT_UNSUPPORTED");
+    expect(detail.requested).toBe("max");
+    expect(detail.model).toBe("gpt-5.5");
+    expect(detail.supportedLevels).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(detail.reason).toContain("max");
+
+    const row = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (row?.metadata ?? {}) as Record<string, unknown>;
+    expect(meta.reasoningEffort).toBe("high");
+    expect(meta.lastSessionId).toBeUndefined();
+  });
+
+  it("keeps a safe level for an unknown ladder instead of nulling it", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "reasoning-unknown-ladder",
+        kind: "openai-codex",
+        models: ["mystery-model-x"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: { name: "agent-unknown-ladder", providerId: provider.id, model: "mystery-model-x" },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    await sessions.patchAgent(agent.id, { reasoningEffort: "ultra" });
+    const row = await prisma.agent.findUnique({ where: { id: agent.id } });
+    expect(((row?.metadata ?? {}) as Record<string, unknown>).reasoningEffort).toBe("ultra");
+
+    const status = await sessions.getStatusReport(agent.id);
+    // Applied, and honest about why that is not the same as "supported".
+    expect(status?.runPlan?.reasoning.resolved).toBe("ultra");
+    expect(status?.runPlan?.reasoning.outcome).toBe("applied");
+    expect(status?.runPlan?.reasoning.levels).toBeNull();
+    expect(status?.runPlan?.reasoning.levelsSource).toMatch(/no evidence|unknown/i);
+    expect(status?.runPlan?.reasoning.rejection).toBeNull();
+  });
+
+  it("reports an unusable stored value instead of letting it read as inherit", async () => {
+    const provider = await prisma.provider.create({
+      data: {
+        name: "reasoning-handedited",
+        kind: "openai-codex",
+        models: ["mystery-model-x"],
+        metadata: { defaultSandbox: "danger-full-access" },
+      },
+    });
+    // Written straight to the row: this is the hand-edited / legacy shape, not
+    // something `patchAgent` would ever accept.
+    const HAND_EDITED = 'high"; rm -rf /';
+    const agent = await prisma.agent.create({
+      data: {
+        name: "agent-handedited",
+        providerId: provider.id,
+        model: "mystery-model-x",
+        metadata: { reasoningEffort: HAND_EDITED },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+
+    const status = await sessions.getStatusReport(agent.id);
+    expect(status?.reasoningEffort).toBeNull();
+    expect(status?.storedReasoningUnusable?.raw).toBe(HAND_EDITED);
+    expect(status?.storedReasoningUnusable?.reason).toMatch(/not a valid reasoning level/i);
+
+    await sessions.sendMessage(agent.id, "run with the stored value");
+    // Nothing is sent (the token would be interpolated into TOML/argv), and the
+    // plan does not blame the model for it — the model never saw the value.
+    expect(capturedRuntimeOptions[0]!.runPlan.execution.reasoningEffort).toBeUndefined();
+    // ...and the stored value is left exactly as it was: no silent clearing.
+    const row = await prisma.agent.findUnique({ where: { id: agent.id } });
+    expect(((row?.metadata ?? {}) as Record<string, unknown>).reasoningEffort).toBe(HAND_EDITED);
   });
 });

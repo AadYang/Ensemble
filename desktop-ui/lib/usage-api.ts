@@ -12,6 +12,15 @@ export interface UsageBucket {
   /** How many rows in this bucket contributed local counts (≥1 nonzero). */
   turnsWithLocal: number;
   turns: number;
+  /** How many of `turns` are actually IN `costUSD` (priced, including
+   *  flat-rate subscription turns whose price is genuinely $0). */
+  turnsCostKnown: number;
+  /** How many of `turns` have no price configured and contributed nothing to
+   *  `costUSD` — so `costUSD` is a lower bound whenever this is > 0. */
+  turnsCostUnknown: number;
+  /** Flat-rate turns inside `turnsCostKnown`. Their $0 is a billing model, not
+   *  a measurement. */
+  turnsSubscription: number;
 }
 
 export interface UsageSummary {

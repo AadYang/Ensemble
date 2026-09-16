@@ -27,8 +27,8 @@ export const editTool: NormalizedTool<typeof EDIT_SCHEMA> = {
     "Perform an in-place text replacement. By default `old_string` must match exactly once; set " +
     "`replace_all: true` to replace every occurrence. The file must exist (use Write to create).",
   parameters: EDIT_SCHEMA,
-  async execute({ file_path, old_string, new_string, replace_all = false }) {
-    const abs = resolveSafe(file_path);
+  async execute({ file_path, old_string, new_string, replace_all = false }, ctx) {
+    const abs = resolveSafe(file_path, ctx.projectRoot);
     const original = await readFile(abs, "utf8");
     if (!original.includes(old_string)) {
       throw new Error(`old_string not found in ${abs}`);

@@ -21,6 +21,23 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
 import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs, type ConversationSearchScope } from "./conversation-search.js";
+import {
+  ARTIFACT_READ_DESCRIPTION,
+  ARTIFACT_SEARCH_DESCRIPTION,
+  renderArtifactRead,
+  renderArtifactSearch,
+  type ArtifactReadResult,
+  type ArtifactSearchResult,
+} from "./artifacts.js";
+import type { ArtifactReadArgs, ArtifactSearchArgs } from "./artifact-mcp.js";
+import {
+  JOB_WAIT_MAX_MS,
+  jobCancelToolText,
+  jobStartToolText,
+  jobStatusToolText,
+  jobWaitToolText,
+  type JobToolContext,
+} from "./jobs.js";
 import { backgroundSubagentStartedText } from "./sessions/subagentFinish.js";
 
 export const BRIDGE_TOKEN = randomUUID();
@@ -92,6 +109,7 @@ export interface BridgeHandlers {
      *  forwarder both dropped the flag, so `Task(background=true)` silently
      *  became a blocking call for every codex agent. */
     background?: boolean;
+    projectRoot?: string;
   }) => Promise<{
     finalText: string;
     subagentId: string;
@@ -99,9 +117,23 @@ export interface BridgeHandlers {
   }>;
   /** Stateless help — always available; agent-id closure not needed. */
   ensembleHelp?: (args: { topic?: string }) => Promise<string>;
-  /** Skill registry inspection / explicit invocation. */
+  /** Skill registry inspection / explicit invocation.
+   *
+   *  skill_invoke may resolve to the structured read result instead of a
+   *  string: the in-process MCP server turns `{ok:false}` into isError, while
+   *  the HTTP bridge (codex) can only carry text and serializes it. */
   skillList?: () => Promise<string>;
-  skillInvoke?: (args: { name: string }) => Promise<string>;
+  skillInvoke?: (args: { name: string }) => Promise<string | object>;
+  /** Reading a stored result artifact (peer source output, peer_query
+   *  transcript, conversation_search page, subagent final). Synchronous: a
+   *  SQLite read plus an in-process sha256 check. */
+  artifactRead?: (args: ArtifactReadArgs) => ArtifactReadResult;
+  artifactSearch?: (args: ArtifactSearchArgs) => ArtifactSearchResult;
+  /** The job primitive, bound to this agent. Present for every codex agent:
+   *  codex's own shell tool has exactly the ownership problem jobs.ts exists
+   *  to solve (work anchored to a process shorter-lived than the work), so the
+   *  bridge would be the one runtime without the fix. */
+  jobs?: JobToolContext;
 }
 
 const handlersByAgent = new Map<string, BridgeHandlers>();
@@ -125,8 +157,42 @@ export type InternalToolName =
   | "ensemble_help"
   | "skill_list"
   | "skill_invoke"
+  | "artifact_read"
+  | "artifact_search"
   | "ask_user"
-  | "Task";
+  | "Task"
+  | "job_start"
+  | "job_status"
+  | "job_wait"
+  | "job_cancel";
+
+/** The stdio forwarder hands back the JSON string the core produced; recover
+ *  the structure so the `ok:false` flag survives as an MCP error instead of
+ *  being flattened into text that looks like a result. */
+function reparseArtifactToolResult(raw: string): ArtifactReadResult | ArtifactSearchResult | string {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && "ok" in parsed) {
+      return parsed as ArtifactReadResult | ArtifactSearchResult;
+    }
+  } catch {
+    /* not JSON — fall through and pass it along as text */
+  }
+  return raw;
+}
+
+/** Both bridge transports carry text only, so a structured artifact result is
+ *  rendered here. `ok:false` becomes an MCP error: a model that receives
+ *  "ARTIFACT_NOT_FOUND" as ordinary content reads it as artifact text. */
+function artifactToolContent(value: ArtifactReadResult | ArtifactSearchResult | string): {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+} {
+  if (typeof value === "string") return { content: [{ type: "text", text: value }] };
+  if (!value.ok) return { content: [{ type: "text", text: JSON.stringify(value) }], isError: true };
+  const text = "hits" in value ? renderArtifactSearch(value) : renderArtifactRead(value);
+  return { content: [{ type: "text", text }] };
+}
 
 export type InternalToolInvoker = (name: InternalToolName, args: Record<string, unknown>) => Promise<string>;
 
@@ -175,9 +241,37 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
     case "skill_list":
       if (!handlers.skillList) throw new Error("skill_list is not available for this agent");
       return handlers.skillList();
-    case "skill_invoke":
+    case "skill_invoke": {
       if (!handlers.skillInvoke) throw new Error("skill_invoke is not available for this agent");
-      return handlers.skillInvoke({ name: String(args.name ?? "") });
+      const out = await handlers.skillInvoke({ name: String(args.name ?? "") });
+      // This path is text-only (it backs InternalToolInvoker + the streamable
+      // HTTP bridge), so a structured result is serialized here. The in-process
+      // MCP server below keeps the object and maps `ok:false` to isError.
+      return typeof out === "string" ? out : JSON.stringify(out);
+    }
+    case "artifact_read": {
+      if (!handlers.artifactRead) throw new Error("artifact_read is not available for this agent");
+      return JSON.stringify(
+        handlers.artifactRead({
+          id: String(args.id ?? ""),
+          cursor: typeof args.cursor === "string" ? args.cursor : undefined,
+          pageBytes: typeof args.pageBytes === "number" ? args.pageBytes : undefined,
+        }),
+      );
+    }
+    case "artifact_search": {
+      if (!handlers.artifactSearch) throw new Error("artifact_search is not available for this agent");
+      return JSON.stringify(
+        handlers.artifactSearch({
+          id: String(args.id ?? ""),
+          query: String(args.query ?? ""),
+          cursor: typeof args.cursor === "string" ? args.cursor : undefined,
+          caseSensitive: args.caseSensitive === true,
+          maxHits: typeof args.maxHits === "number" ? args.maxHits : undefined,
+          snippetBytes: typeof args.snippetBytes === "number" ? args.snippetBytes : undefined,
+        }),
+      );
+    }
     case "ask_user":
       if (!handlers.askUser) throw new Error("ask_user is not available for this agent");
       return handlers.askUser({
@@ -191,16 +285,42 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
           description: String(args.description ?? ""),
           prompt: String(args.prompt ?? ""),
           background: args.background === true,
+          ...(args.projectRoot === undefined ? {} : { projectRoot: String(args.projectRoot) }),
         }),
       );
+    case "job_start":
+      return jobStartToolText(jobsCtx(handlers), {
+        command: String(args.command ?? ""),
+        ...(args.cwd === undefined ? {} : { cwd: String(args.cwd) }),
+        ...(typeof args.timeout_ms === "number" ? { timeout_ms: args.timeout_ms } : {}),
+      });
+    case "job_status":
+      return jobStatusToolText(jobsCtx(handlers), {
+        ...(args.job_id === undefined ? {} : { job_id: String(args.job_id) }),
+      }).text;
+    case "job_wait":
+      return (await jobWaitToolText(jobsCtx(handlers), {
+        job_id: String(args.job_id ?? ""),
+        ...(typeof args.timeout_ms === "number" ? { timeout_ms: args.timeout_ms } : {}),
+      })).text;
+    case "job_cancel":
+      return jobCancelToolText(jobsCtx(handlers), { job_id: String(args.job_id ?? "") }).text;
   }
+}
+
+/** The bridge's invariant: an agent that has no job context has no job tools.
+ *  A missing context is refused here rather than answered with an empty list,
+ *  so "you have no jobs" can never be produced by a tool that cannot see them. */
+function jobsCtx(handlers: BridgeHandlers): JobToolContext {
+  if (!handlers.jobs) throw new Error("the job tools are not available for this agent");
+  return handlers.jobs;
 }
 
 export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer {
   const mcp = new McpServer({ name: "agentorch-internal", version: "1.0.0" });
   mcp.tool(
     "peer_send",
-    "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include bounded source-output. interrupt=true is emergency-only and requires interruptReason.",
+    "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
     {
       target: z.string().min(1),
       message: z.string().min(1),
@@ -218,7 +338,7 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   );
   mcp.tool(
     "peer_query",
-    "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). Use to gather more context when a handoff feels under-specified.",
+    "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). The transcript is stored whole as an artifact and returned verbatim when it fits the turn budget; otherwise you get a first page plus an <<<artifact id=... sha256=...>>> handle to continue with artifact_read. A subagent is private to the agent that spawned it: another agent's subagent cannot be queried — ask its parent instead.",
     {
       target: z.string().min(1),
       limit: z.number().int().min(1).max(50).optional(),
@@ -255,6 +375,29 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
     async (args) => ({ content: [{ type: "text", text: await invoke("skill_invoke", args) }] }),
   );
   mcp.tool(
+    "artifact_read",
+    ARTIFACT_READ_DESCRIPTION,
+    {
+      id: z.string().min(1),
+      cursor: z.string().optional(),
+      pageBytes: z.number().int().optional(),
+    },
+    async (args) => artifactToolContent(reparseArtifactToolResult(await invoke("artifact_read", args))),
+  );
+  mcp.tool(
+    "artifact_search",
+    ARTIFACT_SEARCH_DESCRIPTION,
+    {
+      id: z.string().min(1),
+      query: z.string().min(1),
+      cursor: z.string().optional(),
+      caseSensitive: z.boolean().optional(),
+      maxHits: z.number().int().optional(),
+      snippetBytes: z.number().int().optional(),
+    },
+    async (args) => artifactToolContent(reparseArtifactToolResult(await invoke("artifact_search", args))),
+  );
+  mcp.tool(
     "ask_user",
     "Ask the human user a question and wait for their answer. Pass option labels; the returned string is the chosen label.",
     { question: z.string().min(1), options: z.array(z.string().min(1)).min(1) },
@@ -267,6 +410,38 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
       "working, and you are sent a `subagent-finished` message when it reaches a terminal state.",
     { description: z.string().min(1), prompt: z.string().min(1), background: z.boolean().optional() },
     async (args) => ({ content: [{ type: "text", text: await invoke("Task", args) }] }),
+  );
+  mcp.tool(
+    "job_start",
+    "Start a long-running command whose OWNER IS ENSEMBLE'S SERVER, not this agent process, and return immediately with a job id. " +
+      "Use this — not a background shell — for anything that may outlive the current turn: builds, installers, test suites, long downloads. " +
+      "A background shell is a child of this agent process, so it is killed when the session is recycled and its exit is never recorded; " +
+      "a job survives that, keeps writing to a log file, and always ends with a recorded status.",
+    {
+      command: z.string().min(1),
+      cwd: z.string().optional(),
+      timeout_ms: z.number().int().min(1).optional(),
+    },
+    async (args) => ({ content: [{ type: "text", text: await invoke("job_start", args) }] }),
+  );
+  mcp.tool(
+    "job_status",
+    "Report one job's status (running / exited / failed / cancelled / lost), its exit code, and the last lines of its log. " +
+      "With no job id, list this agent's jobs. `lost` means the process is gone without a recorded exit — never reported as success.",
+    { job_id: z.string().optional() },
+    async (args) => ({ content: [{ type: "text", text: await invoke("job_status", args) }] }),
+  );
+  mcp.tool(
+    "job_wait",
+    `Block until a job reaches a terminal status or the timeout elapses (max ${JOB_WAIT_MAX_MS}ms), then report it like job_status does.`,
+    { job_id: z.string().min(1), timeout_ms: z.number().int().min(1).max(JOB_WAIT_MAX_MS).optional() },
+    async (args) => ({ content: [{ type: "text", text: await invoke("job_wait", args) }] }),
+  );
+  mcp.tool(
+    "job_cancel",
+    "Kill a running job and its descendants. The job is recorded as `cancelled`, with whatever it printed kept in its log.",
+    { job_id: z.string().min(1) },
+    async (args) => ({ content: [{ type: "text", text: await invoke("job_cancel", args) }] }),
   );
   return mcp;
 }
@@ -336,7 +511,7 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const peerSend = handlers.peerSend;
       mcp.tool(
         "peer_send",
-        "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include bounded source-output. interrupt=true is emergency-only and requires interruptReason.",
+        "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
         {
           target: z.string().min(1),
           message: z.string().min(1),
@@ -360,7 +535,7 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const peerQuery = handlers.peerQuery;
       mcp.tool(
         "peer_query",
-        "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). Use to gather more context when a handoff feels under-specified.",
+        "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). The transcript is stored whole as an artifact and returned verbatim when it fits the turn budget; otherwise you get a first page plus an <<<artifact id=... sha256=...>>> handle to continue with artifact_read. A subagent is private to the agent that spawned it: another agent's subagent cannot be queried — ask its parent instead.",
         {
           target: z.string().min(1),
           limit: z.number().int().min(1).max(50).optional(),
@@ -417,7 +592,49 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
         "skill_invoke",
         "Load a specific skill's body into your context by name. Use when auto-activation missed or when the user invokes by name.",
         { name: z.string().min(1) },
-        async (args) => ({ content: [{ type: "text", text: await skillInvoke(args) }] }),
+        async (args) => {
+          const value = await skillInvoke(args);
+          if (value !== null && typeof value === "object") {
+            // A structured result carries its own ok flag; `skill_invoke` must
+            // never report a failed read as a successful tool call, or the
+            // model treats "SKILL_NOT_FOUND" as if it were the skill body.
+            const failed = (value as { ok?: unknown }).ok === false;
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify(value) }],
+              ...(failed ? { isError: true } : {}),
+            };
+          }
+          return { content: [{ type: "text" as const, text: value }] };
+        },
+      );
+    }
+    if (handlers.artifactRead) {
+      const artifactRead = handlers.artifactRead;
+      mcp.tool(
+        "artifact_read",
+        ARTIFACT_READ_DESCRIPTION,
+        {
+          id: z.string().min(1),
+          cursor: z.string().optional(),
+          pageBytes: z.number().int().optional(),
+        },
+        async (args) => artifactToolContent(artifactRead(args)),
+      );
+    }
+    if (handlers.artifactSearch) {
+      const artifactSearch = handlers.artifactSearch;
+      mcp.tool(
+        "artifact_search",
+        ARTIFACT_SEARCH_DESCRIPTION,
+        {
+          id: z.string().min(1),
+          query: z.string().min(1),
+          cursor: z.string().optional(),
+          caseSensitive: z.boolean().optional(),
+          maxHits: z.number().int().optional(),
+          snippetBytes: z.number().int().optional(),
+        },
+        async (args) => artifactToolContent(artifactSearch(args)),
       );
     }
     if (handlers.askUser) {
@@ -441,11 +658,13 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
         "Task",
         "Delegate a subtask to a subagent. The subagent runs to completion and returns its final text. " +
           "Set background=true to run it detached (returns the subagent id immediately; you are sent a " +
-          "`subagent-finished` message when it ends). Use for parallelizable scoped work.",
+          "`subagent-finished` message when it ends). Use for parallelizable scoped work. " +
+          "The subagent works in YOUR project root unless you pass projectRoot to place it elsewhere.",
         {
           description: z.string().min(1),
           prompt: z.string().min(1),
           background: z.boolean().optional(),
+          projectRoot: z.string().optional(),
         },
         async (args) => {
           const out = await spawnTask(args);
@@ -458,6 +677,69 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
                   : JSON.stringify({ finalText: out.finalText, subagentId: out.subagentId }),
               },
             ],
+          };
+        },
+      );
+    }
+
+    if (handlers.jobs) {
+      const jobs = handlers.jobs;
+      mcp.tool(
+        "job_start",
+        "Start a long-running command whose OWNER IS ENSEMBLE'S SERVER, not this agent process, and return immediately with a job id. " +
+          "Use this — not a background shell — for anything that may outlive the current turn: builds, installers, test suites, long downloads. " +
+          "A background shell is a child of this agent process, so it is killed when the session is recycled and its exit is never recorded; " +
+          "a job survives that, keeps writing to a log file, and always ends with a recorded status.",
+        {
+          command: z.string().min(1),
+          cwd: z.string().optional(),
+          timeout_ms: z.number().int().min(1).optional(),
+        },
+        async (args) => {
+          try {
+            return { content: [{ type: "text" as const, text: jobStartToolText(jobs, args) }] };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `job_start failed: ${String(err)}` }],
+              isError: true,
+            };
+          }
+        },
+      );
+      mcp.tool(
+        "job_status",
+        "Report one job's status (running / exited / failed / cancelled / lost), its exit code, and the last lines of its log. " +
+          "With no job id, list this agent's jobs. `lost` means the process is gone without a recorded exit — never reported as success.",
+        { job_id: z.string().optional() },
+        async (args) => {
+          const r = jobStatusToolText(jobs, args);
+          return {
+            content: [{ type: "text" as const, text: r.text }],
+            ...(r.isError ? { isError: true as const } : {}),
+          };
+        },
+      );
+      mcp.tool(
+        "job_wait",
+        `Block until a job reaches a terminal status or the timeout elapses (max ${JOB_WAIT_MAX_MS}ms), then report it like job_status does.`,
+        { job_id: z.string().min(1), timeout_ms: z.number().int().min(1).max(JOB_WAIT_MAX_MS).optional() },
+        async (args) => {
+          const r = await jobWaitToolText(jobs, args);
+          return {
+            content: [{ type: "text" as const, text: r.text }],
+            ...(r.isError ? { isError: true as const } : {}),
+          };
+        },
+      );
+      mcp.tool(
+        "job_cancel",
+        "Kill a running job and its descendants. The job is recorded as `cancelled`, with whatever it printed kept in its log.",
+        { job_id: z.string().min(1) },
+        async (args) => {
+          const r = jobCancelToolText(jobs, args);
+          return {
+            content: [{ type: "text" as const, text: r.text }],
+            ...(r.isError ? { isError: true as const } : {}),
           };
         },
       );

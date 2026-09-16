@@ -30,6 +30,8 @@ let SessionManager: typeof import("../SessionManager.js").SessionManager;
 let isResumeScopedStreamFailure: typeof import("../SessionManager.js").isResumeScopedStreamFailure;
 let isRuntimeResumeRecoverySignal: typeof import("../SessionManager.js").isRuntimeResumeRecoverySignal;
 let runtimeHistoryFromCompletedTurns: typeof import("../SessionManager.js").runtimeHistoryFromCompletedTurns;
+let runtimeHistoryTurnsFromCompletedRows: typeof import("../SessionManager.js").runtimeHistoryTurnsFromCompletedRows;
+let resolveHistoryBudget: typeof import("../../capability/history-budget.js").resolveHistoryBudget;
 let agentRowToSummary: typeof import("../SessionManager.js").agentRowToSummary;
 
 type Broadcast = Record<string, unknown>;
@@ -57,7 +59,8 @@ class StubHub {
 
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
-  ({ SessionManager, isResumeScopedStreamFailure, isRuntimeResumeRecoverySignal, runtimeHistoryFromCompletedTurns, agentRowToSummary } = await import("../SessionManager.js"));
+  ({ SessionManager, isResumeScopedStreamFailure, isRuntimeResumeRecoverySignal, runtimeHistoryFromCompletedTurns, runtimeHistoryTurnsFromCompletedRows, agentRowToSummary } = await import("../SessionManager.js"));
+  ({ resolveHistoryBudget } = await import("../../capability/history-budget.js"));
 });
 
 async function ensureCodexCliPath(): Promise<void> {
@@ -84,7 +87,10 @@ function deferred<T = void>(): {
   return { promise, resolve, reject };
 }
 
-async function withTimeout<T>(promise: Promise<T>, label: string, ms = 1_000): Promise<T> {
+// Same reason as background-spawn-concurrency: the window exists to catch "the
+// turn never dispatched", and the first turn of an openai-compat provider also
+// carries the lazy /responses probe (bounded at 2.5s).
+async function withTimeout<T>(promise: Promise<T>, label: string, ms = 6_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
@@ -178,6 +184,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(hub.socketMessages.map((msg) => msg.type)).toEqual([
       "agent_updated",
       "status",
+      "context_usage",
       "user_question",
     ]);
     expect((hub.socketMessages[0]?.agent as { id?: string; status?: string })?.id).toBe(agent.id);
@@ -187,14 +194,25 @@ describe("SessionManager cancel + stale-session recovery", () => {
       sessionId: agent.id,
       status: "awaiting_user_input",
     });
+    // The context readout is server-owned state and is part of the resync: a
+    // client that just subscribed has no reading of its own, and an explicit
+    // null says "nothing has been observed" instead of leaving the UI to guess.
+    // (The last run plan travels the same way — and is asserted to be ABSENT
+    // here, because this agent has never been dispatched: no plan in, no plan
+    // out, rather than an empty one the UI would render as a resolved route.)
     expect(hub.socketMessages[2]).toMatchObject({
+      type: "context_usage",
+      sessionId: agent.id,
+      usage: null,
+    });
+    expect(hub.socketMessages[3]).toMatchObject({
       type: "user_question",
       sessionId: agent.id,
       question: "Pick a path",
       options: ["A", "B"],
     });
 
-    const reqId = String(hub.socketMessages[2]?.reqId);
+    const reqId = String(hub.socketMessages[3]?.reqId);
     sessions.resolveUserQuestion(agent.id, reqId, "A");
     await expect(questionPromise).resolves.toBe("A");
   });
@@ -238,101 +256,13 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(hub.sessionMessages.some((m) => m.sessionId === stuck.id && m.msg.code === "RUNTIME_STOPPED")).toBe(true);
   });
 
-  it("runtime idle timeout aborts the active run and reports ERROR", async () => {
-    const agent = await prisma.agent.create({ data: { name: "idle-timeout-agent" } });
-    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
-    await prisma.message.create({
-      data: {
-        agentId: agent.id,
-        seq: 0,
-        type: "user",
-        payload: { type: "user", message: { role: "user", content: "finish idle task" } },
-      },
-    });
-
-    const hub = new StubHub();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sessions = new SessionManager(hub as any);
-    const abort = new AbortController();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (sessions as any).running.set(agent.id, {
-      id: agent.id,
-      runId: "run-timeout",
-      abort,
-      seq: 1,
-      userInput: "finish idle task",
-      startedSeq: 0,
-      userMessageSeq: 0,
-      startedAt: new Date().toISOString(),
-      autoAllowedTools: new Set<string>(),
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (sessions as any).recordLiveTranscript(agent.id, {
-      type: "stream_event",
-      event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial idle work" } },
-    });
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stopped = await (sessions as any).handleRuntimeIdleTimeout(agent.id, "run-timeout", 1_000);
-
-    expect(stopped).toBe(true);
-    expect(abort.signal.aborted).toBe(true);
-    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("ERROR");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((sessions as any).running.has(agent.id)).toBe(false);
-    expect(
-      hub.sessionMessages.some(
-        (m) =>
-          m.sessionId === agent.id &&
-          m.msg.type === "error" &&
-          m.msg.code === "RUNTIME_IDLE_TIMEOUT" &&
-          String(m.msg.message).includes("automatically stopped this turn"),
-      ),
-    ).toBe(true);
-    const interrupted = await prisma.message.findFirst({
-      where: { agentId: agent.id, type: "system" },
-      orderBy: { seq: "desc" },
-    });
-    expect(JSON.stringify(interrupted?.payload)).toContain("interrupted_turn");
-    expect(JSON.stringify(interrupted?.payload)).toContain("finish idle task");
-    expect(JSON.stringify(interrupted?.payload)).toContain("partial idle work");
-    expect(
-      hub.sessionMessages.some(
-        (m) => m.sessionId === agent.id && m.msg.type === "status" && m.msg.status === "error",
-      ),
-    ).toBe(true);
-  });
-
-  it("runtime idle timeout ignores a stale run id after a new run owns the session", async () => {
-    const agent = await prisma.agent.create({ data: { name: "idle-timeout-stale-run" } });
-    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
-
-    const hub = new StubHub();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sessions = new SessionManager(hub as any);
-    const abort = new AbortController();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (sessions as any).running.set(agent.id, {
-      id: agent.id,
-      runId: "new-run",
-      abort,
-      seq: 0,
-      userInput: "new active request",
-      startedSeq: 0,
-      startedAt: new Date().toISOString(),
-      autoAllowedTools: new Set<string>(),
-    });
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stopped = await (sessions as any).handleRuntimeIdleTimeout(agent.id, "old-run", 1_000);
-
-    expect(stopped).toBe(false);
-    expect(abort.signal.aborted).toBe(false);
-    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("RUNNING");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((sessions as any).running.get(agent.id)?.runId).toBe("new-run");
-    expect(hub.sessionMessages.some((m) => m.sessionId === agent.id && m.msg.code === "RUNTIME_IDLE_TIMEOUT")).toBe(false);
-  });
+  // Phase 4 replaced the two tests that used to sit here ("runtime idle timeout
+  // aborts the active run and reports ERROR", and its stale-run twin). They
+  // asserted the behaviour the phase removes: silence crossing a threshold
+  // calling forceStopRun and persisting an ERROR. The liveness state machine
+  // they described now has its own gate — `src/__tests__/liveness-controller.test.ts`
+  // (the controller, on a fake clock) and `src/capability/__tests__/liveness.test.ts`
+  // (the pure transition) — and nothing here asserts a timer any more.
 
   it("cancel persists interrupted_turn so continue can recover the active request", async () => {
     const agent = await prisma.agent.create({ data: { name: "cancel-interrupted-agent" } });
@@ -1469,8 +1399,20 @@ describe("SessionManager cancel + stale-session recovery", () => {
       type: "stream_event",
       event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial interrupted output" } },
     });
+    // Phase 4: this fixture needs the FACT "the source run ended before it
+    // answered", and it used to produce it by firing the idle watchdog — the
+    // clock that no longer exists. `forceStopRun` is what actually owns that
+    // record (interrupted turn + no live run + a status), so the fixture asks
+    // for it directly rather than reaching for a timer that has been removed.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (sessions as any).handleRuntimeIdleTimeout(source.id, "source-timeout", 1_000);
+    await (sessions as any).forceStopRun(source.id, {
+      expectedRunId: "source-timeout",
+      dbStatus: "ERROR",
+      protoStatus: "error",
+      logPrefix: "test-interrupted-source",
+      interruptedReason: "RUNTIME_STREAM_CLOSED",
+      error: { code: "RUNTIME_STREAM_CLOSED", message: "the runtime's event stream closed before this run produced a result" },
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (sessions as any).running.set(target.id, {
       id: target.id,
@@ -1918,12 +1860,14 @@ describe("SessionManager cancel + stale-session recovery", () => {
     });
     const sessions = new SessionManager(new StubHub() as never);
 
-    await sessions.patchAgent(agent.id, { systemPrompt: "new role", reasoningEffort: "max" });
+    // "high" is INSIDE gpt-5.5's ladder; the test is about resume clearing, and a
+    // level the model does not have is now refused before anything is written.
+    await sessions.patchAgent(agent.id, { systemPrompt: "new role", reasoningEffort: "high" });
 
     const after = await prisma.agent.findUnique({ where: { id: agent.id } });
     const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
     expect(after?.systemPrompt).toBe("new role");
-    expect(meta.reasoningEffort).toBe("max");
+    expect(meta.reasoningEffort).toBe("high");
     expect(meta.lastSessionId).toBeUndefined();
     expect(meta.codexUsageSnapshot).toBeUndefined();
     expect(meta.codexResumeSignature).toBeUndefined();
@@ -2929,7 +2873,12 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(JSON.stringify(history)).not.toContain("incomplete current prompt");
   });
 
-  it("keeps latest interrupted_turn alongside compact summary under long history budget", () => {
+  // Phase 3: this used to assert the SILENT trim (28 messages / 18 000 chars ->
+  // "question 1" gone, total under 25 000 chars, nothing said). The trim is
+  // gone. Reading the rows no longer drops anything; sizing is the budget
+  // resolver's job, and it reports the overflow as a seq range instead of
+  // deleting the middle of the transcript.
+  it("keeps the whole transcript when reading rows, and lets the budget report overflow", () => {
     const rows: Array<{ type: string; payload: unknown; seq?: number }> = [
       {
         type: "system",
@@ -2973,8 +2922,42 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(text).toContain("critical compact summary");
     expect(text).toContain("latest interrupted request");
     expect(text).toContain("important partial output");
-    expect(text).not.toContain("question 1");
-    expect(text.length).toBeLessThan(25_000);
+    // Nothing is dropped by the READER any more. The turn that used to vanish
+    // is present in the transcript the budget is allowed to consider; whether
+    // it is sent is decided (and reported) below.
+    expect(text).toContain("question 1");
+
+    // The same content, measured against a real window. The overflow is an
+    // explicit contiguous seq range, and a diagnostic says so — which is the
+    // whole difference between "dropped" and "does not fit the budget".
+    const turns = runtimeHistoryTurnsFromCompletedRows(rows);
+    const outcome = resolveHistoryBudget({
+      turns: turns.map((entry) => entry.turn),
+      systemPrompt: "system prompt",
+      toolsText: null,
+      turnPrompt: "next question",
+      context: {
+        effectiveWindow: 2_000,
+        advertisedContextWindow: 2_000,
+        outputReserve: 0,
+        compactionThreshold: null,
+        contextBudget: null,
+      },
+      strategy: "local-rebuild",
+      strategyReason: "test",
+      measure: (t) => t.length,
+    });
+    expect(outcome.history.counts.dropped).toBeGreaterThan(0);
+    expect(outcome.history.overflow).not.toBeNull();
+    expect(outcome.history.overflow!.count).toBe(outcome.history.counts.dropped);
+    expect(outcome.history.diagnostics.join(" ")).toContain("do not fit the budget");
+    // The newest content is what survives an over-budget transcript, and the
+    // summary is pinned, so continuity is not the part that gets cut.
+    const kept = JSON.stringify(outcome.included);
+    expect(kept).toContain("latest interrupted request");
+    expect(kept).toContain("critical compact summary");
+    expect(outcome.history.tokenBudget).not.toBeNull();
+    expect(outcome.history.counting).toBe("exact");
   });
 
   it("does not keep interrupted_turn as current resume target after a later result resolves it", () => {
@@ -3021,21 +3004,50 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(text).not.toContain("old partial");
   });
 
-  it("caps runtime history to precise recent context instead of full transcript", () => {
-    const rows: Array<{ type: string; payload: unknown }> = Array.from({ length: 80 }, (_, i) => ({
-      type: i % 2 === 0 ? "user" : "assistant",
-      payload:
-        i % 2 === 0
-          ? { type: "user", message: { role: "user", content: `question ${i}` } }
-          : { type: "assistant", message: { content: [{ type: "text", text: `answer ${i}` }] } },
-    }));
+  it("hands over the whole completed transcript; the budget, not the reader, decides", () => {
+    const rows: Array<{ type: string; payload: unknown; seq?: number }> = Array.from(
+      { length: 80 },
+      (_, i) => ({
+        type: i % 2 === 0 ? "user" : "assistant",
+        seq: i,
+        payload:
+          i % 2 === 0
+            ? { type: "user", message: { role: "user", content: `question ${i}` } }
+            : { type: "assistant", message: { content: [{ type: "text", text: `answer ${i}` }] } },
+      }),
+    );
     rows.push({ type: "result", payload: { type: "result", subtype: "success" } });
 
     const history = runtimeHistoryFromCompletedTurns(rows);
 
-    expect(history.length).toBeLessThanOrEqual(28);
-    expect(JSON.stringify(history)).toContain("answer 79");
-    expect(JSON.stringify(history)).not.toContain("question 0");
+    // The reader stopped trimming at 28 messages in phase 3: a marker in the
+    // first message used to stop existing, with nothing anywhere to say so.
+    expect(history.length).toBe(80);
+    const text = JSON.stringify(history);
+    expect(text).toContain("answer 79");
+    expect(text).toContain("question 0");
+    // What the old cap dropped silently is now a NUMBER and a RANGE that the
+    // plan carries: the resolver reports the cut instead of making it.
+    const outcome = resolveHistoryBudget({
+      turns: runtimeHistoryTurnsFromCompletedRows(rows).map((entry) => entry.turn),
+      systemPrompt: null,
+      toolsText: null,
+      context: {
+        effectiveWindow: 30,
+        advertisedContextWindow: null,
+        outputReserve: 0,
+        compactionThreshold: null,
+        contextBudget: null,
+      },
+      strategy: "local-rebuild",
+      strategyReason: "test",
+      measure: (t) => Math.max(1, Math.ceil(t.length / 4)),
+    });
+    expect(outcome.history.counts.dropped).toBeGreaterThan(0);
+    expect(outcome.history.counts.included + outcome.history.counts.dropped).toBe(80);
+    expect(outcome.history.overflow).not.toBeNull();
+    expect(outcome.history.overflow!.count).toBe(outcome.history.counts.dropped);
+    expect(outcome.history.diagnostics.join("\n")).toContain("ranged compact path");
   });
 
   it("spawns a background subagent detached, inheriting teamId, tagged for the sidebar", async () => {
@@ -3126,7 +3138,13 @@ describe("SessionManager cancel + stale-session recovery", () => {
       3_000,
     );
     expect(res.background).toBeUndefined();
-    expect(res.finalText).toBe("sub done"); // blocking → returns the child's output
+    // Blocking → the parent gets the child's output. Since the artifact phase it
+    // arrives inside the handle block (the child's answer is stored whole before
+    // the parent sees any of it), so the claim to assert is that the text is
+    // there VERBATIM plus a handle that reads back to it — not that it is bare.
+    expect(res.finalText).toContain("sub done");
+    expect(res.finalText).toMatch(/<<<artifact id=[0-9a-f-]{36} kind=subagent-final bytes=8 sha256=[0-9a-f]{64}/);
+    expect(res.finalText).toContain("artifact>>>");
 
     const child = await prisma.agent.findUnique({ where: { id: res.subagentId } });
     expect(child?.teamId).toBe(team.id);

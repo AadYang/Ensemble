@@ -24,7 +24,7 @@ importers:
         specifier: workspace:*
         version: link:../shared
       '@anthropic-ai/claude-agent-sdk':
-        specifier: ^0.3.233
+        specifier: 0.3.233
         version: 0.3.233(@anthropic-ai/sdk@0.93.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(zod@4.4.3)
       '@fastify/static':
         specifier: ^8.0.0
@@ -36,10 +36,10 @@ importers:
         specifier: ^1.29.0
         version: 1.29.0(zod@4.4.3)
       '@openai/agents':
-        specifier: ^0.16.1
+        specifier: 0.16.1
         version: 0.16.1(ws@8.21.3)(zod@4.4.3)
       '@openai/codex-sdk':
-        specifier: ^0.147.0
+        specifier: 0.147.0
         version: 0.147.0
       fastify:
         specifier: ^5.1.0

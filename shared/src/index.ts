@@ -1,4 +1,12 @@
 export * from "./protocol";
+export * from "./peer-contact";
+export * from "./reasoning";
+export type * from "./capability";
+export * from "./run-plan-view";
+export * from "./status-report";
+export * from "./context-bar-view";
+export * from "./capability-view";
+export * from "./cloud-config";
 export * from "./cloud-realtime";
 export * from "./layout";
 export * from "./layout-ops";

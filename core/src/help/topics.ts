@@ -19,7 +19,7 @@ User-facing surfaces (DO NOT try to script these — point the user to them):
   - sidebar tree: list of agents, click to switch panes
   - provider panel: add / edit providers, refresh model lists
   - MCP panel: add / enable MCP servers
-  - settings dialog (per agent): name, model, provider, permissionMode, sandbox, codexWorkspace
+  - settings dialog (per agent): name, model, provider, permissionMode, sandbox, projectRoot
   - usage stats dialog: token + cost analytics
   - chat pane: slash commands + ↑/↓ history walking
   - permission popups: appear in-app when write tools are called
@@ -125,7 +125,7 @@ that case the manually-entered model fallback list is used.
 
 1. WebSocket message (from frontend):
    { type: "create_agent", name, systemPrompt?, model?, providerId?,
-     parentId?, codexWorkspace?, teamId? }
+     parentId?, projectRoot?, teamId? }
 
 2. UI: "+" button in sidebar. Spawns a NewAgentDialog with name / provider / model fields.
 
@@ -136,10 +136,14 @@ Notes:
   - teamId puts the new agent on an existing team (server validates the team
     exists). Members on a team get a TEAM CONTEXT block injected into their
     systemPrompt at turn start (see teams topic).
-  - codexWorkspace is only valid when bound to an openai-codex provider; must be
-    an absolute existing directory
-  - When provider is openai-codex AND no codexWorkspace is given, the agent's
-    cwd defaults to Ensemble's data dir. Set codexWorkspace for project work.
+  - projectRoot is the directory the agent works in; it is provider-agnostic
+    (Claude, Codex and OpenAI runtimes all honor it), must be an absolute
+    existing directory, and is validated at write time
+  - projectRoot and the legacy alias codexWorkspace mean the same thing. Send
+    one of them; sending both with different values is rejected
+  - With no projectRoot the agent is UNBOUND and works in its own scratch dir
+    (<DATA_DIR>/agents/<id>/scratch) — not in your project, and not in
+    Ensemble's own directory. Set projectRoot for real project work.
 `,
 
   permissions: `Per-agent permissionMode controls how write tools (Edit / Write / Bash) gate:
@@ -206,8 +210,10 @@ peer_send (async push — recipient processes as a new user turn):
     - fork:     "same task, different approach — don't retrace my path"
     - raw:      plain forwarding
   includeSource defaults to "auto": raw sends only the message; continue,
-  review, and fork include a bounded <<<source-output>>> block with the
-  sender's current or most recent key output.
+  review, and fork include a <<<source-output>>> block with the sender's
+  current or most recent key output — verbatim when it fits the recipient's
+  window, otherwise a first-page preview plus an artifact handle (read the rest
+  with artifact_read; the sender's output is stored whole either way).
   interrupt=true is emergency-only and requires interruptReason. Use it only
   when delayed delivery would make the message stale or cause wrong work.
 
@@ -216,6 +222,27 @@ peer_query (sync pull — read peer's recent text turns from DB):
   - Returns oldest → newest text turns, prefixed [user] / [assistant]
   - Tool-use noise filtered out
   - Use when you got a handoff and need more context than the embedded source
+  - The whole transcript is stored as an ARTIFACT and reported verbatim when it
+    fits this turn's budget; when it does not, the result carries a first-page
+    preview plus an <<<artifact id=... sha256=... bytes=...>>> handle. Continue
+    with artifact_read(id, cursor) — paged, UTF-8 safe, hash-checked
+
+artifact_read / artifact_search (read a stored result in full):
+  - Every large result (peer source output, peer_query transcript,
+    conversation_search page, subagent final answer) is saved whole first, then
+    previewed within the turn's budget — nothing is truncated away unstored
+  - artifact_read(id, cursor?, pageBytes?) → one page: byteFrom/byteTo,
+    endReached, nextCursor; concatenating the pages reproduces the original
+    bytes exactly. The header carries the sha256 of the WHOLE body
+  - artifact_search(id, query, cursor?, caseSensitive?, maxHits?) → hit byte
+    offsets + short snippets + a resumable cursor. Snippets point at the
+    content; they are not a substitute for reading it
+  - Errors are structured (ARTIFACT_NOT_FOUND / ARTIFACT_CURSOR_INVALID /
+    ARTIFACT_HASH_MISMATCH / ARTIFACT_UNREADABLE) — never a success-shaped
+    sentence
+  - Retention is PERMANENT: the store is append-only, with no delete, no TTL
+    and no purge, and an artifact deliberately outlives the agent that produced
+    it — an id + sha256 from an old transcript still reads back in full
 
 conversation_search (sync lookup - keyword search across prior text):
   - Does NOT cause any target agent to run; pure read-only DB query
@@ -265,7 +292,9 @@ Format: Anthropic-standard (Claude Code & Codex CLI compatible).
   <markdown body — the actual instructions>
 
 Source directories (priority high → low; first wins on name conflicts):
-  1. project       <agent.codexWorkspace>/.claude/skills/<name>/SKILL.md
+  1. project       <agent.projectRoot>/.agents/skills/<name>/SKILL.md  (also
+                   .claude/skills/ and .codex/skills/ — all three are scanned,
+                   .agents wins a name collision)
   2. ensemble      <DATA_DIR>/skills/<name>/SKILL.md   (managed via UI panel + HTTP API)
   3. claude-user   ~/.claude/skills/<name>/SKILL.md    (shared with Claude Code)
   4. codex-user    ~/.codex/skills/<name>/SKILL.md     (shared with Codex CLI)
@@ -400,7 +429,8 @@ Args:
 
 What the subagent inherits:
   - your model + provider (cross-runtime is possible if provider resolves differently)
-  - your systemPrompt, workspace, and codexWorkspace
+  - your systemPrompt and your projectRoot (pass projectRoot explicitly to
+    place the child somewhere else)
   - a fresh, isolated context (it does NOT see your conversation history)
 
 Depth cap: subagents can spawn subagents up to 3 levels deep. Beyond that the
@@ -435,7 +465,7 @@ Contents:
   - agentorch.db-shm   shared memory file
 
 Schema tables (relevant to most agent tasks):
-  Agent        (id, name, providerId, model, systemPrompt, metadata JSON, codexWorkspace, status, parentId, createdAt)
+  Agent        (id, name, providerId, model, systemPrompt, metadata JSON, projectRoot, status, parentId, createdAt)
   Provider     (id, name, kind, baseUrl, apiKey, models JSON, isDefault, disabled, metadata JSON, ...)
   McpServer    (id, agentId, name, transport, config JSON, enabled)
   Message      (id, agentId, seq, type, payload JSON, createdAt)

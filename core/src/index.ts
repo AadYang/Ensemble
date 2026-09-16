@@ -1,8 +1,16 @@
 import Fastify from "fastify";
+import type { FastifyReply } from "fastify";
 import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { z } from "zod";
 import { PACKAGED, WEB_ROOT, webRootExists } from "./paths.js";
+import {
+  readProviderTransport,
+  transportInputSchema,
+  transportMetadataFor,
+  transportPatchSchema,
+} from "./provider-transport.js";
+import { reasoningPatchSchema } from "./reasoning-choice.js";
 import type {
   ClientMsg,
   LayoutNode,
@@ -11,7 +19,14 @@ import type {
   ServerMsg,
 } from "@agentorch/shared";
 import { WSHub } from "./ws/hub.js";
-import { agentRowToSummary, SessionManager } from "./sessions/SessionManager.js";
+import {
+  agentRowToSummary,
+  isReasoningRejection,
+  isSettingsInvalidationRejection,
+  SessionManager,
+} from "./sessions/SessionManager.js";
+import { inspectProjectRoot, isProjectRootRejection } from "./sessions/project-root.js";
+import { runtimeScopeForKind } from "./sessions/runtimes/index.js";
 import { prisma, closeDb, sqliteDb } from "./db.js";
 import { createHash } from "node:crypto";
 import {
@@ -47,6 +62,13 @@ import {
   type ProbeFlavor,
 } from "./providers/model-discovery.js";
 import { DEFAULT_ANTHROPIC_MODELS } from "./providers/default-models.js";
+import {
+  type ArtifactError,
+  type ArtifactFailureCode,
+  listArtifacts,
+  readArtifactPage,
+  searchArtifact,
+} from "./artifacts.js";
 
 // When ENSEMBLE_AUTO_PORT=1 (set by Tauri shell), listen on a random free port
 // and announce it on stdout's first line as `ENSEMBLE_LISTENING <port>`. The
@@ -128,7 +150,11 @@ const ClientMsgSchema = z.discriminatedUnion("type", [
     model: z.string().optional(),
     parentId: z.string().uuid().optional(),
     providerId: z.string().uuid().optional(),
-    codexWorkspace: z.string().optional(),
+    projectRoot: z.string().optional().nullable(),
+    // Legacy alias. Kept so an older client keeps working; when it is the only
+    // field given it is translated to projectRoot, and sending both with
+    // different values is refused (see reconcileProjectRootInput).
+    codexWorkspace: z.string().optional().nullable(),
     teamId: z.string().uuid().nullable().optional(),
   }),
   z.object({ type: z.literal("send_message"), sessionId: z.string().uuid(), text: z.string().min(1) }),
@@ -555,7 +581,6 @@ async function discoverClaudeModels(): Promise<string[] | null> {
 }
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
-const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 const ProviderInputSchema = z.object({
   name: z.string().min(1),
@@ -568,6 +593,11 @@ const ProviderInputSchema = z.object({
   upstreamModel: z.string().min(1).optional().nullable(),
   models: z.array(z.string().min(1)).optional(),
   defaultSandbox: z.enum(SANDBOX_MODES).optional().nullable(),
+  // The user's transport CHOICE for an OpenAI-shape endpoint. Stored on
+  // `Provider.metadata.transport` by provider-transport.ts, consumed as a
+  // preference by the run planner: `auto` lets a probe decide and permits a
+  // switch, the two explicit values are honoured exactly.
+  transport: transportInputSchema,
 });
 
 const ProviderPatchSchema = z.object({
@@ -582,6 +612,10 @@ const ProviderPatchSchema = z.object({
   // endpoint doesn't list (e.g. MiniMax returns {data: null}).
   models: z.array(z.string().min(1)).optional(),
   defaultSandbox: z.enum(SANDBOX_MODES).optional().nullable(),
+  // `null` clears the stored preference, which is the same behaviour as `auto`
+  // — but says "unset" rather than "deliberately auto", so the UI can show the
+  // difference and a future default change does not silently rewrite a choice.
+  transport: transportPatchSchema,
 });
 
 const sanitizeProvider = (p: {
@@ -630,9 +664,32 @@ const sanitizeProvider = (p: {
       (typeof meta.defaultSandbox === "string"
         ? (meta.defaultSandbox as string)
         : null),
+    // The user's transport choice, as stored. `null` = they have not chosen;
+    // the resolver decides (and may probe) for an `openai-compat` endpoint.
+    transport: readProviderTransport(meta),
+    // Whether a PER-AGENT sandbox override means anything on this provider.
+    // Reported by the server, from the same rule the write path applies
+    // (`runtimeScopeForKind`), because a client that decided it from
+    // `kind === "openai-codex"` would be holding its own copy of a server rule —
+    // and would offer the control on a provider the server refuses to honour it
+    // on. The runtime scope is the rule; the kind string is just today's spelling
+    // of it.
+    sandboxOverrideSupported: sandboxOverrideSupportedForKind(p.kind),
     createdAt: p.createdAt.toISOString(),
   };
 };
+
+/** A per-agent sandbox override is a Codex launch parameter, so it is meaningful
+ *  exactly on the providers whose runtime is Codex. A kind this build does not
+ *  know is `false` rather than a throw: a provider list is not the place to
+ *  discover that a retired kind is still in the database. */
+function sandboxOverrideSupportedForKind(kind: string): boolean {
+  try {
+    return runtimeScopeForKind(kind) === "codex";
+  } catch {
+    return false;
+  }
+}
 
 /** Migrate any pre-anthropic-local default rows. The historical default was
  * `kind=anthropic` + null baseUrl + null apiKey, which behaves identically
@@ -831,6 +888,16 @@ fastify.post("/providers", async (req, reply) => {
       };
     }
   }
+  // Checked here, before any row is written, so a choice can never be stored on
+  // a kind that cannot act on it.
+  const transportChoice =
+    data.transport === undefined
+      ? null
+      : transportMetadataFor({ kind: data.kind, transport: data.transport, metadata: {} });
+  if (transportChoice && !transportChoice.ok) {
+    reply.code(400);
+    return { error: transportChoice.error, message: transportChoice.message };
+  }
   // W19: openai-local = the OpenAI official endpoint (api.openai.com/v1). It
   // still needs a platform.openai.com API key — OpenAI doesn't expose its
   // ChatGPT/codex OAuth to the public Chat Completions API. The naming
@@ -893,10 +960,15 @@ fastify.post("/providers", async (req, reply) => {
   // builds can cancel MCP tool execution under stricter sandboxes even when
   // peer_send is visible. Users can still choose read-only/workspace-write
   // at provider or agent level.
-  const initialMetadata: Record<string, unknown> =
-    data.kind === "openai-codex"
+  const initialMetadata: Record<string, unknown> = {
+    ...(data.kind === "openai-codex"
       ? { defaultSandbox: data.defaultSandbox ?? CODEX_DEFAULT_SANDBOX }
-      : {};
+      : {}),
+    // No probe, no validation against the endpoint: saving a provider must work
+    // offline. The choice is a preference; the turn resolves what the endpoint
+    // actually speaks (and records it as a fact).
+    ...(transportChoice?.ok && transportChoice.metadata ? transportChoice.metadata : {}),
+  };
   const codexNoBaseUrlNoApiKey =
     data.kind === "openai-codex"
       ? { baseUrl: null, apiKey: null }
@@ -959,6 +1031,27 @@ fastify.patch<{ Params: { id: string } }>("/providers/:id", async (req, reply) =
   // codexCliMissing, authMissing) when merging.
   let mergedMetadata: Record<string, unknown> | undefined;
   let providerDefaultSandboxChanged = false;
+  if (parsed.data.transport !== undefined) {
+    const cur = await prisma.provider.findUnique({ where: { id: req.params.id } });
+    if (!cur) {
+      reply.code(404);
+      return { error: "not found" };
+    }
+    // The decision — kind check, clear vs set, "already that value" — lives in
+    // provider-transport.ts, so POST and PATCH cannot disagree about it, and the
+    // capability layer reads the same rules back.
+    const choice = transportMetadataFor({
+      kind: cur.kind,
+      transport: parsed.data.transport,
+      metadata: cur.metadata,
+    });
+    if (!choice.ok) {
+      reply.code(400);
+      return { error: choice.error, message: choice.message };
+    }
+    // `null` = nothing to write (the stored value already matches).
+    if (choice.metadata) mergedMetadata = choice.metadata;
+  }
   if (parsed.data.defaultSandbox !== undefined) {
     const cur = await prisma.provider.findUnique({ where: { id: req.params.id } });
     if (!cur) {
@@ -972,13 +1065,16 @@ fastify.patch<{ Params: { id: string } }>("/providers/:id", async (req, reply) =
         message: "defaultSandbox is only valid for openai-codex providers.",
       };
     }
+    // Build on the transport branch's result when both fields arrived in one
+    // PATCH — a second `{ ...meta }` would silently drop the transport edit.
+    const base = mergedMetadata ??
+      ((cur.metadata && typeof cur.metadata === "object" ? cur.metadata : {}) as Record<string, unknown>);
     const meta = (cur.metadata && typeof cur.metadata === "object" ? cur.metadata : {}) as Record<string, unknown>;
     const previousDefaultSandbox = meta.defaultSandbox;
     if (parsed.data.defaultSandbox === null) {
-      const next = { ...meta, defaultSandbox: CODEX_DEFAULT_SANDBOX };
-      mergedMetadata = next;
+      mergedMetadata = { ...base, defaultSandbox: CODEX_DEFAULT_SANDBOX };
     } else {
-      mergedMetadata = { ...meta, defaultSandbox: parsed.data.defaultSandbox };
+      mergedMetadata = { ...base, defaultSandbox: parsed.data.defaultSandbox };
     }
     providerDefaultSandboxChanged = mergedMetadata.defaultSandbox !== previousDefaultSandbox;
   }
@@ -1386,6 +1482,7 @@ const AgentPatchSchema = z.object({
   model: z.string().min(1).optional(),
   name: z.string().min(1).optional(),
   providerId: z.string().uuid().optional().nullable(),
+  projectRoot: z.string().optional().nullable(),
   codexWorkspace: z.string().optional().nullable(),
   permissionMode: z
     .enum(["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"])
@@ -1394,12 +1491,57 @@ const AgentPatchSchema = z.object({
     .enum(["read-only", "workspace-write", "danger-full-access"])
     .nullable()
     .optional(),
-  reasoningEffort: z
-    .enum(REASONING_EFFORTS)
-    .nullable()
-    .optional(),
+  // An OPEN reasoning level (shared/src/reasoning.ts owns the rule): any safe
+  // token, null to clear, or the literal "inherit" — which normalizes to the
+  // SAME cleared state rather than becoming a second stored shape. Membership is
+  // a per-model capability, checked in patchAgent against the registry; a
+  // closed enum here would refuse a level the model really has (`ultra`).
+  reasoningEffort: reasoningPatchSchema,
+  // The user's wall-clock ceiling on a single run, in milliseconds; `null`
+  // clears it and ABSENT is the default. Validation, not coercion: only a
+  // positive whole number sets a deadline, so a "0", a negative or a fraction
+  // is a 400 here rather than a run that gets killed after zero milliseconds.
+  // Nothing is defaulted either — the absence of this field is the state that
+  // means "no clock may ever end this run" (capability/liveness.ts).
+  maxRunDurationMs: z.number().int().positive().nullable().optional(),
   systemPrompt: z.string().nullable().optional(),
   teamId: z.string().uuid().nullable().optional(),
+  // Fields the user CONFIRMED losing, from `POST /agents/:id/settings-impact`.
+  // A write that would invalidate anything not listed here is refused with 409
+  // and the same report the preflight returns — the confirmation is a real gate
+  // on the write, not a UI convention the API takes on trust.
+  confirmInvalidated: z
+    .array(z.enum(["transport", "reasoning", "project", "context", "outputReserve", "history", "liveness", "sandbox"]))
+    .optional(),
+});
+
+/** The settings fields a proposal may name, shared by the patch body and the
+ *  impact endpoint so the two cannot list different names. */
+const SettingsImpactSchema = z.object({
+  providerId: z.string().uuid().optional().nullable(),
+  model: z.string().min(1).optional(),
+  reasoningEffort: reasoningPatchSchema.optional(),
+  maxRunDurationMs: z.number().int().positive().nullable().optional(),
+  projectRoot: z.string().optional().nullable(),
+  sandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable().optional(),
+});
+
+// What a proposed change would COST, before it is made. Read-only: it resolves
+// and diffs, and writes nothing. The settings form calls this first so "this
+// would clear your reasoning level" is something the user reads, not something
+// they discover afterwards.
+fastify.post<{ Params: { id: string } }>("/agents/:id/settings-impact", async (req, reply) => {
+  const parsed = SettingsImpactSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  const report = await sessions.agentSettingsImpact(req.params.id, parsed.data);
+  if (!report) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return report;
 });
 
 fastify.patch<{ Params: { id: string } }>("/agents/:id", async (req, reply) => {
@@ -1408,7 +1550,34 @@ fastify.patch<{ Params: { id: string } }>("/agents/:id", async (req, reply) => {
     reply.code(400);
     return { error: "invalid", detail: parsed.error.issues };
   }
-  const updated = await sessions.patchAgent(req.params.id, parsed.data);
+  let updated: Awaited<ReturnType<typeof sessions.patchAgent>>;
+  try {
+    updated = await sessions.patchAgent(req.params.id, parsed.data);
+  } catch (err) {
+    // The change would drop stored settings the user has not seen. 409 with the
+    // report the client shows: nothing was written, and the same request can be
+    // replayed with `confirmInvalidated` once the user has agreed.
+    if (isSettingsInvalidationRejection(err)) {
+      reply.code(409);
+      return { error: "settings-invalidation-unconfirmed", impact: err.impact };
+    }
+    // A patch that names something the model does not have is a USER error, and
+    // it is reported as one: the structured cause (requested value, the model,
+    // its supported levels and the source that states them) reaches the caller
+    // instead of becoming a bare 500 the UI can only render as "something
+    // failed". Nothing was persisted — patchAgent refused before the write.
+    if (isReasoningRejection(err)) {
+      reply.code(400);
+      return { error: "reasoning_effort_unsupported", ...err.detail };
+    }
+    // Same rule for the project root: the user named a directory that cannot
+    // be used, and the response says which rule failed and on what path.
+    if (isProjectRootRejection(err)) {
+      reply.code(400);
+      return { error: err.code, path: err.path, message: err.message };
+    }
+    throw err;
+  }
   if (!updated) {
     reply.code(404);
     return { error: "not found" };
@@ -1505,11 +1674,115 @@ fastify.get<{ Params: { id: string } }>("/agents/:id/status", async (req, reply)
   return s;
 });
 
+// The read/restore entry for a compaction generation. `compact` MOVES the
+// originals out of the live transcript; these routes are how they are read back
+// verbatim, or put back.
+//
+//   GET  /agents/:id/archive                 → the generations (index)
+//   GET  /agents/:id/archive/:generation     → every archived record, in order,
+//                                              with the recomputed sourceHash so
+//                                              a reader can verify the range
+//   POST /agents/:id/archive/:generation/restore → put the originals back AT
+//                                              THEIR ORIGINAL SEQS, replacing the
+//                                              compact summary that stood for
+//                                              them. 200 with `status:"restored"`
+//                                              when it happened; 409 with
+//                                              `status:"already-restored"` (or
+//                                              "no-active-summary") when the
+//                                              history is not in a state this
+//                                              can change — the body always says
+//                                              which, so a no-op is never
+//                                              reported as a restore.
+fastify.get<{ Params: { id: string }; Querystring: { fromSeq?: string; toSeq?: string } }>(
+  "/agents/:id/archive",
+  async (req, reply) => {
+    const generations = await sessions.listArchivedGenerations(req.params.id);
+    return {
+      generations: generations.map((g) => ({
+        generation: g.generation,
+        fromSeq: g.fromSeq,
+        toSeq: g.toSeq,
+        count: g.count,
+        sourceHash: g.sourceHash,
+        archivedAt: g.archivedAt,
+      })),
+    };
+  },
+);
+
+fastify.get<{
+  Params: { id: string; generation: string };
+  Querystring: { fromSeq?: string; toSeq?: string };
+}>("/agents/:id/archive/:generation", async (req, reply) => {
+  const generation = Number(req.params.generation);
+  if (!Number.isInteger(generation)) {
+    reply.code(400);
+    return { error: "generation must be an integer" };
+  }
+  const fromSeq = req.query.fromSeq === undefined ? undefined : Number(req.query.fromSeq);
+  const toSeq = req.query.toSeq === undefined ? undefined : Number(req.query.toSeq);
+  if (fromSeq !== undefined && !Number.isInteger(fromSeq)) {
+    reply.code(400);
+    return { error: "fromSeq must be an integer" };
+  }
+  if (toSeq !== undefined && !Number.isInteger(toSeq)) {
+    reply.code(400);
+    return { error: "toSeq must be an integer" };
+  }
+  const read = await sessions.readArchivedGeneration(
+    req.params.id,
+    generation,
+    fromSeq === undefined && toSeq === undefined ? null : { fromSeq, toSeq },
+  );
+  if (!read) {
+    reply.code(404);
+    return { error: "no such generation" };
+  }
+  return read;
+});
+
+fastify.post<{ Params: { id: string; generation: string } }>(
+  "/agents/:id/archive/:generation/restore",
+  async (req, reply) => {
+    const generation = Number(req.params.generation);
+    if (!Number.isInteger(generation)) {
+      reply.code(400);
+      return { error: "generation must be an integer" };
+    }
+    const out = await sessions.restoreArchivedGeneration(req.params.id, generation);
+    if (!out) {
+      reply.code(404);
+      return { error: "no such generation" };
+    }
+    if (out.status !== "restored") {
+      reply.code(409);
+    }
+    return out;
+  },
+);
+
 // ----- Skills (v2) -----
 
-fastify.get("/skills", async () => {
+/** `?agent=<id>` (or `?projectRoot=<path>`) scopes discovery to that agent's
+ *  project, exactly as a turn does. Without it the UI could not see — or show
+ *  as enabled — a skill that lives in the agent's own `.agents/skills`, which
+ *  is the whole point of project-level skills. The priority ladder
+ *  (project > ensemble > claude-user > codex-user > system) is the loader's,
+ *  unchanged: scoping adds a workspace, it does not reorder anything. */
+fastify.get<{ Querystring: { agent?: string; projectRoot?: string } }>("/skills", async (req) => {
   const { loadSkills } = await import("./skills/index.js");
-  const list = loadSkills();
+  let workspace: string | null = req.query.projectRoot ?? null;
+  if (req.query.agent && !workspace) {
+    const agent = await prisma.agent.findUnique({ where: { id: req.query.agent } });
+    // ONLY a usable root becomes a skill workspace. An unusable one contributes
+    // nothing (the same rule the turn applies), and an unbound agent's scratch
+    // directory — which exists to keep session files out of the home dir — is
+    // not a project and must not have `.agents/skills` scanned under it.
+    if (agent?.projectRoot && inspectProjectRoot(agent.projectRoot) === null) {
+      workspace = agent.projectRoot;
+    }
+  }
+  const list = loadSkills(workspace ? [workspace] : []);
   return list.map((s) => ({
     name: s.name,
     description: s.description,
@@ -1518,6 +1791,9 @@ fastify.get("/skills", async () => {
     source: s.source,
     path: s.path,
     body: s.body,
+    // Matching inputs, surfaced so the panel can explain WHY a skill fires.
+    triggers: s.triggers ?? null,
+    examples: s.examples ?? null,
   }));
 });
 
@@ -1675,6 +1951,14 @@ fastify.post<{ Params: { id: string } }>("/agents/:id/suggest-children", async (
 
   // History: last 10 user/assistant text messages, each head-truncated to 200.
   // tool_use / tool_result blobs are excluded as design §1 requires.
+  //
+  // The cap is deliberate — this prompt is a cheap side question and the whole
+  // transcript would make it expensive — but the omission is now NAMED and
+  // COUNTED. A line clipped to 200 characters with no marker reads to the model
+  // as a short message, which is how a suggestion gets made from a context that
+  // looks complete and is not.
+  const SUGGEST_HISTORY_LINE_CHARS = 200;
+  let omittedHistoryChars = 0;
   const recentRows = await prisma.message.findMany({
     where: { agentId },
     orderBy: { seq: "desc" },
@@ -1696,8 +1980,20 @@ fastify.post<{ Params: { id: string } }>("/agents/:id/suggest-children", async (
         .join("");
     }
     if (!text) continue;
-    const truncated = text.length > 200 ? text.slice(0, 200) + "…" : text;
+    const omitted = Math.max(0, text.length - SUGGEST_HISTORY_LINE_CHARS);
+    const truncated =
+      omitted > 0
+        ? `${text.slice(0, SUGGEST_HISTORY_LINE_CHARS)}…[${omitted} more characters omitted]`
+        : text;
+    if (omitted > 0) omittedHistoryChars += omitted;
     chunks.unshift(`[${r.type}] ${truncated}`);
+  }
+  if (omittedHistoryChars > 0) {
+    fastify.log.info(
+      `[suggest-children] agent=${agentId.slice(0, 8)} prompt history clipped: ` +
+        `${omittedHistoryChars} characters omitted across at most ${chunks.length} lines ` +
+        `(cap ${SUGGEST_HISTORY_LINE_CHARS} per line)`,
+    );
   }
 
   // Empty history → static catalog, skip model entirely.
@@ -1715,6 +2011,9 @@ fastify.post<{ Params: { id: string } }>("/agents/:id/suggest-children", async (
   }
 
   // Call the parent agent's runtime through the SessionManager side-channel.
+  // The 15 s is an EXPLICIT deadline this endpoint is willing to make the user
+  // wait behind a suggestion popup — a decision by the caller, which is the only
+  // kind of deadline that may end a helper call in phase 4 (silence never may).
   const prompt = buildSuggestPrompt(chunks);
   let raw = "";
   try {
@@ -1916,6 +2215,120 @@ fastify.get<{
   };
 });
 
+// ── Artifacts (read-only HTTP) ────────────────────────────────────────────────
+//
+// The HTTP view of the same store the artifact_read / artifact_search tools
+// read. artifacts.ts owns the paging, the UTF-8 boundary rule and the hash
+// check, and NONE of that is re-implemented here: these routes validate the
+// query and hand the structured result straight back, so an HTTP caller and a
+// model see the same codes and the same numbers.
+//
+// The consumer this exists for is the result/run inspector — "the chat showed
+// me a preview of a huge peer output, show me the whole thing" — which needs to
+// page one result and walk its search hits without spending a model turn.
+//
+// Deliberately READ-ONLY, and not for lack of a caller: artifacts are
+// append-only by contract (the triggers in db.ts), and an HTTP write path would
+// be the first place that guarantee could be edited from outside the runtime.
+// Writing goes through createArtifact, in process, where the write is verified
+// before the handle is handed out.
+
+/** A structured ArtifactError already carries the code a caller acts on, so the
+ *  code decides the status rather than every failure collapsing into a 500. A
+ *  hash mismatch is a 409 and not a 500 because it is the STORE disagreeing
+ *  with its own metadata (corruption, a partial restore) — a conflict with what
+ *  the caller was told, and one the caller must not paper over by reading the
+ *  text anyway. The response body IS the error object, so an HTTP caller sees
+ *  the same codes the tools do. */
+const ARTIFACT_ERROR_STATUS: Record<ArtifactFailureCode, number> = {
+  ARTIFACT_NOT_FOUND: 404,
+  ARTIFACT_CURSOR_INVALID: 400,
+  ARTIFACT_QUERY_EMPTY: 400,
+  ARTIFACT_UNREADABLE: 415,
+  ARTIFACT_HASH_MISMATCH: 409,
+};
+
+function sendArtifactError(reply: FastifyReply, err: ArtifactError) {
+  reply.code(ARTIFACT_ERROR_STATUS[err.code] ?? 500);
+  return err;
+}
+
+const ArtifactListQuerySchema = z.object({
+  agentId: z.string().min(1).optional(),
+  kind: z.string().min(1).optional(),
+  limit: z.coerce.number().int().optional(),
+});
+
+const ArtifactReadQuerySchema = z.object({
+  cursor: z.string().min(1).optional(),
+  // Any integer is accepted and the READER clamps it (a page size of 0 or one
+  // past the cap is a size the reader already has a documented answer for); a
+  // value that is not a number at all is a mistyped query, which is a 400.
+  pageBytes: z.coerce.number().int().optional(),
+});
+
+const ArtifactSearchQuerySchema = z.object({
+  // Not `.min(1)`: an absent or empty query is the reader's own
+  // ARTIFACT_QUERY_EMPTY refusal, so the HTTP caller gets one refusal with one
+  // code instead of a second, differently-worded schema error.
+  query: z.string().optional(),
+  cursor: z.string().min(1).optional(),
+  caseSensitive: z.enum(["true", "false"]).optional(),
+  maxHits: z.coerce.number().int().optional(),
+  snippetBytes: z.coerce.number().int().optional(),
+});
+
+fastify.get<{ Querystring: { agentId?: string; kind?: string; limit?: string } }>("/artifacts", async (req, reply) => {
+  const parsed = ArtifactListQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid_query", detail: parsed.error.issues };
+  }
+  const listed = listArtifacts({
+    agentId: parsed.data.agentId ?? null,
+    kind: parsed.data.kind ?? null,
+    limit: parsed.data.limit ?? null,
+  });
+  return { ...listed, count: listed.artifacts.length };
+});
+
+fastify.get<{ Params: { id: string }; Querystring: { cursor?: string; pageBytes?: string } }>(
+  "/artifacts/:id",
+  async (req, reply) => {
+    const parsed = ArtifactReadQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      reply.code(400);
+      return { error: "invalid_query", detail: parsed.error.issues };
+    }
+    const result = readArtifactPage(req.params.id, {
+      cursor: parsed.data.cursor ?? null,
+      pageBytes: parsed.data.pageBytes ?? null,
+    });
+    if (!result.ok) return sendArtifactError(reply, result);
+    return result;
+  },
+);
+
+fastify.get<{
+  Params: { id: string };
+  Querystring: { query?: string; cursor?: string; caseSensitive?: string; maxHits?: string; snippetBytes?: string };
+}>("/artifacts/:id/search", async (req, reply) => {
+  const parsed = ArtifactSearchQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid_query", detail: parsed.error.issues };
+  }
+  const result = searchArtifact(req.params.id, {
+    query: parsed.data.query ?? "",
+    cursor: parsed.data.cursor ?? null,
+    caseSensitive: parsed.data.caseSensitive === "true",
+    maxHits: parsed.data.maxHits ?? null,
+    snippetBytes: parsed.data.snippetBytes ?? null,
+  });
+  if (!result.ok) return sendArtifactError(reply, result);
+  return result;
+});
+
 fastify.register(async (instance) => {
   instance.get("/ws", { websocket: true }, (socket) => {
     hub.add(socket);
@@ -1951,6 +2364,7 @@ fastify.register(async (instance) => {
               model: parsed.model,
               parentId: parsed.parentId,
               providerId: parsed.providerId,
+              projectRoot: parsed.projectRoot,
               codexWorkspace: parsed.codexWorkspace,
               teamId: parsed.teamId,
             });
@@ -2001,9 +2415,13 @@ fastify.register(async (instance) => {
             break;
         }
       } catch (err) {
+        // A refused project root is the caller's input being wrong, not a
+        // server fault: the code (PROJECT_ROOT_NOT_ABSOLUTE / _NOT_FOUND /
+        // _NOT_A_DIRECTORY / _UNREADABLE / _CONFLICT) is what lets the client
+        // highlight the field instead of showing an opaque failure.
         const msg: ServerMsg = {
           type: "error",
-          code: "HANDLER_ERROR",
+          code: isProjectRootRejection(err) ? err.code : "HANDLER_ERROR",
           message: err instanceof Error ? err.message : String(err),
         };
         socket.send(JSON.stringify(msg));
@@ -2070,6 +2488,21 @@ void (async () => {
       await sessions.recoverStaleSessions();
     } catch (err) {
       console.warn("[recover] startup hook threw:", err);
+    }
+
+    // Jobs the previous core process started and never finished. Their rows
+    // still say `running`, but this process holds no handle to them: the pid is
+    // checked against the OS and a dead one becomes `lost`, with its log kept.
+    // Done BEFORE any agent can ask about its jobs, so a caller never sees a
+    // stale `running` and waits on work that ended hours ago. A job whose
+    // process is somehow still alive is left alone — that is a real result.
+    try {
+      const lost = sessions.jobs.reconcile();
+      if (lost.length > 0) {
+        console.warn(`[jobs] ${lost.length} job(s) from a previous run were marked lost (no recorded exit)`);
+      }
+    } catch (err) {
+      console.warn("[jobs] startup reconciliation threw:", err);
     }
 
     // Anonymous telemetry — device count + session duration + daily token
@@ -2154,6 +2587,23 @@ void (async () => {
 
 const shutdown = async (sig: string) => {
   fastify.log.info(`received ${sig}, shutting down...`);
+  // Phase 4: stop the liveness watchdog before the DB goes away. It is the only
+  // timer that reads and writes the liveness record, and leaving it to fire
+  // against a closed database would turn a clean shutdown into a logged error.
+  sessions.dispose();
+  // Jobs are children of CORE, so core's exit is the one thing that can orphan
+  // them. Ending them here — explicitly, with a recorded `cancelled` and their
+  // logs left in place — is what keeps a clean shutdown from being reported by
+  // the next boot as a pile of `lost` jobs. Runs before the DB closes: the
+  // status is written through it.
+  try {
+    const ended = sessions.jobs.stopAll();
+    if (ended.length > 0) {
+      fastify.log.info(`stopped ${ended.length} running job(s)`);
+    }
+  } catch (err) {
+    fastify.log.warn(`could not stop running jobs: ${String(err)}`);
+  }
   await fastify.close();
   closeDb();
   process.exit(0);

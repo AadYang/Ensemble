@@ -2,7 +2,9 @@
 // frontmatter + body, and merge by name with source-priority dedup.
 //
 // Sources, highest priority first:
-//   1. project        → <workspace>/.claude/skills/          (per-agent codexWorkspace)
+//   1. project        → <projectRoot>/.agents/skills/        (tool-neutral, canonical)
+//                       <projectRoot>/.claude/skills/        (Claude Code convention)
+//                       <projectRoot>/.codex/skills/         (Codex CLI convention)
 //   2. ensemble       → <DATA_DIR>/skills/                   (app-managed)
 //   3. claude-user    → ~/.claude/skills/                    (Claude Code compat)
 //   4. codex-user     → ~/.codex/skills/                     (Codex CLI compat)
@@ -11,6 +13,9 @@
 //   ---
 //   name: short-slug
 //   description: When to use this skill (used by auto-activation matching).
+//   triggers: code review, 评审   # optional exact phrases that boost matching
+//   examples:                   # optional example user messages (weaker boost)
+//     - review this diff for bugs
 //   tools: [Read, Grep, Glob]     # optional advisory tool list
 //   model: claude-opus-4-7        # optional preferred model (not enforced v2)
 //   ---
@@ -34,6 +39,15 @@ export interface SkillEntry {
   name: string;
   /** When-to-use sentence; consumed by auto-activation. */
   description: string;
+  /** Optional explicit match phrases (frontmatter `triggers:`). A trigger only
+   *  counts when the whole phrase appears in the user's message, so an author
+   *  can pin a skill to exact wording ("code review", "评审") instead of
+   *  relying on description-token overlap. */
+  triggers?: string[];
+  /** Optional example user messages (frontmatter `examples:`). Same matching
+   *  rule as triggers but a weaker boost — examples illustrate, they don't
+   *  pin. */
+  examples?: string[];
   /** Advisory tool allow-list. Claude/OpenAI runtimes can honor as soft
    *  guidance; Codex runtime ignores (it has no per-call tool gate). */
   tools?: string[];
@@ -70,9 +84,23 @@ function claudeUserSkillsDir(): string {
 function codexUserSkillsDir(): string {
   return join(homedir(), ".codex", "skills");
 }
-function projectSkillsDir(workspace: string): string | null {
-  if (rootOverrides?.disableProject) return null;
-  return join(workspace, ".claude", "skills");
+/** The project skill roots, in priority order, for ONE project root.
+ *
+ *  `.agents/skills` is Ensemble's tool-neutral convention and therefore wins a
+ *  name collision; the two tool-specific dirs follow, and their relative order
+ *  is fixed rather than readdir order so the same project always produces the
+ *  same registry. All three are read — a project that keeps its skills in the
+ *  Claude Code dir must not silently lose them just because it also has an
+ *  `.agents/skills`. */
+const PROJECT_SKILL_SUBDIRS = [
+  [".agents", "skills"],
+  [".claude", "skills"],
+  [".codex", "skills"],
+] as const;
+
+function projectSkillsDirs(projectRoot: string): string[] {
+  if (rootOverrides?.disableProject) return [];
+  return PROJECT_SKILL_SUBDIRS.map((parts) => join(projectRoot, ...parts));
 }
 
 function splitEnvPathList(value: string | undefined): string[] {
@@ -152,25 +180,75 @@ function discoverInDir(root: string): string[] {
   return out;
 }
 
+/** Frontmatter keys that hold a LIST of short match strings. These are the only
+ *  keys with extra spellings, and they are needed because all three are common
+ *  in hand-authored SKILL.md files: inline `[a, b]` (the existing array style),
+ *  inline `a, b`, and a block list of `- a` lines — plus the key repeated more
+ *  than once, which YAML itself would merge. */
+const LIST_FRONTMATTER_KEYS = new Set(["triggers", "examples"]);
+
+/** Split one inline list value into items. Commas and newlines both separate,
+ *  quotes are stripped, blanks are dropped. */
+function splitListValue(value: string): string[] {
+  const inner =
+    value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+  return inner
+    .split(/[,\n]/)
+    .map((s) => s.trim().replace(/^["']|["']$/g, "").trim())
+    .filter(Boolean);
+}
+
+/** Append items to a list-valued frontmatter key (repeated keys accumulate). */
+function pushListValue(meta: Record<string, unknown>, key: string, value: string): void {
+  const existing = Array.isArray(meta[key]) ? (meta[key] as unknown[]) : [];
+  meta[key] = [...existing, ...splitListValue(value)];
+}
+
 /** Parse the YAML frontmatter block (between leading `---` lines). Naive
- *  parser: handles `key: value`, `key: [a, b, c]`, `key: "quoted value"`. We
- *  do NOT pull a full YAML lib — the SKILL.md frontmatter convention is
- *  flat by design and a full parser is overkill. */
-function parseFrontmatter(raw: string): { meta: Record<string, unknown>; body: string } {
+ *  parser: handles `key: value`, `key: [a, b, c]`, `key: "quoted value"`, and
+ *  for the list keys above also `key: a, b` / `- item` block lists. We do NOT
+ *  pull a full YAML lib — the SKILL.md frontmatter convention is flat by
+ *  design and a full parser is overkill.
+ *
+ *  Exported because the skill READ path (skills/read.ts) has to re-parse the
+ *  file it just read from disk; a second frontmatter parser there would be a
+ *  second definition of where a body starts. */
+export function parseFrontmatter(raw: string): { meta: Record<string, unknown>; body: string } {
   // Accept both \n and \r\n line endings (Windows authoring).
   const normalized = raw.replace(/\r\n/g, "\n");
   const match = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(normalized);
   if (!match) return { meta: {}, body: normalized };
   const [, header, body] = match;
   const meta: Record<string, unknown> = {};
+  // Set while a `key:` with an empty value is open, so the following `- item`
+  // lines know which key they belong to. Only ever set for LIST_FRONTMATTER_KEYS.
+  let blockListKey: string | null = null;
   for (const line of (header ?? "").split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const colon = trimmed.indexOf(":");
-    if (colon < 0) continue;
+    if (colon < 0) {
+      // Block-list continuation. A dash line under any OTHER key is still
+      // ignored exactly as before, so nothing here changes existing parses.
+      if (blockListKey && trimmed.startsWith("-")) {
+        pushListValue(meta, blockListKey, trimmed.slice(1).trim());
+      }
+      continue;
+    }
     const key = trimmed.slice(0, colon).trim();
     let value = trimmed.slice(colon + 1).trim();
     if (!key) continue;
+    if (LIST_FRONTMATTER_KEYS.has(key)) {
+      if (value) {
+        pushListValue(meta, key, value);
+        blockListKey = null;
+      } else {
+        if (!Array.isArray(meta[key])) meta[key] = [];
+        blockListKey = key;
+      }
+      continue;
+    }
+    blockListKey = null;
     if (value.startsWith("[") && value.endsWith("]")) {
       meta[key] = value
         .slice(1, -1)
@@ -212,11 +290,26 @@ function loadOneSkill(path: string, source: SkillSource): SkillEntry | null {
     ? (meta.tools as unknown[]).filter((x) => typeof x === "string").map((x) => x as string)
     : undefined;
   const model = typeof meta.model === "string" ? (meta.model as string) : undefined;
+  // `key: value` (not a list) is also accepted for these two, so a lone
+  // `triggers: code review` behaves the same as the one-item list form.
+  const stringList = (v: unknown): string[] | undefined => {
+    const items = Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === "string")
+      : typeof v === "string"
+        ? [v]
+        : [];
+    const cleaned = items.map((s) => s.trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  };
+  const triggers = stringList(meta.triggers);
+  const examples = stringList(meta.examples);
   return {
     name,
     description,
     ...(tools && tools.length > 0 ? { tools } : {}),
     ...(model ? { model } : {}),
+    ...(triggers ? { triggers } : {}),
+    ...(examples ? { examples } : {}),
     body,
     source,
     path,
@@ -237,19 +330,17 @@ function cacheKeyFor(workspaces: string[] = []): string {
   return `${workspaces.slice().sort().join("|")}::system=${systemKey}`;
 }
 
-/** Merge skills from all four source dirs, dedup by name with priority. The
- *  optional `workspaces` set lets project-source contribute the .claude/skills
- *  dirs from any codex-workspace-using agent — but for v2 we keep things simple
- *  and ONLY include the project sources passed in. SessionManager calls this
- *  with the active agent's workspace (if any) per-turn. */
+/** Merge skills from all sources, dedup by name with priority. The optional
+ *  `workspaces` list is the canonical project root(s) to scan — SessionManager
+ *  passes the active agent's plan root, and an UNBOUND agent (scratch) passes
+ *  nothing, because a scratch directory is not a project. */
 function buildRegistry(workspaces: string[] = []): Map<string, SkillEntry> {
-  // Collect candidates grouped by source.
-  const projectPaths = rootOverrides?.disableProject
-    ? []
-    : workspaces.flatMap((w) => {
-        const dir = projectSkillsDir(w);
-        return dir ? discoverInDir(dir) : [];
-      });
+  // Project dirs are de-duplicated after resolution: two entries naming the
+  // same project would otherwise produce the same paths twice and log a
+  // duplicate for every skill in it.
+  const projectPaths = uniqueExistingDirs(workspaces.flatMap(projectSkillsDirs)).flatMap(
+    (dir) => discoverInDir(dir),
+  );
   const grouped: Array<{ source: SkillSource; paths: string[] }> = [
     { source: "project", paths: projectPaths },
     { source: "ensemble", paths: discoverInDir(rootOverrides?.ensemble ?? ensembleSkillsDir()) },

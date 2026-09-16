@@ -37,6 +37,8 @@ export function AddTeamMemberDialog({
   const [systemPrompt, setSystemPrompt] = useState("");
   const [providerId, setProviderId] = useState<string | null>(null);
   const [model, setModel] = useState("");
+  // Empty = unbound project (the member works in its own scratch dir).
+  const [projectRoot, setProjectRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -136,7 +138,9 @@ export function AddTeamMemberDialog({
       providerId,
       model: model.trim(),
       teamId,
-      codexWorkspace: undefined,
+      // Omitted when empty → created unbound rather than inheriting a
+      // directory the user never named.
+      ...(projectRoot.trim() ? { projectRoot: projectRoot.trim() } : {}),
     });
   };
 
@@ -198,6 +202,20 @@ export function AddTeamMemberDialog({
               ))}
             </select>
           </div>
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+              {t("project.label")}
+            </span>
+            <input
+              value={projectRoot}
+              onChange={(e) => setProjectRoot(e.target.value)}
+              placeholder={t("project.placeholder")}
+              className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+            />
+            <span className="text-[10px] text-[var(--text-faint)]">
+              {projectRoot.trim() ? projectRoot.trim() : t("project.unbound.hint")}
+            </span>
+          </label>
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
               {t("team.add.label.systemPrompt")}

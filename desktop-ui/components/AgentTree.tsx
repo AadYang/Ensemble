@@ -207,6 +207,11 @@ function TreeRow({
 }) {
   const a = node.agent.summary;
   const bound = boundAgentIds.has(a.id);
+  // A subagent that has been RETIRED (core archives + deactivates it when its
+  // task ends): kept in the tree as a record, marked and dimmed rather than
+  // removed, so the transcript stays reachable and nothing looks like it
+  // silently disappeared.
+  const archived = a.subagentKind !== null && a.closed;
   const t = useT();
   return (
     <>
@@ -221,7 +226,12 @@ function TreeRow({
         {depth > 0 && <span className="text-[var(--text-faint)]">└</span>}
         <span className={`status-dot ${a.status}`} />
         {a.subagentKind && <SubagentBadge kind={a.subagentKind} />}
-        <span className={`truncate flex-1 ${bound ? "text-[var(--accent)]" : "text-[var(--text)]"}`}>
+        {archived && <span className="shrink-0 text-[9px] tracking-wider text-[var(--text-faint)]">{t("agent.badge.archived")}</span>}
+        <span
+          className={`truncate flex-1 ${bound ? "text-[var(--accent)]" : "text-[var(--text)]"} ${
+            archived ? "opacity-50" : ""
+          }`}
+        >
           {a.name}
         </span>
         {bound && <span className="text-[var(--accent)] text-[10px]" aria-label="attached">●</span>}

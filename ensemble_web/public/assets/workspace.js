@@ -45,7 +45,7 @@
     permissionModeSelect: byId("permissionModeSelect"),
     sandboxModeSelect: byId("sandboxModeSelect"),
     reasoningEffortSelect: byId("reasoningEffortSelect"),
-    codexWorkspaceInput: byId("codexWorkspaceInput"),
+    projectRootInput: byId("projectRootInput"),
     teamIdInput: byId("teamIdInput"),
     closedInput: byId("closedInput"),
     systemPromptInput: byId("systemPromptInput"),
@@ -422,7 +422,8 @@
       el.permissionModeSelect.value = agent.permissionMode || "default";
       el.sandboxModeSelect.value = agent.sandboxMode || "";
       el.reasoningEffortSelect.value = agent.reasoningEffort || "";
-      el.codexWorkspaceInput.value = agent.codexWorkspace || "";
+      el.projectRootInput.value = agent.projectRoot || "";
+      el.projectRootInput.placeholder = "absolute path — empty = unbound project";
       el.teamIdInput.value = agent.teamId || "";
       el.closedInput.checked = !!agent.metadata?.closed;
       el.systemPromptInput.value = agent.systemPrompt || "";
@@ -496,7 +497,8 @@
       permissionMode: summary.permissionMode,
       sandboxMode: summary.sandboxMode,
       reasoningEffort: summary.reasoningEffort,
-      codexWorkspace: summary.codexWorkspace,
+      projectRoot: summary.projectRoot,
+      codexWorkspace: summary.projectRoot,
       metadata: {
         ...(current.metadata || {}),
         forcedSkills: summary.forcedSkills || [],
@@ -520,8 +522,10 @@
     if (sandboxMode !== (agent.sandboxMode || null)) patch.sandboxMode = sandboxMode;
     const reasoningEffort = nullableInput(el.reasoningEffortSelect.value);
     if (reasoningEffort !== (agent.reasoningEffort || null)) patch.reasoningEffort = reasoningEffort;
-    const codexWorkspace = nullableInput(el.codexWorkspaceInput.value);
-    if (codexWorkspace !== (agent.codexWorkspace || null)) patch.codexWorkspace = codexWorkspace;
+    // Canonical field. The legacy `codexWorkspace` alias is still accepted by
+    // the server, but new writes name the real thing.
+    const projectRoot = nullableInput(el.projectRootInput.value);
+    if (projectRoot !== (agent.projectRoot || null)) patch.projectRoot = projectRoot;
     const teamId = nullableInput(el.teamIdInput.value);
     if (teamId !== (agent.teamId || null)) patch.teamId = teamId;
     const systemPrompt = nullableInput(el.systemPromptInput.value);

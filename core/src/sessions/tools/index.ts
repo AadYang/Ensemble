@@ -2,7 +2,8 @@
 
 import { tool, type FunctionTool } from "@openai/agents";
 import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
-import type { AnyNormalizedTool } from "./types.js";
+import type { AnyNormalizedTool, ToolContext, ToolOutputSink } from "./types.js";
+import { finalizeToolOutput, stringSource } from "./tool-output.js";
 import { readTool } from "./read.js";
 import { writeTool } from "./write.js";
 import { editTool } from "./edit.js";
@@ -11,7 +12,14 @@ import { grepTool } from "./grep.js";
 import { globTool } from "./glob.js";
 import { exitPlanModeTool } from "./exit-plan-mode.js";
 
-export type { NormalizedTool, AnyNormalizedTool } from "./types.js";
+export type {
+  NormalizedTool,
+  AnyNormalizedTool,
+  ToolContext,
+  ToolOutputSink,
+  ToolOutputPresentation,
+} from "./types.js";
+export type { LineSearchResult, ToolResultTooLarge } from "./tool-output.js";
 export { readTool, writeTool, editTool, bashTool, grepTool, globTool, exitPlanModeTool };
 export {
   makePeerSendTool,
@@ -22,6 +30,9 @@ export {
   makeEnsembleHelpTool,
   makeSkillListTool,
   makeSkillInvokeTool,
+  makeArtifactReadTool,
+  makeArtifactSearchTool,
+  makeJobTools,
 } from "./session-aware.js";
 
 /** All built-in NormalizedTools. OpenAIAgentRuntime registers these via
@@ -57,6 +68,19 @@ const SESSION_AWARE_FREE_TOOLS = new Set([
   "ensemble_help",
   "skill_list",
   "skill_invoke",
+  // Reading a stored result is a read-only DB lookup of the caller's own
+  // transcript material — same class as peer_query / conversation_search.
+  "artifact_read",
+  "artifact_search",
+  // Job status/log reads are inert, and the case jobs exist for is the one
+  // where nobody is watching — a prompt here would stall the very loop that
+  // checks on unattended work. Wait is bounded by JOB_WAIT_MAX_MS.
+  //
+  // job_start and job_cancel are deliberately NOT free: they execute and kill
+  // processes, the class the Bash tool still gates. Freeing them would make
+  // the job primitive a way around the permission prompt.
+  "job_status",
+  "job_wait",
 ]);
 
 /** Maps a permissionMode + tool name to whether the SDK should pause for
@@ -79,11 +103,28 @@ export function shouldRequireApproval(mode: PermissionMode, toolName: string): b
   return true;
 }
 
-/** Adapt a NormalizedTool to the OpenAI Agents SDK's FunctionTool. */
+/** Adapt a NormalizedTool to the OpenAI Agents SDK's FunctionTool.
+ *
+ *  `projectRoot` is the turn's directory (from the run plan) and is passed to
+ *  the tool as its context. It is NOT the SDK's own cwd: the Agents SDK runs
+ *  in-process, so its HTTP runtime's tools have no working directory of their
+ *  own and used to fall back to the sidecar's.
+ *
+ *  This wrapper is also the LAST core-owned point before a tool result becomes
+ *  model input — past it the result belongs to the SDK's runner. So it is where
+ *  a result from a tool that does not bound its own output (Read, Bash) is
+ *  measured against the turn's tool-result budget: over budget, the complete
+ *  bytes are stored as a `tool-output` artifact FIRST and the model is handed a
+ *  preview plus the artifact handle. Grep / Glob already do this themselves and
+ *  answer with an object, which passes through untouched. */
 export function toOpenAITool(
   nt: AnyNormalizedTool,
-  opts: { permissionMode: PermissionMode },
+  opts: { permissionMode: PermissionMode; projectRoot: string; toolOutput?: ToolOutputSink },
 ): FunctionTool<unknown, never, string> {
+  const ctx: ToolContext = {
+    projectRoot: opts.projectRoot,
+    ...(opts.toolOutput ? { toolOutput: opts.toolOutput } : {}),
+  };
   return tool({
     name: nt.name,
     description: nt.description,
@@ -93,8 +134,19 @@ export function toOpenAITool(
     needsApproval: shouldRequireApproval(opts.permissionMode, nt.name),
     async execute(args, _ctx) {
       try {
-        const out = await nt.execute(args);
-        return typeof out === "string" ? out : JSON.stringify(out);
+        const out = await nt.execute(args, ctx);
+        if (typeof out !== "string") return JSON.stringify(out);
+        const bounded = finalizeToolOutput({
+          ctx,
+          tool: nt.name,
+          source: stringSource(out),
+          narrowing:
+            `ask for less in the call itself: ${nt.name} with a narrower request (a smaller limit/offset, ` +
+            "a pattern that matches less), or a command that reports a summary instead of the whole stream",
+        });
+        if (bounded.kind === "artifact") return bounded.presentation.text;
+        if (bounded.kind === "too_large") return JSON.stringify(bounded.error);
+        return bounded.text;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return `Error: ${msg}`;

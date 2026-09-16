@@ -4,9 +4,11 @@ import { useEffect, useState } from "react";
 import {
   createSkill,
   deleteSkill,
+  getAgentSkillState,
   listSkills,
   patchSkill,
   reloadSkills,
+  type AgentSkillState,
   type SkillDTO,
   type SkillSource,
 } from "@/lib/skill-api";
@@ -21,8 +23,12 @@ const SOURCE_BADGE: Record<SkillSource, { label: string; color: string }> = {
   system: { label: "system", color: "var(--text-faint)" },
 };
 
-export function SkillPanel() {
+export function SkillPanel({ agentId }: { agentId?: string | null } = {}) {
   const [skills, setSkills] = useState<SkillDTO[]>([]);
+  /** This agent's per-turn skill state and its enabled/disabled/auto config,
+   *  from /status — the SAME source the turn used (plan.skills + agent
+   *  metadata), so this panel is a view and never a second state. */
+  const [agentState, setAgentState] = useState<AgentSkillState | null>(null);
   const [open, setOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
@@ -36,15 +42,21 @@ export function SkillPanel() {
 
   const refresh = async () => {
     try {
-      setSkills(await listSkills());
+      setSkills(await listSkills(agentId ?? null));
     } catch (err) {
       console.warn("listSkills failed", err);
+    }
+    try {
+      setAgentState(agentId ? await getAgentSkillState(agentId) : null);
+    } catch (err) {
+      console.warn("getAgentSkillState failed", err);
     }
   };
 
   useEffect(() => {
     void refresh();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
 
   const resetForm = () => {
     setName("");
@@ -179,9 +191,54 @@ export function SkillPanel() {
             <div className="px-2 py-1 text-[var(--text-faint)]">{t("skill.empty")}</div>
           )}
 
+          {/* This agent's state, when one is selected. Everything here is a
+              rendering of /status values — auto on/off, disabled, forced, and
+              what the last turn actually loaded / deferred / could not read. */}
+          {agentId && agentState && (
+            <div className="px-2 py-1 border border-[var(--border)] flex flex-col gap-0.5">
+              <div className="flex items-center gap-1 text-[10px] text-[var(--text-faint)]">
+                <span>auto: {agentState.turn ? (agentState.autoActivationEnabled ? "on" : "off") : "—"}</span>
+                <span>·</span>
+                <span>forced: {agentState.forced.length}</span>
+                <span>·</span>
+                <span>disabled: {agentState.blocked.length}</span>
+              </div>
+              {agentState.turn === null ? (
+                <div className="text-[10px] text-[var(--text-faint)]">
+                  no turn has run in this process yet; the numbers above come from agent settings
+                </div>
+              ) : agentState.turn.status === "unavailable" ? (
+                <div className="text-[10px] text-[var(--warn)]">
+                  skill state unavailable: {agentState.turn.reason}
+                </div>
+              ) : (
+                <div className="text-[10px] text-[var(--text-faint)]">
+                  last turn: {agentState.turn.loaded} loaded · {agentState.turn.deferred} deferred ·{" "}
+                  {agentState.turn.unavailable} unreadable · {agentState.turn.tokenCost ?? "?"} tokens ·{" "}
+                  {agentState.turn.counting}
+                </div>
+              )}
+              {agentState.turn?.deferredSkills.map((d) => (
+                <div key={`deferred:${d.name}`} className="text-[10px] text-[var(--warn)] truncate" title={d.reason}>
+                  deferred {d.name} ({d.tokens ?? "?"} tokens) — load with skill_invoke
+                </div>
+              ))}
+              {agentState.turn?.unavailableSkills.map((u) => (
+                <div key={`unavailable:${u.name}`} className="text-[10px] text-[var(--err)] truncate" title={u.reason}>
+                  {u.name}: {u.code}
+                </div>
+              ))}
+            </div>
+          )}
+
           {skills.map((s) => {
             const badge = SOURCE_BADGE[s.source];
             const editable = s.source === "ensemble";
+            // enabled/disabled/auto per skill, from the same lists the turn
+            // reads. A skill can be both forced and disabled (explicit naming
+            // wins) — show exactly that instead of picking one.
+            const disabled = agentState?.blocked.includes(s.name) ?? false;
+            const forced = agentState?.forced.includes(s.name) ?? false;
             return (
               <div
                 key={`${s.source}:${s.name}`}
@@ -197,6 +254,19 @@ export function SkillPanel() {
                   >
                     {badge.label}
                   </span>
+                  {agentId && forced && (
+                    <span className="text-[10px] px-1 border border-[var(--ok)] text-[var(--ok)]" title="forcedSkills: always injected in full">
+                      forced
+                    </span>
+                  )}
+                  {agentId && disabled && (
+                    <span
+                      className="text-[10px] px-1 border border-[var(--text-faint)] text-[var(--text-faint)]"
+                      title="disabledSkills: automatic activation skips it; skill_invoke still loads it in full"
+                    >
+                      disabled
+                    </span>
+                  )}
                   {editable && (
                     <>
                       <button

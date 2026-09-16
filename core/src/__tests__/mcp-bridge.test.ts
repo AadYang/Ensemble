@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import Fastify from "fastify";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import {
   BRIDGE_TOKEN,
   getBridgeUrl,
@@ -10,6 +12,8 @@ import {
   setBridgePort,
   unregisterHandlers,
 } from "../mcp-bridge.js";
+import { DB_PATH, sqliteDb } from "../db.js";
+import { ensureDataDir } from "../paths.js";
 
 // W20 Slice 5.5: codex consumes MCP via TOML overrides. The translator
 // must keep stdio/http/sse rows and drop in-process SDK rows (which can't
@@ -288,5 +292,59 @@ describe("mcpServersToCodexConfig", () => {
       ok: { type: "stdio", command: "node" },
     });
     expect(Object.keys(out)).toEqual(["ok"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// The designated proof for the database isolation in test-setup.ts.
+//
+// This file is the shape of test the incident was made of: it reaches db.ts at
+// import time (mcp-bridge → conversation-search → db) and never sets
+// AGENTORCH_DB_PATH itself. Before the guard it silently opened whatever
+// database the developer's environment pointed at; with the guard but without a
+// setup file it did not run at all. Both of those are what the assertions below
+// rule out, in that order.
+// ─────────────────────────────────────────────────────────────
+describe("test database isolation", () => {
+  it("opens the setup-provided in-memory database and never the default one", () => {
+    const defaultPath = join(ensureDataDir(), "agentorch.db");
+    const existedBefore = existsSync(defaultPath);
+
+    // (a) The import got through: db.ts completed its import-time work and the
+    //     schema is queryable. If test-setup.ts had not run first, or had left
+    //     the variable unset, the module graph would have thrown the guard's
+    //     error and this file would have reported no tests at all.
+    const tables = sqliteDb
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'UsageEvent'")
+      .all();
+    expect(tables).toHaveLength(1);
+
+    // (b) The path db.ts resolved is the one the setup file chose, and is not
+    //     the environment-derived default this file would otherwise have hit.
+    expect(DB_PATH).toBe(":memory:");
+    expect(DB_PATH).toBe(process.env.AGENTORCH_DB_PATH);
+    expect(DB_PATH).not.toBe(defaultPath);
+
+    // (c) The OPEN CONNECTION is not the production file. This is the strongest
+    //     form available and the load-bearing one: `PRAGMA database_list`
+    //     reports the file behind the live handle, so it cannot be satisfied by
+    //     a coincidence in path arithmetic and it does not care what else
+    //     touches that file. An mtime comparison on defaultPath would care: the
+    //     desktop app holds the same database open and appends to its -wal on
+    //     its own schedule, so "mtime unchanged" would be measuring the app,
+    //     not this test, and would flake in exactly the setup it is meant to
+    //     detect. In-memory is reported as the empty string by SQLite.
+    const main = (sqliteDb.prepare("PRAGMA database_list").all() as { name: string; file: string }[])
+      .find((r) => r.name === "main");
+    expect(main?.file ?? "").not.toBe(defaultPath);
+    expect(main?.file ?? "").toBe("");
+
+    // (d) No file was created at the default path by THIS run. Only the
+    //     direction that is deterministic is asserted: a file that did not
+    //     exist before must not exist now. When it does already exist — the
+    //     normal case on a machine that runs the app — nothing here can
+    //     honestly attribute a change to this process, which is what (b) and
+    //     (c) are for. They do not depend on the file existing at all.
+    expect(existsSync(defaultPath)).toBe(existedBefore);
   });
 });

@@ -16,8 +16,14 @@ import type {
   CloudWorkspace,
   JsonObject,
   JsonValue,
+  PublishedAgentPlan,
 } from "./store.js";
-import { CloudRevisionConflictError, sanitizeSnapshotInput } from "./store.js";
+import {
+  CloudRevisionConflictError,
+  PUBLISHED_PLAN_KEY,
+  carryPublishedPlanForward,
+  sanitizeSnapshotInput,
+} from "./store.js";
 
 const SCHEMA_STATEMENTS: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS cloud_account (
@@ -91,6 +97,10 @@ const SCHEMA_STATEMENTS: ReadonlyArray<string> = [
      permission_mode   VARCHAR(80)  NULL,
      sandbox_mode      VARCHAR(80)  NULL,
      reasoning_effort  VARCHAR(80)  NULL,
+     -- project_root is the canonical bound directory. codex_workspace is the
+     -- legacy alias: kept as a column (never written by new code) so an
+     -- existing deployment's values survive and can be backfilled.
+     project_root      VARCHAR(512) NULL,
      codex_workspace   VARCHAR(512) NULL,
      metadata          JSON         NOT NULL,
      sort_order        INT          NOT NULL DEFAULT 0,
@@ -228,7 +238,10 @@ function mapAgent(row: Row): CloudAgent {
     permissionMode: row.permission_mode == null ? null : String(row.permission_mode),
     sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
     reasoningEffort: row.reasoning_effort == null ? null : String(row.reasoning_effort),
-    codexWorkspace: row.codex_workspace == null ? null : String(row.codex_workspace),
+    projectRoot: row.project_root == null ? null : String(row.project_root),
+    // Read-side alias: /status, the snapshot and the desktop UI still speak
+    // `codexWorkspace` in places, and both must name the SAME directory.
+    codexWorkspace: row.project_root == null ? null : String(row.project_root),
     metadata,
     sortOrder: Number(row.sort_order ?? 0),
     revision: Number(row.revision ?? 0),
@@ -247,6 +260,25 @@ function mapMessage(row: Row): CloudMessage {
   };
 }
 
+/** Idempotent ADD COLUMN for a table that already exists in a live deployment.
+ *  MySQL has no `ADD COLUMN IF NOT EXISTS`, so the catalog is consulted first;
+ *  CREATE TABLE IF NOT EXISTS above covers a fresh database and this covers an
+ *  existing one, and running either one twice is a no-op. */
+async function ensureColumn(
+  conn: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  table: string,
+  column: string,
+  declaration: string,
+): Promise<void> {
+  const [rows] = (await conn.query(
+    `SELECT COUNT(*) AS n FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+    [table, column],
+  )) as [Array<{ n: number | string }>, unknown];
+  if (Number(rows?.[0]?.n ?? 0) > 0) return;
+  await conn.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+}
+
 export class CloudDb implements CloudStore {
   constructor(readonly pool: Pool) {}
 
@@ -254,6 +286,15 @@ export class CloudDb implements CloudStore {
     const conn = await this.pool.getConnection();
     try {
       for (const statement of SCHEMA_STATEMENTS) await conn.query(statement);
+      await ensureColumn(conn, "cloud_agent", "project_root", "VARCHAR(512) NULL");
+      // Same rule as the SQLite side: only a NON-EMPTY legacy value is a bound
+      // project. A NULL / empty codex_workspace means the agent was never
+      // bound, and inventing a root for it would turn "unbound" into a
+      // directory the user never chose.
+      await conn.query(
+        `UPDATE cloud_agent SET project_root = codex_workspace
+          WHERE project_root IS NULL AND codex_workspace IS NOT NULL AND codex_workspace <> ''`,
+      );
     } finally {
       conn.release();
     }
@@ -420,13 +461,28 @@ export class CloudDb implements CloudStore {
           [team.id, accountId, workspaceId, team.name, team.description, team.sortOrder, nextRevision, now],
         );
       }
+      // One read for the whole batch, before the writes: a config upload that
+      // does not mention the published plan must not delete it (see
+      // carryPublishedPlanForward). Scoped to the ids being written, so this is
+      // the same order of work as the write it precedes.
+      const storedMetadata = new Map<string, JsonObject>();
+      if (agents.length > 0) {
+        const placeholders = agents.map(() => "?").join(",");
+        const [rows] = await conn.query<Row[]>(
+          `SELECT id, metadata FROM cloud_agent
+            WHERE account_id = ? AND workspace_id = ? AND id IN (${placeholders})`,
+          [accountId, workspaceId, ...agents.map((agent) => agent.id)],
+        );
+        for (const row of rows) storedMetadata.set(String(row.id), parseJson(row.metadata, {}) as JsonObject);
+      }
       for (const agent of agents) {
+        const carried = carryPublishedPlanForward(agent, { metadata: storedMetadata.get(agent.id) ?? {} });
         await conn.query(
           `INSERT INTO cloud_agent
              (id, account_id, workspace_id, parent_id, team_id, name, system_prompt, model, provider_kind,
-              provider_name, provider_id, permission_mode, sandbox_mode, reasoning_effort, codex_workspace,
-              metadata, sort_order, revision, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              provider_name, provider_id, permission_mode, sandbox_mode, reasoning_effort, project_root,
+              codex_workspace, metadata, sort_order, revision, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              parent_id = VALUES(parent_id),
              team_id = VALUES(team_id),
@@ -439,6 +495,13 @@ export class CloudDb implements CloudStore {
              permission_mode = VALUES(permission_mode),
              sandbox_mode = VALUES(sandbox_mode),
              reasoning_effort = VALUES(reasoning_effort),
+             project_root = VALUES(project_root),
+             -- The legacy column is TOMBSTONED on every write (the parameter
+             -- is always NULL, see sanitizeAgentInput) rather than preserved:
+             -- a row that was backfilled from it, then explicitly unbound
+             -- (project_root = NULL), would otherwise keep the old directory
+             -- here and the next migrate() would silently rebind it. The same
+             -- rule the SQLite write path applies.
              codex_workspace = VALUES(codex_workspace),
              metadata = VALUES(metadata),
              sort_order = VALUES(sort_order),
@@ -459,8 +522,9 @@ export class CloudDb implements CloudStore {
             agent.permissionMode,
             agent.sandboxMode,
             agent.reasoningEffort,
-            agent.codexWorkspace,
-            jsonString(agent.metadata),
+            agent.projectRoot,
+            null,
+            jsonString(carried.metadata),
             agent.sortOrder,
             nextRevision,
             now,
@@ -497,5 +561,49 @@ export class CloudDb implements CloudStore {
       },
       messageCursors: await readMessageCursors(),
     };
+  }
+
+  async publishAgentPlan(
+    accountId: string,
+    workspaceId: string,
+    agentId: string,
+    plan: PublishedAgentPlan,
+  ): Promise<PublishedAgentPlan | null> {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Lock the ONE row this write is about. Replacing the whole `metadata`
+      // bag under a row lock keeps every other key (and every config column,
+      // which is not in this statement at all) exactly as another client left
+      // it — the publishing desktop's stale copy of the agent is never
+      // consulted. `revision`/`updated_at` are deliberately not advanced: a
+      // plan is not configuration.
+      const [rows] = await conn.query<Row[]>(
+        `SELECT metadata FROM cloud_agent
+          WHERE account_id = ? AND workspace_id = ? AND id = ?
+          FOR UPDATE`,
+        [accountId, workspaceId, agentId],
+      );
+      const existing = rows[0];
+      if (!existing) {
+        await conn.rollback();
+        return null;
+      }
+      const metadata: JsonObject = {
+        ...(parseJson(existing.metadata, {}) as JsonObject),
+        [PUBLISHED_PLAN_KEY]: plan as unknown as JsonValue,
+      };
+      await conn.query(
+        "UPDATE cloud_agent SET metadata = ? WHERE account_id = ? AND workspace_id = ? AND id = ?",
+        [jsonString(metadata), accountId, workspaceId, agentId],
+      );
+      await conn.commit();
+      return plan;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
 }

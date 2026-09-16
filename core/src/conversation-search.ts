@@ -10,8 +10,15 @@ const DEFAULT_SCOPE: ConversationSearchScope = "team";
 const DEFAULT_LIMIT = 8;
 const MAX_LIMIT = 25;
 const MAX_AGENT_SCAN_ROWS = 500;
+/** One snippet is a pointer to where the match is, so a bounded window around
+ *  it is the right size by design — a snippet is never "the result". */
 const SNIPPET_CHARS = 260;
-const MAX_OUTPUT_CHARS = 12_000;
+// MAX_OUTPUT_CHARS used to cap the whole rendered result at 12 000 characters
+// with a head+tail cut. Two things were wrong with it: the middle of the match
+// list did not exist anywhere afterwards, and the "truncated" notice sat under
+// a tool description that promised the model it could read the result in full.
+// The full text now goes to an artifact (artifacts.ts) and the caller decides
+// what to carry, based on the turn's real window.
 
 export interface ConversationSearchArgs {
   query: string;
@@ -31,25 +38,53 @@ interface SearchHit {
   snippet: string;
 }
 
-export async function conversationSearch(fromAgentId: string, args: ConversationSearchArgs): Promise<string> {
+/** The result of a search: the rendered text, or the reason it could not run.
+ *
+ *  Split from the string form because the CALLER has to know which of the two
+ *  it is holding: the text becomes an artifact with a verifiable handle, while
+ *  an error is returned as itself. A single `string` return forced the caller
+ *  to sniff for "error: " prefixes to tell a successful search from a failed
+ *  one, and getting that wrong stores a failure as if it were content. */
+export type ConversationSearchOutcome =
+  | { ok: true; text: string }
+  | { ok: false; message: string };
+
+export async function conversationSearch(
+  fromAgentId: string,
+  args: ConversationSearchArgs,
+): Promise<string> {
+  const outcome = await conversationSearchOutcome(fromAgentId, args);
+  return outcome.ok ? outcome.text : outcome.message;
+}
+
+export async function conversationSearchOutcome(
+  fromAgentId: string,
+  args: ConversationSearchArgs,
+): Promise<ConversationSearchOutcome> {
   const query = normalizeQuery(args.query);
-  if (!query) return "error: conversation_search query is required";
+  if (!query) return { ok: false, message: "error: conversation_search query is required" };
 
   const scope = sanitizeScope(args.scope);
   const limit = sanitizeLimit(args.limit);
   const source = await prisma.agent.findUnique({ where: { id: fromAgentId } });
-  if (!source) return `error: source agent ${fromAgentId} not found`;
+  if (!source) return { ok: false, message: `error: source agent ${fromAgentId} not found` };
 
   const resolved = await resolveSearchTargets(source, scope, args.target);
-  if ("error" in resolved) return resolved.error;
+  if ("error" in resolved) return { ok: false, message: resolved.error };
 
   const hits: SearchHit[] = [];
+  // An agent whose history is longer than one scan batch is searched over its
+  // NEWEST rows only. That is a real bound, so it is reported in the header:
+  // a caller that reads "matches: 0" as "this was never discussed" is making a
+  // claim the scan cannot support.
+  const scanCapped: string[] = [];
   for (const target of resolved.targets) {
     const rows = await prisma.message.findMany({
       where: { agentId: target.agent.id },
       orderBy: { seq: "desc" },
       take: MAX_AGENT_SCAN_ROWS,
     });
+    if (rows.length >= MAX_AGENT_SCAN_ROWS) scanCapped.push(target.agent.name);
     for (const row of rows) {
       const extracted = searchableMessageText(row);
       if (!extracted) continue;
@@ -75,10 +110,13 @@ export async function conversationSearch(fromAgentId: string, args: Conversation
     resolved.note ? `note: ${resolved.note}` : null,
     `searched: ${searchedAgents || "(none)"}`,
     selected.length === 0 ? "matches: 0" : `matches: ${selected.length}${hits.length > selected.length ? ` of ${hits.length}` : ""}`,
+    scanCapped.length > 0
+      ? `note: scan capped at the newest ${MAX_AGENT_SCAN_ROWS} messages for ${scanCapped.join(", ")} — older history was NOT searched`
+      : null,
   ].filter((line): line is string => Boolean(line));
 
   if (selected.length === 0) {
-    return header.join("\n");
+    return { ok: true, text: header.join("\n") };
   }
 
   const lines = selected.flatMap((hit, index) => [
@@ -86,7 +124,11 @@ export async function conversationSearch(fromAgentId: string, args: Conversation
     `${index + 1}. agent="${hit.agent.name}" agentId=${hit.agent.id} seq=${hit.row.seq} role=${hit.role} createdAt=${hit.row.createdAt.toISOString()}`,
     `   snippet: ${hit.snippet}`,
   ]);
-  return truncateOutput([...header, ...lines].join("\n"), MAX_OUTPUT_CHARS);
+  // The whole match list, uncut. Its size is bounded by the caller's own
+  // `limit`, and whoever carries it decides what to do about the size (the
+  // SessionManager stores it as an artifact and inlines within the turn's
+  // budget). A head+tail cut here would be invisible to that decision.
+  return { ok: true, text: [...header, ...lines].join("\n") };
 }
 
 async function resolveSearchTargets(
@@ -196,9 +238,3 @@ function buildSnippet(text: string, query: string, maxChars: number): string {
   return `${start > 0 ? "... " : ""}${slice}${end < text.length ? " ..." : ""}`;
 }
 
-function truncateOutput(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  const head = Math.floor(maxChars * 0.65);
-  const tail = maxChars - head - 80;
-  return `${text.slice(0, head)}\n\n[... conversation_search output truncated ${text.length - head - tail} chars ...]\n\n${text.slice(-tail)}`;
-}

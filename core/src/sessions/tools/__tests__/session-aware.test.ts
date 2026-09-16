@@ -12,6 +12,12 @@ import {
 } from "../session-aware.js";
 import { exitPlanModeTool } from "../exit-plan-mode.js";
 import { shouldRequireApproval } from "../index.js";
+import type { ToolContext } from "../types.js";
+
+/** The session-aware tools and ExitPlanMode do not read the working directory:
+ *  they fan messages / surface dialogs / echo a plan. The context is still part
+ *  of the tool contract, so a real one is passed rather than a cast. */
+const CTX: ToolContext = { projectRoot: process.cwd() };
 
 describe("makePeerSendTool", () => {
   it("each factory call binds its own callback (no cross-talk)", async () => {
@@ -27,9 +33,9 @@ describe("makePeerSendTool", () => {
     const toolA = makePeerSendTool(sendA);
     const toolB = makePeerSendTool(sendB);
 
-    expect(await toolA.execute({ target: "x", message: "m1" })).toBe("delivered by A");
-    expect(await toolB.execute({ target: "y", message: "m2", mode: "review" })).toBe("delivered by B");
-    expect(await toolA.execute({ target: "z", message: "m3" })).toBe("delivered by A");
+    expect(await toolA.execute({ target: "x", message: "m1" }, CTX)).toBe("delivered by A");
+    expect(await toolB.execute({ target: "y", message: "m2", mode: "review" }, CTX)).toBe("delivered by B");
+    expect(await toolA.execute({ target: "z", message: "m3" }, CTX)).toBe("delivered by A");
 
     expect(calls).toEqual([
       { which: "A", target: "x", mode: undefined },
@@ -63,7 +69,7 @@ describe("makePeerSendTool", () => {
         correlationKind: "request",
         replyToCorrelationId: "decision-0",
         causalRunId: "run-1",
-      }),
+      }, CTX),
     ).toBe("sent");
     expect(observed).toMatchObject({
       messageId: "msg-1",
@@ -83,8 +89,8 @@ describe("makePeerQueryTool", () => {
       return `history for ${args.target}`;
     };
     const tool = makePeerQueryTool(query);
-    expect(await tool.execute({ target: "agent-1", limit: 5 })).toBe("history for agent-1");
-    expect(await tool.execute({ target: "agent-2" })).toBe("history for agent-2");
+    expect(await tool.execute({ target: "agent-1", limit: 5 }, CTX)).toBe("history for agent-1");
+    expect(await tool.execute({ target: "agent-2" }, CTX)).toBe("history for agent-2");
     expect(calls).toEqual([
       { target: "agent-1", limit: 5 },
       { target: "agent-2" },
@@ -101,7 +107,7 @@ describe("makeConversationSearchTool", () => {
     };
     const tool = makeConversationSearchTool(search);
 
-    expect(await tool.execute({ query: "migration", scope: "agent", target: "A", limit: 3 })).toBe("search:migration:agent");
+    expect(await tool.execute({ query: "migration", scope: "agent", target: "A", limit: 3 }, CTX)).toBe("search:migration:agent");
     expect(calls).toEqual([{ query: "migration", scope: "agent", target: "A", limit: 3 }]);
   });
 });
@@ -114,7 +120,7 @@ describe("makeAskUserTool", () => {
       return args.options[0]!;
     };
     const tool = makeAskUserTool(ask);
-    const result = await tool.execute({ question: "go?", options: ["yes", "no"] });
+    const result = await tool.execute({ question: "go?", options: ["yes", "no"] }, CTX);
     expect(result).toBe("yes");
     expect(observed).toBe("go?|yes,no");
   });
@@ -130,7 +136,7 @@ describe("makeTaskTool", () => {
       return { finalText: "subagent done", subagentId: "child-id" };
     };
     const tool = makeTaskTool(spawn);
-    const result = await tool.execute({ description: "search docs", prompt: "find the relevant section" });
+    const result = await tool.execute({ description: "search docs", prompt: "find the relevant section" }, CTX);
     expect(result).toBe("subagent done");
     expect(receivedDescription).toBe("search docs");
     expect(receivedPrompt).toBe("find the relevant section");
@@ -147,7 +153,7 @@ describe("makeTaskTool", () => {
       description: "run build",
       prompt: "compile the desktop app",
       background: true,
-    });
+    }, CTX);
     expect(receivedBackground).toBe(true);
     // Must NOT return empty finalText for a background task — the model needs the
     // id, a clear "don't block" instruction, and the delivery contract: the
@@ -162,7 +168,7 @@ describe("makeTaskTool", () => {
 describe("ExitPlanMode tool", () => {
   it("echoes the plan text on execute", async () => {
     const plan = "# Plan\n\n- Step 1\n- Step 2";
-    const out = await exitPlanModeTool.execute({ plan });
+    const out = await exitPlanModeTool.execute({ plan }, CTX);
     expect(out).toBe(plan);
   });
 

@@ -1,19 +1,39 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { PermissionMode, ReasoningEffort, SandboxMode } from "@agentorch/shared";
+import type {
+  CapabilityViewModel,
+  PermissionMode,
+  RunPlanSettingField,
+  RunPlanStatusView,
+  SandboxMode,
+  SettingInvalidation,
+  SettingsImpactReport,
+  SettingsImpactRequest,
+} from "@agentorch/shared";
 import {
+  capabilityView,
+  isReasoningToken,
+  REASONING_HINTS,
+  REASONING_SYNTAX_RULE,
+} from "@agentorch/shared";
+import {
+  AgentRequestError,
   closeAgent,
   deleteAgent,
+  getAgentSettingsImpact,
+  getAgentStatusReport,
+  isSettingsInvalidationError,
   patchAgent,
   resetRuntimeSession,
   restartAgent,
+  type AgentPatch,
 } from "@/lib/agent-api";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { getWS } from "@/lib/ws";
 import { useStore } from "@/store/agents";
-import { useT } from "@/i18n/useT";
+import { useT, type TranslateFn } from "@/i18n/useT";
 import { getDialog } from "@/lib/dialog";
 import { SuggestSubagentDialog } from "./SuggestSubagentDialog";
 import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
@@ -26,14 +46,132 @@ const PERMISSION_MODES: PermissionMode[] = [
   "dontAsk",
 ];
 
-const REASONING_EFFORTS: ReasoningEffort[] = [
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-];
+// The dropdown used to hold its own copy of the level list, which meant the UI
+// could offer a level the protocol no longer accepted (or hide one it did). The
+// options now come from the shared contract and are HINTS: a model may have
+// levels this list does not know (`ultra`), so the field accepts a typed token.
+const REASONING_OPTION_ID = "reasoning-effort-options";
+
+/** The plan's settings surface: one row per field, read verbatim from the
+ *  shared `CapabilityViewModel`, plus the identity the plan ran under and EVERY
+ *  diagnostic.
+ *
+ *  Display-only, and deliberately so: the rows say what the plan resolved and
+ *  why, and the controls that change a value are the fields above. Nothing here
+ *  decides whether a field applies — `editable`, `disabledReason`, `options` and
+ *  `rejectedChoices` were all decided once, in `shared/src/capability-view.ts`,
+ *  which is also what the `/status` text and the context bar read. */
+function PlanStatusSection({
+  capability,
+  t,
+}: {
+  capability: CapabilityViewModel;
+  t: TranslateFn;
+}) {
+  const plan = capability.planView;
+  const header = capability.header;
+  if (!plan || !header) {
+    return (
+      <span className="text-[10px] text-[var(--text-faint)] leading-tight">
+        {t("settings.plan.none")}
+      </span>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] text-[var(--text-dim)] leading-tight">
+        {t("settings.plan.header", {
+          source: capability.runPlanSource,
+          hash: header.planHash.slice(0, 12),
+          at: header.resolvedAt,
+        })}
+      </span>
+      <span className="text-[10px] text-[var(--text-faint)] leading-tight break-all">
+        {t("settings.plan.identity", {
+          providerScope: header.providerScope,
+          runtime: header.runtime,
+          version: header.runtimeVersion ?? "—",
+          transport: header.transport,
+          model: header.modelId,
+        })}
+      </span>
+      {capability.fields.map((row) => (
+        <div
+          key={row.field}
+          className="flex flex-col gap-0.5 border border-[var(--border)] px-1.5 py-1"
+        >
+          <div className="flex items-center gap-1">
+            <span className={row.editable ? "" : "text-[var(--text-faint)] line-through"}>
+              {row.field}
+            </span>
+            <span className="text-[10px] text-[var(--text-faint)]">{row.path}</span>
+            <span className="ml-auto">
+              {row.requested ?? "—"} → {row.resolved ?? "—"}
+            </span>
+          </div>
+          <div className="text-[10px] text-[var(--text-dim)]">
+            {t("settings.plan.row", {
+              outcome: row.outcome,
+              source: row.source,
+              confidence: row.confidence,
+            })}
+          </div>
+          {/* The server's sentence. A row that cannot be edited says why here
+              rather than leaving a disabled control unexplained — and the
+              reason comes from the view-model, not from this component deciding
+              that a disabled row probably wants one. */}
+          <div className={row.editable ? "text-[10px] text-[var(--text-faint)]" : "text-[10px] text-[var(--warn)]"}>
+            {row.disabledReason ?? row.reason}
+          </div>
+          {/* The value the route refused, shown AS-IS so the user can see what
+              they asked for. The control for this field stays enabled: the fix
+              is another value, not a locked field. */}
+          {row.rejection !== null && (
+            <div className="text-[10px] text-[var(--warn)]">
+              {t("settings.plan.rejectedValue", { value: row.rejection.value, code: row.rejection.code })}
+            </div>
+          )}
+          {row.rejectedChoices.map((rc) => (
+            <div key={rc.value} className="text-[10px] text-[var(--err)]">
+              {t("settings.plan.rejected", { value: rc.value, code: rc.code, detail: rc.detail })}
+            </div>
+          ))}
+        </div>
+      ))}
+      <span className="text-[10px] text-[var(--text-dim)]">
+        {t("settings.plan.diagnostics", {
+          summary: (Object.entries(plan.diagnosticCounts) as [string, number][])
+            .map(([k, v]) => `${k}:${v}`)
+            .join(" "),
+        })}
+      </span>
+      {/* Every diagnostic, including the ones no other surface prints: a
+          diagnostic nobody renders is a fact the plan holds and the user cannot
+          see. */}
+      {plan.diagnostics.map((d, i) => (
+        <span key={`${d.field}-${i}`} className="text-[10px] text-[var(--text-faint)] leading-tight">
+          {t("settings.plan.diagnostic", {
+            field: d.field,
+            status: d.status,
+            origin: d.origin,
+            confidence: d.confidence,
+            detail: d.detail,
+          })}
+        </span>
+      ))}
+      {plan.preferences.map((p) => (
+        <span key={p.field} className="text-[10px] text-[var(--text-faint)] leading-tight">
+          {t("settings.plan.preference", {
+            field: p.field,
+            requested: String(p.requested),
+            outcome: p.outcome,
+          })}
+          {p.rejection ? ` — ${p.rejection.code}: ${p.rejection.detail}` : ""}
+        </span>
+      ))}
+    </div>
+  );
+}
 
 export function AgentSettings({
   agentId,
@@ -60,11 +198,23 @@ export function AgentSettings({
     agent?.summary.sandboxMode ?? "",
   );
   // "" = inherit from the runtime/provider default; otherwise per-agent override.
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(
+  // Plain string: the stored value may be a level this build has no hint for.
+  const [reasoningEffort, setReasoningEffort] = useState<string>(
     agent?.summary.reasoningEffort ?? "",
   );
+  // "" = UNBOUND project (the agent works in its own scratch directory). Not a
+  // provider-scoped field any more: every runtime honors it.
+  const [projectRoot, setProjectRoot] = useState<string>(agent?.summary.projectRoot ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The plan this agent's last turn ran under, as the server's view-model. The
+  // live store value is preferred (it is the turn's own snapshot); when nothing
+  // has run yet we read `/status`, which resolves a PREDICTION and labels it as
+  // one. Either way this is the ONE object every row below is read from — no
+  // field here is decided from the provider kind or the model id.
+  const storePlan = useStore((s) => s.planByAgent[agentId]);
+  const [fetchedPlan, setFetchedPlan] = useState<RunPlanStatusView | null>(null);
+  const planView = storePlan ?? fetchedPlan;
   const t = useT();
 
   // Draggable position. null until first mount → uses centered fallback inline.
@@ -92,25 +242,90 @@ export function AgentSettings({
       });
   }, []);
 
-  // Reset model when the active provider changes to one that doesn't list the
-  // current value. Without this the dropdown's stale-model fallback option
-  // mixes claude-opus-4-8 (or whatever the agent had) into the codex/openai
-  // model list — and "Apply" would PATCH that incompatible model upstream.
+  // Read the plan when the store holds none. `/status` reports what it resolved
+  // (and says the source is `fresh-resolution`, not a turn's own snapshot), so
+  // the rows below are never blank just because nothing has run yet.
   useEffect(() => {
-    const sp = providers.find((p) => p.id === providerId);
-    if (!sp) return;
-    const isDefaultAnth =
-      sp.kind === "anthropic-local" || (sp.kind === "anthropic" && !sp.baseUrl);
-    const avail = sp.models.length
-      ? sp.models
-      : isDefaultAnth ? DEFAULT_ANTHROPIC_MODELS : [];
-    if (!avail.includes(model)) {
-      setModel(avail[0] ?? "");
+    if (storePlan) return;
+    let cancelled = false;
+    void getAgentStatusReport(agentId)
+      .then((report) => {
+        // `null` = this instance has no such agent (a cloud-only one). The rows
+        // then render "no plan", which is the truth, rather than a report
+        // fabricated from the synced snapshot.
+        if (!cancelled) setFetchedPlan(report?.planView ?? null);
+      })
+      .catch((err) => {
+        // A failed read is not a reason to invent a plan: the rows render as
+        // "unknown" instead.
+        console.warn("getAgentStatusReport failed", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, storePlan]);
+
+  // The DRAFT's own plan, refreshed as the form changes.
+  //
+  // Read through the same `/settings-impact` entry the Apply flow uses, which
+  // resolves the proposal with `resolveRunPlan` and `allowProbe: false`: no
+  // write, no probe, no fetch. The answer is labelled `preview` by the server,
+  // so nothing below can render a draft like a plan an agent is running under.
+  const [draftPreview, setDraftPreview] = useState<SettingsImpactReport | null>(null);
+  const [draftPreviewError, setDraftPreviewError] = useState<string | null>(null);
+  const draftRequest = useMemo<SettingsImpactRequest | null>(() => {
+    const summary = agent?.summary;
+    if (!summary) return null;
+    const request: SettingsImpactRequest = {
+      providerId: (providerId ?? null) !== (summary.providerId ?? null) ? providerId : undefined,
+      model: model !== summary.model ? model : undefined,
+      reasoningEffort:
+        (reasoningEffort.trim() || null) !== (summary.reasoningEffort ?? null)
+          ? reasoningEffort.trim() || null
+          : undefined,
+      projectRoot:
+        (projectRoot.trim() || null) !== (summary.projectRoot ?? null) ? projectRoot.trim() || null : undefined,
+    };
+    return Object.values(request).some((value) => value !== undefined) ? request : null;
+  }, [agent?.summary, providerId, model, reasoningEffort, projectRoot]);
+  // The request's CONTENT, not its identity: two renders that compute the same
+  // proposal must not re-ask the server, and every keystroke in a text field
+  // produces a new object.
+  const draftKey = draftRequest === null ? null : JSON.stringify(draftRequest);
+  useEffect(() => {
+    if (draftKey === null) {
+      setDraftPreview(null);
+      setDraftPreviewError(null);
+      return;
     }
-    // model intentionally excluded — only re-evaluate when provider changes,
-    // not when the user manually picks a value within the same provider.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [providerId, providers]);
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void getAgentSettingsImpact(agentId, JSON.parse(draftKey) as SettingsImpactRequest)
+        .then((impact) => {
+          if (cancelled) return;
+          setDraftPreview(impact);
+          setDraftPreviewError(null);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setDraftPreview(null);
+          setDraftPreviewError((err as Error).message);
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [agentId, draftKey]);
+
+  // NOTE: this effect used to REPLACE the model whenever the provider changed to
+  // one that did not list the current value. That is a silent edit of a stored
+  // setting: the user switched the provider, and the model they had chosen was
+  // gone from the form without a word — and "Apply" then wrote the replacement.
+  // The value is now left exactly where the user put it, the field says the
+  // chosen model is not in the new provider's list, and the model/provider change
+  // goes through the invalidation report (which names every field the change
+  // affects and asks first). The server still does the final validation.
 
   // Center after the dialog actually mounts (ref is null on the first effect pass
   // because we early-return until `mounted`).
@@ -153,6 +368,9 @@ export function AgentSettings({
     };
   }, [onClose]);
 
+  const capability = useMemo(() => capabilityView(planView), [planView]);
+  const draftCapability = useMemo(() => capabilityView(draftPreview?.nextPlan ?? null), [draftPreview]);
+
   if (!agent) return null;
 
   const onHeaderMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -168,8 +386,6 @@ export function AgentSettings({
   const summary = agent.summary;
   const selectedProvider = providers.find((p) => p.id === providerId);
   const providerCapabilityKnown = providerId === null || selectedProvider !== undefined;
-  const selectedProviderKind = selectedProvider?.kind ?? (providerId === null ? "anthropic-local" : null);
-  const isCodexProvider = selectedProvider?.kind === "openai-codex";
   const selectedRuntime = selectedProvider?.currentRuntime ?? null;
   const providerCliMissing =
     selectedProvider?.kind === "openai-codex" || selectedProvider?.kind === "anthropic-local"
@@ -177,11 +393,16 @@ export function AgentSettings({
       : false;
   const providerCliVersionTooOld = selectedRuntime?.cliVersionTooOld === true;
   const providerAuthMissing = selectedProvider?.kind === "openai-codex" && selectedRuntime?.authPresent === false;
-  const supportsThinkingMode =
-    selectedProviderKind === "anthropic-local" ||
-    selectedProviderKind === "anthropic" ||
-    selectedProviderKind === "openai-codex" ||
-    selectedProviderKind === "openai-compat";
+  // Whether the setting is REACHABLE no longer depends on the provider kind.
+  // The old kind list excluded `openai-local` by omission, and a kind is the
+  // wrong question anyway: it decides whether an adapter can express a level
+  // (which the runtime answers with a structured error) and never which levels a
+  // model has. Hiding the field would also CLEAR a stored level on a provider
+  // switch, which is the silent edit this contract exists to stop.
+  const supportsThinkingMode = providerCapabilityKnown;
+  // A token that is not even legal syntax cannot be persisted: the API refuses
+  // it (400) and nothing would be written, so the form says so first.
+  const reasoningEffortInvalid = reasoningEffort.trim() !== "" && !isReasoningToken(reasoningEffort);
   // Only the local-OAuth Claude provider (anthropic-local) and the legacy
   // built-in default (kind=anthropic + no baseUrl) get the hardcoded model
   // fallback. For 3rd-party Anthropic-compat providers we MUST show only the
@@ -196,14 +417,39 @@ export function AgentSettings({
       : isDefaultAnthropic
         ? DEFAULT_ANTHROPIC_MODELS
         : [];
-  const effectiveSandbox: SandboxMode | null = isCodexProvider ? (sandboxMode || null) : null;
-  const effectiveReasoningEffort: ReasoningEffort | null | undefined = providerCapabilityKnown
-    ? supportsThinkingMode
-      ? (reasoningEffort || null)
-      : null
+  // Whether a per-agent sandbox override means anything here is the SERVER's
+  // answer (`sandboxOverrideSupported`, from the runtime it would launch), not
+  // this component's reading of a provider kind.
+  const sandboxSupported = selectedProvider?.sandboxOverrideSupported === true;
+  // On a provider that does not honour the override, the draft is the STORED
+  // value — so the patch below leaves `sandboxMode` out entirely and the old
+  // value survives the switch. It used to send `null`, which cleared a stored
+  // override with no prompt at all: the user changed provider and their setting
+  // was gone. The server now reports that clear as an invalidation and asks.
+  const effectiveSandbox: SandboxMode | null = sandboxSupported
+    ? sandboxMode || null
+    : (summary.sandboxMode ?? null);
+  // `null` clears (the same state as `inherit`), a token sets. It is never
+  // derived from the provider kind — that is the runtime's question.
+  const effectiveReasoningEffort: string | null | undefined = providerCapabilityKnown
+    ? (reasoningEffort.trim() || null)
     : undefined;
   const effectiveSystemPrompt: string | null = systemPrompt.trim() ? systemPrompt : null;
   const effectiveTeamId: string | null = teamId || null;
+  const effectiveProjectRoot: string | null = projectRoot.trim() || null;
+  // The plan's verdict on a field, when it has one. A row the plan marked
+  // uneditable disables the control AND shows the server's own reason — a
+  // disabled input with no explanation is the state this contract exists to
+  // prevent. The reason is never re-worded here.
+  // The controls below read their verdicts off the SAME view-model the plan
+  // section renders and `/status` prints. Looking the rows up in
+  // `planView.settings` here instead was a second read of the same contract: it
+  // did not know about `disabledReason`, so "uneditable" and "why" could only be
+  // reconnected by hand.
+  const planRow = (field: RunPlanSettingField) =>
+    capability.fields.find((r) => r.field === field) ?? null;
+  const reasoningPlanReason = planRow("reasoning")?.disabledReason ?? null;
+  const projectPlanReason = planRow("project")?.disabledReason ?? null;
   const roleWeak = !effectiveTeamId && !effectiveSystemPrompt;
   const dirty =
     name.trim() !== summary.name ||
@@ -213,6 +459,7 @@ export function AgentSettings({
     effectiveSandbox !== (summary.sandboxMode ?? null) ||
     (effectiveReasoningEffort !== undefined && effectiveReasoningEffort !== (summary.reasoningEffort ?? null)) ||
     effectiveSystemPrompt !== (summary.systemPrompt ?? null) ||
+    effectiveProjectRoot !== (summary.projectRoot ?? null) ||
     effectiveTeamId !== (summary.teamId ?? null);
 
   const guard = async <T,>(fn: () => Promise<T>) => {
@@ -222,31 +469,116 @@ export function AgentSettings({
       await fn();
       onClose();
     } catch (err) {
-      setError((err as Error).message);
+      // The server's structured refusal keeps its CODE. `reasoning_effort_unsupported`
+      // and `project_root_invalid` are not interchangeable failures, and the
+      // user cannot act on either if all they are shown is an HTTP status.
+      setError(
+        err instanceof AgentRequestError
+          ? err.code && !err.message.startsWith(err.code)
+            ? `${err.code}: ${err.message}`
+            : err.message
+          : (err as Error).message,
+      );
     } finally {
       setBusy(false);
     }
   };
 
-  const onApply = () =>
-    guard(() =>
-      patchAgent(agentId, {
-        name: name.trim() !== summary.name ? name.trim() : undefined,
-        model: model !== summary.model ? model : undefined,
-        providerId:
-          (providerId ?? null) !== (summary.providerId ?? null) ? providerId : undefined,
-        permissionMode: permissionMode !== summary.permissionMode ? permissionMode : undefined,
-        sandboxMode:
-          effectiveSandbox !== (summary.sandboxMode ?? null) ? effectiveSandbox : undefined,
-        reasoningEffort:
-          effectiveReasoningEffort !== undefined && effectiveReasoningEffort !== (summary.reasoningEffort ?? null)
-            ? effectiveReasoningEffort
-            : undefined,
-        systemPrompt:
-          effectiveSystemPrompt !== (summary.systemPrompt ?? null) ? effectiveSystemPrompt : undefined,
-        teamId: effectiveTeamId !== (summary.teamId ?? null) ? effectiveTeamId : undefined,
+  /** The patch this form would send. `undefined` per field means "not part of
+   *  this change" — the same rule `patchAgent` follows, so the proposal sent to
+   *  `/settings-impact` is exactly the change that would be applied. */
+  const buildPatch = (): AgentPatch => ({
+    name: name.trim() !== summary.name ? name.trim() : undefined,
+    model: model !== summary.model ? model : undefined,
+    providerId:
+      (providerId ?? null) !== (summary.providerId ?? null) ? providerId : undefined,
+    permissionMode: permissionMode !== summary.permissionMode ? permissionMode : undefined,
+    sandboxMode:
+      effectiveSandbox !== (summary.sandboxMode ?? null) ? effectiveSandbox : undefined,
+    reasoningEffort:
+      effectiveReasoningEffort !== undefined && effectiveReasoningEffort !== (summary.reasoningEffort ?? null)
+        ? effectiveReasoningEffort
+        : undefined,
+    systemPrompt:
+      effectiveSystemPrompt !== (summary.systemPrompt ?? null) ? effectiveSystemPrompt : undefined,
+    // null clears the binding (back to scratch); a path binds. The server
+    // validates it and answers with a structured code if it is unusable.
+    projectRoot:
+      effectiveProjectRoot !== (summary.projectRoot ?? null) ? effectiveProjectRoot : undefined,
+    teamId: effectiveTeamId !== (summary.teamId ?? null) ? effectiveTeamId : undefined,
+  });
+
+  /** The fields whose change can make a STORED value unusable elsewhere. Only
+   *  these are worth asking the server about; a rename or a persona edit cannot
+   *  invalidate a capability setting. */
+  const impactRequestOf = (patch: AgentPatch): SettingsImpactRequest | null => {
+    const req: SettingsImpactRequest = {
+      providerId: patch.providerId,
+      model: patch.model,
+      reasoningEffort: patch.reasoningEffort as string | null | undefined,
+      projectRoot: patch.projectRoot,
+      sandboxMode: patch.sandboxMode,
+    };
+    const touches = Object.values(req).some((v) => v !== undefined);
+    return touches ? req : null;
+  };
+
+  /** Render the affected fields and ask. Resolves FALSE when the user declines —
+   *  and by then nothing has been written. The server's own wording is used for
+   *  every reason: this dialog explains a decision it did not make. */
+  const confirmInvalidations = async (impact: SettingsImpactReport): Promise<boolean> => {
+    const lines = impact.invalidated.map((i: SettingInvalidation) =>
+      t("settings.invalidate.line", {
+        field: i.field,
+        current: i.current,
+        next: i.next ?? t("settings.invalidate.cleared"),
+        code: i.code,
+        reason: i.reason,
       }),
     );
+    return getDialog().confirm({
+      title: t("settings.invalidate.title"),
+      message: lines.join("\n"),
+      danger: true,
+      okLabel: t("settings.invalidate.ok"),
+    });
+  };
+
+  const onApply = () =>
+    guard(async () => {
+      const patch = buildPatch();
+      const request = impactRequestOf(patch);
+      let confirmedInvalidated: RunPlanSettingField[] | undefined;
+      if (request) {
+        // Ask BEFORE writing. A proposal that cannot resolve is refused with the
+        // server's sentence rather than written and reported afterwards.
+        const impact = await getAgentSettingsImpact(agentId, request);
+        if (impact.resolutionError !== null) {
+          throw new Error(t("settings.invalidate.unresolved", { reason: impact.resolutionError }));
+        }
+        if (impact.requiresConfirmation) {
+          if (!(await confirmInvalidations(impact))) return; // declined: nothing written
+          confirmedInvalidated = impact.invalidated.map((i) => i.field);
+        }
+      }
+      try {
+        await patchAgent(
+          agentId,
+          confirmedInvalidated ? { ...patch, confirmInvalidated: confirmedInvalidated } : patch,
+        );
+      } catch (err) {
+        // The server refused because a value would be invalidated that the
+        // probe above did not predict (it is best-effort; the PATCH is the
+        // authority). Show the server's own report and re-ask instead of
+        // retrying with a blanket confirmation.
+        if (!isSettingsInvalidationError(err)) throw err;
+        if (!(await confirmInvalidations(err.impact))) return;
+        await patchAgent(agentId, {
+          ...patch,
+          confirmInvalidated: err.impact.invalidated.map((i) => i.field),
+        });
+      }
+    });
 
   const onCloseAgent = () => guard(() => closeAgent(agentId));
   const onRestart = () => guard(() => restartAgent(agentId));
@@ -357,6 +689,17 @@ export function AgentSettings({
               <option key="__current__" value={model}>{model}</option>
             )}
           </select>
+          {/* The value stays where the user put it and the field SAYS the new
+              provider does not list it, instead of the old behaviour, which
+              replaced it silently and wrote the replacement on Apply. */}
+          {!availableModels.includes(model) && (
+            <span className="text-[10px] text-[var(--warn)] leading-tight">
+              {t("settings.modelHint.notInProvider", {
+                model,
+                provider: selectedProvider?.name ?? t("settings.modelHint.noProvider"),
+              })}
+            </span>
+          )}
           {selectedProvider && selectedProvider.models.length === 0 && !isDefaultAnthropic && (
             <span className="text-[10px] text-[var(--warn)] leading-tight">
               {t("settings.modelHint.noModels")}
@@ -410,7 +753,7 @@ export function AgentSettings({
         {/* Codex agents have no canUseTool path — permissionMode is inert there
             (only the plan-mode systemPrompt is honored). Surface sandboxMode
             instead (rendered below for codex agents). */}
-        {!isCodexProvider && (
+        {!sandboxSupported && (
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.label.permissionMode")}</span>
             <select
@@ -435,27 +778,49 @@ export function AgentSettings({
               <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
                 {t("settings.label.reasoningEffort")}
               </span>
-              <select
+              {/* A text field with the common levels as suggestions, not a
+                  dropdown: a model may have a level this build has no hint for
+                  (`ultra`), and the stored value must stay visible and editable
+                  rather than being replaced by the nearest known option. */}
+              <input
+                list={REASONING_OPTION_ID}
                 value={reasoningEffort}
-                onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort | "")}
-                className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
-              >
-                <option value="">{t("settings.reasoningEffort.inherit")}</option>
-                {REASONING_EFFORTS.map((effort) => (
-                  <option key={effort} value={effort}>
-                    {effort}
-                  </option>
+                onChange={(e) => setReasoningEffort(e.target.value)}
+                placeholder={t("settings.reasoningEffort.inherit")}
+                spellCheck={false}
+                autoComplete="off"
+                disabled={reasoningPlanReason !== null}
+                title={reasoningPlanReason ?? undefined}
+                className={
+                  "bg-[var(--bg-pane)] border px-1.5 py-1 outline-none focus:border-[var(--accent)] " +
+                  (reasoningEffortInvalid ? "border-[var(--err)]" : "border-[var(--border)]")
+                }
+              />
+              <datalist id={REASONING_OPTION_ID}>
+                {REASONING_HINTS.map((effort) => (
+                  <option key={effort} value={effort} />
                 ))}
-              </select>
-              <span className="text-[10px] text-[var(--text-faint)] leading-tight">
-                {reasoningEffort === ""
-                  ? t("settings.reasoningEffort.hint.inherit")
-                  : t(`settings.reasoningEffort.hint.${reasoningEffort}`)}
+              </datalist>
+              <span
+                className={
+                  "text-[10px] leading-tight " +
+                  (reasoningEffortInvalid ? "text-[var(--err)]" : "text-[var(--text-faint)]")
+                }
+              >
+                {reasoningPlanReason !== null
+                  ? reasoningPlanReason
+                  : reasoningEffortInvalid
+                  ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE })
+                  : reasoningEffort.trim() === ""
+                    ? t("settings.reasoningEffort.hint.inherit")
+                    : REASONING_HINTS.includes(reasoningEffort)
+                      ? t(`settings.reasoningEffort.hint.${reasoningEffort}`)
+                      : t("settings.reasoningEffort.hint.custom")}
               </span>
             </label>
           </>
         )}
-        {isCodexProvider && (
+        {sandboxSupported && (
           <>
             <label className="flex flex-col gap-1">
               <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
@@ -479,11 +844,37 @@ export function AgentSettings({
             </label>
           </>
         )}
+        <label className="flex flex-col gap-1">
+          <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+            {t("project.label")}
+          </span>
+          <input
+            value={projectRoot}
+            onChange={(e) => setProjectRoot(e.target.value)}
+            placeholder={t("project.placeholder")}
+            disabled={projectPlanReason !== null}
+            title={projectPlanReason ?? undefined}
+            className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
+          />
+          <span
+            className={
+              "text-[10px] leading-tight " +
+              (projectPlanReason !== null ? "text-[var(--warn)]" : "text-[var(--text-faint)]")
+            }
+          >
+            {projectPlanReason !== null
+              ? projectPlanReason
+              : projectRoot.trim()
+                ? projectRoot.trim()
+                : `${t("project.unbound")} — ${t("project.unbound.hint")}`}
+          </span>
+        </label>
         {error && <div className="text-[var(--err)] text-[10px]">{error}</div>}
         <div className="flex gap-2">
           <button
             onClick={onApply}
-            disabled={!dirty || busy}
+            disabled={!dirty || busy || reasoningEffortInvalid}
+            title={reasoningEffortInvalid ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE }) : undefined}
             className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
           >
             {t("settings.apply")}
@@ -495,6 +886,44 @@ export function AgentSettings({
             {t("settings.cancel")}
           </button>
         </div>
+
+        <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
+          <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+            {t("settings.plan.title")}
+          </span>
+          <PlanStatusSection capability={capability} t={t} />
+        </div>
+
+        {/* The DRAFT's plan, when there is one. Rendered from the same view-model
+            as everything above (a different plan, the same projection), so the
+            rows cannot disagree with the ones the write will produce. */}
+        {draftRequest !== null && (
+          <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
+            <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
+              {t("settings.preview.title")}
+            </span>
+            {/* A proposal the API would REFUSE is shown as a refusal, with the
+                code the write would answer with — not discovered by submitting
+                and reading a 400. */}
+            {draftPreview?.rejection && (
+              <span className="text-[10px] text-[var(--err)] leading-tight">
+                {t("settings.preview.rejected", {
+                  code: draftPreview.rejection.code,
+                  detail: draftPreview.rejection.detail,
+                })}
+              </span>
+            )}
+            {draftPreviewError !== null && (
+              <span className="text-[10px] text-[var(--warn)] leading-tight">{draftPreviewError}</span>
+            )}
+            {draftPreview?.resolutionError != null && (
+              <span className="text-[10px] text-[var(--warn)] leading-tight">
+                {t("settings.invalidate.unresolved", { reason: draftPreview.resolutionError })}
+              </span>
+            )}
+            <PlanStatusSection capability={draftCapability} t={t} />
+          </div>
+        )}
 
         <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.lifecycle")}</span>

@@ -9,7 +9,12 @@ import {
 } from "@agentorch/shared";
 import { closeAgent, patchAgent, restartAgent } from "@/lib/agent-api";
 import { CloudRealtimeClient } from "@/lib/cloud-realtime";
-import { cloudConfigSignature, type CloudAgent, type CloudSnapshot } from "@/lib/cloud-api";
+import {
+  cloudConfigSignature,
+  publishCloudAgentPlan,
+  type CloudAgent,
+  type CloudSnapshot,
+} from "@/lib/cloud-api";
 import { getWS } from "@/lib/ws";
 import { useStore } from "@/store/agents";
 
@@ -160,6 +165,33 @@ export function CloudRemoteBridge() {
     }
   }, [cloudAgentIds, cloudCurrentWorkspaceId, localAgents, localWs]);
 
+  // Publishing, not resolving. The cloud has no runtime, so the ONLY place a
+  // cloud agent's plan can come from is this desktop, and it comes from the very
+  // broadcast the local UI renders (one view-model, one producer). Fires on the
+  // local `run_plan` for an agent that is IN the current cloud workspace; an
+  // agent that was never uploaded has no remote row to attach it to, and a name
+  // is never used to find one.
+  useEffect(() => {
+    if (!cloudSession || !cloudCurrentWorkspaceId) return;
+    const workspaceId = cloudCurrentWorkspaceId;
+    const unsubscribe = localWs.subscribe((msg: ServerMsg) => {
+      if (msg.type !== "run_plan") return;
+      const state = useStore.getState();
+      if (state.cloudCurrentWorkspaceId !== workspaceId) return;
+      const agent = state.cloudSnapshot?.agents.find((entry) => entry.id === msg.sessionId);
+      if (!agent) return;
+      // Only the ID travels: the plan is published onto the row that already
+      // exists, so this desktop's snapshot of the agent's configuration is
+      // never sent back to overwrite a change another client has made.
+      void publishCloudAgentPlan(cloudSession, workspaceId, agent.id, msg.plan).catch(() => {
+        // Best effort: a plan the cloud did not receive reads as
+        // `source: "unavailable"`, which is a true answer, and the next turn
+        // publishes again. Failing a turn over a relay would not be.
+      });
+    });
+    return unsubscribe;
+  }, [cloudSession, cloudCurrentWorkspaceId, localWs]);
+
   return null;
 }
 
@@ -223,12 +255,19 @@ function cloudAgentFromSummary(existing: CloudAgent, summary: AgentSummary): Clo
     permissionMode: summary.permissionMode,
     sandboxMode: summary.sandboxMode,
     reasoningEffort: summary.reasoningEffort,
+    projectRoot: summary.projectRoot,
+    // One field server-side: the cloud DTO echoes the canonical value here for
+    // a client that still reads `codexWorkspace`.
     codexWorkspace: summary.codexWorkspace,
     metadata: {
       ...existing.metadata,
       forcedSkills: summary.forcedSkills,
       disabledSkills: summary.disabledSkills,
       closed: summary.closed,
+      // The run ceiling travels in `metadata`, under the same key the local
+      // agent metadata uses — the synced copy must not silently lack a setting
+      // the local one has.
+      maxRunDurationMs: summary.maxRunDurationMs,
     },
   };
 }

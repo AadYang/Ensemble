@@ -47,17 +47,97 @@ describe("aggregateUsage totals", () => {
     expect(r.totals.agents).toBe(1); // both rows under agent a1
   });
 
-  it("excludes costKnown=false rows from costUSD but counts their turns elsewhere", () => {
+  it("keeps unpriced rows in the totals and reports how much of the cost they are missing from", () => {
     const rows = [
       mk({ costUSD: 1.0, costKnown: true }),
       mk({ model: "fake", costUSD: 0, costKnown: false, inputTokens: 999 }),
     ];
     const r = aggregateUsage(rows);
+    // Cost is still the priced half — an unpriced turn has no price to add.
     expect(r.totals.costUSD).toBe(1.0);
-    expect(r.totals.turns).toBe(1); // only known counted in totals
+    // …but the turn and its tokens are MEASURED facts and are counted, so the
+    // panel does not under-report work it can see.
+    expect(r.totals.turns).toBe(2);
+    expect(r.totals.inputTokens).toBe(1999);
+    // And the sum says out loud that it covers 1 of 2 turns.
+    expect(r.totals.turnsCostKnown).toBe(1);
+    expect(r.totals.turnsCostUnknown).toBe(1);
     expect(r.unknownModels).toHaveLength(1);
     expect(r.unknownModels[0]!.model).toBe("fake");
     expect(r.unknownModels[0]!.inputTokens).toBe(999);
+  });
+
+  // THE OUTAGE THIS FILE EXISTS TO CATCH (2026-09-15).
+  //
+  // Regression: `aggregateUsage` partitioned rows by `costKnown` and walked
+  // only the priced half — in the live DB, 411 of the last 30 days' 2325 turns,
+  // running seven models that had no price configured (deepseek-v4-pro,
+  // claude-fable-5, deepseek-v4-flash, deepseek-flash, claude-opus-5, …). Those
+  // turns, their tokens, their models and their AGENTS were absent from totals,
+  // from the daily chart and from all three tables, so an agent that ran only
+  // unpriced models — every deepseek agent on the team — showed up as having no
+  // usage at all, and the cost card printed a subset sum as a total.
+  it("does not drop unpriced agents, models or days out of the report", () => {
+    const rows = [
+      mk({ agentId: "priced", agentName: "priced", costUSD: 2.0, costKnown: true }, "2026-05-11T10:00:00Z"),
+      mk(
+        {
+          agentId: "unpriced",
+          agentName: "deepseek-agent",
+          model: "deepseek-v4-pro",
+          costUSD: 0,
+          costKnown: false,
+          inputTokens: 500,
+          outputTokens: 250,
+        },
+        "2026-05-12T10:00:00Z",
+      ),
+    ];
+    const r = aggregateUsage(rows, { tz: "UTC" });
+
+    // The agent is in the table, with its work, at a cost of 0 that is
+    // labelled as "not priced" rather than passed off as "free".
+    const agent = r.byAgent.find((a) => a.agentId === "unpriced")!;
+    expect(agent).toBeDefined();
+    expect(agent.turns).toBe(1);
+    expect(agent.inputTokens).toBe(500);
+    expect(agent.outputTokens).toBe(250);
+    expect(agent.costUSD).toBe(0);
+    expect(agent.turnsCostKnown).toBe(0);
+    expect(agent.turnsCostUnknown).toBe(1);
+
+    // Same for the model, and for the day it ran on.
+    const model = r.byModel.find((m) => m.model === "deepseek-v4-pro")!;
+    expect(model.turns).toBe(1);
+    expect(model.turnsCostUnknown).toBe(1);
+    expect(r.daily.map((d) => d.date)).toEqual(["2026-05-11", "2026-05-12"]);
+    expect(r.daily[1]!.turns).toBe(1);
+    expect(r.daily[1]!.costUSD).toBe(0);
+    // …and provider, which also carries the coverage.
+    expect(r.byProvider.some((p) => p.turnsCostUnknown === 1)).toBe(true);
+
+    // Totals count both turns; the cost is a lower bound and says so.
+    expect(r.totals.turns).toBe(2);
+    expect(r.totals.turnsCostKnown).toBe(1);
+    expect(r.totals.turnsCostUnknown).toBe(1);
+    expect(r.totals.agents).toBe(2);
+  });
+
+  it("distinguishes flat-rate subscription turns from unpriced ones", () => {
+    const rows = [
+      // Codex / ChatGPT plan: $0 per turn BY CONTRACT — priced, and known.
+      mk({ model: "gpt-5.6-sol", costUSD: 0, costKnown: true, billingModel: "subscription" }),
+      // No price configured for this model at all.
+      mk({ model: "mystery", costUSD: 0, costKnown: false }),
+    ];
+    const r = aggregateUsage(rows);
+    expect(r.totals.turns).toBe(2);
+    expect(r.totals.turnsCostKnown).toBe(1);
+    expect(r.totals.turnsSubscription).toBe(1);
+    expect(r.totals.turnsCostUnknown).toBe(1);
+    // A subscription-only history is NOT "unavailable": cost is known, it is
+    // just zero. Only `turnsCostKnown === 0` means the cost cannot be stated.
+    expect(r.totals.turnsCostKnown > 0).toBe(true);
   });
 });
 

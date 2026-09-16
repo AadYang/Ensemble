@@ -22,8 +22,8 @@ export const readTool: NormalizedTool<typeof READ_SCHEMA> = {
     "Read the contents of a file from disk. Returns text with line-number prefixes (cat -n style). " +
     "Use `offset` (1-indexed) and `limit` for partial reads of large files.",
   parameters: READ_SCHEMA,
-  async execute({ file_path, offset = 1, limit = DEFAULT_LIMIT }) {
-    const abs = resolveSafe(file_path);
+  async execute({ file_path, offset = 1, limit = DEFAULT_LIMIT }, ctx) {
+    const abs = resolveSafe(file_path, ctx.projectRoot);
     const raw = await readFile(abs, "utf8");
     const allLines = raw.split(/\r?\n/);
     const start = offset - 1; // convert to 0-indexed
@@ -31,6 +31,18 @@ export const readTool: NormalizedTool<typeof READ_SCHEMA> = {
     const numbered = slice
       .map((line, i) => `${String(start + i + 1).padStart(6, " ")}\t${line}`)
       .join("\n");
-    return numbered;
+    // A slice that stops short of the file's end is a PREFIX, and a prefix that
+    // does not say so is a whole file as far as the model can tell: at the
+    // default limit a 3 000-line file simply looked like a 2 000-line one, and
+    // nothing in the result pointed at the remaining 1 000. The notice names the
+    // exact next call, so the pages reassemble with one more Read.
+    const lastReturned = start + slice.length;
+    if (lastReturned >= allLines.length) return numbered;
+    const next = `\tRead(file_path=${JSON.stringify(file_path)}, offset=${lastReturned + 1}, limit=${limit})`;
+    return (
+      `${numbered}\n` +
+      `[showing lines ${start + 1}-${lastReturned} of ${allLines.length}; ` +
+      `the rest is NOT included — continue with${next}]`
+    );
   },
 };

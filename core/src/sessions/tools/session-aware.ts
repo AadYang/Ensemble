@@ -20,7 +20,24 @@ import { z } from "zod";
 import type { PeerCorrelationKind, PeerIncludeSource } from "@agentorch/shared";
 import { backgroundSubagentStartedText } from "../subagentFinish.js";
 import { CONVERSATION_SEARCH_SCOPES, type ConversationSearchArgs } from "../../conversation-search.js";
-import type { NormalizedTool } from "./types.js";
+import {
+  ARTIFACT_MAX_PAGE_BYTES,
+  ARTIFACT_READ_DESCRIPTION,
+  ARTIFACT_SEARCH_DESCRIPTION,
+  renderArtifactRead,
+  renderArtifactSearch,
+  type ArtifactReadResult,
+  type ArtifactSearchResult,
+} from "../../artifacts.js";
+import {
+  JOB_WAIT_MAX_MS,
+  jobCancelToolText,
+  jobStartToolText,
+  jobStatusToolText,
+  jobWaitToolText,
+  type JobToolContext,
+} from "../../jobs.js";
+import type { AnyNormalizedTool, NormalizedTool } from "./types.js";
 
 const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
 const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
@@ -48,11 +65,30 @@ type SpawnTaskCallback = (args: {
   description: string;
   prompt: string;
   background?: boolean;
+  projectRoot?: string | null;
 }) => Promise<{ finalText: string; subagentId: string; background?: boolean }>;
+
+type ArtifactReadCallback = (args: {
+  id: string;
+  cursor?: string;
+  pageBytes?: number;
+}) => ArtifactReadResult;
+type ArtifactSearchCallback = (args: {
+  id: string;
+  query: string;
+  cursor?: string;
+  caseSensitive?: boolean;
+  maxHits?: number;
+  snippetBytes?: number;
+}) => ArtifactSearchResult;
 
 type EnsembleHelpCallback = (args: { topic?: string }) => Promise<string>;
 type SkillListCallback = () => Promise<string>;
-type SkillInvokeCallback = (args: { name: string }) => Promise<string>;
+// May resolve to the structured read result ({ok:false,...}) — NormalizedTool.execute
+// already accepts string-or-object and the OpenAI adapter JSON-stringifies a
+// non-string, so the failure shape survives to the model instead of being
+// flattened into a success-shaped sentence.
+type SkillInvokeCallback = (args: { name: string }) => Promise<string | object>;
 
 const PEER_SEND_SCHEMA = z.object({
   target: z.string().min(1).describe("Name (preferred) or UUID of the recipient agent."),
@@ -100,14 +136,19 @@ export function makePeerSendTool(send: PeerSendCallback): NormalizedTool<typeof 
       "  - raw:      plain message forwarding (default).",
       "",
       "Source context defaults to includeSource='auto': raw sends only your message;",
-      "continue/review/fork include a bounded <<<source-output>>> block with your current",
-      "or most recent key output. Use peer_query when more context is needed.",
+      "continue/review/fork include a <<<source-output>>> block with your current or most",
+      "recent key output — verbatim when it fits the recipient's window, otherwise its first",
+      "page plus an artifact handle the recipient reads in full with artifact_read.",
       "",
       "interrupt=true is emergency-only: use it only when delayed delivery would make",
       "the message stale or cause the target to continue incorrectly. You must provide",
       "interruptReason. Ordinary notifications, questions, and handoffs must not interrupt.",
       "",
       "Use the target agent's name (preferred) or its UUID.",
+      "Subagents are PRIVATE to their spawner: an agent spawned by another agent (Task /",
+      "spawn_subagent) can only be messaged by the agent that spawned it, and a subagent can",
+      "message ONLY that one parent — not other agents, not sibling subagents, not subagents of",
+      "its own. Anything else is refused; send the work to the parent agent instead.",
       "Returns delivery status; does NOT wait for the recipient to reply.",
       "For read-only context pulls without running anyone, prefer peer_query.",
     ].join("\n"),
@@ -139,8 +180,15 @@ export function makePeerQueryTool(query: PeerQueryCallback): NormalizedTool<type
       "you need more context than what arrived in a handoff, or to inspect a peer's",
       "state before sending them work.",
       "",
+      "A subagent is private to the agent that spawned it: another agent's subagent cannot be",
+      "queried — ask its parent instead.",
+      "",
       "Does NOT cause the target agent to run; pure DB read. Returns oldest-first",
       "text turns prefixed with [user] / [assistant], tool-use noise stripped.",
+      "",
+      "The transcript is stored whole as an artifact and returned verbatim when it fits",
+      "this turn's budget; otherwise you get its first page plus an <<<artifact id=…",
+      "sha256=…>>> handle to continue with artifact_read(id, cursor).",
     ].join("\n"),
     parameters: PEER_QUERY_SCHEMA,
     async execute(args) {
@@ -226,6 +274,15 @@ const TASK_SCHEMA = z.object({
         "its id immediately and you keep working while it runs. If false/omitted, " +
         "wait for the subagent and return its final response. Either way the " +
         "subagent appears in the sidebar tree under you.",
+    ),
+  projectRoot: z
+    .string()
+    .optional()
+    .describe(
+      "Optional override for the subagent's project root (absolute path to an " +
+        "existing directory). Omit it and the subagent inherits YOUR project root " +
+        "verbatim — that is almost always what you want, since a subtask is part of " +
+        "your project.",
     ),
 });
 
@@ -317,6 +374,8 @@ export function makeTaskTool(spawn: SpawnTaskCallback): NormalizedTool<typeof TA
       "exploration, multi-step decomposition). Set background=true to spawn it as a " +
       "detached background task (returns its id immediately; you keep working while it " +
       "runs, and you are sent a `subagent-finished` message when it ends — never poll). " +
+      "The subagent works in YOUR project root unless you pass projectRoot to place it " +
+      "elsewhere (that directory must exist). " +
       "Subagent depth is capped at 3 levels.",
     parameters: TASK_SCHEMA,
     async execute(args) {
@@ -325,6 +384,171 @@ export function makeTaskTool(spawn: SpawnTaskCallback): NormalizedTool<typeof TA
         return backgroundSubagentStartedText(result.subagentId);
       }
       return result.finalText;
+    },
+  };
+}
+
+const ARTIFACT_READ_SCHEMA = z.object({
+  id: z.string().min(1).describe("Artifact id, as printed in the result that stored it."),
+  cursor: z
+    .string()
+    .optional()
+    .describe("Opaque byte cursor from a previous artifact_read/artifact_search for the SAME artifact."),
+  pageBytes: z
+    .number()
+    .int()
+    .optional()
+    .describe(`Bytes to return (default 16384, max ${ARTIFACT_MAX_PAGE_BYTES}). Snapped to a UTF-8 boundary.`),
+});
+
+const ARTIFACT_SEARCH_SCHEMA = z.object({
+  id: z.string().min(1).describe("Artifact id, as printed in the result that stored it."),
+  query: z.string().min(1).describe("Literal string to find (not a regex)."),
+  cursor: z.string().optional().describe("Resume the scan from a previous artifact_search's nextCursor."),
+  caseSensitive: z.boolean().optional().describe("Default false."),
+  maxHits: z.number().int().optional().describe("Maximum hits per call (default 20, max 200)."),
+  snippetBytes: z.number().int().optional().describe("Bytes of context around each hit (default 160)."),
+});
+
+/** artifact_read NormalizedTool. The OpenAI runtime's surface for the same
+ *  paged read the Claude MCP server and the Codex bridge expose; all three
+ *  render through `artifacts.ts` so the contract cannot drift per runtime.
+ *
+ *  Resolves to the rendered page STRING on success (the model reads the text
+ *  directly) and to the structured error OBJECT on failure, which the OpenAI
+ *  adapter serializes — so a failure is a code, never a success-shaped
+ *  sentence. */
+export function makeArtifactReadTool(read: ArtifactReadCallback): NormalizedTool<typeof ARTIFACT_READ_SCHEMA> {
+  return {
+    name: "artifact_read",
+    description: ARTIFACT_READ_DESCRIPTION,
+    parameters: ARTIFACT_READ_SCHEMA,
+    async execute(args) {
+      const result = read(args);
+      return result.ok ? renderArtifactRead(result) : result;
+    },
+  };
+}
+
+// ── jobs: long work whose owner is core, not this turn ────────────────────
+//
+// The OpenAI runtime's surface for the same primitive the Claude runtime
+// reaches through the `agentorch-jobs` MCP server. Both call the SAME
+// `jobs.ts` operations, so "what does job_wait return" has one answer.
+//
+// Unlike the other factories in this file, these four share one context
+// object rather than four callbacks: the context IS the binding (which agent,
+// which project root, which manager) and splitting it would let the four
+// tools disagree about, say, the default cwd. Per the plan's §2 reasoning the
+// OpenAI SDK's MCP support is client-only, so an in-process MCP server here
+// would be 4-hop where 0-hop works.
+
+const JOB_START_SCHEMA = z.object({
+  command: z.string().min(1).describe("Shell command to run. Windows runs PowerShell; macOS/Linux runs sh."),
+  cwd: z.string().optional().describe("Working directory; defaults to the agent's project root."),
+  timeout_ms: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe("Optional hard ceiling. Omit for work whose length is unknown — a job has no default timeout."),
+});
+
+const JOB_STATUS_SCHEMA = z.object({
+  job_id: z.string().optional().describe("Job id from job_start. Omit to list this agent's jobs."),
+});
+
+const JOB_WAIT_SCHEMA = z.object({
+  job_id: z.string().min(1).describe("Job id from job_start."),
+  timeout_ms: z
+    .number()
+    .int()
+    .min(1)
+    .max(JOB_WAIT_MAX_MS)
+    .optional()
+    .describe(`How long to wait before reporting the job as still running (max ${JOB_WAIT_MAX_MS}).`),
+});
+
+const JOB_CANCEL_SCHEMA = z.object({
+  job_id: z.string().min(1).describe("Job id from job_start."),
+});
+
+const JOB_START_DESCRIPTION =
+  "Start a long-running command whose OWNER IS ENSEMBLE'S SERVER, not this agent process, and return immediately with a job id. " +
+  "Use this — not a background shell — for anything that may outlive the current turn: builds, installers, test suites, long downloads. " +
+  "A background shell is a child of this agent process, so it is killed when the session is recycled (for example when the context window fills) " +
+  "and its exit is never recorded; a job survives that, keeps writing to a log file, and always ends with a recorded status. " +
+  "Poll with job_status, or block with job_wait. Output is streamed to a log file you can read in full.";
+
+const JOB_STATUS_DESCRIPTION =
+  "Report one job's status (running / exited / failed / cancelled / lost), its exit code, and the last lines of its log. " +
+  "With no job id, list this agent's jobs. `lost` means the process is gone without a recorded exit — the honest answer after a crash — " +
+  "and it is never reported as success.";
+
+const JOB_WAIT_DESCRIPTION =
+  "Block until a job reaches a terminal status or the timeout elapses, then report it the same way job_status does. " +
+  "Prefer this to polling when you have nothing else to do; the timeout is capped so a turn can never hang here forever.";
+
+const JOB_CANCEL_DESCRIPTION =
+  "Kill a running job and its descendants. The job is recorded as `cancelled`, with whatever it printed kept in its log.";
+
+/** The four job NormalizedTools for one agent's context.
+ *
+ *  Each is annotated with its OWN schema rather than the erased
+ *  `AnyNormalizedTool` — otherwise `execute` would take `Record<string,
+ *  unknown>` and every call below would need a cast that could hide a renamed
+ *  parameter. */
+export function makeJobTools(ctx: JobToolContext): AnyNormalizedTool[] {
+  const start: NormalizedTool<typeof JOB_START_SCHEMA> = {
+    name: "job_start",
+    description: JOB_START_DESCRIPTION,
+    parameters: JOB_START_SCHEMA,
+    async execute(args) {
+      return jobStartToolText(ctx, args);
+    },
+  };
+  const status: NormalizedTool<typeof JOB_STATUS_SCHEMA> = {
+    name: "job_status",
+    description: JOB_STATUS_DESCRIPTION,
+    parameters: JOB_STATUS_SCHEMA,
+    async execute(args) {
+      const r = jobStatusToolText(ctx, args);
+      if (r.isError) throw new Error(r.text);
+      return r.text;
+    },
+  };
+  const wait: NormalizedTool<typeof JOB_WAIT_SCHEMA> = {
+    name: "job_wait",
+    description: JOB_WAIT_DESCRIPTION,
+    parameters: JOB_WAIT_SCHEMA,
+    async execute(args) {
+      const r = await jobWaitToolText(ctx, args);
+      if (r.isError) throw new Error(r.text);
+      return r.text;
+    },
+  };
+  const cancel: NormalizedTool<typeof JOB_CANCEL_SCHEMA> = {
+    name: "job_cancel",
+    description: JOB_CANCEL_DESCRIPTION,
+    parameters: JOB_CANCEL_SCHEMA,
+    async execute(args) {
+      const r = jobCancelToolText(ctx, args);
+      if (r.isError) throw new Error(r.text);
+      return r.text;
+    },
+  };
+  return [start, status, wait, cancel];
+}
+
+/** artifact_search NormalizedTool — same shape of contract as artifact_read. */
+export function makeArtifactSearchTool(search: ArtifactSearchCallback): NormalizedTool<typeof ARTIFACT_SEARCH_SCHEMA> {
+  return {
+    name: "artifact_search",
+    description: ARTIFACT_SEARCH_DESCRIPTION,
+    parameters: ARTIFACT_SEARCH_SCHEMA,
+    async execute(args) {
+      const result = search(args);
+      return result.ok ? renderArtifactSearch(result) : result;
     },
   };
 }

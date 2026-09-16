@@ -35,8 +35,15 @@ export interface SubagentIdentity {
   name: string;
 }
 
-/** Bounded so a chatty subagent can never blow up its parent's context. */
-const MAX_FINAL_TEXT = 4_000;
+// MAX_FINAL_TEXT used to live here: a 4 000-character cap applied to a
+// subagent's final output before it reached its parent. It was the same silent
+// truncation the phase-3 budget work removed from history and skills — the
+// parent got a report whose second half simply did not exist, with nothing
+// saying so. A subagent's final text is now stored whole as an artifact first
+// (artifacts.ts) and the parent's turn carries it verbatim when it fits the
+// parent's real window, or its first page plus the artifact handle when it does
+// not — so the report is always somewhere, and the notice says which. No cap is
+// applied here.
 
 /** Tool-result text for a detached background spawn. The old wording told the
  *  model to "use peer_query on it later to read its progress/result" — i.e. the
@@ -57,11 +64,6 @@ const STATUS_LABEL: Record<SubagentTerminalOutcome["status"], string> = {
   ERROR: "ERROR",
   IDLE: "INTERRUPTED",
 };
-
-function truncate(text: string): string {
-  if (text.length <= MAX_FINAL_TEXT) return text;
-  return `${text.slice(0, MAX_FINAL_TEXT)}\n[… truncated ${text.length - MAX_FINAL_TEXT} chars]`;
-}
 
 /** One-line, human-facing summary. Also carried in the persisted system row so
  *  the transcript reads correctly without any client-side formatting. */
@@ -96,9 +98,9 @@ export function subagentFinishedSystemPayload(
 
 /** The queued-turn text delivered to the PARENT agent. Written as an explicit
  *  non-human notification so the model neither thanks the user for it nor
- *  treats it as a new instruction, and told what it may do about it (the
- *  "monitor → delete → respawn" loop the sidebar previously required a human
- *  to perform). */
+ *  treats it as a new instruction, and told what it may do about it: the child
+ *  is already archived (see SessionManager.retireSubagent), so the only action
+ *  left is spawn a corrected replacement or read the transcript. */
 export function formatSubagentFinishedNotice(
   child: SubagentIdentity,
   outcome: SubagentTerminalOutcome,
@@ -112,15 +114,16 @@ export function formatSubagentFinishedNotice(
   if (outcome.error) lines.push(`Error: ${outcome.error}`);
   const finalText = outcome.finalText?.trim();
   if (finalText) {
-    lines.push("--- final output ---", truncate(finalText), "--- end final output ---");
+    lines.push("--- final output ---", finalText, "--- end final output ---");
   } else if (outcome.status === "DONE") {
     lines.push("(The subagent produced no final text.)");
   }
   lines.push(
     "What you can do: if the output above is usable, carry on — no acknowledgement is needed. " +
-      "If the task failed or the output is unusable, the subagent is finished and will not run again on its own: " +
-      "drop it from the sidebar (it is already terminal) and spawn a replacement with a corrected prompt via " +
-      "Task(background=true), or read its full transcript with peer_query.",
+      "If the task failed or the output is unusable, spawn a replacement with a corrected prompt via " +
+      "Task(background=true), or read the full transcript with peer_query. " +
+      "The subagent has already been archived and deactivated — it will not run again on its own and there is " +
+      "nothing to clean up.",
     "</subagent-finished>",
   );
   return lines.join("\n");

@@ -3,7 +3,29 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { ensureDataDir } from "./paths.js";
 
-const DB_PATH = process.env.AGENTORCH_DB_PATH ?? join(ensureDataDir(), "agentorch.db");
+// A test run must never open a database it did not ask for.
+//
+// The default path is derived from the environment, and the environment of a
+// test process is whatever the developer's shell had: the desktop app exports
+// AGENTORCH_DATA_DIR, so a test that forgot its own path silently opened the
+// LIVE database — and the schema statements below then ran against it for real.
+// Nothing was lost that time (every table and index it reached already existed),
+// but the difference between that and a corrupted user database is which
+// statement happened to come next. An unset path in a test is a mistake, and
+// this line is the last place it can still be caught.
+if (process.env.VITEST && !process.env.AGENTORCH_DB_PATH) {
+  throw new Error(
+    "refusing to open the default database in a test run: set AGENTORCH_DB_PATH " +
+      '(usually ":memory:") before importing db.ts — the default resolves against the ' +
+      "developer's real data directory, and tests must not write there",
+  );
+}
+
+/** The path this process actually opened. Exported so a test can assert WHICH
+ *  database it got — the guard above rules out the silent default, and this is
+ *  how "the default was never resolved to" is checked rather than assumed. It
+ *  is not an interface for callers: nothing may branch on it. */
+export const DB_PATH = process.env.AGENTORCH_DB_PATH ?? join(ensureDataDir(), "agentorch.db");
 
 export const sqliteDb = new DatabaseSync(DB_PATH);
 sqliteDb.exec("PRAGMA journal_mode = WAL");
@@ -36,8 +58,14 @@ CREATE TABLE IF NOT EXISTS Agent (
     CHECK (status IN ('IDLE','RUNNING','AWAITING_PERMISSION','AWAITING_USER_INPUT','ERROR','DONE')),
   model TEXT NOT NULL DEFAULT 'claude-opus-4-8',
   providerId TEXT REFERENCES Provider(id) ON DELETE RESTRICT,
+  -- Legacy column: kept so old rows stay readable, nothing may start using it
+  -- again (its meaning was never defined).
   workspace TEXT,
+  -- codexWorkspace is the legacy alias of projectRoot, kept as a column so an
+  -- existing row is never rewritten and a downgrade still finds its value.
+  -- New writes go to projectRoot only; reads go through projectRootOf().
   codexWorkspace TEXT,
+  projectRoot TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
   createdAt INTEGER NOT NULL DEFAULT (unixepoch()),
   updatedAt INTEGER NOT NULL DEFAULT (unixepoch())
@@ -56,6 +84,157 @@ CREATE TABLE IF NOT EXISTS Message (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS msg_agent_seq_uq ON Message(agentId, seq);
 CREATE INDEX IF NOT EXISTS msg_agent_time_idx ON Message(agentId, createdAt);
+
+-- Phase 3: the recoverable half of /compact. Compaction used to DELETE the
+-- rows it summarized, which made an irreversible edit to the user's record.
+-- The originals now move here verbatim, in the SAME transaction that writes
+-- the summary and removes the active rows, so a compact is either complete or
+-- it did not happen. generation is the compact ordinal for the agent, and
+-- (agentId, generation, originalSeq) is unique, which is what makes a retried
+-- compact idempotent. Deliberately a separate table rather than a soft-delete
+-- column on Message: a nullable deletedAt would leave every existing reader
+-- (runtime history, /status counts, cloud sync, conversation search) silently
+-- including archived rows unless each one was audited and filtered.
+CREATE TABLE IF NOT EXISTS MessageArchive (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  originalMessageId INTEGER NOT NULL,
+  agentId TEXT NOT NULL REFERENCES Agent(id) ON DELETE CASCADE,
+  generation INTEGER NOT NULL,
+  originalSeq INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  createdAt INTEGER NOT NULL,
+  archivedAt INTEGER NOT NULL,
+  contentHash TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS msg_archive_uq ON MessageArchive(agentId, generation, originalSeq);
+CREATE INDEX IF NOT EXISTS msg_archive_gen_idx ON MessageArchive(agentId, generation);
+
+-- Phase 4: result artifacts — the durable, verifiable copy of a large result
+-- (peer source output, peer_query transcript, conversation_search page, a
+-- subagent's final answer).
+--
+-- Table is ResultArtifact, not Artifact: some live databases already have an
+-- Artifact table from an earlier project-orchestration experiment (projectId /
+-- workItemId, no agentId). CREATE TABLE IF NOT EXISTS would no-op, and the
+-- next CREATE INDEX ON Artifact(agentId) crashed sidecar boot with
+-- `no such column: agentId` — the 0.0.30 white screen.
+--
+-- Why a table rather than a bigger constant: the previous design capped those
+-- results with layered character limits (1 600 / 4 000 / 5 000 / 8 000 / 12 000)
+-- and then told the model it could read the result in full. The second half of
+-- a large result therefore did not exist anywhere: not in the message, not on
+-- disk, not in the archive. An artifact is written BEFORE any digest is built
+-- from it, so the whole text always exists and the digest is a view of it.
+--
+-- The rows are append-only and enforced as such by triggers: an artifact that
+-- can be rewritten is a claim that can be edited after the fact, and the
+-- sha256 column is only worth having if the body behind it cannot move. No
+-- foreign key to Agent on purpose — deleting an agent must not cascade-delete
+-- the record of what it produced.
+--
+-- Retention is PERMANENT, and that is the phase decision rather than an
+-- omission: append-only with no DELETE and no UPDATE path (the triggers below),
+-- no TTL column, no purge job, no quota, and no age-based cleanup anywhere in
+-- the runtime. An id + sha256 printed in an old transcript therefore still
+-- resolves, which is the whole reason the digest can be trusted: a reader that
+-- kept only the handle has not lost the only copy. "Permanent" is also what
+-- makes the absence of an Agent foreign key load-bearing — an artifact
+-- deliberately outlives the agent that produced it, so nothing about agent
+-- deletion (or team deletion, or a re-created agent with a reused name) may
+-- reach these rows. If a bound is ever wanted, it belongs in a new explicit
+-- entry point that expires rows on purpose; it does not belong here as a column
+-- no reader consults.
+CREATE TABLE IF NOT EXISTS ResultArtifact (
+  id TEXT PRIMARY KEY,
+  agentId TEXT NOT NULL,
+  runId TEXT,
+  turnSeq INTEGER,
+  kind TEXT NOT NULL,
+  mediaType TEXT NOT NULL DEFAULT 'text/plain; charset=utf-8',
+  byteSize INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  createdAt INTEGER NOT NULL DEFAULT (unixepoch()),
+  body TEXT NOT NULL,
+  chunkCount INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS result_artifact_agent_time_idx ON ResultArtifact(agentId, createdAt);
+CREATE INDEX IF NOT EXISTS result_artifact_sha_idx ON ResultArtifact(sha256);
+CREATE TRIGGER IF NOT EXISTS result_artifact_immutable_update BEFORE UPDATE ON ResultArtifact
+BEGIN
+  SELECT RAISE(ABORT, 'Artifact rows are immutable: write a new artifact instead of rewriting one');
+END;
+CREATE TRIGGER IF NOT EXISTS result_artifact_append_only_delete BEFORE DELETE ON ResultArtifact
+BEGIN
+  SELECT RAISE(ABORT, 'Artifact rows are append-only: the durable copy of a result must survive');
+END;
+
+-- Phase 4 rework: the body of an artifact that was STREAMED in.
+--
+-- A tool that produces more output than the turn's budget does not have that
+-- output in memory and must not build it there: it spools the bytes to a file
+-- as they arrive, then commits them here. So the text of such an artifact lives
+-- in chunk rows instead of in Artifact.body (which stays '' and keeps the row
+-- shape every reader already selects).
+--
+-- byteFrom / bytes are what make the row addressable: a page read has to reach
+-- byte 40 MB of a 100 MB artifact without reading the 40 MB before it, so a
+-- range query has to be answerable from the table itself. The byte count is
+-- stored rather than taken from length(body) because length() counts CHARACTERS
+-- on a TEXT column while every offset in this system is a BYTE offset.
+--
+-- The same two guarantees the Artifact rows carry apply here, for the same
+-- reason: the sha256 is worth something only if the bytes behind it cannot
+-- change. Chunks are inserted inside the same transaction as their Artifact
+-- row, and are never updated or deleted afterwards.
+CREATE TABLE IF NOT EXISTS ResultArtifactChunk (
+  artifactId TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  byteFrom INTEGER NOT NULL,
+  bytes INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  PRIMARY KEY (artifactId, seq)
+);
+CREATE TRIGGER IF NOT EXISTS result_artifact_chunk_immutable_update BEFORE UPDATE ON ResultArtifactChunk
+BEGIN
+  SELECT RAISE(ABORT, 'Artifact chunk rows are immutable: write a new artifact instead of rewriting one');
+END;
+CREATE TRIGGER IF NOT EXISTS result_artifact_chunk_append_only_delete BEFORE DELETE ON ResultArtifactChunk
+BEGIN
+  SELECT RAISE(ABORT, 'Artifact chunk rows are append-only: the durable copy of a result must survive');
+END;
+
+-- Phase 4: liveness — one row per run, the ONLY place "is this run alive?"
+-- is recorded.
+--
+-- Why a table and not a field on Agent: a run's liveness outlives the run, and
+-- the question it has to answer is asked AFTER the fact ("the core restarted
+-- while this run was open — did it finish?"). An in-memory map cannot answer
+-- that, and the agent's status column cannot either: it says IDLE, which is
+-- true and useless.
+--
+-- Unlike Artifact, this row is MUTABLE by design — it is a state machine, and a
+-- state machine that can only be appended to cannot transition. It is
+-- still not deletable through any phase-4 entry point, and carries no foreign
+-- key to Agent for the same reason as Artifact: the record of how a run ended
+-- must not disappear with the agent.
+--
+-- Timestamps are epoch MILLISECONDS (unlike the second-precision tables above),
+-- because the whole point of these numbers is comparing them against suspicion
+-- and deadline thresholds that are expressed in ms.
+CREATE TABLE IF NOT EXISTS RunLiveness (
+  runId TEXT PRIMARY KEY,
+  agentId TEXT NOT NULL,
+  state TEXT NOT NULL,
+  policy TEXT NOT NULL,
+  signals TEXT NOT NULL,
+  startedAt INTEGER NOT NULL DEFAULT 0,
+  updatedAt INTEGER NOT NULL DEFAULT 0,
+  endedAt INTEGER,
+  terminalReason TEXT
+);
+CREATE INDEX IF NOT EXISTS run_liveness_agent_idx ON RunLiveness(agentId, updatedAt);
+CREATE INDEX IF NOT EXISTS run_liveness_updated_idx ON RunLiveness(updatedAt);
 
 CREATE TABLE IF NOT EXISTS PendingTurn (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +320,40 @@ CREATE TABLE IF NOT EXISTS UsageEvent (
 CREATE INDEX IF NOT EXISTS usage_time_idx ON UsageEvent(createdAt);
 CREATE INDEX IF NOT EXISTS usage_agent_idx ON UsageEvent(agentId);
 CREATE INDEX IF NOT EXISTS usage_provider_idx ON UsageEvent(providerId);
+
+-- A process whose OWNER IS CORE, not the agent session that asked for it.
+--
+-- Why this table exists (2026-09-15 outage): long work started as an agent-CLI
+-- background shell is a child of that CLI process. The CLI process is exactly
+-- as long-lived as its session, and a session is recycled whenever the
+-- context window fills. So the work died with the session, no terminal record
+-- was ever written, and nothing on disk said whether it had finished — the
+-- build had to be re-derived from file mtimes and re-run by hand.
+--
+-- The fix is ownership, not more care: the process is spawned by core, which
+-- outlives every session. The pid is kept so the row can be reconciled against
+-- the real OS process at boot (a 'running' row whose pid is gone becomes
+-- 'lost', never a silent success). logPath is the evidence: output is streamed
+-- to a file so the last lines survive whatever happens next. agentName is
+-- denormalized alongside the nullable FK for the same reason it is on
+-- UsageEvent: the row must still read correctly after the agent is gone.
+CREATE TABLE IF NOT EXISTS Job (
+  id TEXT PRIMARY KEY,
+  agentId TEXT REFERENCES Agent(id) ON DELETE SET NULL,
+  agentName TEXT NOT NULL,
+  command TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  pid INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('running', 'exited', 'failed', 'cancelled', 'lost')),
+  exitCode INTEGER,
+  logPath TEXT NOT NULL,
+  lastOutputAt INTEGER,
+  startedAt INTEGER NOT NULL DEFAULT (unixepoch()),
+  endedAt INTEGER,
+  lostReason TEXT
+);
+CREATE INDEX IF NOT EXISTS job_agent_idx ON Job(agentId);
+CREATE INDEX IF NOT EXISTS job_status_idx ON Job(status);
 `;
 
 sqliteDb.exec(SCHEMA);
@@ -158,9 +371,42 @@ function ensureColumn(table: string, column: string, decl: string): void {
   }
 }
 
+/** Run `fn` inside a real SQLite transaction.
+ *
+ *  Compaction is the one operation that must move rows between two tables and
+ *  delete them from the first: a crash between the archive insert and the
+ *  delete would either lose messages or duplicate them. The driver here is
+ *  `node:sqlite`'s synchronous `DatabaseSync`, so `fn` is synchronous by
+ *  construction — there is no await point at which another writer could
+ *  interleave, and no BUSY handling to get wrong. Anything asynchronous (the
+ *  model call that produces the summary) happens BEFORE this is entered.
+ *
+ *  Nested use is rejected rather than silently joined: a nested BEGIN throws in
+ *  SQLite, and a silently-joined transaction would commit work the outer scope
+ *  still believes it can roll back. */
+export function transaction<T>(fn: () => T): T {
+  if (sqliteDb.isTransaction) {
+    throw new Error("transaction() cannot be nested: the caller is already inside a transaction");
+  }
+  sqliteDb.exec("BEGIN IMMEDIATE");
+  try {
+    const out = fn();
+    sqliteDb.exec("COMMIT");
+    return out;
+  } catch (err) {
+    try {
+      sqliteDb.exec("ROLLBACK");
+    } catch {
+      /* the transaction is already gone; the original error is the one to report */
+    }
+    throw err;
+  }
+}
+
 ensureColumn("Provider", "disabled", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("Provider", "metadata", "TEXT NOT NULL DEFAULT '{}'");
 ensureColumn("Agent", "codexWorkspace", "TEXT");
+ensureColumn("Agent", "projectRoot", "TEXT");
 // W20 Slice 5.6: billingModel distinguishes pay-per-token ('usage') from
 // flat-rate plans ('subscription'). codex rows write 'subscription' so the
 // W17 cost rollup can either exclude them or render them in a separate
@@ -178,6 +424,10 @@ ensureColumn("UsageEvent", "outputTokensLocal", "INTEGER NOT NULL DEFAULT 0");
 // level (PRAGMA foreign_keys is off for AgentUI compatibility); the cascade
 // behavior is implemented in code by the team delete path.
 ensureColumn("Agent", "teamId", "TEXT");
+// Phase 4 rework: how many ResultArtifactChunk rows hold this artifact's body.
+// 0 means the body is in `ResultArtifact.body` — which is every row written
+// before chunked bodies existed, so the default is also the migration.
+ensureColumn("ResultArtifact", "chunkCount", "INTEGER NOT NULL DEFAULT 0");
 
 // ─────────────────────────────────────────────────────────────
 // W16 Slice 1.2: deprecated provider migration.
@@ -214,6 +464,36 @@ export function migrateDeprecatedProviders(): { count: number } {
 migrateDeprecatedProviders();
 
 // ─────────────────────────────────────────────────────────────
+// projectRoot backfill: the legacy `codexWorkspace` column becomes the
+// canonical `projectRoot`.
+//
+// The condition is deliberately narrow. A row is migrated ONLY when it has a
+// non-empty legacy value AND no canonical value yet. A row with neither stays
+// UNBOUND — it never had a project root, and inventing one (home dir? the
+// process's cwd? the data dir?) would silently move that agent's work
+// somewhere the user never chose. NULL is an answer here, not a gap.
+//
+// Idempotent by construction: after the first run `projectRoot` is no longer
+// NULL for the migrated rows, so they no longer match. The one way a migrated
+// row could match again is an explicit UNBIND (projectRoot back to NULL) while
+// a legacy value is still on the row — which is why the write path clears the
+// legacy column in the same statement. Otherwise this backfill would read that
+// leftover as "not yet migrated" and rebind the agent.
+// ─────────────────────────────────────────────────────────────
+
+export function backfillProjectRoot(): { count: number } {
+  const res = sqliteDb
+    .prepare(
+      `UPDATE Agent SET projectRoot = codexWorkspace
+       WHERE projectRoot IS NULL AND codexWorkspace IS NOT NULL AND codexWorkspace <> ''`,
+    )
+    .run();
+  return { count: Number(res.changes ?? 0) };
+}
+
+backfillProjectRoot();
+
+// ─────────────────────────────────────────────────────────────
 // Type definitions (mirror Prisma row shapes, for callers).
 // JSON fields are parsed; DateTime → Date; Boolean → boolean.
 // ─────────────────────────────────────────────────────────────
@@ -234,8 +514,13 @@ export interface Agent {
   status: AgentStatus;
   model: string;
   providerId: string | null;
+  /** Legacy column. Kept readable for old rows; nothing may write or use it. */
   workspace: string | null;
+  /** Legacy alias of `projectRoot` (see the backfill above). Compatibility
+   *  only: read `projectRoot`. */
   codexWorkspace: string | null;
+  /** The canonical project root for this agent, or NULL when it is unbound. */
+  projectRoot: string | null;
   /** W21: team membership. NULL = ungrouped (preserves all pre-team behavior). */
   teamId: string | null;
   metadata: unknown;
@@ -347,6 +632,37 @@ export interface UsageEvent {
   createdAt: Date;
 }
 
+/** Lifecycle of a core-owned job.
+ *
+ *  `exited` and `failed` are the two ways a process can END; they are separate
+ *  statuses so "finished, exit 0" is never confused with "finished, exit 3".
+ *  `lost` is the honest third answer: the row said `running` but the process is
+ *  gone and nothing observed it finish — a crash, a reboot, or an owner that
+ *  was killed. It is deliberately NOT collapsed into `failed`, because we do
+ *  not know it failed; and never into `exited` with a default code, because
+ *  that would fabricate the one fact we are missing. */
+export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "lost";
+
+export interface Job {
+  id: string;
+  /** Nullable: the job outlives the agent row (see the DDL comment). */
+  agentId: string | null;
+  agentName: string;
+  command: string;
+  cwd: string;
+  pid: number | null;
+  status: JobStatus;
+  exitCode: number | null;
+  logPath: string;
+  /** Last time output arrived. For a running job this is the only liveness
+   *  signal that is not "the pid still exists". */
+  lastOutputAt: Date | null;
+  startedAt: Date;
+  endedAt: Date | null;
+  /** Why the row is `lost`, in the reconciler's own words. Null otherwise. */
+  lostReason: string | null;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Row mappers (raw SQLite row → typed row)
 // ─────────────────────────────────────────────────────────────
@@ -372,6 +688,7 @@ const mapAgent = (r: Record<string, unknown>): Agent => ({
   providerId: (r.providerId as string | null) ?? null,
   workspace: (r.workspace as string | null) ?? null,
   codexWorkspace: (r.codexWorkspace as string | null) ?? null,
+  projectRoot: (r.projectRoot as string | null) ?? null,
   teamId: (r.teamId as string | null) ?? null,
   metadata: parseJson(r.metadata as string),
   createdAt: dateOf(r.createdAt as number),
@@ -453,6 +770,22 @@ const mapAppSetting = (r: Record<string, unknown>): AppSetting => ({
   key: r.key as string,
   value: parseJson(r.value as string),
   updatedAt: dateOf(r.updatedAt as number),
+});
+
+const mapJob = (r: Record<string, unknown>): Job => ({
+  id: r.id as string,
+  agentId: (r.agentId as string | null) ?? null,
+  agentName: r.agentName as string,
+  command: r.command as string,
+  cwd: r.cwd as string,
+  pid: r.pid == null ? null : Number(r.pid),
+  status: r.status as JobStatus,
+  exitCode: r.exitCode == null ? null : Number(r.exitCode),
+  logPath: r.logPath as string,
+  lastOutputAt: dateOrNull(r.lastOutputAt as number | null),
+  startedAt: dateOf(r.startedAt as number),
+  endedAt: dateOrNull(r.endedAt as number | null),
+  lostReason: (r.lostReason as string | null) ?? null,
 });
 
 const mapUsageEvent = (r: Record<string, unknown>): UsageEvent => ({
@@ -704,6 +1037,7 @@ const workspaceRepo = makeRepo("Workspace", mapWorkspace, {
 });
 const usageEventRepo = makeRepo("UsageEvent", mapUsageEvent);
 const teamRepo = makeRepo("Team", mapTeam);
+const jobRepo = makeRepo("Job", mapJob);
 const appSettingRepo = {
   findUnique(args: { where: { key?: unknown } }): AppSetting | null {
     const row = sqliteDb
@@ -747,6 +1081,7 @@ export const db = {
   usageEvent: usageEventRepo,
   appSetting: appSettingRepo,
   team: teamRepo,
+  job: jobRepo,
 };
 
 /** Drop-in for the prior Prisma export so existing imports keep working. */

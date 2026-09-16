@@ -16,7 +16,9 @@ const CONTEXT_TEMPLATE = (vars: {
   if (vars.sourceLastOutput) {
     lines.push(
       `Source state: ${vars.sourceState ?? "completed"}`,
-      `Source agent's most recent output (this is the artifact under review):`,
+      `Source agent's most recent output (this is the artifact under review). If the block opens with a`,
+      `<<<artifact ...>>> handle and says preview, only the first page travelled: read the whole thing with`,
+      `artifact_read(id=...) before judging it — a verdict on a preview is a verdict on a prefix.`,
       `<<<source-output`,
       vars.sourceLastOutput,
       `source-output>>>`,
@@ -35,6 +37,7 @@ const CONTEXT_TEMPLATE = (vars: {
 const REVIEW_INSTRUCTION = [
   "你正在以 **review（审阅）** 模式收到来自 peer agent 的工作交接。",
   "- `<<<source-output ... source-output>>>` 区块是源 agent 最近一轮的产出，这是你要审阅的对象，逐字可读，请勿 paraphrase。",
+  "- 若区块里带有 `<<<artifact ...` 句柄并标注 preview，说明只带过来第一页——先用 artifact_read 把完整原文读回来再下结论，不要审阅一个前缀。",
   "- `Operator's accompanying note` 区块是操作者发来的附注（通常是问句或聚焦指引），用于指导你审阅的方向。",
   "- 请提供独立的第二意见审查：先用 3-5 句复述你对源 agent 任务/方案的理解（基于 source-output），",
   "  再列出值得肯定的地方、潜在风险、明确的改进建议。",

@@ -12,7 +12,15 @@ import {
   type FixedAccountConfig,
 } from "./auth.js";
 import type { CloudAccountRecord, CloudStore } from "./store.js";
-import { CloudRevisionConflictError, publicAccount } from "./store.js";
+import {
+  CloudRevisionConflictError,
+  isCloudInputRejection,
+  publicAccount,
+  publishedAgentPlan,
+  sanitizeAgentInput,
+  withLegacyProjectRootAlias,
+} from "./store.js";
+import type { RunPlanStatusView } from "@agentorch/shared";
 import { bearerToken, authenticateCloudRequest, requireCloudAuth } from "./session-auth.js";
 
 const EMAIL_MAX = 255;
@@ -51,8 +59,45 @@ const syncBatchBodySchema = snapshotBodySchema.extend({
   expectedRevision: z.number().int().min(0).optional(),
 });
 
+/** The SAME canonical-root rule the local write path enforces, applied to an
+ *  incoming body before anything is stored: one field, and a payload that names
+ *  two different directories for it is refused with a structured code rather
+ *  than resolved by field order. Returns the refusal to send, or null. */
+function refuseProjectRootConflict(
+  agents: unknown[] | undefined,
+  reply: { code: (status: number) => unknown },
+): { error: string; path: string; message: string } | null {
+  try {
+    for (const agent of agents ?? []) sanitizeAgentInput(agent);
+  } catch (err) {
+    if (!isCloudInputRejection(err)) throw err;
+    reply.code(400);
+    return { error: err.code, path: err.path, message: err.message };
+  }
+  return null;
+}
+
+const agentParamsSchema = z.object({
+  workspaceId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(128),
+});
+
 const paramsSchema = z.object({
   workspaceId: z.string().regex(CLOUD_ID_RE),
+});
+
+/** A published plan is relayed, not resolved: the shape checked here is the
+ *  same shallow one the read path accepts (see `publishedAgentPlan`), so a
+ *  write can never store something `/status` would then refuse to serve. The
+ *  full contract lives in `shared` and is validated by the surface that renders
+ *  it — re-deriving it here would be the second resolver this design removes. */
+const planPublishBodySchema = z.object({
+  planView: z.object({
+    source: z.string().min(1),
+    planHash: z.string().min(1),
+    settings: z.array(z.unknown()),
+  }).passthrough(),
+  publishedAt: z.string().min(1).max(64),
 });
 
 export interface CloudRoutesOptions {
@@ -256,7 +301,109 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
         reply.code(404);
         return { error: "not_found" };
       }
-      return { snapshot };
+      // One response shape whichever store answered: the legacy column is
+      // written as NULL by new writers, so a reader that still asks for
+      // `codexWorkspace` gets the canonical value echoed back.
+      return { snapshot: { ...snapshot, agents: snapshot.agents.map(withLegacyProjectRootAlias) } };
+    } catch {
+      reply.code(401);
+      return { error: "unauthorized" };
+    }
+  });
+
+  // Read-only, and honest about what it does not have.
+  //
+  // The cloud has no runtime, so it cannot RESOLVE a plan — it can only relay
+  // the one the owning desktop published with the agent it already syncs. Two
+  // answers, and no third:
+  //
+  //   404                      — this account's workspace has no such agent. The
+  //                              lookup is scoped to the WORKSPACE snapshot, so
+  //                              a local agent that happens to share the id is
+  //                              never consulted and a name is never matched.
+  //   { source: "snapshot" }   — the desktop published a plan; here it is,
+  //                              verbatim.
+  //   { source: "unavailable" }— the agent is known and no plan was published
+  //                              for it. An explicit answer, not an empty 200
+  //                              the client would have to interpret.
+  app.get("/v1/cloud/workspaces/:workspaceId/agents/:agentId/status", async (req, reply) => {
+    const params = agentParamsSchema.safeParse(req.params);
+    if (!params.success) {
+      reply.code(400);
+      return { error: "bad_request", detail: params.error.issues };
+    }
+    try {
+      const auth = await requireCloudAuth(req, store);
+      const snapshot = await store.getSnapshot(auth.account.id, params.data.workspaceId);
+      if (!snapshot) {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      const agent = snapshot.agents.find((entry) => entry.id === params.data.agentId);
+      if (!agent) {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      const published = publishedAgentPlan(agent);
+      if (!published) {
+        return {
+          source: "unavailable" as const,
+          planView: null,
+          publishedAt: null,
+          reason:
+            "no desktop has published a run plan for this agent — the cloud holds this agent's " +
+            "synced configuration, but a plan is a fact about a run, and only the desktop that " +
+            "owns the agent can resolve one",
+        };
+      }
+      return {
+        source: "snapshot" as const,
+        planView: published.planView,
+        publishedAt: published.publishedAt,
+        reason: `published by the owning desktop at ${published.publishedAt}`,
+      };
+    } catch {
+      reply.code(401);
+      return { error: "unauthorized" };
+    }
+  });
+
+  // The write half of the same relay — narrow on purpose.
+  //
+  // Publishing a plan used to ride along with a whole-agent `sync-batch`, which
+  // meant the publishing desktop sent its ENTIRE copy of the agent back with it.
+  // A desktop holding a snapshot from before another client's change would then
+  // revert that change on the next turn: a status publish acting as a config
+  // write. This route writes exactly one thing — `metadata.publishedPlan` on the
+  // named agent — so no configuration field can be carried, overwritten or
+  // rewritten by a publish.
+  //
+  // 404 for an unknown workspace or agent: an id this account does not have is
+  // never created, and a name is never matched.
+  app.post("/v1/cloud/workspaces/:workspaceId/agents/:agentId/plan", async (req, reply) => {
+    const params = agentParamsSchema.safeParse(req.params);
+    if (!params.success) {
+      reply.code(400);
+      return { error: "bad_request", detail: params.error.issues };
+    }
+    const body = planPublishBodySchema.safeParse(req.body);
+    if (!body.success) {
+      reply.code(400);
+      return { error: "bad_request", detail: body.error.issues };
+    }
+    try {
+      const auth = await requireCloudAuth(req, store);
+      const published = await store.publishAgentPlan(
+        auth.account.id,
+        params.data.workspaceId,
+        params.data.agentId,
+        { planView: body.data.planView as unknown as RunPlanStatusView, publishedAt: body.data.publishedAt },
+      );
+      if (!published) {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      return { agentId: params.data.agentId, publishedAt: published.publishedAt };
     } catch {
       reply.code(401);
       return { error: "unauthorized" };
@@ -274,6 +421,8 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       reply.code(400);
       return { error: "bad_request", detail: body.error.issues };
     }
+    const refused = refuseProjectRootConflict(body.data.agents, reply);
+    if (refused) return refused;
     try {
       const auth = await requireCloudAuth(req, store);
       const workspace = await store.getWorkspace(auth.account.id, params.data.workspaceId);
@@ -313,6 +462,8 @@ export function registerCloudRoutes(app: FastifyInstance, store: CloudStore, rou
       reply.code(400);
       return { error: "bad_request", detail: body.error.issues };
     }
+    const refused = refuseProjectRootConflict(body.data.agents, reply);
+    if (refused) return refused;
     try {
       const auth = await requireCloudAuth(req, store);
       const workspace = await store.getWorkspace(auth.account.id, params.data.workspaceId);

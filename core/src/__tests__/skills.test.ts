@@ -153,6 +153,62 @@ describe("registry test seam", () => {
   });
 });
 
+describe("project skill roots", () => {
+  let temp: string;
+
+  beforeEach(() => {
+    temp = mkdtempSync(join(tmpdir(), "ensemble-skills-project-"));
+    __setSkillRootOverridesForTest({
+      ensemble: join(temp, "ensemble"),
+      claudeUser: join(temp, "claude-user"),
+      codexUser: join(temp, "codex-user"),
+      systemDirs: [join(temp, "system")],
+      disableProject: false,
+    });
+  });
+
+  afterEach(() => {
+    __setSkillRootOverridesForTest(null);
+    rmSync(temp, { recursive: true, force: true });
+  });
+
+  it("scans all three project conventions, not just .claude", async () => {
+    const { loadSkills } = await import("../skills/index.js");
+    const root = join(temp, "project");
+    writeSkill(join(root, ".agents", "skills"), "neutral-skill", "tool-neutral", "neutral body");
+    writeSkill(join(root, ".claude", "skills"), "claude-skill", "claude convention", "claude body");
+    writeSkill(join(root, ".codex", "skills"), "codex-skill", "codex convention", "codex body");
+
+    const names = loadSkills([root]).map((s) => `${s.name}:${s.source}`).sort();
+    expect(names).toEqual([
+      "claude-skill:project",
+      "codex-skill:project",
+      "neutral-skill:project",
+    ]);
+  });
+
+  it("resolves a name collision by a fixed priority, with .agents first", async () => {
+    const { loadSkills } = await import("../skills/index.js");
+    const root = join(temp, "project-priority");
+    writeSkill(join(root, ".agents", "skills"), "shared", "from .agents", "neutral body");
+    writeSkill(join(root, ".claude", "skills"), "shared", "from .claude", "claude body");
+    writeSkill(join(root, ".codex", "skills"), "shared", "from .codex", "codex body");
+
+    const list = loadSkills([root]);
+    expect(list.filter((s) => s.name === "shared")).toHaveLength(1);
+    expect(list.find((s) => s.name === "shared")?.body).toBe("neutral body");
+  });
+
+  it("keeps user-level sources when a project has no skills at all", async () => {
+    const { loadSkills } = await import("../skills/index.js");
+    writeSkill(join(temp, "ensemble"), "managed", "ensemble-level", "managed body");
+    writeSkill(join(temp, "claude-user"), "user-level", "user-level", "user body");
+
+    const names = loadSkills([join(temp, "empty-project")]).map((s) => s.name).sort();
+    expect(names).toEqual(["managed", "user-level"]);
+  });
+});
+
 function writeSkill(root: string, name: string, description: string, body: string): void {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });

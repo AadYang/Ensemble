@@ -84,6 +84,10 @@ export default function Page() {
   const upsertAgent = useStore((s) => s.upsertAgent);
   const setStatus = useStore((s) => s.setStatus);
   const setContextUsage = useStore((s) => s.setContextUsage);
+  const setLiveness = useStore((s) => s.setLiveness);
+  const clearLiveness = useStore((s) => s.clearLiveness);
+  const setRunPlan = useStore((s) => s.setRunPlan);
+  const clearRunPlan = useStore((s) => s.clearRunPlan);
   const ingestSdkMessage = useStore((s) => s.ingestSdkMessage);
   const appendError = useStore((s) => s.appendError);
   const agents = useStore((s) => s.agents);
@@ -341,6 +345,18 @@ export default function Page() {
       switch (msg.type) {
         case "hello":
           setConnected(true);
+          // A reconnect invalidates every liveness verdict we hold. There is no
+          // polling to recalibrate them, and "suspected-stall" carried across a
+          // disconnect is exactly the lie this whole phase removes: the server
+          // may have finished the run, or never have been in that state at all.
+          // The authoritative value is re-established by the next
+          // `liveness_update` or by `/status` — never by keeping the old one.
+          clearLiveness();
+          // A held plan describes the turn that produced it, so it goes with the
+          // connection for exactly the same reason. The next `run_plan` event
+          // re-establishes it; keeping the old one would render a finished
+          // turn's limits as the ones the next turn runs under.
+          clearRunPlan();
           // Re-subscribe to all known agents so events route after a reconnect.
           for (const id of Object.keys(useStore.getState().agents)) {
             ws.send({ type: "subscribe", sessionId: id });
@@ -371,6 +387,21 @@ export default function Page() {
           break;
         case "context_usage":
           setContextUsage(msg.sessionId, msg.usage);
+          break;
+        case "liveness_update":
+          // Stored verbatim. The client does NOT compute quiet/state/description
+          // from it and does not time anything out locally: those are the
+          // server's measurements, and any rendering of this value is phase 5
+          // and out of scope here.
+          setLiveness(msg.sessionId, msg.liveness);
+          break;
+        case "run_plan":
+          // The plan the turn is about to run under, as the server's own
+          // view-model. Stored verbatim: every field a component shows —
+          // transport, reasoning, project root, context, history, skills,
+          // preferences, diagnostics — is read off THIS object rather than
+          // inferred from the provider kind or the model id.
+          setRunPlan(msg.sessionId, msg.plan);
           break;
         case "message":
           ingestSdkMessage(msg.sessionId, msg.seq, msg.msg);
@@ -409,6 +440,10 @@ export default function Page() {
     upsertAgent,
     setStatus,
     setContextUsage,
+    setLiveness,
+    clearLiveness,
+    setRunPlan,
+    clearRunPlan,
     ingestSdkMessage,
     addPermissionRequest,
     addUserQuestion,
@@ -851,7 +886,7 @@ export default function Page() {
           </div>
           <ProviderPanel />
           <McpServerPanel />
-          <SkillPanel />
+          <SkillPanel agentId={activeId} />
           <div
             onMouseDown={(e) => {
               sidebarDraggingRef.current = true;
@@ -989,13 +1024,17 @@ export default function Page() {
         <NewAgentDialog
           defaultName={nextDefaultName}
           onClose={() => setNewAgentOpen(false)}
-          onSubmit={({ name, providerId, model, codexWorkspace }) => {
+          onSubmit={({ name, providerId, model, projectRoot }) => {
             ws.send({
               type: "create_agent",
               name,
               ...(providerId ? { providerId } : {}),
               ...(model ? { model } : {}),
-              ...(codexWorkspace ? { codexWorkspace } : {}),
+              // Omitted entirely when the user left it empty: the agent is
+              // created UNBOUND and works in its own scratch dir. Sending "" or
+              // guessing a directory here is what turned "no project" into a
+              // silently wrong one.
+              ...(projectRoot ? { projectRoot } : {}),
             });
           }}
         />

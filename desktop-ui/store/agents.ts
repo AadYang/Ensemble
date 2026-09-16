@@ -16,7 +16,9 @@ import {
   type LayoutNode,
   type LayoutWindow,
   type LayoutWorkspace,
+  type LivenessUpdate,
   type PeerMode,
+  type RunPlanStatusView,
   type SdkMessage,
   type SplitDir,
   type TeamSummary,
@@ -126,6 +128,42 @@ interface Store {
   removeAgent: (id: string) => void;
   setStatus: (id: string, status: AgentStatus) => void;
   setContextUsage: (id: string, usage: ContextUsage | null) => void;
+
+  /** Phase 4 liveness, keyed by session id. The value is the SERVER's
+   *  projection, verbatim: `quietMs`, `state` and `description` are measured
+   *  and worded by the process that can see the run, and nothing on this side
+   *  recomputes them. Displaying it is phase 5 and deliberately not here yet —
+   *  this slice only holds the last thing the server said.
+   *
+   *  In-memory only, and it must be: a liveness verdict is true for as long as
+   *  the events keep arriving. A reconnect clears it rather than preserving a
+   *  "suspected-stall" that no one can vouch for any more. */
+  livenessByAgent: Record<string, LivenessUpdate>;
+  setLiveness: (sessionId: string, update: LivenessUpdate) => void;
+  /** Drop every held verdict — the authoritative value is re-established by the
+   *  next `liveness_update` or by `/status`, never by keeping the old one. */
+  clearLiveness: () => void;
+
+  /** The plan the agent's last turn actually ran under, keyed by session id, as
+   *  the SERVER's own view-model (`RunPlanStatusView`) — stored verbatim and
+   *  never re-derived here. This is the ONE place a component reads transport,
+   *  reasoning, project root, context, history, skills, liveness, preferences
+   *  or diagnostics from: a component that decided any of those from the
+   *  provider kind or a model-id prefix would be a second resolver, and the two
+   *  would disagree the moment the server learned something new.
+   *
+   *  Absent = no plan has been resolved for this agent yet (nothing has run in
+   *  this page's lifetime). Absent is rendered as unknown; it is never filled in
+   *  with a plausible default. In-memory only, for the same reason liveness is:
+   *  a plan describes the turn that produced it, and a reconnect cannot vouch
+   *  for it. */
+  planByAgent: Record<string, RunPlanStatusView>;
+  setRunPlan: (sessionId: string, plan: RunPlanStatusView) => void;
+  /** Drop every held plan. Like `clearLiveness`, this is the honest response to
+   *  a reconnect or a page-level reset: the next `run_plan` or `/status` read
+   *  re-establishes it, and keeping a stale one would show a previous turn's
+   *  limits as the current turn's. */
+  clearRunPlan: () => void;
   appendUserTurn: (id: string, text: string, peerOrigin?: PeerOrigin) => void;
   appendNotice: (id: string, text: string) => void;
   ingestSdkMessage: (id: string, seq: number, msg: SdkMessage) => void;
@@ -164,7 +202,11 @@ interface Store {
 
   /** Server broadcast on /clear or /compact — wipe local turns and (compact
    *  only) drop a notice carrying the summary so the user sees what survived. */
-  resetAgentHistory: (id: string, reason: "clear" | "compact", summary?: string) => void;
+  /** `restore` is the inverse of `compact`: archived originals were appended
+   *  back. The transcript is reloaded from the server either way, so the UI
+   *  only has to say WHICH event happened — showing a restored history as
+   *  "cleared" would be the opposite of what occurred. */
+  resetAgentHistory: (id: string, reason: "clear" | "compact" | "restore", summary?: string) => void;
 
   /** W21: team registry keyed by team id. Refreshed via listTeams() on
    *  connect and patched by team_created / team_updated / team_deleted WS
@@ -296,6 +338,20 @@ const formatBackgroundTaskSystem = (
           ? "background task orphaned: the turn was aborted while it was still running"
           : "background task interrupted: no terminal notification before the runtime stream closed";
       const text = typeof m.text === "string" && m.text.trim() ? m.text : fallback;
+      return { text: `⚠ ${text}`, tone: "error" };
+    }
+    // A core-owned job reached a terminal state. Core writes this row itself
+    // (SessionManager.notifyJobSettled) precisely because the turn that started
+    // the job may be long gone by the time it ends — this notice is how its
+    // outcome reaches a transcript at all. `lost` is shown as an error and
+    // never softened into a success: a job whose process vanished without an
+    // exit code did NOT succeed, and saying otherwise is the failure mode the
+    // whole job primitive exists to remove.
+    case "job_settled": {
+      const jobStatus = typeof m.status === "string" ? m.status : "";
+      const text = typeof m.text === "string" && m.text.trim() ? m.text : `job ${m.jobId ?? ""} ${jobStatus}`;
+      if (jobStatus === "exited") return { text: `✓ ${text}` };
+      if (jobStatus === "cancelled") return { text: `■ ${text}`, tone: "warn" };
       return { text: `⚠ ${text}`, tone: "error" };
     }
     // Core writes this durable row when a DETACHED subagent reaches a terminal
@@ -621,8 +677,15 @@ export const useStore = create<Store>((set) => ({
       const { [id]: _, ...rest } = s.agents;
       const { [id]: _draft, ...inputDrafts } = s.inputDrafts;
       const { [id]: _selection, ...inputSelections } = s.inputSelections;
+      // The liveness verdict goes with the agent: a map entry for a session
+      // that no longer exists is a verdict with nothing to be true about.
+      const { [id]: _liveness, ...livenessByAgent } = s.livenessByAgent;
+      // Same for the plan: it describes a session that no longer exists.
+      const { [id]: _plan, ...planByAgent } = s.planByAgent;
       void _draft;
       void _selection;
+      void _liveness;
+      void _plan;
       // Detach from every pane in every window.
       const windows = s.windows.map((w) => {
         const nextRoot = clearAgentFromTree(w.root, id);
@@ -632,6 +695,8 @@ export const useStore = create<Store>((set) => ({
         agents: rest,
         inputDrafts,
         inputSelections,
+        livenessByAgent,
+        planByAgent,
         windows,
         activeId: s.activeId === id ? null : s.activeId,
       };
@@ -650,6 +715,22 @@ export const useStore = create<Store>((set) => ({
       if (!ag) return s;
       return { agents: { ...s.agents, [id]: { ...ag, contextUsage: usage } } };
     }),
+
+  livenessByAgent: {},
+
+  planByAgent: {},
+
+  setRunPlan: (sessionId, plan) =>
+    set((s) => ({ planByAgent: { ...s.planByAgent, [sessionId]: plan } })),
+
+  clearRunPlan: () =>
+    set((s) => (Object.keys(s.planByAgent).length === 0 ? s : { planByAgent: {} })),
+
+  setLiveness: (sessionId, update) =>
+    set((s) => ({ livenessByAgent: { ...s.livenessByAgent, [sessionId]: update } })),
+
+  clearLiveness: () =>
+    set((s) => (Object.keys(s.livenessByAgent).length === 0 ? s : { livenessByAgent: {} })),
 
   appendUserTurn: (id, text, peerOrigin) =>
     set((s) => {
@@ -878,6 +959,8 @@ export const useStore = create<Store>((set) => ({
       const turns: ChatTurn[] = [];
       if (reason === "compact" && summary) {
         turns.push({ seq: 0, kind: "raw", text: `[context compacted] ${summary}` });
+      } else if (reason === "restore") {
+        turns.push({ seq: 0, kind: "raw", text: "[archived messages restored]" });
       } else {
         turns.push({ seq: 0, kind: "raw", text: reason === "compact" ? "[context compacted]" : "[context cleared]" });
       }

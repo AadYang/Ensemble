@@ -1,5 +1,14 @@
 # 会话上下文占比显示 + 关停自动 compact（提案 · 决议版）
 
+> **⚠️ v2 修订（2026-09-15）——§2.2 的单一窗口表 + `resolveContextWindow` 已被取代。**
+> 本文档其余部分（关停自动 compact、占比位置、数据通道）仍然有效；但「分母」的取法改了：
+> 厂商标称容量、runtime 实际有效窗口、压缩阈值是**三个不同的事实**，分别由
+> `advertisedWindow` / `effectiveWindow` / `compactionThreshold` 解析（见
+> `docs/plans/context-window-display.md` 文首的 v2 修订表），`resolveContextWindow` **已删除**。
+> 进度条的分母只取 `effectiveWindow`（本会话实测 > 版本匹配的 runtime profile > null），
+> **不得回退到厂商标称值**；标称值只在旁边/tooltip 展示。前端显示规则在
+> `shared/src/context-bar-view.ts`（纯函数 + 单测）。
+
 > **状态**：✅ 已实施；2026-09-14 修订分子算法（本地 tokenizer 数真实 transcript，见 §2.1）
 > **目标**：关掉「turn 前自动 compact」，改为在 ChatPane 头部实时显示当前会话的上下文占用百分比，≥70% 红色闪烁提醒；compact 只保留手动 `/compact`。
 > **触发动机**：自动 compact 基于「条数 + 字符数」拍脑袋触发，可能正好打断正在处理的代码细节；官方客户端与社区项目已普遍用「上下文占比」替代隐性压缩，用户要求对齐该体验。
@@ -14,6 +23,11 @@
 | 2 | 占比显示位置 | **只在 ChatPane 头部**（不放侧栏 AgentTree） |
 | 3 | OpenAI/Codex 的 contextWindow | **接受静态 model→窗口表兜底**（随新模型维护） |
 | 4 | 阈值与样式 | **≥70% 红色闪烁**，不做黄色分档；**同意先落盘再开发** |
+
+> **后续修订（2026-09-15）**：议题 3 / 4 已被 `context-window-display.md` 的后续决议取代 ——
+> ①分母不再是静态表（见文首 v2 修订）；②阈值改为 context-rot 的 **20/40 三档**
+> （≤20% 绿 / 20–40% 黄 / >40% 红，实现见 `shared/src/context-bar-view.ts` 的 `contextTone`），
+> 不再是「≥70% 红色闪烁」。本文档下文出现的 `70` / 闪烁相关描述均按此理解。
 
 ---
 
@@ -81,28 +95,32 @@ export interface ContextUsage {
 ```
 
 - `usedTokens` = 本地 tokenizer 数真实 transcript（merged systemPrompt + 各 message 可见文本），见 context-usage.ts 头注（2026-09-14 修订：不再用 provider usage 相加 —— DeepSeek anthropic-compat 会上报 `cache_read_input_tokens` 2.83M 超过自身 1M 窗口）
-- `contextWindow`：curated 表优先（第三方/OpenAI 官方窗口）> SDK 上报（Claude 实时值）> 静态表兜底。
+- ~~`contextWindow`：curated 表优先（第三方/OpenAI 官方窗口）> SDK 上报（Claude 实时值）> 静态表兜底。~~
+  **v2（2026-09-15）**：这个优先级是反的——运行时上报的**本会话实测值**必须最优先，静态表只能做
+  版本匹配的兜底，且两者都拿不到时有值就显示「有效上限未知」而不是拿标称值顶上。
+  另外「厂商标称容量」与「运行中有效窗口」是两个字段，不能挤进同一个 `contextWindow`。
 
-### 2.2 静态 context-window 表
+### 2.2 上下文窗口事实层（v2：`core/src/context-window.ts`）
 
-新文件 `core/src/context-window.ts`：
+~~`resolveContextWindow`~~ 已删除。现在是分层 resolver，每层有各自的可信度与作用域：
+
+| 层 | 内容 | key | 可否做分母 / 写配置 |
+|---|---|---|---|
+| catalog | 厂商标称上下文窗口 + 最大输出 | `vendor/model` | 否 / 仅在 `confirmed` 且 runtime 键语义已验证时 |
+| runtime profile | 实测有效窗口 + 压缩阈值 | `runtime/vendor/model`（+ 版本匹配） | 是（兜底） / 仅阈值已实测时 |
+| session 实测 | 本会话 runtime 上报的窗口 | 会话级 | 是（最优先） / 否 |
+| override | 用户覆盖 | 同上两层的 key | 按字段 / 需显式 `confidence: "confirmed"` |
 
 ```ts
-const CONTEXT_WINDOW_TOKENS: Record<string, number> = {
-  // OpenAI / Codex / 第三方 compat：官方窗口值，随新模型更新
-  "gpt-5.2": 400_000,
-  "gpt-4o": 128_000,
-  "gpt-4o-mini": 128_000,
-  // DeepSeek / GLM 等按官方文档补齐（实施时核对）
-};
-
-export function resolveContextWindow(model: string, reported?: number): number | null {
-  if (reported && reported > 0) return reported; // Claude SDK 权威值
-  return CONTEXT_WINDOW_TOKENS[model] ?? null;
-}
+advertisedWindow(model, vendor?): number | null    // 厂商标称，仅显示
+effectiveWindow(model, ctx): EffectiveWindow | null // 分母；无可靠值 → null
+compactionThreshold(model, scope): number | null    // 未实测 → null → 不设 env
+requestedRuntimeWindow(model, scope): number | null  // 唯一可写配置的入口
 ```
 
-> 表中的具体数值以实施时官方文档为准，本文档只定机制 + 示意。Claude 不依赖该表（走 SDK 实时值），表仅为 OpenAI/Codex/第三方兜底；未知模型返回 `null` → UI 不显示占比。
+> 具体数值以官方文档 / 实测为准，本文档只定机制。未知模型 → `effectiveWindow` 返回 `null`：
+> UI 显示占用 token + 「有效上限未知」（若标称值已知则一并显示），**不给假百分比**。
+> 旧的 `models.*.maxInputTokens` override 仍可读，迁移为 `legacy` 条目（仅显示）。
 
 ### 2.3 后端：内存态 + 纯函数
 
@@ -112,12 +130,12 @@ export function resolveContextWindow(model: string, reported?: number): number |
 export function reportedContextWindowFromResult(msg: unknown, model: string): number | undefined;
 export function contextUsageFromTranscript(
   model: string,
-  reportedContextWindow: number | undefined,
+  ctx: EffectiveWindowContext,   // { runtime, vendor, runtimeVersion?, sessionObserved?, requested? }
   transcriptTexts: readonly string[],
 ): ContextUsage | null;
 ```
 
-逻辑：result 钩子处用 `contextTranscriptTexts` 收集 mergedSystemPrompt + 各 message 可见文本；`contextUsageFromTranscript` 用本地 tokenizer 数 token，解析 `contextWindow`（curated > SDK 上报 > 静态表），percent 封顶 100；窗口未知或计数为 0 返回 `null`。
+逻辑：result 钩子处用 `contextTranscriptTexts` 收集 mergedSystemPrompt + 各 message 可见文本；`contextUsageFromTranscript` 用本地 tokenizer 数 token，分母走 `effectiveWindow(model, ctx)`（`ctx.sessionObserved` 即 `reportedContextWindowFromResult` 的返回值，优先级最高），percent 封顶 100；计数为 0 返回 `null`；**有计数但无有效分母时返回只有 `usedTokens`（+ `advertisedContextWindow`）的对象，`percent` 缺失**。
 
 `SessionManager` 增加：
 
@@ -209,7 +227,8 @@ WS 协议新增（`shared/src/protocol.ts` `ServerMsg`）：
 
 | 风险 | 缓解 |
 |---|---|
-| 静态表数值过时 / 缺新模型 | `resolveContextWindow` 返回 null → UI 不显示；随新模型发布更新 `context-window.ts`（同 `pricing.json` 校准节奏） |
+| 静态表数值过时 / 缺新模型 | `effectiveWindow` 返回 null → UI 显示「有效上限未知」（标称值已知则照常展示），**不回退标称值**；随新模型发布更新 `MODEL_CATALOG`（同 `pricing.json` 校准节奏） |
+| 厂商标称值与 runtime 实际有效值不一致（Codex clamp、Claude Code 对无表模型回退 ≈200K） | 两者是不同字段：分母只取 `effectiveWindow`，标称值只在旁边/tooltip；runtime profile 必须带版本 + 实测条件（`measuredUnder`），不同配置条件下的数字不得拼进同一条记录 |
 | Claude SDK 的 `inputTokens` 口径若与「不含 cache」不符 | 已按 `pricing.ts`/`openai.ts` 现有约定统一；单测覆盖 cache 计入公式，若 SDK 行为变化由 3.2 单测暴露 |
 | 多模型 turn 选错 model 条目 | `contextUsageFromResult` 优先 `currentModel`，缺则选最大 usage 条目；单测覆盖 |
 | `percent` 封顶 | 本地计数可能略超窗口，percent 封顶 100（对齐 OpenHands `min(100,…)`）；`usedTokens` 不 clamp，tooltip 仍显示真实 used/window |

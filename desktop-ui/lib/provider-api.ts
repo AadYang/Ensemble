@@ -25,6 +25,10 @@ export interface ProviderDTO {
   upstreamProvider: string | null;
   /** Legacy field; only meaningful on deprecated autoManaged rows. */
   upstreamModel: string | null;
+  /** Whether a per-agent sandbox override is honoured on this provider. The
+   *  SERVER's answer, from the runtime scope it will actually launch — the
+   *  settings form must not decide this from `kind` itself. */
+  sandboxOverrideSupported: boolean;
   models: string[];
   isDefault: boolean;
   disabled: boolean;

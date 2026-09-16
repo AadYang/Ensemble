@@ -29,6 +29,10 @@ interface MemberDraft {
   systemPrompt: string;
   providerId: string | null;
   model: string;
+  /** Empty string = unbound. Kept per-member (not per-team): a team is a
+   *  grouping of roles, and two roles in one team can legitimately work in two
+   *  different repositories. */
+  projectRoot: string;
 }
 
 function emptyMember(): MemberDraft {
@@ -37,6 +41,7 @@ function emptyMember(): MemberDraft {
     systemPrompt: "",
     providerId: null,
     model: "",
+    projectRoot: "",
   };
 }
 
@@ -49,6 +54,7 @@ function memberWithDefaults(providers: ProviderDTO[]): MemberDraft {
     systemPrompt: "",
     providerId: def.id,
     model: models[0] ?? "",
+    projectRoot: "",
   };
 }
 
@@ -116,10 +122,9 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
         //   1. Reset model to the new provider's first available (with the
         //      anthropic-local FALLBACK_MODELS treatment, otherwise the
         //      dropdown shows nothing).
-        //   2. Clear codexWorkspace if the new provider isn't codex —
-        //      otherwise the stale path tags along on submit and the server
-        //      rejects with "codexWorkspace is only valid for openai-codex"
-        //      → that member silently fails to create.
+        //   2. The project directory is NOT provider-scoped any more, so it
+        //      is deliberately left alone when the provider changes — switching
+        //      a member from codex to Claude must not silently unbind it.
         if (patch.providerId !== undefined && patch.providerId !== m.providerId) {
           const p = providers.find((pr) => pr.id === patch.providerId);
           next.model = availableModelsFor(p)[0] ?? "";
@@ -166,12 +171,6 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
       });
       const ws = getWS();
       for (const m of members) {
-        // Defensive: even if the codex workspace input is hidden when the
-        // current provider isn't codex, the underlying state may carry a
-        // stale value from a previous provider selection. Only send it
-        // when the SELECTED provider is codex; otherwise the server's
-        // strict "codexWorkspace requires openai-codex" check would silently
-        // drop this agent.
         ws.send({
           type: "create_agent",
           name: m.role.trim(),
@@ -179,7 +178,9 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
           providerId: m.providerId ?? undefined,
           model: m.model.trim() || undefined,
           teamId,
-          codexWorkspace: undefined,
+          // Omitted when empty → the member is created unbound (own scratch
+          // dir) rather than inheriting some other directory by accident.
+          ...(m.projectRoot.trim() ? { projectRoot: m.projectRoot.trim() } : {}),
         });
       }
       onClose();
@@ -295,6 +296,13 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
                       ))}
                     </select>
                   </div>
+                  <input
+                    value={m.projectRoot}
+                    onChange={(e) => updateMember(idx, { projectRoot: e.target.value })}
+                    placeholder={t("project.placeholder")}
+                    title={t("project.label")}
+                    className="bg-[var(--bg)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)]"
+                  />
                   <textarea
                     value={m.systemPrompt}
                     onChange={(e) => updateMember(idx, { systemPrompt: e.target.value })}

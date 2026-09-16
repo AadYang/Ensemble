@@ -18,17 +18,39 @@
 import { randomUUID } from "node:crypto";
 import { execFile, execSync, spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, type Dirent } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join as joinPath } from "node:path";
 import type { SdkMessage } from "@agentorch/shared";
+import { isReasoningToken, REASONING_SYNTAX_RULE } from "@agentorch/shared";
+import type { LivenessProbeKind } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeErrorEvent, RuntimeEvent, RuntimeOptions } from "./types.js";
+
+/** The answer a Codex health check gives, from what this process can see.
+ *
+ *  While the child lives the run is alive. Once the OS says the child is gone,
+ *  the answer depends on whether the turn had already reached its own terminal
+ *  result: an exit that ends a completed turn is NOT evidence of death, and this
+ *  probe says `unknown` rather than pretending it is. Only an exit in the middle
+ *  of a turn, with the process no longer there to finish it, is `dead`.
+ *
+ *  Exported so the phase-4 gate can prove the wiring and the answers instead of
+ *  reading the source: a private closure inside the runtime is untestable
+ *  without launching a real codex CLI. */
+export function codexChildProbe(state: { exited: boolean; turnCompleted: boolean }): LivenessProbeKind {
+  if (!state.exited) return "alive";
+  return state.turnCompleted ? "unknown" : "dead";
+}
 import {
   codexUsageSnapshotToDelta,
   normalizeCodexUsageSnapshot,
+  readCodexTurnContext,
   readCodexUsageSnapshot,
   type CodexUsageSnapshot,
 } from "./codex-usage.js";
+import { fileMark, sessionFileMark } from "../../capability/marks.js";
+import { markCoversPath } from "../../capability/run-plan.js";
+import type { ArtifactMark } from "../../capability/types.js";
 import {
   getBridgeBaseUrl,
   getBridgeUrl,
@@ -38,6 +60,19 @@ import {
   unregisterHandlers,
 } from "../../mcp-bridge.js";
 import { CLI_INSTALL_INFO, getCodexCliPath } from "../../cli-config.js";
+import {
+  requestedRuntimeWindow,
+  vendorScopeForModel,
+  type WindowScope,
+} from "../../context-window.js";
+
+/** This runtime's scope for a model. `runtimeVersion` is left null: the policy
+ *  gate does not consult it, and any compaction observation needs a version we
+ *  do not have here — so an unmatched observation stays unused instead of being
+ *  borrowed from another build. */
+function codexScopeFor(model: string | null | undefined): WindowScope {
+  return { runtime: "codex", vendor: vendorScopeForModel(model), runtimeVersion: null };
+}
 import { DATA_DIR, PACKAGED, REPO_ROOT } from "../../paths.js";
 import { reloadSkills } from "../../skills/index.js";
 
@@ -162,7 +197,6 @@ function locateCodexBinary(): string | null {
 }
 
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
-type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 const DEFAULT_CODEX_SANDBOX: SandboxMode = "danger-full-access";
 
 /** Hard kill a codex child process AND its grandchildren.
@@ -223,14 +257,20 @@ function readSandboxFromAgentMetadata(agentMeta: unknown): SandboxMode | null {
   return null;
 }
 
-function readReasoningEffortFromAgentMetadata(agentMeta: unknown): ReasoningEffort | null {
-  if (agentMeta && typeof agentMeta === "object") {
-    const m = (agentMeta as Record<string, unknown>).reasoningEffort;
-    if (m === "minimal" || m === "low" || m === "medium" || m === "high" || m === "xhigh" || m === "max") {
-      return m;
-    }
+/** The reasoning level is interpolated into `config.toml` (`key = "value"`) and
+ *  into `-c key="value"` argv, so it has to BE a token before it gets there: a
+ *  quote, a space or a newline would stop being a value and start being config
+ *  syntax. The runtime checks the plan value before it launches anything (see
+ *  `query`), which is where a bad value produces a structured error; this is the
+ *  same check at the interpolation point, so no other caller of these exported
+ *  renderers can interpolate something unvalidated. */
+function assertReasoningToken(value: string): string {
+  if (!isReasoningToken(value)) {
+    throw new Error(
+      `refusing to write an unsafe reasoning level into Codex config (${REASONING_SYNTAX_RULE}): ${JSON.stringify(value)}`,
+    );
   }
-  return null;
+  return value;
 }
 
 function tomlKey(key: string): string {
@@ -332,11 +372,17 @@ export function renderMcpConfigTomlForCodexRuntime(
   mcpServers: Record<string, Record<string, unknown>>,
   trustedProjectPaths: readonly string[] = [],
   sandboxMode?: SandboxMode | null,
-  reasoningEffort?: ReasoningEffort | null,
+  /** An open level token from the plan (see shared/src/reasoning.ts), not a
+   *  closed enum: Codex's own ladder (`ultra`, and whatever a future CLI adds)
+   *  is not ours to enumerate, and the model capability registry is what decides
+   *  whether a value is allowed. */
+  reasoningEffort?: string | null,
   inheritedUserConfigToml = "",
+  contextWindow?: number | null,
 ): string {
   const overriddenRootKeys = new Set<string>();
   if (reasoningEffort) overriddenRootKeys.add("model_reasoning_effort");
+  if (contextWindow) overriddenRootKeys.add("model_context_window");
   const safeInheritedUserConfigToml = stripRootConfigKeysFromToml(
     inheritedUserConfigToml,
     overriddenRootKeys,
@@ -361,7 +407,22 @@ export function renderMcpConfigTomlForCodexRuntime(
     lines.push(`sandbox_mode = "${sandboxMode}"`);
   }
   if (reasoningEffort) {
-    lines.push(`model_reasoning_effort = "${reasoningEffort}"`);
+    lines.push(`model_reasoning_effort = "${assertReasoningToken(reasoningEffort)}"`);
+  }
+  // Declare the model's documented CAPACITY (claude.ts declares the same thing
+  // through CLAUDE_CODE_MAX_CONTEXT_TOKENS). Codex otherwise uses its own
+  // model-table default — for gpt-5.6-sol that is context_window 272,000, so it
+  // compacted at 258,400 (95%) while the model is documented at 1.05M.
+  //
+  // This is a REQUEST, not the effective window. Measured with the installed CLI
+  // 0.154.0: a bigger value lifts the effective window to 95% of the backend's
+  // max_context_window (872,000 → 828,400 for this model) and anything above
+  // that is clamped silently, not rejected. So the value written here must never
+  // be shown as available headroom — the bar uses the OBSERVED effective window
+  // (context-window.ts RUNTIME_WINDOW_PROFILES / effectiveWindow). Values come
+  // only from `confirmed` catalog entries via the policy gate.
+  if (contextWindow) {
+    lines.push(`model_context_window = ${contextWindow}`);
   }
   lines.push(
     "",
@@ -397,10 +458,17 @@ export function renderMcpConfigTomlForCodexRuntime(
 export function prepareCodexHomeForRuntime(
   sessionId: string,
   mcpServers: Record<string, Record<string, unknown>>,
+  /** REQUIRED, and deliberately not optional: this used to be the trailing
+   *  optional parameter and the only production caller omitted it, so
+   *  `requestedRuntimeWindow("")` returned null and `model_context_window` was
+   *  silently never written — the config.toml "durable safety net" did not
+   *  exist and nothing failed. As a required parameter TypeScript catches a
+   *  dropped argument at the call site instead of shipping a no-op. */
+  model: string | null,
   sourceHomeOverride?: string,
   trustedProjectPath?: string,
   sandboxMode?: SandboxMode | null,
-  reasoningEffort?: ReasoningEffort | null,
+  reasoningEffort?: string | null,
 ): string {
   // Read login state from the user's normal Codex home by default, but never
   // inherit CODEX_HOME from Ensemble's parent process. Ensemble sets CODEX_HOME
@@ -427,6 +495,7 @@ export function prepareCodexHomeForRuntime(
       sandboxMode ?? null,
       reasoningEffort ?? null,
       inheritedUserConfig,
+      requestedRuntimeWindow(model ?? "", codexScopeFor(model)),
     ),
     "utf8",
   );
@@ -439,7 +508,8 @@ export function buildCodexExecArgs(opts: {
   promptFromStdin: boolean;
   resume?: string;
   sandbox?: SandboxMode | null;
-  reasoningEffort?: ReasoningEffort | null;
+  reasoningEffort?: string | null;
+  contextWindow?: number | null;
 }): string[] {
   const promptArg = opts.promptFromStdin ? "-" : "";
   const approvalOverride = ["-c", "approval_policy=\"never\""];
@@ -455,7 +525,18 @@ export function buildCodexExecArgs(opts: {
     ? ["-c", `sandbox_mode="${opts.sandbox}"`]
     : [];
   const reasoningOverride = opts.reasoningEffort
-    ? ["-c", `model_reasoning_effort="${opts.reasoningEffort}"`]
+    ? ["-c", `model_reasoning_effort="${assertReasoningToken(opts.reasoningEffort)}"`]
+    : [];
+  // Request the documented context window (see context-window.ts). Codex's own
+  // model table defaults gpt-5.6-sol to 272,000 and compacts at 95% of that
+  // (258,400) even though the model is documented at 1.05M. `-c` is the only
+  // channel that always applies: it works on `exec` AND `exec resume`, whereas
+  // the isolated CODEX_HOME (which also pins it in config.toml now that the
+  // model is passed through) is only created when the agent has MCP servers.
+  // The CLI clamps silently to the backend's max (95% of 872,000 = 828,400 on
+  // CLI 0.154.0) rather than erroring, so treat this as a request only.
+  const contextWindowOverride = opts.contextWindow
+    ? ["-c", `model_context_window=${opts.contextWindow}`]
     : [];
   const common = [
     "--json",
@@ -464,8 +545,11 @@ export function buildCodexExecArgs(opts: {
     ...approvalOverride,
     ...sandboxOverride,
     ...reasoningOverride,
+    ...contextWindowOverride,
     "--disable",
     "apps",
+    // The turn's project root, from the plan. `--cd` and the spawn cwd are the
+    // two channels Codex resolves paths through; both take the same value.
     "--cd",
     opts.cwd,
     ...(opts.sandbox ? ["--sandbox", opts.sandbox] : []),
@@ -482,6 +566,7 @@ export function buildCodexExecArgs(opts: {
       ...approvalOverride,
       ...sandboxOverride,
       ...reasoningOverride,
+      ...contextWindowOverride,
       "--disable",
       "apps",
       opts.resume,
@@ -576,7 +661,51 @@ export class CodexCliRuntime implements AgentRuntime {
     // Per-agent sandbox override > provider default > Codex CLI config/default.
     const sandbox =
       readSandboxFromAgentMetadata(opts.agentMetadata) ?? readSandboxFromProvider(opts.provider);
-    const reasoningEffort = opts.reasoningEffort ?? readReasoningEffortFromAgentMetadata(opts.agentMetadata);
+    // From the plan, never re-derived: the value `/status` reports and the value
+    // written into config.toml / argv are the same field of the same snapshot.
+    // `undefined` is `inherit` — no `model_reasoning_effort` is written at all,
+    // so Codex applies its own default for the model.
+    const reasoningEffort = opts.runPlan.execution.reasoningEffort ?? null;
+    if (reasoningEffort !== null && !isReasoningToken(reasoningEffort)) {
+      // Codex would take this value straight into config.toml and argv. Refuse
+      // before spawning, and refuse to quietly run without it — Codex passes any
+      // level its models accept, so an unrepresentable value is a bug upstream
+      // of here, not a reason to drop the user's setting.
+      yield {
+        type: "error",
+        code: "REASONING_EFFORT_UNSUPPORTED",
+        message: `reasoning level ${JSON.stringify(reasoningEffort)} is not a safe token (${REASONING_SYNTAX_RULE}) and cannot be passed to the Codex CLI`,
+        recoverable: false,
+        reasoning: {
+          requested: String(reasoningEffort),
+          runtime: opts.runPlan.identity.runtime,
+          model: opts.runPlan.identity.modelId,
+          // Codex forwards any safe token, so the only thing it cannot express is
+          // an unsafe one; the empty list says that without pretending to know
+          // which levels the model has.
+          supportedLevels: [],
+          source: "Codex CLI runtime forwards any syntactically safe level token to the CLI; the level itself is the model's, not the adapter's",
+        },
+      };
+      return;
+    }
+    // The turn's working directory, from the plan: `--cd` on a new turn, the
+    // spawned process's cwd on every turn (including `exec resume`, which does
+    // not accept `--cd`), and the MCP preflight's cwd. `CODEX_DEFAULT_CWD` and
+    // the agent's home directory are gone: a turn that has not been told where
+    // to work has nowhere to work, and guessing is how an agent ends up editing
+    // files in the sidecar's directory.
+    const cwd = opts.runPlan.execution.projectRoot.value;
+    if (cwd === null) {
+      yield {
+        type: "error",
+        code: "PROJECT_ROOT_NOT_FOUND",
+        message: `no working directory for this turn: ${opts.runPlan.execution.projectRoot.invalid?.reason ?? "the plan carries no project root"}`,
+        recoverable: false,
+      };
+      unregisterHandlers(opts.sessionId);
+      return;
+    }
 
     // W20 Slice 5.5: register peer/ask/Task callbacks with the HTTP MCP
     // bridge keyed on this agent id so codex's MCP client can call them via
@@ -592,6 +721,12 @@ export class CodexCliRuntime implements AgentRuntime {
       ensembleHelp: opts.ensembleHelp,
       skillList: opts.skillList,
       skillInvoke: opts.skillInvoke,
+      artifactRead: opts.artifactRead,
+      artifactSearch: opts.artifactSearch,
+      // Codex's own shell tool has the same ownership defect the job primitive
+      // removes, so the bridge must carry the fix — otherwise the one runtime
+      // a long build is most likely to be launched from is the one without it.
+      jobs: opts.jobs,
     });
 
     // Build codex's mcp_servers TOML map:
@@ -614,7 +749,10 @@ export class CodexCliRuntime implements AgentRuntime {
       opts.spawnTask ||
       opts.ensembleHelp ||
       opts.skillList ||
-      opts.skillInvoke;
+      opts.skillInvoke ||
+      opts.artifactRead ||
+      opts.artifactSearch ||
+      opts.jobs;
     if (bridgeBaseUrl && wantsBridge) {
       mcpServersForCodex[internalMcpServerName] = buildCodexInternalStdioServerConfig({
         ENSEMBLE_MCP_BASE_URL: bridgeBaseUrl,
@@ -675,8 +813,11 @@ export class CodexCliRuntime implements AgentRuntime {
       codexHome = prepareCodexHomeForRuntime(
         opts.sessionId,
         mcpServersForCodex,
+        // The model decides the declared window; omitting it silently disabled
+        // the config.toml safety net (see the parameter doc).
+        opts.model,
         undefined,
-        opts.cwd,
+        cwd,
         sandbox,
         reasoningEffort,
       );
@@ -687,7 +828,7 @@ export class CodexCliRuntime implements AgentRuntime {
     const preflight = await preflightCodexMcp({
       codexPath,
       env: codexEnv,
-      cwd: opts.cwd,
+      cwd,
       internalMcpServerName: bridgeBaseUrl && wantsBridge ? internalMcpServerName : null,
     });
     if (!preflight.ok) {
@@ -696,17 +837,39 @@ export class CodexCliRuntime implements AgentRuntime {
       return;
     }
     const cliArgs = buildCodexExecArgs({
-      cwd: opts.cwd,
+      cwd,
       model: opts.model,
       promptFromStdin: true,
       resume: canResumeNative ? opts.resume : undefined,
       sandbox,
       reasoningEffort,
+      // The CAPACITY declaration, from the plan — the same window the turn's
+      // history budget and `/status` were derived from. `runPlan.context` is
+      // resolved once by the planner, so this and claude.ts's
+      // CLAUDE_CODE_MAX_CONTEXT_TOKENS can no longer be two different numbers.
+      contextWindow:
+        opts.runPlan.context.advertisedContextWindow ?? opts.runPlan.context.effectiveWindow,
     });
     let codexSessionId = canResumeNative ? opts.resume! : randomUUID();
     const resumeSessionFile = canResumeNative
       ? findCodexSessionFile(codexHome ?? joinPath(homedir(), ".codex"), opts.resume)
       : null;
+    // What this turn's rollout looked like BEFORE the turn started.
+    //
+    //   resume      — the file is on disk, so the mark is that exact path plus
+    //                 its byte length (the size the reading has to beat).
+    //   fresh thread— the file does not exist yet and its name carries a thread
+    //                 id we only learn from `thread.started`; the mark is written
+    //                 there, naming the sessions directory and the session.
+    //
+    // Without this, a turn that dies before its first model request appends
+    // nothing to the rollout, and the newest `token_count` in it is the PREVIOUS
+    // turn's — an event with no turn id to check, so only the pre-turn size can
+    // reject it.
+    let turnMarks: ArtifactMark[] = resumeSessionFile
+      ? [fileMark(resumeSessionFile)].filter((m): m is ArtifactMark => m !== null)
+      : [];
+    const codexSessionsDir = joinPath(codexHome ?? joinPath(homedir(), ".codex"), "sessions");
 
     // Diagnostic for the recurring "codex provider can't see peer_send" bug.
     // Logs the exact CLI invocation shape plus which URL we expect codex to
@@ -723,7 +886,7 @@ export class CodexCliRuntime implements AgentRuntime {
         model: opts.model,
         reasoningEffort,
         sandbox,
-        cwd: opts.cwd,
+        cwd,
         resume: canResumeNative ? opts.resume : null,
         resumeSessionFileExists: resumeSessionFile !== null,
         resumeSessionFile,
@@ -748,15 +911,39 @@ export class CodexCliRuntime implements AgentRuntime {
     // decoupling reported when the window shows "interrupted" but a subprocess
     // is still alive.
     let childForCleanup: ChildProcess | null = null;
+    // Phase 4 liveness. `exited` is the raw observation from the OS; whether it
+    // is EVIDENCE of death is decided elsewhere. The runtime's only job here is
+    // to report it at a moment when it can also say whether the exit was the
+    // end of a completed turn (which is not evidence) or a process that vanished
+    // mid-turn (which is).
+    let childExited = false;
+    let reportedError = false;
     try {
       const input = canResumeNative ? buildCurrentTurnPrompt(opts.prompt) : buildPromptWithHistory(opts);
       const child = spawn(codexPath, cliArgs, {
-        cwd: opts.cwd,
+        cwd,
         env: codexEnv,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
       childForCleanup = child;
+      // The handle we are holding right now is what makes this route
+      // observable at all: "codex has printed nothing for seven minutes" used to
+      // be indistinguishable from "codex is gone", and the difference is the
+      // entire point of the phase-4 rule.
+      opts.liveness?.childProcessStarted({ pid: child.pid ?? null });
+      child.once("exit", () => {
+        childExited = true;
+      });
+      child.once("error", () => {
+        childExited = true;
+      });
+      // Registered BEFORE the loop so a health check during the turn gets a
+      // real answer. While the child lives it is `alive`; once it is gone the
+      // answer depends on whether the turn had already completed — an exit that
+      // ends a completed turn is not evidence, and this probe refuses to
+      // pretend it is by answering `unknown`.
+      opts.liveness?.registerProbe?.(() => codexChildProbe({ exited: childExited, turnCompleted }));
       const stderrChunks: string[] = [];
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
@@ -799,6 +986,12 @@ export class CodexCliRuntime implements AgentRuntime {
         }
         if (isRecord(ev) && ev.type === "thread.started" && typeof ev.thread_id === "string") {
           codexSessionId = ev.thread_id;
+          // A fresh thread's rollout is named after the id we just learned, so
+          // this is the first moment its mark CAN be written.
+          if (turnMarks.length === 0) {
+            const mark = sessionFileMark(codexSessionsDir, ev.thread_id);
+            if (mark) turnMarks = [mark];
+          }
           continue;
         }
         if (isRecord(ev) && (ev.type === "turn.started" || ev.type === "turn.failed")) turnStarted = true;
@@ -815,6 +1008,7 @@ export class CodexCliRuntime implements AgentRuntime {
         }
         if (out.usage) lastUsage = out.usage;
         if (out.errorMessage) {
+          reportedError = true;
           yield buildCodexRuntimeErrorEvent(out.errorMessage, {
             usedNativeResume: canResumeNative,
             turnStarted,
@@ -841,6 +1035,7 @@ export class CodexCliRuntime implements AgentRuntime {
         );
       } else if (!opts.abortController.signal.aborted && close.code !== 0) {
         const stderr = stderrChunks.join("").trim();
+        reportedError = true;
         yield buildCodexRuntimeErrorEvent(
           `codex exec exited with code ${close.code}${close.signal ? ` (${close.signal})` : ""}${stderr ? `\n${stderr}` : ""}`,
           {
@@ -852,6 +1047,7 @@ export class CodexCliRuntime implements AgentRuntime {
         return;
       }
       if (!opts.abortController.signal.aborted && turnStarted && !turnCompleted) {
+        reportedError = true;
         yield buildCodexRuntimeErrorEvent("codex turn ended before turn.completed", {
           usedNativeResume: canResumeNative,
           turnStarted,
@@ -868,19 +1064,41 @@ export class CodexCliRuntime implements AgentRuntime {
       const usageDelta = lastUsage
         ? codexUsageSnapshotToDelta(lastUsage, readCodexUsageSnapshot(opts.agentMetadata))
         : null;
+      // The rollout file is named after the thread id, which for a FRESH thread
+      // only exists once `thread.started` arrived — so it is located here, after
+      // the turn, rather than with the resume preflight far above.
+      const rolloutPath =
+        findCodexSessionFile(codexHome ?? joinPath(homedir(), ".codex"), codexSessionId) ?? "";
+      const turnContext = rolloutReadingBelongsToThisTurn(rolloutPath, turnMarks)
+        ? readCodexTurnContext(rolloutPath)
+        : null;
+      // `contextWindow` here is the window the BACKEND declared for this very
+      // session — the number codex is actually enforcing, including any clamp
+      // of what we asked for. It is published on modelUsage so the bar gets it
+      // through the one shared reader (reportedContextWindowFromResult) as a
+      // SESSION OBSERVATION, which outranks the static runtime profile. Leaving
+      // it at 0 (as this used to) threw away the only per-session evidence we
+      // have and left the bar dependent on a profile pinned to one CLI version.
+      const modelKey = opts.model || "codex";
+      const sessionContextWindow = turnContext?.contextWindow ?? 0;
       const modelUsage = usageDelta
         ? {
-            [opts.model || "codex"]: {
+            [modelKey]: {
               inputTokens: usageDelta.regularInputTokens,
               outputTokens: usageDelta.outputTokens,
               cacheReadInputTokens: usageDelta.cacheReadInputTokens,
               cacheCreationInputTokens: usageDelta.cacheCreationInputTokens,
               costUSD: 0,
               webSearchRequests: 0,
-              contextWindow: 0,
+              contextWindow: sessionContextWindow,
             },
           }
-        : {};
+        : sessionContextWindow > 0
+          ? // No usage delta (e.g. an aborted turn) but the rollout still told
+            // us the window. Carry it so the bar is not blinded; the usage
+            // extractor skips all-zero rows, so this cannot fabricate billing.
+            { [modelKey]: { contextWindow: sessionContextWindow } }
+          : {};
       yield {
         type: "sdk_message",
         payload: {
@@ -889,10 +1107,37 @@ export class CodexCliRuntime implements AgentRuntime {
           session_id: codexSessionId,
           modelUsage,
           ...(lastUsage ? { _codexUsageSnapshot: lastUsage } : {}),
+          // Context-bar input: unlike `lastUsage` above (a cumulative thread
+          // total), the rollout's newest `token_count` event holds the size of
+          // the LAST model request. Emitted in the same `contextUsage` shape the
+          // OpenAI runtime uses so SessionManager needs one reader for both,
+          // keeping that runtime's convention (inputTokens excludes the cached
+          // prefix) so the shared reader's sum is the true prompt size.
+          //
+          // The event's `model_context_window` IS the denominator for this
+          // session: it is published on `modelUsage[model].contextWindow` above
+          // and read back via `reportedContextWindowFromResult`, where it
+          // outranks any static profile. That is what makes a silent backend
+          // clamp visible — we ask for 1,050,000, the backend enforces 828,400,
+          // and the bar follows the enforced number rather than the request.
+          // The requested value only ever travels to the CLI (config.toml /
+          // `-c model_context_window=`), never to the bar.
+          ...(turnContext
+            ? {
+                contextUsage: {
+                  model: opts.model,
+                  inputTokens: Math.max(0, turnContext.promptTokens - turnContext.cachedInputTokens),
+                  outputTokens: 0,
+                  cacheReadInputTokens: turnContext.cachedInputTokens,
+                  cacheCreationInputTokens: 0,
+                },
+              }
+            : {}),
         },
       };
     } catch (err) {
       if (opts.abortController.signal.aborted) return;
+      reportedError = true;
       const msg = err instanceof Error ? err.message : String(err);
       yield buildCodexRuntimeErrorEvent(msg, {
         usedNativeResume: canResumeNative,
@@ -900,6 +1145,27 @@ export class CodexCliRuntime implements AgentRuntime {
         turnCompleted,
       });
     } finally {
+      // Phase 4: report the process and the stream at the one moment the
+      // runtime can CLASSIFY them. Deliberately not at the raw 'exit' event: a
+      // codex child that exits after `turn.completed` is a turn finishing
+      // normally, and telling the liveness controller "the process is gone"
+      // while it still believes the run has work outstanding would be a false
+      // positive it is required to act on. `abnormal` is limited to a close
+      // nothing has explained yet — an error the runtime already reported, an
+      // abort, or a completed turn are all explained.
+      // Only an exit we actually OBSERVED is reported. A child we are about to
+      // kill is not a child that exited, and saying it did would hand the
+      // controller an observation the OS never made.
+      if (childExited) {
+        opts.liveness?.childProcessExited({
+          pid: childForCleanup?.pid ?? null,
+          exitCode: childForCleanup?.exitCode ?? null,
+          signal: childForCleanup?.signalCode ?? null,
+        });
+      }
+      opts.liveness?.streamClosed(
+        !turnCompleted && !reportedError && !opts.abortController.signal.aborted,
+      );
       // Guarantee no codex process (or its grandchild MCP subprocesses)
       // outlives this turn holding the thread-store writer lock. Idempotent:
       // killCodexChildTree no-ops if the process already exited cleanly.
@@ -916,6 +1182,33 @@ function isLikelyCodexThreadId(id: string | undefined): id is string {
   // Codex CLI session ids are currently UUIDv7. Older Ensemble builds stored a
   // synthetic UUIDv4 here, which cannot be resumed via `codex exec resume`.
   return /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
+/** Is the newest `token_count` in this rollout THIS turn's reading?
+ *
+ *  Two questions, both asked of the same rules the observation judge uses
+ *  (`markCoversPath` — canonicalized containment plus the session-id file-name
+ *  convention), never of a string comparison written here:
+ *
+ *    1. does a mark of this turn cover the artifact at all?
+ *    2. for a file we already had, did it GROW? A turn that failed before
+ *       issuing a model request appends nothing, and the rollout still holds the
+ *       previous turn's `token_count` — which carries no turn id, so "the newest
+ *       event" is the previous turn's answer. Reusing it would publish a stale
+ *       window as a live observation.
+ *
+ *  A `session-file` mark is the fresh-thread case: the CLI created that file
+ *  during THIS turn, so everything in it is ours. */
+function rolloutReadingBelongsToThisTurn(rolloutPath: string, marks: readonly ArtifactMark[]): boolean {
+  if (rolloutPath === "") return false;
+  const mark = markCoversPath(marks, rolloutPath);
+  if (!mark) return false;
+  if (mark.kind === "session-file") return true;
+  try {
+    return statSync(rolloutPath).size > mark.size;
+  } catch {
+    return false;
+  }
 }
 
 function findCodexSessionFile(codexHome: string, threadId: string | undefined): string | null {

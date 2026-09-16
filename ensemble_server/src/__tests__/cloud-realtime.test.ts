@@ -3,7 +3,7 @@ import type { AgentSummary } from "@agentorch/shared";
 import Fastify from "fastify";
 import { CloudRealtimeHub, registerCloudRealtimeRoutes, type CloudSocket } from "../cloud/realtime.js";
 import { registerCloudRoutes } from "../cloud/routes.js";
-import { MemoryCloudStore } from "../cloud/store.js";
+import { isCloudInputRejection, MemoryCloudStore, sanitizeAgentInput } from "../cloud/store.js";
 
 class FakeSocket implements CloudSocket {
   readonly OPEN = 1;
@@ -551,6 +551,209 @@ describe("cloud realtime websocket routes", () => {
   });
 });
 
+// Phase 2: the cloud mirror speaks `projectRoot` canonically and keeps
+// `codexWorkspace` only as a read-side alias for an older desktop client.
+describe("cloud project root", () => {
+  it("translates the legacy field on the way in and never writes the old one", () => {
+    const fromLegacy = sanitizeAgentInput({ id: "a1", name: "A", codexWorkspace: "/repo/legacy" });
+    expect(fromLegacy.projectRoot).toBe("/repo/legacy");
+    // New writes stop writing the legacy column; it survives only as an echo.
+    expect(fromLegacy.codexWorkspace).toBeNull();
+
+    const canonical = sanitizeAgentInput({ id: "a2", name: "A", projectRoot: "/repo/canonical" });
+    expect(canonical.projectRoot).toBe("/repo/canonical");
+    expect(canonical.codexWorkspace).toBeNull();
+
+    // Neither field: UNBOUND. Nothing is invented for it.
+    const unbound = sanitizeAgentInput({ id: "a3", name: "A" });
+    expect(unbound.projectRoot).toBeNull();
+    const empty = sanitizeAgentInput({ id: "a4", name: "A", codexWorkspace: "" });
+    expect(empty.projectRoot).toBeNull();
+  });
+
+  it("stores the desktop-acked project root and echoes it to old readers", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-project@example.com");
+      await setupCloudAgent(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+      const desktop = await app.injectWS(`/v1/cloud/realtime?role=desktop&token=${encodeURIComponent(token)}`);
+
+      const forwarded = waitForWsJson(desktop, (msg) => (msg as { type?: string }).type === "config_request");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg-root",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { projectRoot: "/repo/desktop-choice" },
+      }));
+      expect(await forwarded).toMatchObject({
+        type: "config_request",
+        requestId: "cfg-root",
+        patch: { projectRoot: "/repo/desktop-choice" },
+      });
+
+      const updated = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "config_updated");
+      desktop.send(JSON.stringify({
+        type: "config_ack",
+        requestId: "cfg-root",
+        workspaceId: "workspace",
+        agentId: "agent",
+        agent: agentSummary({ projectRoot: "/repo/desktop-choice" }),
+      }));
+      expect(await updated).toMatchObject({
+        type: "config_updated",
+        agent: { id: "agent", projectRoot: "/repo/desktop-choice" },
+      });
+
+      // What the mirror actually holds: ONE directory, echoed — not two.
+      const stored = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const agent = (stored.json() as { snapshot: { agents: Array<Record<string, unknown>> } })
+        .snapshot.agents.find((entry) => entry.id === "agent");
+      expect(agent?.projectRoot).toBe("/repo/desktop-choice");
+      // Legacy reader compatibility: the same value, not a second one.
+      expect(agent?.codexWorkspace).toBe("/repo/desktop-choice");
+      web.close();
+      desktop.close();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("applies the local conflict rule at the input boundary", () => {
+    // One directory, two spellings: accepted, and the canonical spelling is
+    // what gets stored.
+    const equivalent = [
+      ["D:\\Repo", "D:/Repo/"],
+      ["/repo", "/repo/./"],
+    ] as const;
+    for (const [canonical, legacy] of equivalent) {
+      expect(sanitizeAgentInput({ id: "a", name: "A", projectRoot: canonical, codexWorkspace: legacy }))
+        .toMatchObject({ projectRoot: canonical, codexWorkspace: null });
+    }
+    // Two directories: refused, and the refusal is recognizable (so the route
+    // can answer 400 with the code instead of choosing one for the user).
+    let thrown: unknown;
+    try {
+      sanitizeAgentInput({ id: "a", name: "A", projectRoot: "/repo/one", codexWorkspace: "/repo/two" });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(isCloudInputRejection(thrown)).toBe(true);
+    expect((thrown as { code: string }).code).toBe("PROJECT_ROOT_CONFLICT");
+    // A lone legacy field still binds the project (translation, not refusal).
+    expect(sanitizeAgentInput({ id: "a", name: "A", codexWorkspace: "/repo/only" }).projectRoot).toBe(
+      "/repo/only",
+    );
+  });
+
+  it("answers 400 for a snapshot that names two directories", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "snapshot-conflict@example.com");
+      await setupCloudAgent(app, token);
+      const res = await app.inject({
+        method: "POST",
+        url: "/v1/cloud/workspaces/workspace/sync-batch",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          expectedRevision: 1,
+          agents: [
+            { id: "conflict", name: "Conflict", projectRoot: "/repo/one", codexWorkspace: "/repo/two" },
+          ],
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ error: "PROJECT_ROOT_CONFLICT" });
+
+      // Nothing was stored by the refused request.
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const agents = (snapshot.json() as { snapshot: { agents: Array<{ id: string }> } }).snapshot.agents;
+      expect(agents.map((a) => a.id)).toEqual(["agent"]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("answers the desktop with the same code when a config_ack disagrees", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-conflict@example.com");
+      await setupCloudAgent(app, token);
+      const web = await app.injectWS(`/v1/cloud/realtime?role=web&token=${encodeURIComponent(token)}`);
+      const desktop = await app.injectWS(`/v1/cloud/realtime?role=desktop&token=${encodeURIComponent(token)}`);
+
+      const forwarded = waitForWsJson(desktop, (msg) => (msg as { type?: string }).type === "config_request");
+      web.send(JSON.stringify({
+        type: "config_request",
+        requestId: "cfg-conflict",
+        workspaceId: "workspace",
+        agentId: "agent",
+        patch: { projectRoot: "/repo/one" },
+      }));
+      await forwarded;
+
+      // Not stored: the desktop is told which code it broke instead.
+      const error = waitForWsJson(web, (msg) => (msg as { type?: string }).type === "remote_error");
+      desktop.send(JSON.stringify({
+        type: "config_ack",
+        requestId: "cfg-conflict",
+        workspaceId: "workspace",
+        agentId: "agent",
+        agent: agentSummary({ projectRoot: "/repo/one", codexWorkspace: "/repo/two" }),
+      }));
+      expect(await error).toMatchObject({
+        type: "remote_error",
+        requestId: "cfg-conflict",
+        code: "PROJECT_ROOT_CONFLICT",
+      });
+
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const agent = (snapshot.json() as { snapshot: { agents: Array<{ id: string; projectRoot: string | null }> } })
+        .snapshot.agents.find((a) => a.id === "agent");
+      expect(agent?.projectRoot).toBeNull();
+      web.close();
+      desktop.close();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("leaves an unbound agent unbound", async () => {
+    const { app } = await makeRealtimeApp();
+    try {
+      const token = await login(app, "config-unbound@example.com");
+      await setupCloudAgent(app, token);
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/v1/cloud/workspaces/workspace/snapshot",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const agent = (snapshot.json() as { snapshot: { agents: Array<Record<string, unknown>> } })
+        .snapshot.agents.find((entry) => entry.id === "agent");
+      // A NULL row means "no project", and the mirror must not fill it in with
+      // anything (a cwd, a home directory, a default).
+      expect(agent?.projectRoot).toBeNull();
+      expect(agent?.codexWorkspace).toBeNull();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 function agentSummary(overrides: Partial<AgentSummary> = {}): AgentSummary {
   return { ...agentSummaryBase(), ...overrides };
 }
@@ -564,10 +767,12 @@ function agentSummaryBase(): AgentSummary {
     model: "model",
     systemPrompt: null,
     providerId: null,
+    projectRoot: null,
     codexWorkspace: null,
     permissionMode: "default",
     sandboxMode: null,
     reasoningEffort: null,
+    maxRunDurationMs: null,
     teamId: null,
     subagentKind: null,
     forcedSkills: [],

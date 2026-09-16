@@ -107,6 +107,12 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
     }));
   }, [data]);
 
+  // Every turn in range is unpriced: the cost sum is not a small amount, it is
+  // no amount. (`turns === 0` is the other way to get costUSD 0 — there,
+  // $0.00 is a true statement, so this is false.)
+  const totalsCostUnavailable =
+    !!data && data.totals.turns > 0 && data.totals.turnsCostKnown === 0;
+
   const seriesLabel = (k: string): string => {
     switch (k) {
       case "input": return t("usage.token.input");
@@ -125,27 +131,29 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
     let filename = "";
     if (groupBy === "day") {
       filename = `usage-daily-${rangeLabel}.csv`;
-      csv = "date,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns\n";
+      // turnsCostKnown/turnsCostUnknown travel with every row: an exported
+      // costUSD whose coverage is not in the same file reads as a total.
+      csv = "date,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns,turnsCostKnown,turnsCostUnknown\n";
       for (const d of data.daily) {
-        csv += `${d.date},${d.costUSD.toFixed(6)},${d.inputTokens},${d.outputTokens},${d.cacheReadTokens},${d.cacheCreationTokens},${d.turns}\n`;
+        csv += `${d.date},${d.costUSD.toFixed(6)},${d.inputTokens},${d.outputTokens},${d.cacheReadTokens},${d.cacheCreationTokens},${d.turns},${d.turnsCostKnown},${d.turnsCostUnknown}\n`;
       }
     } else if (groupBy === "agent") {
       filename = `usage-by-agent-${rangeLabel}.csv`;
-      csv = "agentId,agentName,parentId,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns,includesDescendants\n";
+      csv = "agentId,agentName,parentId,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns,turnsCostKnown,turnsCostUnknown,includesDescendants\n";
       for (const a of data.byAgent) {
-        csv += `${a.agentId ?? ""},"${a.agentName.replace(/"/g, '""')}",${a.parentId ?? ""},${a.costUSD.toFixed(6)},${a.inputTokens},${a.outputTokens},${a.cacheReadTokens},${a.cacheCreationTokens},${a.turns},${includeDescendants}\n`;
+        csv += `${a.agentId ?? ""},"${a.agentName.replace(/"/g, '""')}",${a.parentId ?? ""},${a.costUSD.toFixed(6)},${a.inputTokens},${a.outputTokens},${a.cacheReadTokens},${a.cacheCreationTokens},${a.turns},${a.turnsCostKnown},${a.turnsCostUnknown},${includeDescendants}\n`;
       }
     } else if (groupBy === "model") {
       filename = `usage-by-model-${rangeLabel}.csv`;
-      csv = "model,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns\n";
+      csv = "model,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns,turnsCostKnown,turnsCostUnknown\n";
       for (const m of data.byModel) {
-        csv += `${m.model},${m.costUSD.toFixed(6)},${m.inputTokens},${m.outputTokens},${m.cacheReadTokens},${m.cacheCreationTokens},${m.turns}\n`;
+        csv += `${m.model},${m.costUSD.toFixed(6)},${m.inputTokens},${m.outputTokens},${m.cacheReadTokens},${m.cacheCreationTokens},${m.turns},${m.turnsCostKnown},${m.turnsCostUnknown}\n`;
       }
     } else {
       filename = `usage-by-provider-${rangeLabel}.csv`;
-      csv = "providerId,providerName,kind,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns\n";
+      csv = "providerId,providerName,kind,costUSD,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,turns,turnsCostKnown,turnsCostUnknown\n";
       for (const p of data.byProvider) {
-        csv += `${p.providerId ?? ""},"${p.providerName.replace(/"/g, '""')}",${p.kind},${p.costUSD.toFixed(6)},${p.inputTokens},${p.outputTokens},${p.cacheReadTokens},${p.cacheCreationTokens},${p.turns}\n`;
+        csv += `${p.providerId ?? ""},"${p.providerName.replace(/"/g, '""')}",${p.kind},${p.costUSD.toFixed(6)},${p.inputTokens},${p.outputTokens},${p.cacheReadTokens},${p.cacheCreationTokens},${p.turns},${p.turnsCostKnown},${p.turnsCostUnknown}\n`;
       }
     }
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -169,7 +177,7 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
               onClick={() => onOpenPricing()}
               className="px-2 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
             >
-              pricing
+              {t("usage.pricing")}
             </button>
           )}
           <button
@@ -201,13 +209,37 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
 
         {/* stat cards */}
         <div className="grid shrink-0 grid-cols-4 gap-2 mb-3">
-          <StatCard label={t("usage.card.totalCost")} value={data ? fmtUSD(data.totals.costUSD) : "—"} />
+          <StatCard
+            label={t("usage.card.totalCost")}
+            // The sum only covers priced turns. With none priced it is not a
+            // small total, it is NO total — printing "$0.00" there would be
+            // asserting a cost the server never established, so the card says
+            // unavailable and names the reason. Below full coverage it prints
+            // the sum and marks it a lower bound.
+            value={data ? (totalsCostUnavailable ? t("usage.col.cost.none") : fmtUSD(data.totals.costUSD)) : "—"}
+            sub={
+              !data
+                ? undefined
+                : totalsCostUnavailable
+                  ? t("usage.cost.unavailable")
+                  : data.totals.turnsCostUnknown > 0
+                    ? t("usage.cost.partial", { turns: data.totals.turnsCostUnknown })
+                    : undefined
+            }
+          />
           <StatCard label={t("usage.card.agents")} value={data ? String(data.totals.agents) : "—"} />
           <StatCard label={t("usage.card.turns")} value={data ? String(data.totals.turns) : "—"} />
           <StatCard
             label={t("usage.card.topAgent")}
+            // Ranked by cost, then by turns — on an all-unpriced range this is
+            // the agent that ran the most work, and claiming a $0.00 spend for
+            // it would be the same lie the totals card refuses.
             value={data?.topAgent ? data.topAgent.agentName : "—"}
-            sub={data?.topAgent ? fmtUSD(data.topAgent.costUSD) : undefined}
+            sub={
+              data?.topAgent && !totalsCostUnavailable
+                ? fmtUSD(data.topAgent.costUSD)
+                : undefined
+            }
             onClick={
               data?.topAgent?.agentId && onNavigateAgent
                 ? () => onNavigateAgent(data.topAgent!.agentId!)
@@ -437,6 +469,9 @@ function DetailTable({
     outputLocal: number;
     turnsWithLocal: number;
     turns: number;
+    // Cost coverage for this row: how much of `turns` the cost figure covers.
+    turnsCostKnown: number;
+    turnsCostUnknown: number;
   }> = [];
 
   if (groupBy === "day") {
@@ -452,6 +487,8 @@ function DetailTable({
         outputLocal: d.outputTokensLocal,
         turnsWithLocal: d.turnsWithLocal,
         turns: d.turns,
+        turnsCostKnown: d.turnsCostKnown,
+        turnsCostUnknown: d.turnsCostUnknown,
       });
     }
   } else if (groupBy === "agent") {
@@ -470,6 +507,8 @@ function DetailTable({
         outputLocal: a.outputTokensLocal,
         turnsWithLocal: a.turnsWithLocal,
         turns: a.turns,
+        turnsCostKnown: a.turnsCostKnown,
+        turnsCostUnknown: a.turnsCostUnknown,
       });
     }
   } else if (groupBy === "model") {
@@ -485,6 +524,8 @@ function DetailTable({
         outputLocal: m.outputTokensLocal,
         turnsWithLocal: m.turnsWithLocal,
         turns: m.turns,
+        turnsCostKnown: m.turnsCostKnown,
+        turnsCostUnknown: m.turnsCostUnknown,
       });
     }
   } else {
@@ -501,6 +542,8 @@ function DetailTable({
         outputLocal: p.outputTokensLocal,
         turnsWithLocal: p.turnsWithLocal,
         turns: p.turns,
+        turnsCostKnown: p.turnsCostKnown,
+        turnsCostUnknown: p.turnsCostUnknown,
       });
     }
   }
@@ -550,6 +593,18 @@ function DetailTable({
             const auditTitle = hasAudit
               ? `upstream ${fmtToken(upstreamTotal)} vs local ${fmtToken(localTotal)} (${r.turnsWithLocal}/${r.turns} turns audited)`
               : t("usage.col.audit.none");
+            // Same rule as the totals card, per row: nothing priced → no cost
+            // to print; partly priced → a lower bound, marked as one.
+            const costUnavailable = r.turns > 0 && r.turnsCostKnown === 0;
+            const costPartial = !costUnavailable && r.turnsCostUnknown > 0;
+            const costTitle = costUnavailable
+              ? t("usage.col.cost.tip.none")
+              : costPartial
+                ? t("usage.col.cost.tip.partial", {
+                    unknown: r.turnsCostUnknown,
+                    total: r.turns,
+                  })
+                : undefined;
             return (
               <tr key={i} className="border-t border-[var(--border)] hover:bg-[var(--bg-pane)]">
                 <td className="px-2 py-1" style={{ paddingLeft: 8 + (r.indent ?? 0) * 16 }}>
@@ -557,7 +612,13 @@ function DetailTable({
                   {r.label}
                   {r.sub && <span className="text-[10px] text-[var(--text-faint)] ml-2">{r.sub}</span>}
                 </td>
-                <td className="text-right px-2 py-1 text-[var(--accent)]">{fmtUSD(r.cost)}</td>
+                <td
+                  className={`text-right px-2 py-1 ${costUnavailable ? "text-[var(--text-faint)]" : "text-[var(--accent)]"}`}
+                  title={costTitle}
+                >
+                  {costUnavailable ? t("usage.col.cost.none") : fmtUSD(r.cost)}
+                  {costPartial && <span className="text-[var(--warn)]">*</span>}
+                </td>
                 <td className="text-right px-2 py-1">{fmtToken(r.input)}</td>
                 <td className="text-right px-2 py-1">{fmtToken(r.output)}</td>
                 <td className="text-right px-2 py-1">{fmtToken(r.cacheRead)}</td>
@@ -574,14 +635,18 @@ function DetailTable({
       {data.unknownModels.length > 0 && (
         <div className="flex items-center gap-2 border-t border-[var(--warn)] px-2 py-1 text-[10px] text-[var(--warn)] bg-[var(--bg-pane)]">
           <span className="min-w-0 flex-1 truncate">
-            {data.unknownModels.length} unknown model(s) (no price configured): {data.unknownModels.map((u) => u.model).join(", ")}
+            {t("usage.unpriced.banner", {
+              models: data.unknownModels.length,
+              turns: data.unknownModels.reduce((n, u) => n + u.turns, 0),
+              names: data.unknownModels.map((u) => u.model).join(", "),
+            })}
           </span>
           {onOpenPricing && (
             <button
               onClick={() => onOpenPricing(data.unknownModels[0]?.model)}
               className="shrink-0 px-2 py-0.5 border border-[var(--warn)] hover:bg-[var(--warn)] hover:text-black"
             >
-              set price
+              {t("usage.unpriced.setPrice")}
             </button>
           )}
         </div>

@@ -55,6 +55,17 @@ const en: Dict = {
   "usage.col.audit": "audit",
   "usage.col.audit.tip": "upstream-reported tokens ÷ Ensemble's local tokenizer count. ~1.0× = consistent. >2× or <0.5× warrants scrutiny. — only for OpenAI/compat agents; gpt-4o/o200k vs cl100k vocabulary differences cause natural drift ±10-30% on non-OpenAI models.",
   "usage.col.audit.none": "no local audit data (claude/codex runtime, or older row)",
+  // Cost honesty. A cost sum that leaves rows out is a LOWER BOUND, and saying
+  // so is not a nicety: without these the panel printed "$0.00" for a history
+  // it simply had no price for.
+  "usage.cost.unavailable": "unavailable — no price configured",
+  "usage.cost.partial": "partial — {turns} turn(s) unpriced",
+  "usage.col.cost.none": "n/a",
+  "usage.col.cost.tip.none": "no price is configured for this row's models, so its cost is not measurable — tokens and turns below are still counted",
+  "usage.col.cost.tip.partial": "{unknown} of {total} turn(s) have no price configured; this cost is a lower bound, not a total",
+  "usage.unpriced.banner": "{models} model(s) unpriced · {turns} turn(s) left out of cost: {names}",
+  "usage.unpriced.setPrice": "set price",
+  "usage.pricing": "pricing",
   "usage.exportCsv": "export CSV",
   "usage.close": "close",
 
@@ -101,6 +112,8 @@ const en: Dict = {
   "agent.badge.background.tip": "background task — a detached subagent spawned by its parent; runs on its own",
   "agent.badge.task": "SUB",
   "agent.badge.task.tip": "subagent — spawned by its parent agent to do a delegated subtask",
+  "agent.badge.archived": "ARCH",
+  "agent.badge.archived.tip": "archived — this subagent finished its task and was deactivated; its transcript is still readable, and it can be restarted from settings",
 
   // teams
   "team.create": "+ team",
@@ -138,7 +151,17 @@ const en: Dict = {
   "team.new.member": "#{idx}",
   "team.new.placeholder.role": "role name (e.g. devil's advocate / editor / 调研员 ...)",
   "team.new.placeholder.systemPrompt": "system prompt: what this role does, how they should behave",
-  "team.new.placeholder.codexWorkspace": "codex workspace absolute path (only for codex provider)",
+  "team.new.placeholder.projectRoot": "project directory (absolute path; empty = unbound project)",
+  "project.label": "project directory",
+  "project.placeholder": "absolute path, e.g. D:\WorkSpace\my-project",
+  "project.unbound": "unbound project",
+  "project.unbound.hint": "no project bound — this agent works in its own scratch directory",
+  "project.invalid": "this project directory cannot be used",
+  "project.err.notAbsolute": "the project directory must be an absolute path",
+  "project.err.notFound": "the project directory does not exist",
+  "project.err.notDirectory": "that path is not a directory",
+  "project.err.unreadable": "the project directory is not readable",
+  "project.err.conflict": "project directory and the legacy codex workspace disagree — send one of them",
   "team.new.addMember": "add member",
   "team.new.removeMember": "remove",
   "team.new.cancel": "cancel",
@@ -193,6 +216,7 @@ const en: Dict = {
   "chat.send": "send",
   "chat.notLoaded": "agent {id} not loaded yet",
   "chat.badge.closed": "CLOSED",
+  "chat.badge.archived": "ARCHIVED",
   "chat.badge.plan": "PLAN",
 
   // pane shell
@@ -209,6 +233,56 @@ const en: Dict = {
   "pane.context.unknown": "context: unknown",
   "pane.context.unknownTip": "unknown model — add its window size to context-window-overrides.json",
   "pane.context.tip": "context usage: {used} / {window} tokens ({percent}%)",
+  "pane.context.tipAdvertised":
+    "context usage: {used} / {window} tokens ({percent}%)\nmodel maximum: {advertised} tokens",
+  "pane.context.tipClamped":
+    "context usage: {used} / {window} tokens ({percent}%)\nmodel maximum: {advertised} tokens — the runtime clamps this to the usable window shown",
+  "pane.context.tipAdvertisedUnverified":
+    "context usage: {used} / {window} tokens ({percent}%)\nlisted maximum: {advertised} tokens — not verified against the vendor's docs, so not an official figure and never the effective ceiling",
+  "pane.context.tipClampedUnverified":
+    "context usage: {used} / {window} tokens ({percent}%)\nlisted maximum: {advertised} tokens (not verified) — the runtime clamps this to the usable window shown",
+  "pane.context.max": "max {advertised}",
+  "pane.context.maxUnverified": "listed {advertised}",
+  "pane.context.tipUnknownCeiling":
+    "context usage: {used} tokens\neffective ceiling unknown — {advertised} is the vendor's documented maximum, not the window in force",
+  "pane.context.tipUnknownCeilingUnverified":
+    "context usage: {used} tokens\neffective ceiling unknown — {advertised} is an unverified listed value, neither a documented maximum nor the window in force",
+  "pane.context.usedOnly": "{used} tokens",
+  // Phase 5: the plan's half of the bar. `effective` is the window the session
+  // actually runs under — never the advertised figure, which has its own label.
+  "pane.context.plan.effective": "effective {window}",
+  "pane.context.plan.effectiveUnknown": "effective unknown",
+  "pane.context.plan.reserve": "reserve {reserve}",
+  "pane.context.plan.compacted": "compacted +{summarised}/-{dropped}",
+  "pane.context.plan.overBudget": "over budget",
+  "pane.context.plan.degraded": "partial data",
+  "pane.context.plan.countingExact": "counted exactly",
+  "pane.context.plan.countingEstimated": "counted as an estimate",
+  "pane.context.plan.countingUnmeasured": "not counted",
+  "pane.context.plan.countingUnknown": "counting unknown",
+  "pane.context.plan.tipHeader": "-- plan (last turn) --",
+  "pane.context.plan.tipEffective": "effective window: {window} (source: {source})",
+  "pane.context.plan.tipEffectiveUnknown":
+    "effective window: unknown (source: {source}) — no denominator is shown rather than a substituted one",
+  "pane.context.plan.tipAdvertised":
+    "model advertised: {advertised} — the vendor's figure, shown for reference only and never used as the denominator",
+  "pane.context.plan.tipReserve": "output reserve: {reserve} tokens held back from the input budget",
+  "pane.context.plan.tipReserveUnknown": "output reserve: none was established for this route",
+  "pane.context.plan.tipHistory":
+    "history: {strategy} — summarised {summarised}, dropped {dropped}, compacted {compacted}, over budget {overBudget}",
+  "pane.context.plan.tipCounting": "token counting: {counting}",
+  "pane.context.plan.tipDegraded": "partial data: {reason}",
+  "pane.context.plan.noStrategy": "no strategy",
+  "pane.context.plan.yes": "yes",
+  "pane.context.plan.no": "no",
+  "pane.context.noteLegacy":
+    "unverified: migrated from the legacy \"models\" section of context-window-overrides.json — shown for reference only, never declared to the runtime. Migrate it to {\"catalog\": {\"<vendor>/<model>\": {\"advertisedContextWindow\": N, \"confidence\": \"unverified\"}}} — only write \"confirmed\" after you have checked the vendor's own documentation, since that is what grants declaration rights.",
+  "pane.context.noteUnverified":
+    "unverified: community-maintained snapshot, not checked against the vendor's docs — shown for reference only, never used as the effective ceiling.",
+  "pane.context.noteFamilyAnalogy":
+    "family analogy: inferred from a sibling model, not checked individually — shown for reference only, never declared to the runtime.",
+  "pane.context.noteUnknownProvenance":
+    "unverified: this figure carries no source, so we cannot say it was ever checked — shown for reference only, never used as the effective ceiling.",
   "pane.bgtasks.label": "bg tasks ({n}):",
   "pane.bgtasks.open": "open this background task in the pane",
   "pane.bgtasks.dismiss": "dismiss this finished background task (deletes the child agent)",
@@ -274,12 +348,33 @@ const en: Dict = {
   "settings.roleWeak": "role constraints weak: no team and no role prompt are set.",
   "settings.systemPromptHint": "changing this resets the resume pointer — next turn opens a fresh session so the new prompt takes effect.",
   "settings.team.ungrouped": "(no team)",
+  "settings.modelHint.notInProvider":
+    "{model} is not in {provider}’s model list — it is kept exactly as you left it and nothing is written until you apply (the server validates the final choice)",
+  "settings.modelHint.noProvider": "the selected provider",
   "settings.modelHint.noCache": "no cached models for this provider — refresh in the provider panel",
   "settings.modelHint.noModels": "no models discovered yet — go to Providers panel → click ↻",
   "settings.apply": "apply",
   "settings.cancel": "cancel",
   "settings.applyHint": "changes take effect on next message. agent in mid-run uses old settings.",
   "settings.lifecycle": "lifecycle",
+  // Phase 5: the plan's settings surface. Every reason/detail below is printed
+  // from the server's own text — the labels here are the only client wording.
+  "settings.plan.title": "plan (transport / reasoning / project / context / history / liveness)",
+  "settings.plan.none":
+    "no plan has been resolved for this agent yet — nothing has run, so there is nothing to report rather than a default to assume",
+  "settings.plan.header": "source: {source} · plan {hash} · resolved {at}",
+  "settings.plan.identity": "identity: {providerScope} · {runtime} {version} · {transport} · {model}",
+  "settings.plan.row": "outcome: {outcome} · source: {source} · confidence: {confidence}",
+  "settings.plan.rejected": "{value} — rejected: {code}: {detail}",
+  "settings.plan.rejectedValue": "your value {value} cannot be set here ({code}) — pick another one",
+  "settings.plan.diagnostics": "diagnostics: {summary}",
+  "settings.plan.diagnostic": "· {field} [{status}] ({origin}/{confidence}) {detail}",
+  "settings.plan.preference": "· preference {field} = {requested} → {outcome}",
+  "settings.invalidate.title": "this change invalidates stored settings",
+  "settings.invalidate.line": "{field}: {current} → {next} — {code}: {reason}",
+  "settings.invalidate.cleared": "(cleared)",
+  "settings.invalidate.ok": "apply anyway",
+  "settings.invalidate.unresolved": "this change cannot be resolved, so nothing was written — {reason}",
   "settings.close": "◼ close",
   "settings.close.title": "abort run + lock chat. resume info kept for restart",
   "settings.restart": "▶ restart",
@@ -317,6 +412,10 @@ const en: Dict = {
   "settings.reasoningEffort.hint.medium": "medium reasoning for balanced coding work.",
   "settings.reasoningEffort.hint.high": "high reasoning for harder architecture and debugging.",
   "settings.reasoningEffort.hint.xhigh": "extra-high reasoning for the hardest tasks.",
+  "settings.reasoningEffort.hint.max": "maximum reasoning; slowest and most expensive.",
+  "settings.reasoningEffort.hint.custom":
+    "custom level, sent as typed. It is checked against the model's known levels when the app has them; otherwise it is sent unverified.",
+  "settings.reasoningEffort.hint.invalid": "not a usable level: {rule}.",
   "settings.label.sandboxMode": "sandbox (codex)",
   "settings.sandboxMode.inherit": "inherit from provider",
   "settings.sandboxMode.hint.inherit": "use provider.defaultSandbox. clear override.",
@@ -433,6 +532,13 @@ const en: Dict = {
   "slash.picker.provider": "select provider — ↑/↓ + Enter, Esc to cancel",
   "slash.picker.hint": "or click",
   "slash.picker.placeholder": "(picker active — press Enter or Esc)",
+  "slash.status.notLocal":
+    "no local status report for this agent — it is not one this instance runs, so its plan and usage are produced elsewhere",
+  "slash.status.cloudSnapshot":
+    "cloud source={source} publishedAt={at} — relayed verbatim from the desktop that owns this agent",
+  "slash.status.cloudUnavailable": "cloud source={source} — {reason}",
+  "settings.preview.title": "DRAFT PREVIEW (not written)",
+  "settings.preview.rejected": "this change would be refused: {code} — {detail}",
   "slash.error": "command failed: {err}",
 
   // key help dialog
@@ -507,6 +613,14 @@ const zh: Dict = {
   "usage.col.audit": "审计",
   "usage.col.audit.tip": "上游回报的 token 数 ÷ Ensemble 本地数。1.0× 左右 = 一致；>2× 或 <0.5× 值得人工核实。仅 OpenAI / compat agents 有数据；OpenAI 自家模型用 gpt-4o/o200k 编码较准，非 OpenAI 模型因 tokenizer 词表差异天然有 ±10-30% 漂移。",
   "usage.col.audit.none": "无本地审计数据（claude / codex runtime 或旧行）",
+  "usage.cost.unavailable": "无法统计 — 未配置价格",
+  "usage.cost.partial": "部分统计 — {turns} 回合未配置价格",
+  "usage.col.cost.none": "不可用",
+  "usage.col.cost.tip.none": "该行模型未配置价格，成本无法统计；下方 token 与回合数照常计入",
+  "usage.col.cost.tip.partial": "{total} 回合中有 {unknown} 回合未配置价格，此处成本为下限而非总额",
+  "usage.unpriced.banner": "{models} 个模型未配置价格 · {turns} 回合未计入成本：{names}",
+  "usage.unpriced.setPrice": "设置价格",
+  "usage.pricing": "价格设置",
   "usage.exportCsv": "导出 CSV",
   "usage.close": "关闭",
 
@@ -581,7 +695,17 @@ const zh: Dict = {
   "team.new.member": "#{idx}",
   "team.new.placeholder.role": "角色名（如 反方 / 编辑 / 安全审计 / 故事大纲师 ……）",
   "team.new.placeholder.systemPrompt": "system prompt：这个角色干什么、用什么口吻、避免什么",
-  "team.new.placeholder.codexWorkspace": "codex 工作目录绝对路径（仅 codex provider 需要）",
+  "team.new.placeholder.projectRoot": "项目目录（绝对路径；留空 = 未绑定项目）",
+  "project.label": "项目目录",
+  "project.placeholder": "绝对路径，例如 D:\WorkSpace\my-project",
+  "project.unbound": "未绑定项目",
+  "project.unbound.hint": "未绑定项目——该 agent 在自己的 scratch 目录中工作",
+  "project.invalid": "该项目目录不可用",
+  "project.err.notAbsolute": "项目目录必须是绝对路径",
+  "project.err.notFound": "项目目录不存在",
+  "project.err.notDirectory": "该路径不是目录",
+  "project.err.unreadable": "项目目录不可读",
+  "project.err.conflict": "项目目录与旧 codex 工作目录不一致——只发送其中一个",
   "team.new.addMember": "加成员",
   "team.new.removeMember": "删除",
   "team.new.cancel": "取消",
@@ -599,6 +723,8 @@ const zh: Dict = {
   "agent.badge.background.tip": "后台任务——父 agent 派生的脱钩子代理，独立后台运行",
   "agent.badge.task": "子",
   "agent.badge.task.tip": "子代理——由父 agent 派生，用于完成被委派的子任务",
+  "agent.badge.archived": "归档",
+  "agent.badge.archived.tip": "已归档——该子代理完成任务后已被停用；记录仍可查看，如需再次使用可在设置里重启",
   "agent.new.title": "新建 agent",
   "agent.new.label.name": "名称",
   "agent.new.label.provider": "供应商",
@@ -643,6 +769,7 @@ const zh: Dict = {
   "chat.send": "发送",
   "chat.notLoaded": "agent {id} 尚未加载",
   "chat.badge.closed": "已关闭",
+  "chat.badge.archived": "已归档",
   "chat.badge.plan": "计划模式",
 
   // pane shell
@@ -659,6 +786,56 @@ const zh: Dict = {
   "pane.context.unknown": "上下文：未知",
   "pane.context.unknownTip": "未知模型 —— 可在 context-window-overrides.json 补充窗口大小",
   "pane.context.tip": "上下文占用：{used} / {window} tokens（{percent}%）",
+  "pane.context.tipAdvertised":
+    "上下文占用：{used} / {window} tokens（{percent}%）\n模型官方上限：{advertised} tokens",
+  "pane.context.tipClamped":
+    "上下文占用：{used} / {window} tokens（{percent}%）\n模型官方上限：{advertised} tokens —— 运行时将其压到上图所示的有效窗口",
+  "pane.context.tipAdvertisedUnverified":
+    "上下文占用：{used} / {window} tokens（{percent}%）\n列表上限：{advertised} tokens —— 未经厂商文档核对，既不是官方值，也从不用作有效上限",
+  "pane.context.tipClampedUnverified":
+    "上下文占用：{used} / {window} tokens（{percent}%）\n列表上限：{advertised} tokens（未核实）—— 运行时将其压到上图所示的有效窗口",
+  "pane.context.max": "上限 {advertised}",
+  "pane.context.maxUnverified": "列表值 {advertised}",
+  "pane.context.tipUnknownCeiling":
+    "上下文占用：{used} tokens\n有效上限未知 —— {advertised} 是厂商文档记载的上限，并非当前生效的窗口",
+  "pane.context.tipUnknownCeilingUnverified":
+    "上下文占用：{used} tokens\n有效上限未知 —— {advertised} 是未经核实的列表值，既非厂商文档上限，也非当前生效的窗口",
+  "pane.context.usedOnly": "{used} tokens",
+  // 阶段 5：上下文条的“计划”一半。“有效”指本次会话真正生效的窗口，绝不使用宣称上限——
+  // 后者有自己的标签，从不顶替分母。
+  "pane.context.plan.effective": "有效 {window}",
+  "pane.context.plan.effectiveUnknown": "有效上限未知",
+  "pane.context.plan.reserve": "预留 {reserve}",
+  "pane.context.plan.compacted": "已压缩 +{summarised}/-{dropped}",
+  "pane.context.plan.overBudget": "超出预算",
+  "pane.context.plan.degraded": "数据不完整",
+  "pane.context.plan.countingExact": "精确计数",
+  "pane.context.plan.countingEstimated": "估算计数",
+  "pane.context.plan.countingUnmeasured": "未计数",
+  "pane.context.plan.countingUnknown": "计数方式未知",
+  "pane.context.plan.tipHeader": "-- 计划（最近一轮）--",
+  "pane.context.plan.tipEffective": "有效窗口：{window}（来源：{source}）",
+  "pane.context.plan.tipEffectiveUnknown":
+    "有效窗口：未知（来源：{source}）—— 宁可显示未知，也不用替代值充当分母",
+  "pane.context.plan.tipAdvertised":
+    "模型宣称上限：{advertised} —— 厂商公布值，仅供参照，从不用作分母",
+  "pane.context.plan.tipReserve": "输出预留：{reserve} tokens（从输入预算中扣除）",
+  "pane.context.plan.tipReserveUnknown": "输出预留：该路由未能确定",
+  "pane.context.plan.tipHistory":
+    "历史：{strategy} —— 摘要 {summarised}，丢弃 {dropped}，已压缩 {compacted}，超预算 {overBudget}",
+  "pane.context.plan.tipCounting": "token 计数方式：{counting}",
+  "pane.context.plan.tipDegraded": "数据不完整：{reason}",
+  "pane.context.plan.noStrategy": "无策略",
+  "pane.context.plan.yes": "是",
+  "pane.context.plan.no": "否",
+  "pane.context.noteLegacy":
+    "未核实：由 context-window-overrides.json 旧版 \"models\" 段迁移而来 —— 仅供显示参考，从不会声明给 runtime。建议迁移为 {\"catalog\": {\"<vendor>/<model>\": {\"advertisedContextWindow\": N, \"confidence\": \"unverified\"}}} —— 只有在核对过厂商文档后才写 \"confirmed\"，因为那才是取得声明权的开关。",
+  "pane.context.noteUnverified":
+    "未核实：来自社区维护的快照，未与厂商文档核对 —— 仅供显示参考，不会作为有效上限。",
+  "pane.context.noteFamilyAnalogy":
+    "同族推断：由同系列模型类比得出，未逐个核对 —— 仅供显示参考，从不会声明给 runtime。",
+  "pane.context.noteUnknownProvenance":
+    "未核实：该数值未标注来源，无法确认是否核对过 —— 仅供显示参考，不会作为有效上限。",
   "pane.bgtasks.label": "后台任务（{n}）：",
   "pane.bgtasks.open": "在此 pane 中打开该后台任务",
   "pane.bgtasks.dismiss": "清除已结束的后台任务（删除子 agent）",
@@ -723,12 +900,33 @@ const zh: Dict = {
   "settings.placeholder.systemPrompt": "这个 agent 干什么、用什么口吻、避免什么...",
   "settings.systemPromptHint": "改了会清掉 resume 指针——下一轮开新 session，新 prompt 才能生效",
   "settings.team.ungrouped": "（无团队）",
+  "settings.modelHint.notInProvider":
+    "{model} 不在 {provider} 的模型列表中 —— 保留你的原值，未应用前不写入任何内容（由服务端做最终校验）",
+  "settings.modelHint.noProvider": "所选的供应商",
   "settings.modelHint.noCache": "此供应商无缓存模型 — 请在供应商面板点 ↻ 刷新",
   "settings.modelHint.noModels": "尚未发现模型 — 请到供应商面板点 ↻",
   "settings.apply": "应用",
   "settings.cancel": "取消",
   "settings.applyHint": "变更在下次消息生效。运行中的 agent 仍用旧设置。",
   "settings.lifecycle": "生命周期",
+  // 阶段 5：计划的设置面。下面每条 reason/detail 都直接打印服务端原文，
+  // 这里的标签是唯一的客户端措辞。
+  "settings.plan.title": "计划（传输 / 推理 / 项目 / 上下文 / 历史 / 存活）",
+  "settings.plan.none":
+    "该 agent 尚未解析出计划 —— 什么都没运行过，因此如实显示“无”，而不是填一个默认值",
+  "settings.plan.header": "来源：{source} · 计划 {hash} · 解析于 {at}",
+  "settings.plan.identity": "身份：{providerScope} · {runtime} {version} · {transport} · {model}",
+  "settings.plan.row": "结果：{outcome} · 来源：{source} · 置信度：{confidence}",
+  "settings.plan.rejected": "{value} —— 被拒绝：{code}：{detail}",
+  "settings.plan.rejectedValue": "你填写的 {value} 在此不可用（{code}）——请换一个值",
+  "settings.plan.diagnostics": "诊断：{summary}",
+  "settings.plan.diagnostic": "· {field} [{status}]（{origin}/{confidence}）{detail}",
+  "settings.plan.preference": "· 偏好 {field} = {requested} → {outcome}",
+  "settings.invalidate.title": "该变更会使已保存的设置失效",
+  "settings.invalidate.line": "{field}：{current} → {next} —— {code}：{reason}",
+  "settings.invalidate.cleared": "（将被清除）",
+  "settings.invalidate.ok": "仍然应用",
+  "settings.invalidate.unresolved": "该变更无法解析，因此没有写入任何内容 —— {reason}",
   "settings.close": "◼ 关闭",
   "settings.close.title": "中止运行并锁定输入。保留 resume 信息以便重启",
   "settings.restart": "▶ 重启",
@@ -870,6 +1068,13 @@ const zh: Dict = {
   "slash.picker.provider": "选择供应商 — ↑/↓ + Enter，Esc 取消",
   "slash.picker.hint": "或点击",
   "slash.picker.placeholder": "（选择器已激活——按 Enter 或 Esc）",
+  "slash.status.notLocal":
+    "本实例没有该 agent 的状态报告 —— 它不是由本实例运行的，其计划与用量在别处产生",
+  "slash.status.cloudSnapshot":
+    "云端 source={source} publishedAt={at} —— 由拥有该 agent 的桌面端原样中继",
+  "slash.status.cloudUnavailable": "云端 source={source} —— {reason}",
+  "settings.preview.title": "草稿预览（尚未写入）",
+  "settings.preview.rejected": "该修改会被拒绝：{code} —— {detail}",
   "slash.error": "命令失败：{err}",
 
   // key help dialog

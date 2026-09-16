@@ -1,19 +1,46 @@
-import type { AgentSummary, TeamSummary } from "@agentorch/shared";
-import type { PersistedMessage } from "./agent-api";
+// The cloud client: session storage and the requests. The DTO, the upload
+// builder and the config signature live in `@agentorch/shared` (see
+// `shared/src/cloud-config.ts`) — they are the half that has invariants worth
+// testing (no legacy path field in the payload, signature keys === payload keys,
+// the run ceiling in `metadata`), and `desktop-ui` has no test runner. They are
+// re-exported here so every existing import keeps working and there is still
+// exactly ONE definition of each name.
+export {
+  CLOUD_AGENT_FIELDS,
+  CLOUD_AGENT_SERVER_FIELDS,
+  CloudSnapshotScrubError,
+  PUBLISHED_PLAN_KEY,
+  buildCloudSnapshotFromLocal,
+  cloudConfigSignature,
+  isCloudSnapshotScrubError,
+  scrubSecrets,
+} from "@agentorch/shared";
+export type {
+  CloudAgent,
+  CloudAgentStatus,
+  CloudMessage,
+  CloudMessageCursor,
+  CloudSnapshot,
+  CloudSnapshotInput,
+  CloudSyncBatchInput,
+  CloudSyncBatchResult,
+  CloudTeam,
+  CloudWorkspace,
+} from "@agentorch/shared";
+
+import {
+  type CloudAgentStatus,
+  type CloudMessageCursor,
+  type CloudSnapshot,
+  type CloudSnapshotInput,
+  type CloudSyncBatchInput,
+  type CloudSyncBatchResult,
+  type CloudWorkspace,
+  type RunPlanStatusView,
+} from "@agentorch/shared";
 
 const DEFAULT_CLOUD_ORIGIN = "https://ensemble-ai.cn";
 const CLOUD_SESSION_KEY = "ensemble:cloud-session";
-
-const SECRET_KEY_RE =
-  /(api[_-]?key|secret|token|oauth|ssh|password|credential|cookie|private[_-]?key|env|authorization|bearer|access[_-]?token|refresh[_-]?token|session)/i;
-const BLOCKED_METADATA_KEYS = new Set([
-  "lastSessionId",
-  "codexResumeSignature",
-  "codexUsageSnapshot",
-  "resumeMetadata",
-  "providerSecrets",
-  "providerCredentials",
-]);
 
 export interface CloudAccount {
   id: string;
@@ -28,83 +55,6 @@ export interface CloudSession {
   token: string;
   expiresAt: string;
   account: CloudAccount;
-}
-
-export interface CloudWorkspace {
-  id: string;
-  name: string;
-  revision: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface CloudTeam {
-  id: string;
-  name: string;
-  description: string | null;
-  sortOrder: number;
-  revision: number;
-  updatedAt: string;
-}
-
-export interface CloudAgent {
-  id: string;
-  parentId: string | null;
-  teamId: string | null;
-  name: string;
-  systemPrompt: string | null;
-  model: string | null;
-  providerKind: string | null;
-  providerName: string | null;
-  providerId: string | null;
-  permissionMode: string | null;
-  sandboxMode: string | null;
-  reasoningEffort: string | null;
-  codexWorkspace: string | null;
-  metadata: Record<string, unknown>;
-  sortOrder: number;
-  revision: number;
-  updatedAt: string;
-}
-
-export interface CloudMessage {
-  agentId: string;
-  seq: number;
-  type: string;
-  payload: unknown;
-  createdAt?: string;
-}
-
-export interface CloudSnapshot {
-  workspace: CloudWorkspace;
-  teams: CloudTeam[];
-  agents: CloudAgent[];
-  messages: CloudMessage[];
-}
-
-export interface CloudSnapshotInput {
-  teams: CloudTeam[];
-  agents: CloudAgent[];
-  messages: CloudMessage[];
-}
-
-export interface CloudMessageCursor {
-  agentId: string;
-  maxSeq: number;
-}
-
-export interface CloudSyncBatchInput extends Partial<CloudSnapshotInput> {
-  expectedRevision?: number;
-}
-
-export interface CloudSyncBatchResult {
-  workspace: CloudWorkspace;
-  applied: {
-    teams: number;
-    agents: number;
-    messages: number;
-  };
-  messageCursors: CloudMessageCursor[];
 }
 
 interface StoredCloudSession {
@@ -293,124 +243,37 @@ export async function syncCloudBatch(
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
+export async function fetchCloudAgentStatus(
+  session: CloudSession,
+  workspaceId: string,
+  agentId: string,
+): Promise<CloudAgentStatus> {
+  return cloudFetch<CloudAgentStatus>(
+    session.origin,
+    `/v1/cloud/workspaces/${encodeURIComponent(workspaceId)}/agents/${encodeURIComponent(agentId)}/status`,
+    {},
+    session.token,
+  );
 }
 
-function scrubSecrets(value: unknown, depth = 0): unknown {
-  if (depth > 8) return null;
-  if (value == null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
-    return value;
-  }
-  if (Array.isArray(value)) return value.slice(0, 500).map((entry) => scrubSecrets(entry, depth + 1));
-  if (!isRecord(value)) return null;
-  const out: Record<string, unknown> = {};
-  for (const [key, nested] of Object.entries(value).slice(0, 100)) {
-    if (SECRET_KEY_RE.test(key) || BLOCKED_METADATA_KEYS.has(key)) continue;
-    out[key] = scrubSecrets(nested, depth + 1);
-  }
-  return out;
-}
-
-function messageTypeFromPayload(msg: PersistedMessage): string {
-  if (isRecord(msg.msg) && typeof msg.msg.type === "string") return msg.msg.type;
-  return "system";
-}
-
-export function buildCloudSnapshotFromLocal(input: {
-  agents: AgentSummary[];
-  teams: TeamSummary[];
-  messagesByAgent: Record<string, PersistedMessage[]>;
-}): CloudSnapshotInput {
-  const teams: CloudTeam[] = input.teams.map((team, index) => ({
-    id: team.id,
-    name: team.name,
-    description: team.description,
-    sortOrder: index,
-    revision: 0,
-    updatedAt: team.createdAt,
-  }));
-
-  const agents: CloudAgent[] = input.agents.map((agent, index) => ({
-    id: agent.id,
-    parentId: agent.parentId,
-    teamId: agent.teamId,
-    name: agent.name,
-    systemPrompt: agent.systemPrompt,
-    model: agent.model,
-    providerKind: null,
-    providerName: null,
-    providerId: agent.providerId,
-    permissionMode: agent.permissionMode,
-    sandboxMode: agent.sandboxMode,
-    reasoningEffort: agent.reasoningEffort,
-    codexWorkspace: agent.codexWorkspace,
-    metadata: {
-      forcedSkills: agent.forcedSkills,
-      disabledSkills: agent.disabledSkills,
-      closed: agent.closed,
-    },
-    sortOrder: index,
-    revision: 0,
-    updatedAt: agent.createdAt,
-  }));
-
-  const messages: CloudMessage[] = [];
-  for (const agent of input.agents) {
-    const agentMessages = input.messagesByAgent[agent.id] ?? [];
-    for (const msg of agentMessages) {
-      messages.push({
-        agentId: agent.id,
-        seq: msg.seq,
-        type: messageTypeFromPayload(msg),
-        payload: scrubSecrets(msg.msg),
-      });
-    }
-  }
-  return { teams, agents, messages };
-}
-
-function stableConfigMetadata(value: unknown): unknown {
-  const scrubbed = scrubSecrets(value);
-  if (!isRecord(scrubbed)) return {};
-  return sortObject(scrubbed);
-}
-
-function sortObject(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortObject);
-  if (!isRecord(value)) return value;
-  const out: Record<string, unknown> = {};
-  for (const key of Object.keys(value).sort()) {
-    out[key] = sortObject(value[key]);
-  }
-  return out;
-}
-
-export function cloudConfigSignature(snapshot: { teams: CloudTeam[]; agents: CloudAgent[] }): string {
-  const teams = [...snapshot.teams]
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map((team) => ({
-      id: team.id,
-      name: team.name,
-      description: team.description,
-      sortOrder: team.sortOrder,
-    }));
-  const agents = [...snapshot.agents]
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map((agent) => ({
-      id: agent.id,
-      parentId: agent.parentId,
-      teamId: agent.teamId,
-      name: agent.name,
-      systemPrompt: agent.systemPrompt,
-      model: agent.model,
-      providerId: agent.providerId,
-      permissionMode: agent.permissionMode,
-      sandboxMode: agent.sandboxMode,
-      reasoningEffort: agent.reasoningEffort,
-      codexWorkspace: agent.codexWorkspace,
-      metadata: stableConfigMetadata(agent.metadata),
-      sortOrder: agent.sortOrder,
-    }));
-  return JSON.stringify({ teams, agents });
+/** Publish THIS desktop's resolved plan for one agent.
+ *
+ *  A plan is not configuration, so it travels on its own narrow write — the
+ *  agent is named by ID and nothing but `metadata.publishedPlan` moves. Sending
+ *  the whole agent back (as this used to) meant a desktop whose snapshot was
+ *  older than another client's settings change would revert that change on its
+ *  next turn: a status publish acting as a config write. Nothing about the
+ *  agent's configuration is sent, so nothing about it can be rewritten here. */
+export async function publishCloudAgentPlan(
+  session: CloudSession,
+  workspaceId: string,
+  agentId: string,
+  planView: RunPlanStatusView,
+): Promise<void> {
+  await cloudFetch<{ agentId: string; publishedAt: string }>(
+    session.origin,
+    `/v1/cloud/workspaces/${encodeURIComponent(workspaceId)}/agents/${encodeURIComponent(agentId)}/plan`,
+    { method: "POST", body: JSON.stringify({ planView, publishedAt: new Date().toISOString() }) },
+    session.token,
+  );
 }

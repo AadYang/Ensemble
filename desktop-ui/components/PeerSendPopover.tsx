@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { PeerMode } from "@agentorch/shared";
+import type { AgentSummary, PeerMode } from "@agentorch/shared";
+import { peerContactAllowed, peerIdentityFromSummary } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import { useStore } from "@/store/agents";
 import { useT } from "@/i18n/useT";
@@ -21,15 +22,31 @@ export function PeerSendPopover({
   const appendUserTurn = useStore((s) => s.appendUserTurn);
   const fromAgent = agents[fromAgentId];
 
-  const peers = useMemo(
-    () =>
-      Object.values(agents)
-        .filter((a) => a.summary.id !== fromAgentId && !a.summary.closed)
-        .sort((x, y) => x.summary.name.localeCompare(y.summary.name)),
-    [agents, fromAgentId],
-  );
+  // Only targets this agent can actually reach. A subagent is private to the
+  // agent that spawned it (core refuses everyone else, and refuses a subagent
+  // contacting anyone but its own parent), so offering one here would be
+  // offering an option whose only outcome is an error. The rule is NOT restated
+  // here: `peerContactAllowed` is the same function core enforces with, and the
+  // relationship comes from the summary's own parentId/subagentKind.
+  const peers = useMemo(() => {
+    if (!fromAgent) return [];
+    const from = peerIdentityFromSummary(fromAgent.summary);
+    const reachable = (s: AgentSummary) =>
+      s.id !== fromAgentId &&
+      !s.closed &&
+      peerContactAllowed(from, peerIdentityFromSummary(s));
+    return Object.values(agents)
+      .filter((a) => reachable(a.summary))
+      .sort((x, y) => x.summary.name.localeCompare(y.summary.name));
+  }, [agents, fromAgent, fromAgentId]);
 
   const [targetId, setTargetId] = useState<string>(peers[0]?.summary.id ?? "");
+  // The picker is derived, not remembered: a target that stops being reachable
+  // (its agent finished and was archived, or the parent link changed) must not
+  // stay silently selected behind a form that can only fail.
+  const selectedId = peers.some((p) => p.summary.id === targetId)
+    ? targetId
+    : peers[0]?.summary.id ?? "";
   const [text, setText] = useState("");
   const [mode, setMode] = useState<PeerMode>("raw");
   const [interrupt, setInterrupt] = useState(false);
@@ -99,14 +116,14 @@ export function PeerSendPopover({
   const onSend = () => {
     const trimmed = text.trim();
     const reason = interruptReason.trim();
-    if (!trimmed || !targetId || (interrupt && !reason)) return;
+    if (!trimmed || !selectedId || (interrupt && !reason)) return;
     setBusy(true);
-    const targetAgent = agents[targetId];
-    const targetName = targetAgent?.summary.name ?? targetId.slice(0, 8);
+    const targetAgent = agents[selectedId];
+    const targetName = targetAgent?.summary.name ?? selectedId.slice(0, 8);
     getWS().send({
       type: "peer_send",
       fromSessionId: fromAgentId,
-      targetSessionId: targetId,
+      targetSessionId: selectedId,
       text: trimmed,
       mode,
       interrupt,
@@ -162,7 +179,7 @@ export function PeerSendPopover({
                 {t("peer.popover.toLabel")}
               </span>
               <select
-                value={targetId}
+                value={selectedId}
                 onChange={(e) => setTargetId(e.target.value)}
                 className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
               >
@@ -237,7 +254,7 @@ export function PeerSendPopover({
             <div className="flex gap-2">
               <button
                 onClick={onSend}
-                disabled={!text.trim() || !targetId || busy || (interrupt && !interruptReason.trim())}
+                disabled={!text.trim() || !selectedId || busy || (interrupt && !interruptReason.trim())}
                 className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
               >
                 {t("peer.popover.send")}

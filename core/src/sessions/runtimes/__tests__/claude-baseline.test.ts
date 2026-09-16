@@ -21,6 +21,12 @@ import { ClaudeAgentRuntime } from "../claude.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Provider } from "../../../db.js";
 import type { RuntimeOptions } from "../types.js";
+import { resolveRunPlan } from "../../../capability/run-plan.js";
+
+/** A real directory for the plan's project root: the resolver's `bound` branch
+ *  echoes whatever path it is given, and the runtime passes it to the SDK's
+ *  `cwd` — which the SDK itself requires to exist. */
+const PROJECT_ROOT = process.cwd();
 
 const stubProvider: Provider = {
   id: "p1",
@@ -50,10 +56,39 @@ const baseOpts = (): RuntimeOptions => ({
   abortController: new AbortController(),
   mcpServers: {},
   env: {},
-  cwd: "/",
   provider: stubProvider,
+  // The plan is required for every runtime now, and it is the ONE source of the
+  // working directory — there is no `cwd` option any more. The real resolver
+  // produces the answer the runtime reads.
+  runPlan: resolveRunPlan({
+    model: "claude-opus-4-8",
+    runtime: "claude",
+    providerId: stubProvider.id,
+    projectRoot: {
+      configured: { path: PROJECT_ROOT, invalid: null },
+      scratchPath: PROJECT_ROOT,
+    },
+  }),
   history: [],
 });
+
+/** A plan carrying a reasoning request, resolved by the real resolver — the
+ *  runtime reads `runPlan.execution.reasoningEffort`, so a fixture that set the
+ *  value anywhere else would be testing a channel that no longer exists. */
+const planWithReasoning = (reasoningEffort: string, model = "claude-opus-4-8") =>
+  resolveRunPlan({
+    model,
+    runtime: "claude",
+    providerId: stubProvider.id,
+    // The root is no longer deferred: a plan that cannot name a directory is a
+    // plan whose turn is refused, so a fixture that omitted it would be testing
+    // the refusal path instead of the reasoning path it means to test.
+    projectRoot: {
+      configured: { path: PROJECT_ROOT, invalid: null },
+      scratchPath: PROJECT_ROOT,
+    },
+    preferences: { reasoningEffort },
+  });
 
 let previousClaudeConfigDir: string | undefined;
 let tmpClaudeConfigDir: string | null = null;
@@ -133,10 +168,63 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(out[0]).toBe(msg); // referential — runtime is pass-through
   });
 
+  it("spawns in the plan's project root, not the process's own directory", async () => {
+    // A root that is deliberately NOT `process.cwd()`: if the runtime still
+    // reached for a process-wide default, this is the assertion that fails.
+    const root = mkdtempSync(join(tmpdir(), "ensemble-claude-root-"));
+    try {
+      queuedMessages.push([]);
+      const rt = new ClaudeAgentRuntime();
+      for await (const _ of rt.query({
+        ...baseOpts(),
+        runPlan: resolveRunPlan({
+          model: "claude-opus-4-8",
+          runtime: "claude",
+          providerId: stubProvider.id,
+          projectRoot: { configured: { path: root, invalid: null }, scratchPath: root },
+        }),
+      })) {
+        // consume stream
+      }
+
+      const options = vi.mocked(query).mock.calls.at(-1)![0]!.options!;
+      expect(options.cwd).toBe(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses the turn when the plan carries no usable root", async () => {
+    // The plan's `value` is null exactly when the configured root was found
+    // unusable (or no scratch could be resolved). The runtime must not invent a
+    // directory for it: the SDK call is never made.
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    const events: unknown[] = [];
+    for await (const ev of rt.query({
+      ...baseOpts(),
+      runPlan: resolveRunPlan({
+        model: "claude-opus-4-8",
+        runtime: "claude",
+        providerId: stubProvider.id,
+        projectRoot: { configured: { path: PROJECT_ROOT, invalid: { code: "PROJECT_ROOT_NOT_FOUND", reason: "gone" } }, scratchPath: PROJECT_ROOT },
+      }),
+    })) {
+      events.push(ev);
+    }
+    expect(vi.mocked(query)).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      expect.objectContaining({ type: "error", code: "PROJECT_ROOT_NOT_FOUND" }),
+    ]);
+  });
+
   it("passes explicit thinking mode as Claude Code max thinking tokens", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
-    for await (const _ of rt.query({ ...baseOpts(), reasoningEffort: "high" })) {
+    for await (const _ of rt.query({
+      ...baseOpts(),
+      runPlan: planWithReasoning("high"),
+    })) {
       // consume stream
     }
 
@@ -147,9 +235,44 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(options.maxThinkingTokens).toBe(16384);
   });
 
+  // The level reaches the adapter from the plan (that is the only channel now),
+  // and a level this adapter cannot turn into a budget is REFUSED before the
+  // request — the alternative is sending the turn while silently ignoring what
+  // the user asked for, which is the exact failure the contract forbids.
+  it("refuses an unexpressible level before calling the SDK instead of dropping it", async () => {
+    const rt = new ClaudeAgentRuntime();
+    const events: unknown[] = [];
+    for await (const ev of rt.query({
+      ...baseOpts(),
+      runPlan: planWithReasoning("ultra"),
+    })) {
+      events.push(ev);
+    }
+
+    expect(vi.mocked(query)).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    const err = events[0] as {
+      type: string;
+      code?: string;
+      reasoning?: { requested: string; model: string; supportedLevels: string[]; source: string };
+    };
+    expect(err.type).toBe("error");
+    expect(err.code).toBe("REASONING_EFFORT_UNSUPPORTED");
+    expect(err.reasoning?.requested).toBe("ultra");
+    expect(err.reasoning?.model).toBe("claude-opus-4-8");
+    // What it CAN express, as data — not only as prose in the message.
+    expect(err.reasoning?.supportedLevels).toContain("high");
+    expect(err.reasoning?.supportedLevels).not.toContain("ultra");
+    expect(err.reasoning?.source).toContain("thinking-token budget");
+  });
+
   it("omits max thinking tokens when thinking mode inherits runtime defaults", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
+    // A plan that resolved `inherit` (the default `baseOpts()` already is one):
+    // `execution.reasoningEffort` is undefined, so no parameter is sent and the
+    // upstream default applies. An omitted key, not a zero or a "default" one.
+    expect(baseOpts().runPlan.execution.reasoningEffort).toBeUndefined();
     for await (const _ of rt.query(baseOpts())) {
       // consume stream
     }
@@ -210,6 +333,111 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(options.env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
     expect(options).not.toHaveProperty("hooks");
     expect(options.mcpServers).toEqual({});
+  });
+
+  it("declares the documented context CAPACITY for a third-party model", async () => {
+    // Claude Code assumes ≈200k for models it doesn't recognize and
+    // auto-compacts at ~85% of that; on this provider's 1M window that threw
+    // away ~1.1M tokens of context across six measured compactions.
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({ ...baseOpts(), model: "deepseek-flash" })) {
+      // consume stream
+    }
+
+    expect(lastQueryOptions().env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
+    });
+  });
+
+  // MAX_CONTEXT is a CAPACITY declaration; AUTO_COMPACT is a POLICY trigger and
+  // must leave headroom for the response. We have never measured Claude Code's
+  // compaction behaviour for these models, so we do not get to invent one.
+  it("does NOT pin the compaction policy to the model maximum", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({ ...baseOpts(), model: "deepseek-flash" })) {
+      // consume stream
+    }
+
+    const env = (lastQueryOptions().env ?? {}) as Record<string, string>;
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+  });
+
+  it("declares a smaller documented window too (glm-4.5 documents 128k)", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({ ...baseOpts(), model: "glm-4.5" })) {
+      // consume stream
+    }
+
+    expect(lastQueryOptions().env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+    });
+  });
+
+  // A value we never verified is a guess about the model, so it must never
+  // reach config. `deepseek-chat` is carried at its last documented V3-era
+  // window with `unverified` confidence.
+  it("does not declare a window we have not confirmed", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({ ...baseOpts(), model: "deepseek-chat" })) {
+      // consume stream
+    }
+
+    const env = (lastQueryOptions().env ?? {}) as Record<string, string>;
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+  });
+
+  // Every gpt-5.6 variant now has its own vendor page, so the gate opens for
+  // them — and it opens with the DOCUMENTED value, which differs for cyber.
+  it("declares each individually verified model at its own documented value", async () => {
+    for (const [model, expected] of [
+      ["gpt-5.6-terra", "1050000"],
+      ["gpt-5.6-cyber", "400000"],
+    ] as const) {
+      queuedMessages.push([]);
+      const rt = new ClaudeAgentRuntime();
+      for await (const _ of rt.query({ ...baseOpts(), model })) {
+        // consume stream
+      }
+      expect((lastQueryOptions().env ?? {}) as Record<string, string>, model)
+        .toMatchObject({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: expected });
+    }
+  });
+
+  it("leaves the SDK's own window alone for models we have no verified value for", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({ ...baseOpts(), model: "claude-opus-4-8" })) {
+      // consume stream
+    }
+
+    const env = (lastQueryOptions().env ?? {}) as Record<string, string>;
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+  });
+
+  it("never overrides a window the caller set explicitly", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({
+      ...baseOpts(),
+      model: "deepseek-flash",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "750000",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "250000",
+      },
+    })) {
+      // consume stream
+    }
+
+    expect(lastQueryOptions().env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "750000",
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "250000",
+    });
   });
 
   it("keeps explicit runtime env ahead of Claude settings auth env", async () => {

@@ -47,7 +47,11 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-async function withTimeout<T>(promise: Promise<T>, label: string, ms = 2_000): Promise<T> {
+// The window covers "did the turn get dispatched at all", not how fast it was:
+// the FIRST turn of an openai-compat provider may include the lazy /responses
+// probe (bounded at 2.5s by capability/transport-probe.ts), which these fixtures
+// reach with an unreachable base URL.
+async function withTimeout<T>(promise: Promise<T>, label: string, ms = 6_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([

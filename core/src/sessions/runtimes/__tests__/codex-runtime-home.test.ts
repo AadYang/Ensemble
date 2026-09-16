@@ -108,6 +108,39 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     ]));
   });
 
+  it("declares the documented context window via -c on new and resume turns", () => {
+    // Codex's own model table defaults gpt-5.6-sol to context_window 272,000 and
+    // compacts at 95% of it (258,400) although the model is documented at
+    // 1.05M. `-c` is the channel that always applies: `exec resume` takes it,
+    // and the isolated CODEX_HOME is only created when the agent has MCP
+    // servers. Measured on CLI 0.154.0: the effective window becomes 95% of the
+    // backend's max_context_window once we declare a bigger value.
+    expect(buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      model: "gpt-5.6-sol",
+      promptFromStdin: true,
+      sandbox: "workspace-write",
+      contextWindow: 1_050_000,
+    })).toEqual(expect.arrayContaining(["-c", "model_context_window=1050000"]));
+
+    expect(buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      promptFromStdin: true,
+      resume: "018f0000-0000-7000-8000-000000000000",
+      contextWindow: 1_050_000,
+    })).toEqual(expect.arrayContaining(["-c", "model_context_window=1050000"]));
+  });
+
+  it("omits the window declaration for models we have no documented value for", () => {
+    const args = buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      model: "claude-opus-5",
+      promptFromStdin: true,
+      contextWindow: null,
+    });
+    expect(args.some((a) => a.startsWith("model_context_window"))).toBe(false);
+  });
+
   it("builds codex mcp list args without the obsolete builtin_mcp flag", () => {
     expect(buildCodexMcpListArgs()).toEqual(["mcp", "--disable", "apps", "list"]);
   });
@@ -257,6 +290,111 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     expect(toml).toContain("model_reasoning_effort = \"xhigh\"");
   });
 
+  // `inherit` must be an OMITTED key, not an empty or defaulted one: Codex reads
+  // a present key as a choice, so writing `""` would send the CLI looking for a
+  // level named nothing instead of using its own default. The user's OWN Codex
+  // config is a different matter and is preserved: inherit means "we do not
+  // decide", which is exactly why we must not strip their setting either.
+  it("writes no model_reasoning_effort of its own when the level is inherited", () => {
+    const toml = renderMcpConfigTomlForCodexRuntime(
+      { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+      [],
+      null,
+      null,
+      ["model_reasoning_effort = \"low\"", ""].join("\n"),
+    );
+    expect(toml.match(/model_reasoning_effort/g)).toHaveLength(1);
+    expect(toml).toContain("model_reasoning_effort = \"low\"");
+    expect(buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      model: "gpt-5.5",
+      promptFromStdin: true,
+    })).not.toEqual(expect.arrayContaining(["model_reasoning_effort=\"low\""]));
+  });
+
+  // The token is interpolated into TOML and into argv, so an unsafe value is
+  // refused at the interpolation point rather than escaped — quotes, spaces and
+  // newlines are simply not representable as a level.
+  it("refuses to interpolate an unsafe reasoning level into TOML or argv", () => {
+    for (const bad of ['hi"gh', "hi gh", "hi\ngh", "hi=gh", "-leading-dash"]) {
+      expect(() =>
+        renderMcpConfigTomlForCodexRuntime({}, [], null, bad),
+      ).toThrow(/unsafe reasoning level/);
+      expect(() =>
+        buildCodexExecArgs({ cwd: "D:\\WorkSpace\\Repo", promptFromStdin: true, reasoningEffort: bad }),
+      ).toThrow(/unsafe reasoning level/);
+    }
+  });
+
+  it("writes model_context_window into config.toml, replacing the user's value", () => {
+    const toml = renderMcpConfigTomlForCodexRuntime(
+      { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+      [],
+      null,
+      null,
+      ["model = \"gpt-5.6-sol\"", "model_context_window = 258400", ""].join("\n"),
+      1_050_000,
+    );
+    const matches = toml.match(/^model_context_window\s*=/gm) ?? [];
+    expect(matches).toHaveLength(1);
+    expect(toml).toContain("model_context_window = 1050000");
+    expect(toml).not.toContain("model_context_window = 258400");
+  });
+
+  // Regression: the model used to be the trailing OPTIONAL parameter and the
+  // only production caller omitted it, so `requestedRuntimeWindow("")` returned
+  // null and model_context_window was silently never written — the "durable
+  // safety net" the isolated home is supposed to provide did not exist, and
+  // nothing failed. The parameter is now required (so a dropped argument is a
+  // compile error at the call site) and this pins the behaviour it guards.
+  it("prepares an isolated home whose config.toml carries the confirmed model window", () => {
+    const sessionId = `test-context-window-${Date.now()}`;
+    runtimeSessionIds.push(sessionId);
+    const home = prepareCodexHomeForRuntime(
+      sessionId,
+      { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+      "gpt-5.6-sol",
+    );
+    const toml = readFileSync(join(home, "config.toml"), "utf8");
+    expect(toml).toContain("model_context_window = 1050000");
+  });
+
+  // `gpt-5.1` has no confirmed catalog entry (only a community snapshot), so
+  // there is nothing legitimate to declare.
+  it("writes no window for a model we have not confirmed", () => {
+    const sessionId = `test-unknown-${Date.now()}`;
+    runtimeSessionIds.push(sessionId);
+    const home = prepareCodexHomeForRuntime(
+      sessionId,
+      { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+      "gpt-5.1",
+    );
+    const toml = readFileSync(join(home, "config.toml"), "utf8");
+    expect(toml).not.toContain("model_context_window");
+  });
+
+  // Every gpt-5.6 variant now has its own vendor page, so each may be declared
+  // — including the small-window one, which must not inherit the family value.
+  it("declares the documented window for each individually verified model", () => {
+    for (const [model, expected] of [
+      ["gpt-5.6-sol", "1050000"],
+      ["gpt-5.6-terra", "1050000"],
+      ["gpt-5.6-luna", "1050000"],
+      ["gpt-5.6-cyber", "400000"],
+      ["gpt-6-astra", "1050000"],
+    ] as const) {
+      const sessionId = `test-doc-${model}-${Date.now()}`;
+      runtimeSessionIds.push(sessionId);
+      const home = prepareCodexHomeForRuntime(
+        sessionId,
+        { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+        model,
+      );
+      expect(readFileSync(join(home, "config.toml"), "utf8"), model)
+        .toContain(`model_context_window = ${expected}`);
+    }
+  });
+
   it("does not duplicate inherited model_reasoning_effort when an agent override is supplied", () => {
     const toml = renderMcpConfigTomlForCodexRuntime(
       {
@@ -320,6 +458,7 @@ describe("Codex runtime isolated CODEX_HOME", () => {
           bearer_token_env_var: "ENSEMBLE_MCP_BEARER",
         },
       },
+      null,
       sourceHome,
       "D:\\WorkSpace\\Repo",
     );
@@ -349,6 +488,7 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     const runtimeHome = prepareCodexHomeForRuntime(
       sessionId,
       { "agentorch-internal-agent2": { url: "http://127.0.0.1:1234/api/mcp/internal/agent-2" } },
+      null,
       sourceHome,
     );
 
@@ -369,6 +509,7 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     const runtimeHome = prepareCodexHomeForRuntime(
       sessionId,
       { "agentorch-internal-agent3": { url: "http://127.0.0.1:1234/api/mcp/internal/agent-3" } },
+      null,
     );
 
     const runtimeAuth = join(runtimeHome, "auth.json");

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentStatus, CloudRealtimeServerMsg, SdkMessage } from "@agentorch/shared";
 import { CloudRealtimeClient } from "@/lib/cloud-realtime";
 import { type CloudAgent, type CloudMessage, type CloudSnapshot } from "@/lib/cloud-api";
+import { useT } from "@/i18n/useT";
 import { useStore } from "@/store/agents";
 
 export function CloudWorkspaceView({
@@ -13,6 +14,7 @@ export function CloudWorkspaceView({
   activeAgentId: string | null;
   onPickAgent: (id: string | null) => void;
 }) {
+  const t = useT();
   const cloudSession = useStore((s) => s.cloudSession);
   const cloudCurrentWorkspaceId = useStore((s) => s.cloudCurrentWorkspaceId);
   const cloudSnapshot = useStore((s) => s.cloudSnapshot);
@@ -140,7 +142,9 @@ export function CloudWorkspaceView({
           <div className="shrink-0 border-b border-[var(--border)] px-3 py-2 text-xs flex items-center gap-2">
             <span className="font-bold text-[var(--text)] truncate">{activeAgent.name}</span>
             <span className="text-[var(--text-dim)] truncate">{activeAgent.model ?? "model unset"}</span>
-            <span className="text-[var(--text-faint)] truncate">{activeAgent.codexWorkspace ?? ""}</span>
+            <span className="text-[var(--text-faint)] truncate" title={activeAgent.projectRoot ?? "unbound project"}>
+              {activeAgent.projectRoot ?? t("project.unbound")}
+            </span>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-2">
             {messages.length === 0 ? (

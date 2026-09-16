@@ -17,8 +17,8 @@ export const writeTool: NormalizedTool<typeof WRITE_SCHEMA> = {
   description:
     "Write (overwrite) the file at `file_path` with `content`. Creates parent directories as needed.",
   parameters: WRITE_SCHEMA,
-  async execute({ file_path, content }) {
-    const abs = resolveSafe(file_path);
+  async execute({ file_path, content }, ctx) {
+    const abs = resolveSafe(file_path, ctx.projectRoot);
     await mkdir(dirname(abs), { recursive: true });
     await writeFile(abs, content, "utf8");
     return `Wrote ${content.length} bytes to ${abs}`;

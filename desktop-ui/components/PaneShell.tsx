@@ -26,11 +26,22 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
   const [settingsOpen, setSettingsOpen] = useState(false);
   const t = useT();
 
-  // Background tasks this agent spawned (detached subagents). Derived live from
-  // the store so their status updates in place — no chat-text parsing.
+  // Background tasks this agent spawned (detached subagents) that are still
+  // worth a slot in the strip. Derived live from the store so their status
+  // updates in place — no chat-text parsing.
+  //
+  // A FINISHED task drops out on its own: core archives + deactivates a
+  // subagent when its task ends (`retireSubagent`), so `closed` is what tells
+  // this strip the work is over. The strip is a pulse of what is RUNNING under
+  // this agent; a permanently-growing row of finished children is what made the
+  // sidebar read as an agent accumulation problem. The child is still in the
+  // tree (dimmed) and its transcript is still readable.
   const backgroundTasks = agentId
     ? Object.values(agents).filter(
-        (x) => x.summary.parentId === agentId && x.summary.subagentKind === "background",
+        (x) =>
+          x.summary.parentId === agentId &&
+          x.summary.subagentKind === "background" &&
+          !x.summary.closed,
       )
     : [];
 

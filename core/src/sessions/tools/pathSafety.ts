@@ -7,10 +7,17 @@
 
 import { isAbsolute, resolve } from "node:path";
 
-export function resolveSafe(input: string): string {
+/** Absolute-only, with the turn's project root NAMED in the error.
+ *
+ *  The rule is unchanged (a relative path is refused rather than guessed at);
+ *  what changed is that the refusal now tells the model which directory to
+ *  resolve against, so a rejected call is correctable in one step instead of
+ *  leaving it to guess at a root it cannot see. */
+export function resolveSafe(input: string, projectRoot: string): string {
   if (!isAbsolute(input)) {
     throw new Error(
-      `path must be absolute: got "${input}". Resolve with the workspace root before calling.`,
+      `path must be absolute: got "${input}". The agent's project root is "${projectRoot}" — ` +
+        `resolve the path against it (e.g. "${resolve(projectRoot, input)}") and call again.`,
     );
   }
   // resolve() normalizes `..` and `.` segments; keeps the abs path stable.

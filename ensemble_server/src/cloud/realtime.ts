@@ -3,6 +3,7 @@ import websocket from "@fastify/websocket";
 import { z } from "zod";
 import type { AgentSummary, CloudRealtimeClientMsg, CloudRealtimeRole, CloudRealtimeServerMsg } from "@agentorch/shared";
 import type { CloudAgent, CloudStore } from "./store.js";
+import { assertProjectRootAgreement, isCloudInputRejection } from "./store.js";
 import { authenticateCloudToken } from "./session-auth.js";
 
 export type CloudSocket = {
@@ -28,7 +29,19 @@ const configPatchSchema = z
     providerId: z.string().max(128).nullable().optional(),
     permissionMode: z.enum(["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]).optional(),
     sandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable().optional(),
-    reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]).nullable().optional(),
+    // Shape only, deliberately: a reasoning level is an OPEN token (see
+    // shared/src/reasoning.ts — the one validator, which the core's HTTP route
+    // runs). This layer cannot import it: @agentorch/shared ships TS source that
+    // Node cannot load, so the deployed tsc build of this server would break.
+    // Bounding the length keeps a patch bounded, and the patch is forwarded to
+    // the core, whose answer (400 reasoning_effort_unsupported) is the authority.
+    // What this replaced was a literal whitelist — the second place a level list
+    // lived, and the one that would have rejected a level the model does have.
+    reasoningEffort: z.string().max(64).nullable().optional(),
+    // Canonical bound directory. The legacy alias below is accepted for an
+    // older desktop client; the core translates it (and rejects a
+    // contradictory pair), so this layer forwards both verbatim.
+    projectRoot: z.string().max(512).nullable().optional(),
     codexWorkspace: z.string().max(512).nullable().optional(),
     teamId: z.string().max(128).nullable().optional(),
     closed: z.boolean().optional(),
@@ -356,7 +369,9 @@ export function registerCloudRealtimeRoutes(app: FastifyInstance, store: CloudSt
               hub.handle(context.accountId, context.role, socket, {
                 type: "remote_error",
                 requestId: parsed.requestId,
-                code: "CONFIG_APPLY_FAILED",
+                // A refused project root is the caller's input being wrong, so
+                // it keeps its own code all the way back to the desktop.
+                code: isCloudInputRejection(err) ? err.code : "CONFIG_APPLY_FAILED",
                 message: err instanceof Error ? err.message : "Remote settings change failed.",
                 workspaceId: parsed.workspaceId,
                 agentId: parsed.agentId,
@@ -473,8 +488,12 @@ async function applyConfigAck(
   agent: unknown,
   store: CloudStore,
 ): Promise<{ agent: AgentSummary; revision: number; messageCursors: Array<{ agentId: string; maxSeq: number }> }> {
-  const summary = agentSummarySchema.parse(agent);
-  if (summary.id !== agentId) throw new Error("config_ack agent id mismatch");
+  const parsedSummary = agentSummarySchema.parse(agent);
+  if (parsedSummary.id !== agentId) throw new Error("config_ack agent id mismatch");
+  // Absent means "no ceiling", and an AgentSummary says that with `null` — not
+  // with `undefined`, which the wire schema tolerates only because an older
+  // desktop build does not send the key at all.
+  const summary: AgentSummary = { ...parsedSummary, maxRunDurationMs: parsedSummary.maxRunDurationMs ?? null };
   const snapshot = await store.getSnapshot(accountId, workspaceId);
   const existing = snapshot?.agents.find((entry) => entry.id === agentId);
   if (!existing) throw new Error("agent_not_found");
@@ -492,10 +511,18 @@ const agentSummarySchema = z.object({
   model: z.string().min(1).max(160),
   systemPrompt: z.string().nullable(),
   providerId: z.string().nullable(),
+  projectRoot: z.string().nullable(),
   codexWorkspace: z.string().nullable(),
   permissionMode: z.enum(["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]),
   sandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable(),
-  reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]).nullable(),
+  // Mirrors AgentSummary.reasoningEffort, which is an open token: the value was
+  // validated by the core that produced it, so re-checking it against a literal
+  // list here could only ever REJECT a level core accepted (see the patch schema
+  // above for why the shared validator cannot be imported at this layer).
+  reasoningEffort: z.string().max(64).nullable(),
+  // The run ceiling mirrors AgentSummary. Positive integer or null/absent.
+  // Absent is treated as "no ceiling" rather than "unset and therefore 0".
+  maxRunDurationMs: z.number().int().positive().nullable().optional(),
   teamId: z.string().nullable(),
   subagentKind: z.enum(["background", "task"]).nullable(),
   forcedSkills: z.array(z.string()).max(500),
@@ -506,6 +533,10 @@ const agentSummarySchema = z.object({
 });
 
 function cloudAgentFromSummary(existing: CloudAgent, summary: AgentSummary): CloudAgent {
+  // A desktop that sends both names with two different directories is refused
+  // here rather than stored: the mirror must not become the place where a
+  // disagreement is discovered later.
+  assertProjectRootAgreement(summary.projectRoot, summary.codexWorkspace);
   return {
     ...existing,
     id: summary.id,
@@ -518,12 +549,19 @@ function cloudAgentFromSummary(existing: CloudAgent, summary: AgentSummary): Clo
     permissionMode: summary.permissionMode,
     sandboxMode: summary.sandboxMode,
     reasoningEffort: summary.reasoningEffort,
-    codexWorkspace: summary.codexWorkspace,
+    projectRoot: summary.projectRoot,
+    // Echo the canonical value into the legacy field so an older client that
+    // reads only `codexWorkspace` still shows the right directory.
+    codexWorkspace: summary.projectRoot,
     metadata: {
       ...existing.metadata,
       forcedSkills: summary.forcedSkills,
       disabledSkills: summary.disabledSkills,
       closed: summary.closed,
+      // Same key, same meaning as the local agent setting. Folded in rather than
+      // given a column of its own: `metadata` is the synced extension bag, and a
+      // second home for one value is a second value.
+      maxRunDurationMs: summary.maxRunDurationMs ?? null,
     },
   };
 }

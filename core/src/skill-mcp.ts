@@ -8,7 +8,14 @@ import {
   tool,
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
-import { loadSkills, formatSkillInvokeForTool, formatSkillListForTool } from "./skills/index.js";
+import { loadSkills, formatSkillListForTool, skillInvokeToolResult } from "./skills/index.js";
+
+/** A tool failure the model can act on: the code is machine-readable, the
+ *  message is human-readable, and both travel in the same JSON so an isError
+ *  result never looks like a skill body. */
+function skillErrorPayload(fields: Record<string, unknown>): string {
+  return JSON.stringify(fields);
+}
 
 export const SKILL_MCP_SERVER_NAME = "agentorch-skill";
 export const SKILL_INVOKE_TOOL_NAME = `mcp__${SKILL_MCP_SERVER_NAME}__skill_invoke`;
@@ -17,6 +24,15 @@ export const SKILL_LIST_TOOL_NAME = `mcp__${SKILL_MCP_SERVER_NAME}__skill_list`;
 export interface SkillRuntimeContext {
   workspace?: string;
   runtimeKind: string;
+  /** The turn's skill-section budget (see skillsBudgetFor). A tool call happens
+   *  mid-turn, so the exact remainder is not knowable here; the plan's budget is
+   *  the conservative upper bound the read is bounded by, and going over it is a
+   *  structured SKILL_BUDGET_EXCEEDED instead of an unbounded body in a context
+   *  that has no room for it. `null` = no budget was established. */
+  tokenBudget?: number | null;
+  /** Injected token measurer, so the tool path counts with the same tokenizer
+   *  the turn's budget did. */
+  measure?: (text: string) => number | null;
 }
 
 export function makeSkillMcpServer(ctx: SkillRuntimeContext): McpSdkServerConfigWithInstance {
@@ -36,13 +52,21 @@ export function makeSkillMcpServer(ctx: SkillRuntimeContext): McpSdkServerConfig
     {},
     async () => {
       if (loadSkills(workspaces).length === 0) {
+        // isError, not a success-shaped sentence: "no skills" is a finding the
+        // model must not read as a list of zero-or-more usable skills.
         return {
           content: [
             {
               type: "text" as const,
-              text: "No skills loaded. Add SKILL.md files to <ensemble dataDir>/skills/, ~/.claude/skills/, or ~/.codex/skills/.",
+              text: skillErrorPayload({
+                code: "SKILL_NOT_FOUND",
+                message:
+                  "No skills loaded. Add SKILL.md files to <ensemble dataDir>/skills/, ~/.claude/skills/, or ~/.codex/skills/.",
+                available: [],
+              }),
             },
           ],
+          isError: true,
         };
       }
       return { content: [{ type: "text" as const, text: formatSkillListForTool(workspaces) }] };
@@ -62,9 +86,36 @@ export function makeSkillMcpServer(ctx: SkillRuntimeContext): McpSdkServerConfig
     {
       name: z.string().min(1).describe("Skill name (slug from SKILL.md frontmatter)."),
     },
-    async ({ name }) => ({
-      content: [{ type: "text" as const, text: formatSkillInvokeForTool(name, workspaces, ctx.runtimeKind) }],
-    }),
+    async ({ name }) => {
+      const res = skillInvokeToolResult(name, {
+        runtimeKind: ctx.runtimeKind,
+        workspaces,
+        tokenBudget: ctx.tokenBudget ?? null,
+        ...(ctx.measure ? { measure: ctx.measure } : {}),
+      });
+      if (!res.ok) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: skillErrorPayload({
+                code: res.code,
+                name: res.name,
+                message: res.message,
+                available: res.available,
+                // A size refusal carries its arithmetic: the model can tell the
+                // user how big the skill is and how much room there was,
+                // instead of reporting "it did not load" with no number.
+                ...(res.tokenCost === undefined ? {} : { tokenCost: res.tokenCost }),
+                ...(res.availableBudget === undefined ? {} : { availableBudget: res.availableBudget }),
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      return { content: [{ type: "text" as const, text: res.text }] };
+    },
   );
 
   return createSdkMcpServer({

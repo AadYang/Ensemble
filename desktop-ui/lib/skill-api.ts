@@ -1,4 +1,5 @@
-import type { AgentSummary } from "@agentorch/shared";
+import type { AgentStatusReport, AgentSummary } from "@agentorch/shared";
+import { getAgentStatusReport } from "@/lib/agent-api";
 
 export type SkillSource = "project" | "ensemble" | "claude-user" | "codex-user" | "system";
 
@@ -10,12 +11,39 @@ export interface SkillDTO {
   source: SkillSource;
   path: string;
   body: string;
+  /** Optional matching inputs (`triggers` / `examples` frontmatter). */
+  triggers?: string[] | null;
+  examples?: string[] | null;
 }
 
-export async function listSkills(): Promise<SkillDTO[]> {
-  const res = await fetch("/api/skills");
+/** Discovery scope. Pass an agent id so its own project skills
+ *  (`.agents/skills`, `.claude/skills`, …) are discovered — the same scope the
+ *  agent's turns use. Without it the list is the user/ensemble/system set only,
+ *  and an enabled project skill would look like it does not exist. */
+export async function listSkills(agentId?: string | null): Promise<SkillDTO[]> {
+  const qs = agentId ? `?agent=${encodeURIComponent(agentId)}` : "";
+  const res = await fetch(`/api/skills${qs}`);
   if (!res.ok) throw new Error(`listSkills: ${res.status}`);
   return (await res.json()) as SkillDTO[];
+}
+
+/** This turn's skill state for one agent, straight from `plan.skills` — the
+ *  same object selection used, so the panel cannot report a skill as loaded
+ *  that the prompt never carried.
+ *
+ *  Aliased to the report's own field rather than re-declared: the panel and
+ *  `/status` are reading one object, and a second declaration is how the panel
+ *  ends up missing a field the server started sending. */
+export type AgentSkillStatus = NonNullable<AgentStatusReport["skills"]["turn"]>;
+export type AgentSkillState = AgentStatusReport["skills"];
+
+/** Read the skills slice of the SAME report `/status` prints, through the same
+ *  client. No cast: the response is the report type, so a renamed or removed
+ *  field is a compile error instead of a `body.skills ?? null` that quietly
+ *  reads `undefined` and renders an empty panel. */
+export async function getAgentSkillState(agentId: string): Promise<AgentSkillState | null> {
+  const report = await getAgentStatusReport(agentId);
+  return report?.skills ?? null;
 }
 
 export async function reloadSkills(): Promise<{ ok: true; count: number }> {

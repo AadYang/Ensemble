@@ -1,7 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { measureChatInputHeight } from "@agentorch/shared";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  capabilityView,
+  formatCapabilityFieldLines,
+  measureChatInputHeight,
+  type RunPlanStatusView,
+} from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import {
   clearAgentContext,
@@ -12,6 +17,7 @@ import {
   resetRuntimeSession,
   restartAgent,
 } from "@/lib/agent-api";
+import { fetchCloudAgentStatus } from "@/lib/cloud-api";
 import { listSkills, toggleAgentSkill } from "@/lib/skill-api";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useStore, type ChatTurn } from "@/store/agents";
@@ -107,6 +113,158 @@ function extractNextStepHint(text: string): string | null {
   return null;
 }
 
+const NONE = "(none)";
+
+/** Last path segment, for the header. `/` and `\` both count: this runs on
+ *  Windows and a project root can arrive with either separator. */
+function basename(p: string): string {
+  const parts = p.split(/[\\/]+/).filter(Boolean);
+  return parts[parts.length - 1] ?? p;
+}
+
+/** What the CLOUD can say about an agent this instance does not run.
+ *
+ *  `null` means "not this workspace's agent" and the caller falls back to the
+ *  ordinary "no local report" notice. Otherwise the answer is printed as it
+ *  came: a relayed plan, or `source: "unavailable"` with the server's reason.
+ *  Nothing here resolves anything — the cloud has no runtime and this surface
+ *  has no snapshot to guess from. */
+async function cloudStatusNotice(agentId: string, t: TranslateFn): Promise<string | null> {
+  const state = useStore.getState();
+  const session = state.cloudSession;
+  const workspaceId = state.cloudCurrentWorkspaceId;
+  if (!session || !workspaceId) return null;
+  // Membership is checked against the workspace SNAPSHOT by id — never by name,
+  // and never against the local agent list.
+  if (!state.cloudSnapshot?.agents.some((entry) => entry.id === agentId)) return null;
+  const status = await fetchCloudAgentStatus(session, workspaceId, agentId);
+  if (status.planView === null) {
+    return t("slash.status.cloudUnavailable", { source: status.source, reason: status.reason });
+  }
+  return [
+    t("slash.status.cloudSnapshot", {
+      source: status.source,
+      at: status.publishedAt ?? "(unknown)",
+    }),
+    ...formatRunPlanLines(status.planView),
+  ].join("\n");
+}
+
+/** `/status`'s plan section, rendered from the view-model and nothing else.
+ *
+ *  Every value here is read off `RunPlanStatusView` — the SAME object the
+ *  settings page and the context bar read, built once by the server. This
+ *  function decides nothing: it does not look at the provider kind, the model
+ *  id, its prefix, or the runtime name, because a text surface that decided
+ *  "sandbox applies here" from a provider kind would be a second resolver and
+ *  would disagree with the server the moment the server learned something new.
+ *
+ *  Coverage is deliberately complete rather than curated: identity, source,
+ *  confidence, EVERY diagnostic (not just the ones we thought to print) and
+ *  every settings row, so the text report answers the same questions the UI
+ *  does. A `null` prints as `(none)`/`(unknown)` — never as a default that
+ *  would read like a finding. */
+export function formatRunPlanLines(plan: RunPlanStatusView | null): string[] {
+  if (!plan) {
+    // No plan is a real state (nothing has run in this process); inventing one
+    // from the agent's provider would be exactly the inference this replaces.
+    return ["plan=(none — no turn has resolved a plan for this agent yet)"];
+  }
+  const out: string[] = [];
+  const id = plan.identity;
+  const t = plan.transport;
+  const r = plan.reasoning;
+  const pr = plan.projectRoot;
+  const ctx = plan.context;
+  const h = plan.history;
+  const sk = plan.skills;
+  const l = plan.liveness;
+
+  out.push(`plan.source=${plan.source} planHash=${plan.planHash} resolvedAt=${plan.resolvedAt}`);
+  out.push(
+    `plan.identity=providerId:${id.providerId ?? NONE} providerScope:${id.providerScope} ` +
+      `runtime:${id.runtime} runtimeVersion:${id.runtimeVersion ?? NONE} ` +
+      `transport:${id.transport} modelId:${id.modelId}`,
+  );
+  out.push(
+    `plan.transport=requested:${t.requested ?? NONE} resolved:${t.resolved} origin:${t.origin} ` +
+      `confidence:${t.confidence} transportSource:${plan.transportSource} ` +
+      `fallbackAllowed:${t.fallbackAllowed} fallbackTarget:${t.fallbackTarget ?? NONE} ` +
+      `fallbackReason:${t.fallbackReason}`,
+  );
+  out.push(
+    `plan.reasoning=requested:${r.requested ?? "(inherit)"} resolved:${r.resolved ?? NONE} ` +
+      `outcome:${r.outcome} levels:${r.levels === null ? "(unknown)" : r.levels.join("|")} ` +
+      `levelsOrigin:${r.levelsOrigin} levelsConfidence:${r.levelsConfidence} levelsSource:${r.levelsSource}`,
+  );
+  if (r.rejection) out.push(`plan.reasoning.rejection=${r.rejection.code}: ${r.rejection.detail}`);
+  out.push(
+    `plan.projectRoot=value:${pr.value ?? NONE} configuredPath:${pr.configuredPath ?? NONE} ` +
+      `source:${pr.source} state:${pr.state}`,
+  );
+  if (pr.invalid) out.push(`plan.projectRoot.invalid=${pr.invalid.code}: ${pr.invalid.reason}`);
+  out.push(
+    `plan.context=effectiveWindow:${ctx.effectiveWindow ?? "(unknown)"} ` +
+      `advertisedContextWindow:${ctx.advertisedContextWindow ?? "(unknown)"} ` +
+      `outputReserve:${ctx.outputReserve ?? "(unknown)"} ` +
+      `compactionThreshold:${ctx.compactionThreshold ?? "(unknown)"} ` +
+      `contextBudget:${ctx.contextBudget ?? "(unset)"}`,
+  );
+  out.push(
+    `plan.history=status:${h.status} strategy:${h.strategy ?? NONE} reason:${h.reason} ` +
+      `tokenBudget:${h.tokenBudget ?? "(unknown)"} measuredTokens:${h.measuredTokens ?? "(unmeasured)"} ` +
+      `actualIncludedTokens:${h.actualIncludedTokens} overBudget:${h.overBudget} counting:${h.counting} ` +
+      `counts:included=${h.counts.included},summarized=${h.counts.summarized},dropped=${h.counts.dropped} ` +
+      `includedRanges:${h.includedRanges.map((x) => `${x.fromSeq}-${x.toSeq}`).join(",") || NONE} ` +
+      `overflow:${h.overflow ? `${h.overflow.fromSeq}-${h.overflow.toSeq}(${h.overflow.count})` : NONE} ` +
+      `summaries:${h.summaries.map((x) => `gen${x.generation}:${x.fromSeq}-${x.toSeq}#${x.count}`).join(",") || NONE}`,
+  );
+  for (const d of h.diagnostics) out.push(`plan.history.diagnostic=${d}`);
+  out.push(
+    `plan.skills=status:${sk.status} reason:${sk.reason} discovered:${sk.discovered} ` +
+      `selected:${sk.selected} loaded:${sk.loaded} deferred:${sk.deferred} ` +
+      `unavailable:${sk.unavailable} tokenCost:${sk.tokenCost ?? "(unknown)"} counting:${sk.counting}`,
+  );
+  for (const s of sk.loadedSkills) out.push(`plan.skills.loaded=${s.name} [${s.source}] tokens:${s.tokens ?? "(unknown)"}`);
+  for (const s of sk.deferredSkills) out.push(`plan.skills.deferred=${s.name} [${s.source}] ${s.reason}`);
+  for (const s of sk.unavailableSkills) out.push(`plan.skills.unavailable=${s.name} [${s.source}] ${s.code}: ${s.reason}`);
+  for (const d of sk.diagnostics) out.push(`plan.skills.diagnostic=${d}`);
+  out.push(
+    `plan.liveness=status:${l.status} reason:${l.reason} suspectedAfterMs:${l.suspectedAfterMs} ` +
+      `suspectedAfterSource:${l.suspectedAfterSource} healthCheckGraceMs:${l.healthCheckGraceMs} ` +
+      `hardDeadlineMs:${l.hardDeadlineMs ?? "(none: no wall-clock ceiling)"} ` +
+      `hardDeadlineSource:${l.hardDeadlineSource} probe.capability:${l.probe.capability} ` +
+      `signals:${l.signals.join("|") || NONE}`,
+  );
+  out.push(`plan.liveness.probe.reason=${l.probe.reason}`);
+  for (const d of l.diagnostics) out.push(`plan.liveness.diagnostic=${d}`);
+  for (const p of plan.preferences) {
+    out.push(
+      `plan.preference=${p.field} requested:${String(p.requested)} outcome:${p.outcome}` +
+        (p.rejection ? ` rejection:${p.rejection.code}: ${p.rejection.detail}` : "") +
+        (p.deferred ? ` deferred:${p.deferred.pendingPhase ?? "(no phase settled)"}: ${p.deferred.reason}` : ""),
+    );
+  }
+  // EVERY diagnostic, including the ones nothing else renders: a diagnostic that
+  // does not reach a surface is the "we know but are not telling you" case.
+  for (const d of plan.diagnostics) {
+    out.push(`plan.diagnostic=${d.field} status:${d.status} origin:${d.origin} confidence:${d.confidence} — ${d.detail}`);
+  }
+  out.push(
+    `plan.diagnosticCounts=${Object.entries(plan.diagnosticCounts)
+      .map(([k, v]) => `${k}:${v}`)
+      .join(" ")}`,
+  );
+  // The settings rows come from the SAME view-model the settings page renders.
+  // Printing `plan.settings` here directly was a second interpretation of the
+  // same rows: a disabled row had no stated reason in the text, and a rejected
+  // choice could read differently from the dialog. `formatCapabilityFieldLines`
+  // is the text half of that one model, so the two surfaces print the same
+  // `resolved` value for the same field by construction.
+  out.push(...formatCapabilityFieldLines(capabilityView(plan).fields));
+  return out;
+}
+
 function makeScrollFollowSignal(turns: readonly ChatTurn[], status: string): string {
   const last = turns[turns.length - 1];
   return [
@@ -134,6 +292,12 @@ export function ChatPane({ agentId }: { agentId: string }) {
   const clearInputDraft = useStore((s) => s.clearInputDraft);
   const setInputSelection = useStore((s) => s.setInputSelection);
   const setUsageOpen = useStore((s) => s.setUsageOpen);
+  // The agent's last resolved plan, or undefined when nothing has run yet. Read
+  // here and handed down: the bar must not go looking for a plan of its own.
+  const plan = useStore((s) => s.planByAgent[agentId]);
+  // The server's last word on this agent's run. Absent = nothing has been said
+  // for it since the connection opened, which renders as nothing at all.
+  const liveness = useStore((s) => s.livenessByAgent[agentId]);
   const [peerOpen, setPeerOpen] = useState(false);
   const [picker, setPicker] = useState<PickerState | null>(null);
   const [providers, setProviders] = useState<ProviderDTO[]>([]);
@@ -370,6 +534,13 @@ export function ChatPane({ agentId }: { agentId: string }) {
     });
   }, [inputSelection]);
 
+  // Built before the early return: a hook after `if (!agent)` white-screens
+  // the pane once the agent hydrates (Rules of Hooks).
+  const capability = useMemo(
+    () => capabilityView(plan ?? null, agent?.contextUsage?.contextWindow ?? null),
+    [plan, agent?.contextUsage?.contextWindow],
+  );
+
   if (!agent) {
     return (
       <div className="flex-1 flex items-center justify-center text-[var(--text-dim)] text-xs">
@@ -515,6 +686,19 @@ export function ChatPane({ agentId }: { agentId: string }) {
       case "status": {
         try {
           const s = await getAgentStatusReport(agentId);
+          if (!s) {
+            // No LOCAL report — but that is not the same as no answer. When
+            // this agent IS in the current cloud workspace, the plan it ran
+            // under was published there by the desktop that owns it, and the
+            // cloud relays it verbatim. `source: "unavailable"` is a complete
+            // answer too, printed with its reason. What is never done is
+            // answering from a local agent that merely shares the id: the
+            // lookup below is by id INSIDE the workspace snapshot, so an id
+            // that is not in it falls through to the same notice as before.
+            const cloud = await cloudStatusNotice(agentId, t);
+            appendNotice(agentId, cloud ?? t("slash.status.notLocal"));
+            return;
+          }
           const lines = [
             `name=${s.name}`,
             `provider=${s.providerName ?? "(default)"} (${s.providerKind ?? "?"}) id=${s.providerId ?? "(default)"}`,
@@ -523,15 +707,22 @@ export function ChatPane({ agentId }: { agentId: string }) {
             `teamId=${s.teamId ?? "(none)"}`,
             s.roleWeak ? "roleWeak=true (no team and no role prompt; role constraints are weak)" : null,
             `permissionMode=${s.permissionMode}`,
-            s.providerKind === "openai-codex"
-              ? `sandboxOverride=${s.sandboxMode ?? "(inherit)"}`
-              : null,
-            s.providerKind === "openai-codex"
+            // Sandbox shows whenever the route HAS one. `sandboxSource === "n/a"`
+            // is the SERVER saying the field does not apply here — this surface
+            // does not get to decide that from the provider kind.
+            s.sandboxSource !== "n/a" ? `sandboxOverride=${s.sandboxMode ?? "(inherit)"}` : null,
+            s.sandboxSource !== "n/a"
               ? `effectiveSandbox=${s.effectiveSandboxMode ?? "(none)"} (${s.sandboxSource})`
               : null,
             `reasoningEffort=${s.reasoningEffort ?? "(inherit)"}`,
-            `cwd=${s.runtimeCwd}`,
-            s.codexWorkspace ? `codexWorkspace=${s.codexWorkspace}` : null,
+            // A stored value that cannot be used is NOT the same as "inherit":
+            // nothing is sent and the stored value is left untouched, but the
+            // user is told, so their setting is never quietly replaced by the
+            // runtime default.
+            s.storedReasoningUnusable
+              ? `reasoningStoredUnusable=${JSON.stringify(s.storedReasoningUnusable.raw)}: ${s.storedReasoningUnusable.reason}`
+              : null,
+            `cwd=${s.runtimeCwd ?? "(none)"}`,
             `systemPromptHash=${s.systemPromptHash}`,
             `storedSystemPromptHash=${s.storedSystemPromptHash ?? "(none)"}`,
             `systemPromptHashMatchesStored=${s.systemPromptHashMatchesStored ? "yes" : "no"}`,
@@ -541,6 +732,21 @@ export function ChatPane({ agentId }: { agentId: string }) {
             `codexResumeSignature=${s.hasCodexResumeSignature ? "yes" : "no"}`,
             `codexUsageSnapshot=${s.hasCodexUsageSnapshot ? "yes" : "no"}`,
             s.closed ? "closed=true" : null,
+            // The whole plan surface, from the ONE view-model. The same object
+            // the settings page and the context bar render, so the text report
+            // and the UI cannot answer differently.
+            ...formatRunPlanLines(s.planView),
+            // A compacted history whose originals are invisible reads as data
+            // the user lost. Read-only this phase: the generations are listed and
+            // nothing here restores them.
+            s.archivedGenerations.length === 0
+              ? "archived=(none)"
+              : `archived=${s.archivedGenerations.length} generation(s): ` +
+                s.archivedGenerations
+                  // `archivedAt` is UNIX SECONDS (see the status DTO); feeding it
+                  // straight to Date printed 1970 for every generation.
+                  .map((g) => `gen${g.generation}[${g.fromSeq}-${g.toSeq}]×${g.count}@${new Date(g.archivedAt * 1000).toISOString()}`)
+                  .join(", "),
           ].filter(Boolean);
           appendNotice(agentId, lines.join("\n"));
         } catch (err) {
@@ -780,12 +986,52 @@ export function ChatPane({ agentId }: { agentId: string }) {
       <div className="px-3 py-1.5 border-b border-[var(--border)] flex items-center gap-2 text-xs">
         <span className={`status-dot ${summary.status}`} />
         <span className="font-bold">{summary.name}</span>
-        <span className="text-[var(--text-dim)]">{summary.model}</span>
-        {contextUsage && <ContextBar context={contextUsage} />}
+        {/* The model the LAST TURN actually used, when we have a plan. `summary
+            .model` is the configured value and can differ from what ran, and a
+            header that shows the configuration as if it were the fact is a
+            small lie the plan lets us avoid. Falls back to the configured value
+            only when there is no plan at all — never to a guess. */}
+        <span className="text-[var(--text-dim)]">{plan?.identity.modelId ?? summary.model}</span>
+        {/* The project this agent actually works in. Shown only when the plan
+            established one: absent means "we do not know", which is NOT the same
+            as "unbound", and rendering `(unbound)` for it would invent a state
+            the user never chose. */}
+        {plan?.projectRoot.value && (
+          <span
+            className="text-[var(--text-dim)] opacity-70"
+            title={plan.projectRoot.value}
+          >
+            {basename(plan.projectRoot.value)}
+          </span>
+        )}
+        {/* The run's liveness, in the server's own words. Rendered ONLY when the
+            server has said something: the state, the quiet time and the sentence
+            are all measured by the process that can see the run, and nothing
+            here recomputes or times them out. */}
+        {liveness && (
+          <span
+            className={
+              liveness.state === "suspected-stall" || liveness.state === "confirmed-dead"
+                ? "text-[var(--warn)]"
+                : "text-[var(--text-dim)] opacity-70"
+            }
+            title={liveness.description}
+          >
+            {liveness.state}
+          </span>
+        )}
+        {/* Always rendered. `null` is a real state (nothing has run yet, or the
+            server has not reported since we subscribed) and `contextBarView`
+            renders it as "context: unknown" plus the plan's own limits — the
+            alternative was for the whole readout, plan half included, to
+            disappear and tell the user nothing. */}
+        <ContextBar context={contextUsage} capability={capability} />
         <span className="text-[var(--text-dim)]">· {summary.status}</span>
         {summary.closed && (
           <span className="px-1.5 py-0.5 border border-[var(--warn)] text-[var(--warn)] text-[10px] tracking-wider">
-            {t("chat.badge.closed")}
+            {/* A closed SUBAGENT was retired by the lifecycle, not closed by the
+                user — the same state, but the label has to say what it means. */}
+            {summary.subagentKind ? t("chat.badge.archived") : t("chat.badge.closed")}
           </span>
         )}
         {summary.permissionMode === "plan" && (

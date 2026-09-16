@@ -20,10 +20,14 @@ export function makeSpawnSubagentHandler(
   description: string;
   prompt: string;
   background?: boolean;
+  projectRoot?: string;
 }) => Promise<{ finalText: string; subagentId: string; background?: boolean }> {
   return async (args) =>
     sessions.spawnTaskSubagent(parentId, args.description, args.prompt, {
       background: args.background === true,
+      // Omitting the key (rather than passing undefined through an explicit
+      // field) is what keeps "no override" distinct from "explicitly unbound".
+      ...(args.projectRoot === undefined ? {} : { projectRoot: args.projectRoot }),
     });
 }
 
@@ -44,7 +48,8 @@ export function makeSubagentMcpServer(
       "Set background=true to spawn a detached BACKGROUND TASK: the tool returns the " +
       "subagent's id immediately and you keep working while it runs; you will be sent a " +
       "`subagent-finished` message when it reaches a terminal state. Omit background to " +
-      "wait and receive the final response. Subagent depth is capped at 3 levels.",
+      "wait and receive the final response. The subagent works in YOUR project root " +
+      "unless you pass projectRoot to place it elsewhere. Subagent depth is capped at 3 levels.",
     {
       description: z.string().min(1).describe("Short task summary (3-5 words); becomes the subagent's name."),
       prompt: z.string().min(1).describe("Full task description / instructions for the subagent."),
@@ -54,6 +59,14 @@ export function makeSubagentMcpServer(
         .describe(
           "true = detached background task (returns id immediately, you keep working). " +
             "false/omitted = wait and return the subagent's final response.",
+        ),
+      projectRoot: z
+        .string()
+        .optional()
+        .describe(
+          "Optional override for the subagent's project root (absolute path to an " +
+            "existing directory). Omit to inherit YOUR project root — usually correct, " +
+            "since a subtask is part of your project.",
         ),
     },
     async (args) => {

@@ -13,19 +13,29 @@ const claudeRuntime = new ClaudeAgentRuntime();
 const openaiRuntime = new OpenAIAgentRuntime();
 const codexRuntime = new CodexCliRuntime();
 
+/** The runtime SCOPE a provider kind runs under — what the run plan records as
+ *  `identity.runtime`. One table, read by both `chooseRuntime` and the plan, so
+ *  a runtime cannot execute under a name other than the one `/status` resolved
+ *  against. */
+const RUNTIME_SCOPE_BY_KIND: Record<string, "claude" | "openai" | "codex"> = {
+  "anthropic-local": "claude",
+  anthropic: "claude",
+  "openai-local": "openai",
+  "openai-compat": "openai",
+  "openai-codex": "codex",
+};
+
+export function runtimeScopeForKind(kind: string): string {
+  const scope = RUNTIME_SCOPE_BY_KIND[kind];
+  if (!scope) throw new Error(`unknown provider kind: ${kind}`);
+  return scope;
+}
+
 export function chooseRuntime(kind: string): AgentRuntime {
-  switch (kind) {
-    case "anthropic-local":
-    case "anthropic":
-      return claudeRuntime;
-    case "openai-local":
-    case "openai-compat":
-      return openaiRuntime;
-    case "openai-codex":
-      return codexRuntime;
-    default:
-      throw new Error(`unknown provider kind: ${kind}`);
-  }
+  const scope = runtimeScopeForKind(kind);
+  if (scope === "claude") return claudeRuntime;
+  if (scope === "openai") return openaiRuntime;
+  return codexRuntime;
 }
 
 export type { AgentRuntime, RuntimeEvent, RuntimeOptions } from "./types.js";
