@@ -170,7 +170,7 @@ describe("a human in the loop pauses stall judgement", () => {
 });
 
 describe("hard evidence, and only hard evidence", () => {
-  it("terminates when the child exited mid-turn", () => {
+  it("does not terminate on a raw child exit before the stream is classified", () => {
     const s = signals({
       childProcess: {
         pid: 42,
@@ -183,8 +183,26 @@ describe("hard evidence, and only hard evidence", () => {
       },
     });
     const decision = decide("running", s, policy(), START + 1_001);
+    expect(decision.action).toBe("none");
+  });
+
+  it("terminates when the runtime classifies the child-backed stream as abnormal", () => {
+    const s = signals({
+      streamClosedAt: START + 1_000,
+      streamClosedAbnormally: true,
+      childProcess: {
+        pid: 42,
+        started: true,
+        alive: false,
+        exited: true,
+        exitCode: 1,
+        exitSignal: null,
+        exitAt: START + 1_000,
+      },
+    });
+    const decision = decide("running", s, policy(), START + 1_001);
     expect(decision.action).toBe("terminate");
-    expect(decision.action === "terminate" && decision.code).toBe("RUNTIME_CONFIRMED_DEAD");
+    expect(decision.action === "terminate" && decision.code).toBe("RUNTIME_STREAM_CLOSED");
   });
 
   it("does NOT terminate on an exit we asked for", () => {

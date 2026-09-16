@@ -350,24 +350,16 @@ export function evaluateLiveness(input: {
     };
   }
 
-  // 2. Hard evidence: the child process is gone and the run had not finished.
+  // 2. A child exit is recorded, but the drained stream/result owns the
+  //    immediate verdict; a delayed dead-process verdict comes from the probe.
   //    An exit after we asked it to stop is not evidence — it is what we asked
   //    for. Neither is an exit that lands after the model's own terminal result.
-  if (
-    signals.childProcess.exited &&
-    !signals.stopRequested &&
-    !signals.sawResult &&
-    signals.streamClosedAt === null
-  ) {
-    return {
-      action: "terminate",
-      state: "confirmed-dead",
-      code: "RUNTIME_CONFIRMED_DEAD",
-      reason:
-        `the runtime's child process exited (code=${signals.childProcess.exitCode ?? "n/a"}, ` +
-        `signal=${signals.childProcess.exitSignal ?? "n/a"}) without producing a result for this run`,
-    };
-  }
+  // A raw child exit is deliberately not a terminal verdict. On Claude the OS
+  // exit event can arrive before the SDK iterator yields its final `result`;
+  // evaluating it synchronously turned clean exit(0) into a false
+  // RUNTIME_CONFIRMED_DEAD. The runtime classifies the stream after draining
+  // it. A genuinely broken stream terminates below, while a wedged stream with
+  // a dead child is still caught by the bounded health-check probe.
 
   // 3. Hard evidence: the stream closed abnormally with work outstanding.
   if (signals.streamClosedAbnormally && !signals.stopRequested) {

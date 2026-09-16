@@ -1,5 +1,8 @@
 # 解放模型能力：Capability Registry 与 ResolvedRunPlan 总方案
 
+> 2026-09-16 复审、已修回归与剩余实施项见
+> [`model-capability-audit-2026-09-16.md`](./model-capability-audit-2026-09-16.md)。
+
 > 状态：已拍板，待分阶段实施（2026-09-15）  
 > 主线优先级：本方案高于 context-window 展示与 provenance 精修。后者只能作为本方案的输入或后续 UI 消费者，不得阻塞阶段 0～2。  
 > 当前工作树：E开发 的 context-window 改动保持未提交并冻结边界；本文件只记录新主线，不代表那些改动已验收。

@@ -530,9 +530,15 @@ export function resolveModelCapabilities(req: ResolutionRequest): ResolvedCapabi
           },
         ],
       )
-    : unknownCapability<boolean>("not established for this route; no default is assumed", [
+    : // The HTTP answer comes from the layer that can actually observe it: the
+      // session layer knows which endpoint the provider points at and what that
+      // endpoint last said about `previous_response_id` (see
+      // capability/server-conversation.ts). No value = not established, and the
+      // turn rebuilds its transcript locally rather than naming a continuation.
+      (req.serverConversationFacts ??
+      unknownCapability<boolean>("not established for this route; no default is assumed", [
         { origin: "provider-discovered", outcome: "absent", reason: "no discovery has run (phase 1)" },
-      ]);
+      ]));
   const observedCompaction = nativeCli
     ? compactionThreshold(req.model, { runtime, vendor, runtimeVersion, providerId })
     : null;

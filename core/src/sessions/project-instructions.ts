@@ -1,15 +1,12 @@
-// Project instructions for the runtimes that cannot read them themselves.
+// Project instructions for runtimes that do not read them under Ensemble's
+// actual adapter configuration.
 //
-// Claude and Codex are spawned CLIs: the user's own tool already knows how to
-// find and load its project instruction files from the working directory the
-// plan hands it. Injecting them a second time would put the same rules in the
-// prompt twice and, worse, would let Ensemble's copy drift from the file the
-// CLI actually read.
-//
-// The OpenAI/API runtime is different: it is an in-process HTTP client with no
-// notion of a directory, so the project's instructions reach the model only if
-// Ensemble loads them. That is what this module is for, and it is called ONLY
-// for that runtime.
+// Codex reads project instructions from the cwd itself. The OpenAI/API runtime
+// has no directory awareness, so Ensemble must load them. Claude Code normally
+// understands CLAUDE.md, but our adapter supplies a complete string
+// `systemPrompt` and disables filesystem `settingSources`; under that exact
+// configuration the SDK performs no CLAUDE.md walk-up. Ensemble therefore
+// injects the same full block for Claude too, while leaving Codex alone.
 //
 // The boundaries are the ones the plan drew:
 //   • files directly inside the project root — never a parent directory and

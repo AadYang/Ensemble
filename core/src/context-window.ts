@@ -124,6 +124,9 @@ export interface ModelCatalogEntry {
    *  the vendor's model list. Reporting one provenance for both would put a
    *  citation on a value that citation never covered. */
   reasoningSource?: string;
+  /** Confidence of the LADDER, when it is not the same rung as the window.
+   *  Omitted = reuse `confidence`. */
+  reasoningConfidence?: WindowConfidence;
   /** Provider doc URL, or who/where the value was confirmed. */
   source: string;
   /** ISO date this value was last checked against `source`. */
@@ -283,6 +286,8 @@ export function scopeForAgent(
  *  says 1,050,000" is a citation. Verified 2026-09-15. */
 const openaiDoc = (id: string) => `https://developers.openai.com/api/docs/models/${id}`;
 const DEEPSEEK_PRICING_DOC = "https://api-docs.deepseek.com/quick_start/pricing";
+const DEEPSEEK_THINKING_DOC = "https://api-docs.deepseek.com/guides/thinking_mode";
+const ANTHROPIC_EFFORT_DOC = "https://platform.claude.com/docs/en/build-with-claude/effort";
 const MINIMAX_DOC = "https://platform.minimaxi.com/docs/api-reference/text-anthropic-api";
 const GLM_DOC = "https://docs.bigmodel.cn/cn/guide/models";
 
@@ -337,11 +342,10 @@ export const MODEL_CATALOG: Record<string, ModelCatalogEntry> = {
   },
   // ── reasoning ladders ───────────────────────────────────────────────
   // Only the models whose vendor-served ladder we actually have are listed.
-  // Everything else (including every non-OpenAI entry above and below) stays
-  // WITHOUT `reasoningLevels` on purpose: the planner then reports the ladder
-  // as unknown and accepts a syntactically valid token as user-declared rather
-  // than inventing a set. Note what the real data says — `ultra` exists, and
-  // `minimal` appears nowhere, which is the whole argument against a closed
+  // A model without `reasoningLevels` stays unknown: the planner then accepts a
+  // syntactically valid token as user-declared rather than inventing a set.
+  // Note what the real data says — `ultra` exists, and `minimal` appears
+  // nowhere on the OpenAI list, which is the whole argument against a closed
   // enum shared by six files.
   [key("openai", "gpt-5.5")]: {
     advertisedContextWindow: 1_050_000,
@@ -461,12 +465,22 @@ export const MODEL_CATALOG: Record<string, ModelCatalogEntry> = {
     source: `${DEEPSEEK_PRICING_DOC} (owner-confirmed 2026-09-15)`,
     verifiedAt: "2026-09-15",
     confidence: "confirmed",
+    // Official Chat Completions / Responses ladder: low / high / max.
+    // Default effort is high with thinking enabled. Compatibility aliases
+    // (minimal→low, medium/xhigh→high, ultra→max) are the vendor's mapping,
+    // not extra levels we offer in the picker.
+    reasoningLevels: ["low", "high", "max"],
+    defaultReasoningLevel: "high",
+    reasoningSource: `${DEEPSEEK_THINKING_DOC} (verified 2026-09-16)`,
   },
   [key("deepseek", "deepseek-v4-pro")]: {
     advertisedContextWindow: 1_000_000,
     source: `${DEEPSEEK_PRICING_DOC} (owner-confirmed 2026-09-15)`,
     verifiedAt: "2026-09-15",
     confidence: "confirmed",
+    reasoningLevels: ["low", "high", "max"],
+    defaultReasoningLevel: "high",
+    reasoningSource: `${DEEPSEEK_THINKING_DOC} (verified 2026-09-16)`,
   },
   // Legacy V3/R1-era ids kept in DEEPSEEK_OFFICIAL_MODELS for existing agents;
   // the current pricing page no longer lists them. Held at the last documented
@@ -576,6 +590,56 @@ export const MODEL_CATALOG: Record<string, ModelCatalogEntry> = {
     verifiedAt: "2026-09-11",
     confidence: "confirmed",
   },
+};
+
+/** Official Claude `output_config.effort` ladders, keyed `vendor/model`.
+ *
+ *  These sit beside `MODEL_CATALOG` rather than on it because we have not
+ *  independently verified Anthropic context windows (those still come from the
+ *  LiteLLM snapshot). A ladder is a different fact: the effort page names the
+ *  levels per model, verified 2026-09-16. Hanging them on an unverified window
+ *  entry would either invent a window or mark a documented ladder unverified.
+ *
+ *  Default effort is `high` (equivalent to omitting the parameter).
+ *  `xhigh` is not universal: the page lists it for Fable 5 / Mythos 5 /
+ *  Opus 5 / Opus 4.8 / Opus 4.7 / Sonnet 5, and explicitly notes that not
+ *  every `max`-capable model has it (Opus 4.6, Sonnet 4.6, Mythos Preview).
+ *  Opus 4.5 is effort-capable but on neither the `max` nor `xhigh` list. */
+const ANTHROPIC_EFFORT_SOURCE = `${ANTHROPIC_EFFORT_DOC} (verified 2026-09-16)`;
+const ANTHROPIC_EFFORT_FULL = ["low", "medium", "high", "xhigh", "max"] as const;
+const ANTHROPIC_EFFORT_NO_XHIGH = ["low", "medium", "high", "max"] as const;
+const ANTHROPIC_EFFORT_CORE = ["low", "medium", "high"] as const;
+
+type BuiltinReasoningLadder = {
+  levels: readonly string[];
+  defaultLevel: string;
+  source: string;
+  confidence: WindowConfidence;
+};
+
+const anthropicEffort = (levels: readonly string[]): BuiltinReasoningLadder => ({
+  levels,
+  defaultLevel: "high",
+  source: ANTHROPIC_EFFORT_SOURCE,
+  confidence: "confirmed",
+});
+
+const MODEL_REASONING_LADDERS: Record<string, BuiltinReasoningLadder> = {
+  [key("anthropic", "claude-opus-5")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-opus-4-8")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-opus-4-7")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-opus-4-7-20260416")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-sonnet-5")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-fable-5")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-fable-5-1")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-mythos-5")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-mythos-5-1")]: anthropicEffort(ANTHROPIC_EFFORT_FULL),
+  [key("anthropic", "claude-opus-4-6")]: anthropicEffort(ANTHROPIC_EFFORT_NO_XHIGH),
+  [key("anthropic", "claude-opus-4-6-20260205")]: anthropicEffort(ANTHROPIC_EFFORT_NO_XHIGH),
+  [key("anthropic", "claude-sonnet-4-6")]: anthropicEffort(ANTHROPIC_EFFORT_NO_XHIGH),
+  [key("anthropic", "claude-mythos-preview")]: anthropicEffort(ANTHROPIC_EFFORT_NO_XHIGH),
+  [key("anthropic", "claude-opus-4-5")]: anthropicEffort(ANTHROPIC_EFFORT_CORE),
+  [key("anthropic", "claude-opus-4-5-20251101")]: anthropicEffort(ANTHROPIC_EFFORT_CORE),
 };
 
 /** The configuration condition a codex observation is only valid under. Kept
@@ -966,15 +1030,27 @@ export function reasoningLevelsEntry(
     };
   }
 
-  if (base?.reasoningLevels === undefined) return null;
-  const levels = [...base.reasoningLevels];
-  const dflt = base.defaultReasoningLevel ?? null;
+  if (base?.reasoningLevels !== undefined) {
+    const levels = [...base.reasoningLevels];
+    const dflt = base.defaultReasoningLevel ?? null;
+    return {
+      ok: true,
+      levels,
+      defaultLevel: dflt !== null && levels.includes(dflt) ? dflt : null,
+      source: baseSource,
+      confidence: base.reasoningConfidence ?? base.confidence,
+    };
+  }
+
+  const extra = MODEL_REASONING_LADDERS[k];
+  if (extra === undefined) return null;
+  const levels = [...extra.levels];
   return {
     ok: true,
     levels,
-    defaultLevel: dflt !== null && levels.includes(dflt) ? dflt : null,
-    source: baseSource,
-    confidence: base.confidence,
+    defaultLevel: levels.includes(extra.defaultLevel) ? extra.defaultLevel : null,
+    source: extra.source,
+    confidence: extra.confidence,
   };
 }
 

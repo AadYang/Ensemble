@@ -254,7 +254,8 @@ describe("resolveModelCapabilities", () => {
   });
 
   // Claiming server conversation support we have not verified is how history
-  // gets dropped. Only a native CLI proves it by construction.
+  // gets dropped. A native CLI holds a local session file, which is not the
+  // same claim as "the server stored a conversation we can continue".
   it("does not claim HTTP capabilities it has not discovered", () => {
     const { facts } = m.resolveModelCapabilities({ model: "gpt-5.6-sol", runtime: "openai" });
     expect(facts.supportsServerConversation.value).toBeUndefined();
@@ -269,8 +270,11 @@ describe("resolveModelCapabilities", () => {
       runtime: "codex",
       runtimeVersion: "0.154.0",
     });
-    expect(facts.supportsServerConversation.value).toBe(true);
-    expect(facts.supportsNativeCompaction.value).toBe(true);
+    // A local session file is not a server-side conversation; holding a session
+    // is also not evidence of native compaction without a version-matched
+    // observation. Tool calling and MCP are facts about the harness.
+    expect(facts.supportsServerConversation.value).toBe(false);
+    expect(facts.supportsNativeCompaction.value).toBeUndefined();
     expect(facts.tools.toolCalling.value).toBe(true);
     expect(facts.tools.mcp.value).toBe(true);
   });
@@ -306,6 +310,51 @@ describe("resolveModelCapabilities", () => {
     // The provenance names the artifact the ladder was read from, so a reader
     // can check it rather than trust it.
     expect(d.detail).toContain("codex CLI");
+  });
+
+  it("reads DeepSeek's official thinking ladder from the registry", () => {
+    const { facts, diagnostics } = m.resolveModelCapabilities({
+      model: "deepseek-flash",
+      runtime: "openai",
+    });
+    expect(facts.reasoningLevels.value).toEqual(["low", "high", "max"]);
+    expect(facts.defaultReasoningLevel.value).toBe("high");
+    expect(facts.reasoningLevels.origin).toBe("catalog-confirmed");
+    expect(facts.reasoningLevels.confidence).toBe("confirmed");
+    const d = diag(diagnostics, "facts.reasoningLevels");
+    expect(d.status).toBe("resolved");
+    expect(d.detail).toContain("guides/thinking_mode");
+  });
+
+  it("gives deepseek-v4-pro the same official ladder", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "deepseek-v4-pro",
+      runtime: "openai",
+    });
+    expect(facts.reasoningLevels.value).toEqual(["low", "high", "max"]);
+    expect(facts.defaultReasoningLevel.value).toBe("high");
+  });
+
+  it("reads Claude's official effort ladder from the registry", () => {
+    const { facts, diagnostics } = m.resolveModelCapabilities({
+      model: "claude-opus-4-8",
+      runtime: "claude",
+    });
+    expect(facts.reasoningLevels.value).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(facts.defaultReasoningLevel.value).toBe("high");
+    expect(facts.reasoningLevels.origin).toBe("catalog-confirmed");
+    expect(facts.reasoningLevels.confidence).toBe("confirmed");
+    const d = diag(diagnostics, "facts.reasoningLevels");
+    expect(d.status).toBe("resolved");
+    expect(d.detail).toContain("build-with-claude/effort");
+  });
+
+  it("does not invent xhigh for Claude models the vendor omitted from that level", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "claude-sonnet-4-6",
+      runtime: "claude",
+    });
+    expect(facts.reasoningLevels.value).toEqual(["low", "medium", "high", "max"]);
   });
 
   // The other half of the same rule: no evidence is not "no support". The plan

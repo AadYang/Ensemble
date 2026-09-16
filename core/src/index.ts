@@ -26,6 +26,16 @@ import {
   SessionManager,
 } from "./sessions/SessionManager.js";
 import { inspectProjectRoot, isProjectRootRejection } from "./sessions/project-root.js";
+import {
+  checkoutGitBranch,
+  listGitBranches,
+  readGitState,
+  resolveGitRoot,
+  unboundGitBranches,
+  unboundGitStatus,
+  type GitRootResolution,
+} from "./git.js";
+import type { GitCheckoutError, GitErrorCode } from "@agentorch/shared";
 import { runtimeScopeForKind } from "./sessions/runtimes/index.js";
 import { prisma, closeDb, sqliteDb } from "./db.js";
 import { createHash } from "node:crypto";
@@ -1674,6 +1684,93 @@ fastify.get<{ Params: { id: string } }>("/agents/:id/status", async (req, reply)
   return s;
 });
 
+// ── Git ─────────────────────────────────────────────────────────────────────
+//
+// The window-level branch chip asks about "the project this agent works in",
+// and the only thing that names such a directory is the agent's projectRoot —
+// the SAME value a turn runs in (`resolveProjectRoot`). A root that is unbound,
+// or configured but no longer usable, is REFUSED with a code: falling back to
+// the home directory or the process's own cwd would describe — and let the user
+// switch — a repository the agent has nothing to do with.
+//
+// The work itself lives in `git.ts`; these three handlers only resolve the
+// agent and pick the HTTP status, so the subprocess rules (argv arrays, cwd,
+// timeout, output cap, no `--force`) are stated in exactly one place.
+
+/** `found: false` is a different answer from every refusal: there is no such
+ *  agent at all. Everything else is `resolveGitRoot`'s decision, made from the
+ *  stored value alone. */
+type AgentGitRoot = { found: false } | { found: true; resolved: GitRootResolution };
+
+const agentGitRoot = async (id: string): Promise<AgentGitRoot> => {
+  const agent = await prisma.agent.findUnique({ where: { id } });
+  if (!agent) return { found: false };
+  return { found: true, resolved: resolveGitRoot(agent.projectRoot) };
+};
+
+/** 400 = the caller sent something wrong; 409 = the repository is in a state
+ *  that forbids this; 503 = the environment could not answer at all. */
+const gitHttpStatus = (code: GitErrorCode): number =>
+  code === "GIT_BRANCH_INVALID" ? 400 : code === "GIT_UNAVAILABLE" || code === "GIT_TIMEOUT" ? 503 : 409;
+
+const GitCheckoutBodySchema = z.object({
+  branch: z.string().min(1),
+  create: z.boolean().optional(),
+  from: z.string().optional(),
+});
+
+fastify.get<{ Params: { id: string } }>("/agents/:id/git", async (req, reply) => {
+  const lookup = await agentGitRoot(req.params.id);
+  if (!lookup.found) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  if (!lookup.resolved.ok) return unboundGitStatus(lookup.resolved.reason);
+  return readGitState(lookup.resolved.root);
+});
+
+fastify.get<{ Params: { id: string } }>("/agents/:id/git/branches", async (req, reply) => {
+  const lookup = await agentGitRoot(req.params.id);
+  if (!lookup.found) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  if (!lookup.resolved.ok) return unboundGitBranches(lookup.resolved.reason);
+  return listGitBranches(lookup.resolved.root);
+});
+
+fastify.post<{ Params: { id: string } }>("/agents/:id/git/checkout", async (req, reply) => {
+  const parsed = GitCheckoutBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    const refused: GitCheckoutError = {
+      ok: false,
+      code: "GIT_BRANCH_INVALID",
+      error: "a non-empty `branch` is required",
+      detail: JSON.stringify(parsed.error.issues),
+    };
+    return refused;
+  }
+  const lookup = await agentGitRoot(req.params.id);
+  if (!lookup.found) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  if (!lookup.resolved.ok) {
+    reply.code(gitHttpStatus(lookup.resolved.code));
+    const refused: GitCheckoutError = {
+      ok: false,
+      code: lookup.resolved.code,
+      error: lookup.resolved.reason,
+      detail: null,
+    };
+    return refused;
+  }
+  const result = await checkoutGitBranch(lookup.resolved.root, parsed.data);
+  if (!result.ok) reply.code(gitHttpStatus(result.code));
+  return result;
+});
+
 // The read/restore entry for a compaction generation. `compact` MOVES the
 // originals out of the live transcript; these routes are how they are read back
 // verbatim, or put back.
@@ -2501,6 +2598,11 @@ void (async () => {
       if (lost.length > 0) {
         console.warn(`[jobs] ${lost.length} job(s) from a previous run were marked lost (no recorded exit)`);
       }
+      // A terminal job may have settled while its agent owned the transcript
+      // sequence and then the core may have exited before that turn unwound.
+      // The Job row is the durable pending queue; replay it only after stale
+      // sessions have been reset above.
+      sessions.flushSettledJobNotices();
     } catch (err) {
       console.warn("[jobs] startup reconciliation threw:", err);
     }

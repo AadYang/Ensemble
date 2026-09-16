@@ -114,6 +114,14 @@ export interface RuntimeOptions {
   /** Optional resume token. Claude SDK uses for ~/.claude session resume.
    *  OpenAI runtime ignores (it self-maintains history via `history`). */
   resume?: string;
+  /** The SERVER-side conversation this turn continues, when one was established
+   *  for this exact route (see capability/server-conversation.ts for the
+   *  signature that gates it). Only the OpenAI Responses runtime can use it, as
+   *  `previous_response_id`; a runtime that receives one and cannot carry it must
+   *  say so rather than fall back to replaying the transcript, because replaying
+   *  it against a server that already holds it is the duplicate-history bug this
+   *  field exists to prevent. Absent = the transcript travels in the request. */
+  serverConversationId?: string;
   /** Native claude binary path. ClaudeAgentRuntime needs this in SEA mode
    *  where `import.meta.url` is undefined and the SDK's default cli.js
    *  derivation fails. OpenAI runtime ignores. */
@@ -257,7 +265,12 @@ export type RuntimeErrorCode =
   // scratch dir could not be created. The turn is REFUSED rather than run in
   // whatever directory the process happens to be in.
   | "PROJECT_ROOT_NOT_FOUND"
-  | "SCRATCH_UNWRITABLE";
+  | "SCRATCH_UNWRITABLE"
+  // The model asked for approval on the SAME call, with the same arguments, more
+  // times than one turn can be doing anything but looping. This replaces a fixed
+  // round budget, which could not tell 33 rounds of progress from 33 rounds of
+  // the same tool: the bound is now an observation about repetition, not a count.
+  | "RUNTIME_TOOL_APPROVAL_LOOP";
 
 /** One automatic transport switch, as reported by the runtime that made it. */
 export interface TransportFallbackInfo {

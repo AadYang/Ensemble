@@ -9,7 +9,13 @@ const TMP = mkdtempSync(join(tmpdir(), "openai-plan-test-"));
 process.env.AGENTORCH_DATA_DIR = TMP;
 process.env.AGENTORCH_DB_PATH = join(TMP, "plan.db");
 
-import { OpenAIAgentRuntime, buildRunnerRunOptions, planTransportAttempts } from "../openai.js";
+import {
+  OpenAIAgentRuntime,
+  buildInputItems,
+  buildRunnerRunOptions,
+  makeApprovalLoopTracker,
+  planTransportAttempts,
+} from "../openai.js";
 import { resolveRunPlan } from "../../../capability/run-plan.js";
 import type { RuntimeEvent, RuntimeOptions } from "../types.js";
 import type { ResolvedCapability, RunPlanTransport } from "@agentorch/shared";
@@ -40,6 +46,68 @@ describe("buildRunnerRunOptions", () => {
     const opts = buildRunnerRunOptions(ac.signal);
     expect(opts.stream).toBe(true);
     expect(opts.signal).toBe(ac.signal);
+  });
+
+  // The server-side conversation owner. `previous_response_id` is the ONE way
+  // this runtime continues a conversation the server stored; the SDK forwards it
+  // as `previous_response_id` and refuses to combine it with `conversation`
+  // (openaiResponsesModel builds the request from exactly one of them).
+  it("carries the continuation id when there is one, and omits the key when there is not", () => {
+    expect(buildRunnerRunOptions(new AbortController().signal, "resp_abc").previousResponseId)
+      .toBe("resp_abc");
+    // Absent, not empty: an empty or undefined value would be sent as a
+    // malformed continuation instead of "rebuild the transcript locally".
+    expect("previousResponseId" in buildRunnerRunOptions(new AbortController().signal)).toBe(false);
+    expect("previousResponseId" in buildRunnerRunOptions(new AbortController().signal, "")).toBe(false);
+  });
+});
+
+// ── what actually goes over the wire ──────────────────────────────────────
+//
+// The rule this pins is the one the whole feature can be lost to: with a
+// continuation, the transcript must NOT also travel in the body. The server
+// already holds it (reasoning and tool items included, in their native form) and
+// recovers it from the response id — sending both is the duplicate-history bug.
+describe("buildInputItems", () => {
+  const withHistory = (): RuntimeOptions => {
+    const base = optsFor();
+    return {
+      ...base,
+      history: [
+        { type: "user", message: { role: "user", content: "first" } },
+        { type: "assistant", message: { content: [{ type: "text", text: "answer" }] } },
+      ],
+    } as unknown as RuntimeOptions;
+  };
+
+  it("replays the transcript only when there is no continuation", () => {
+    const rebuilt = buildInputItems(withHistory());
+    expect(JSON.stringify(rebuilt)).toContain("first");
+    expect(rebuilt).toHaveLength(3);
+
+    const delta = buildInputItems(withHistory(), { continueFrom: "resp_abc" });
+    expect(delta).toHaveLength(1);
+    expect(JSON.stringify(delta)).toContain("hello");
+    expect(JSON.stringify(delta)).not.toContain("first");
+  });
+});
+
+// ── the approval loop, observed instead of counted ────────────────────────
+//
+// This replaces `MAX_INTERRUPT_ROUNDS = 32`: a round budget could not tell a
+// long turn doing new work from the same call coming back forever.
+describe("makeApprovalLoopTracker", () => {
+  it("trips on the same call with the same arguments, and never on new work", () => {
+    const tracker = makeApprovalLoopTracker();
+    expect(tracker.record("Bash", { command: "npm test" }).loop).toBe(false);
+    expect(tracker.record("Bash", { command: "npm test" }).loop).toBe(false);
+    expect(tracker.record("Bash", { command: "npm test" }).loop).toBe(true);
+    // A different call (or the same tool with different arguments) is progress,
+    // however many rounds the turn takes.
+    for (let i = 0; i < 40; i++) {
+      expect(tracker.record("Bash", { command: `echo ${i}` }).loop).toBe(false);
+      expect(tracker.record("Read", { file_path: "x" }).loop).toBe(false);
+    }
   });
 });
 

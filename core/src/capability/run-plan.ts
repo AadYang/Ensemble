@@ -31,6 +31,7 @@
 
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { requestedRuntimeWindow, vendorScopeForModel } from "../context-window.js";
 
 // The reasoning token rule is a VALUE, and it is consumed here, at the HTTP
 // schema, at the metadata reader and in the runtime adapters. One definition
@@ -604,6 +605,12 @@ export function resolveRunPlan(opts: ResolveRunPlanOptions): ResolvedRunPlan {
     },
     context: {
       effectiveWindow: facts.runtimeEffectiveWindow.value ?? null,
+      requestedRuntimeWindow: requestedRuntimeWindow(opts.model, {
+        runtime: facts.scope.runtime,
+        vendor: opts.vendor?.trim() || vendorScopeForModel(opts.model),
+        runtimeVersion: facts.scope.runtimeVersion,
+        providerId: facts.scope.providerId,
+      }),
       advertisedContextWindow: facts.advertisedContextWindow.value ?? null,
       outputReserve: valueOf<number | null>("maxOutputTokens"),
       compactionThreshold: opts.compactionThreshold ?? null,

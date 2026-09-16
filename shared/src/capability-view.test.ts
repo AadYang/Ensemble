@@ -90,6 +90,7 @@ function planFixture(over: Partial<ResolvedRunPlan> = {}): ResolvedRunPlan {
     },
     context: {
       effectiveWindow: 200_000,
+      requestedRuntimeWindow: 200_000,
       advertisedContextWindow: 200_000,
       outputReserve: 8_000,
       compactionThreshold: 150_000,

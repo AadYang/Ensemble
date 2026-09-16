@@ -65,6 +65,7 @@ describe("resolveRunPlan", () => {
   it("exposes the same window facts the capability set resolved", () => {
     const plan = basePlan({ sessionObservedWindow: 700_000, requestedWindow: 1_050_000 });
     expect(plan.context.effectiveWindow).toBe(700_000);
+    expect(plan.context.requestedRuntimeWindow).toBe(1_050_000);
     expect(plan.context.advertisedContextWindow).toBe(1_050_000);
     expect(plan.context.outputReserve).toBe(128_000);
     // Consumer and resolver must not be able to disagree.
@@ -74,6 +75,7 @@ describe("resolveRunPlan", () => {
   it("leaves an unknown ceiling null rather than borrowing the advertised one", () => {
     const plan = basePlan({ runtimeVersion: "0.199.0" });
     expect(plan.context.effectiveWindow).toBeNull();
+    expect(plan.context.requestedRuntimeWindow).toBe(1_050_000);
     expect(plan.context.advertisedContextWindow).toBe(1_050_000);
   });
 
@@ -387,6 +389,48 @@ describe("preference / constraint intersection", () => {
     expect(pref.rejection!.detail).toContain("ultra"); // the supported levels
     expect(pref.rejection!.detail).toContain("codex CLI"); // the source
     expect(pref.rejection!.detail).toContain("hyper"); // the request
+  });
+
+  it("applies a DeepSeek official level as supported, not as an unverified guess", () => {
+    const plan = m.resolveRunPlan({
+      model: "deepseek-flash",
+      runtime: "openai",
+      preferences: { reasoningEffort: "max" },
+    });
+    expect(plan.execution.reasoningEffort).toBe("max");
+    const pref = plan.preferences.find((p) => p.field === "reasoningEffort")!;
+    expect(pref.outcome).toBe("applied");
+    expect(plan.facts.reasoningLevels.value).toEqual(["low", "high", "max"]);
+    const d = plan.diagnostics.find((x) => x.field === "preferences.reasoningEffort");
+    expect(d?.detail ?? "").not.toMatch(/not established|sent unverified/);
+  });
+
+  it("applies a Claude official effort level as supported, not as an unverified guess", () => {
+    const plan = m.resolveRunPlan({
+      model: "claude-opus-4-8",
+      runtime: "claude",
+      preferences: { reasoningEffort: "xhigh" },
+    });
+    expect(plan.execution.reasoningEffort).toBe("xhigh");
+    const pref = plan.preferences.find((p) => p.field === "reasoningEffort")!;
+    expect(pref.outcome).toBe("applied");
+    expect(plan.facts.reasoningLevels.value).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    const d = plan.diagnostics.find((x) => x.field === "preferences.reasoningEffort");
+    expect(d?.detail ?? "").not.toMatch(/not established|sent unverified/);
+  });
+
+  it("rejects xhigh on a Claude model the vendor did not list for that level", () => {
+    const plan = m.resolveRunPlan({
+      model: "claude-sonnet-4-6",
+      runtime: "claude",
+      preferences: { reasoningEffort: "xhigh" },
+    });
+    expect(plan.execution.reasoningEffort).toBeUndefined();
+    const pref = plan.preferences.find((p) => p.field === "reasoningEffort")!;
+    expect(pref.outcome).toBe("rejected");
+    expect(pref.rejection!.detail).toContain("claude-sonnet-4-6");
+    expect(pref.rejection!.detail).toContain("max");
+    expect(pref.rejection!.detail).toContain("xhigh");
   });
 
   it("carries a legal level as user-declared when the model's ladder is unknown", () => {

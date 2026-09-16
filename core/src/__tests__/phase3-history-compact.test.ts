@@ -41,6 +41,7 @@ beforeEach(async () => {
 
 const ctx = (over: Partial<Record<string, number | null>> = {}) => ({
   effectiveWindow: 100_000,
+  requestedRuntimeWindow: 100_000,
   advertisedContextWindow: 100_000,
   outputReserve: 1_000,
   compactionThreshold: null,
@@ -536,7 +537,7 @@ describe("gate 5: an unmeasurable tokenizer is reported, never silently zero", (
       turns: Array.from({ length: 500 }, (_, i) => ({ seq: i, kind: "user" as const, text: "x".repeat(500) })),
       systemPrompt: null,
       toolsText: null,
-      context: ctx({ effectiveWindow: null, advertisedContextWindow: null }),
+      context: ctx({ effectiveWindow: null, advertisedContextWindow: 1_000_000 }),
       strategy: "local-rebuild",
       strategyReason: "test",
       measure: (t) => Math.ceil(t.length / 4),
@@ -545,6 +546,7 @@ describe("gate 5: an unmeasurable tokenizer is reported, never silently zero", (
     expect(outcome.history.counts.dropped).toBe(0);
     expect(outcome.history.counts.included).toBe(500);
     expect(outcome.history.diagnostics.join("\n")).toContain("nothing was dropped on a guess");
+    expect(outcome.history.diagnostics.join("\n")).not.toContain("window 1000000");
   });
 });
 
@@ -693,6 +695,62 @@ describe("gate 7: a server conversation is claimed only when it genuinely exists
       sc.resolveServerConversation({ metadata: { serverConversation: { id: "" } }, signature, supported: true }).id,
     ).toBeNull();
     expect(sc.withoutServerConversation(metadata).serverConversation).toBeUndefined();
+  });
+
+  // What EARNS the claim above. A compat endpoint that answers /responses is not
+  // enough: the route has to be the official OpenAI endpoint, because nothing
+  // establishes that a compat implementation stores responses or honours
+  // `previous_response_id` — and an endpoint that accepts the parameter and
+  // ignores it loses the transcript with no error to show for it.
+  it("is established by the official endpoint over Responses, and by nothing less", async () => {
+    const sc = await import("../capability/server-conversation.js");
+    const fact = (over: Record<string, unknown> = {}) =>
+      sc.serverConversationSupportFact({
+        runtime: "openai",
+        transport: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        providerMetadata: {},
+        ...over,
+      });
+
+    expect(fact().value).toBe(true);
+    expect(fact().origin).toBe("provider-discovered");
+    // The kind is a label; the HOST is the claim.
+    expect(fact({ baseUrl: "https://api.deepseek.com/v1" }).value).toBeUndefined();
+    expect(fact({ baseUrl: "not a url" }).value).toBeUndefined();
+    expect(fact({ transport: "chat-completions" }).value).toBeUndefined();
+    expect(fact({ runtime: "claude" }).value).toBeUndefined();
+  });
+
+  // A rejection is a verdict about the route, and it EXPIRES: an endpoint that
+  // refused the parameter today may be a gateway mid-upgrade, so a permanent
+  // downgrade with no way to clear it would be worse than the retry.
+  it("stops claiming a continuation after the endpoint rejected one, until the verdict expires", async () => {
+    const sc = await import("../capability/server-conversation.js");
+    const at = new Date("2026-09-16T10:00:00.000Z");
+    const rejected = sc.withServerConversationRejection(
+      { serverConversation: { id: "resp_1", signature: "s", storedAt: 1 } },
+      { reason: "previous_response_id not found", httpStatus: 404, upstreamCode: "invalid_request_error" },
+      at,
+    );
+    // Writing the rejection drops the id in the same breath: a rejected
+    // continuation would fail again, and a stale id is worse than none.
+    expect(rejected.serverConversation).toBeUndefined();
+
+    const factAt = (now: Date) =>
+      sc.serverConversationSupportFact({
+        runtime: "openai",
+        transport: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        providerMetadata: rejected,
+        now,
+      });
+    const during = factAt(new Date(at.getTime() + 60_000));
+    expect(during.value).toBe(false);
+    expect(during.confidence).toBe("observed");
+    expect(during.source).toContain("previous_response_id not found");
+    // Past the TTL the verdict is stale, not permanent: the route is tried again.
+    expect(factAt(new Date(at.getTime() + sc.SERVER_CONVERSATION_REJECTION_TTL_MS + 1)).value).toBe(true);
   });
 });
 

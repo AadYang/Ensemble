@@ -328,6 +328,49 @@ async function* runTurnOnce(
     // the setting (it can) is a different question from which levels the model
     // has (the plan's business).
     const reasoningEffort = opts.runPlan.execution.reasoningEffort;
+    // Chat Completions: @openai/agents maps `reasoning.effort` onto the
+    // top-level `reasoning_effort` field (openaiChatCompletionsModel #fetchResponse).
+    // DeepSeek also wants thinking mode ON for that field to mean anything —
+    // default is enabled, but compat gateways do not all honour the default, so
+    // an explicit effort also sends `thinking: { type: "enabled" }` via
+    // providerData (the Chat Completions extra-body slot). Responses already
+    // carries `reasoning.effort` natively and must not get that extra field.
+    const chatCompletionsThinking =
+      !useResponses && reasoningEffort
+        ? { providerData: { thinking: { type: "enabled" as const } } }
+        : null;
+    // The server-side conversation this turn continues, if any. It is a
+    // validated id (see RuntimeOptions.serverConversationId): SessionManager
+    // only supplies it when the stored id was issued for THIS provider, model,
+    // project root, system prompt and transport, and when the route is
+    // established as able to continue (facts.supportsServerConversation).
+    //
+    // Gated on the ATTEMPT, not just on the plan: this function also runs the
+    // chat-completions fallback, where `previous_response_id` does not exist. A
+    // fallback attempt therefore rebuilds the transcript locally instead of
+    // sending a delta to a route that holds nothing — which is the one way this
+    // feature could silently lose history.
+    const continueFrom = useResponses ? opts.serverConversationId ?? null : null;
+    // Whether the route earned the continuation at all — read from the plan, so
+    // "we store what we may later continue" and "we may continue what was
+    // stored" are one decision instead of two. On such a route the response is
+    // explicitly stored: `previous_response_id` can only point at a response the
+    // server kept, and leaving `store` to the endpoint's default would make the
+    // next turn's continuation depend on a default we never verified.
+    const serverConversationRoute = useResponses && opts.runPlan.facts.supportsServerConversation.value === true;
+    // The compaction POLICY comes from the plan, exactly like the CLI envelope
+    // numbers: `null` means no verified threshold exists for this route, and the
+    // runtime then keeps its own policy. Inventing one here would trade a dropped
+    // transcript for a server-side compaction nobody measured the headroom of.
+    const compactionThreshold = opts.runPlan.context.compactionThreshold;
+    const serverManagedSettings: SdkModelSettings | null = serverConversationRoute
+      ? {
+          store: true,
+          ...(compactionThreshold !== null && compactionThreshold > 0
+            ? { contextManagement: [{ type: "compaction", compactThreshold: compactionThreshold }] }
+            : {}),
+        }
+      : null;
 
     const agent = new Agent({
       name: opts.sessionId,
@@ -352,12 +395,18 @@ async function* runTurnOnce(
       // forwarded verbatim — an endpoint that does not know a level says so,
       // which is a real answer, while substituting a level the user did not ask
       // for is the silent edit this whole contract forbids.
-      ...(reasoningEffort
-        ? { modelSettings: { reasoning: { effort: reasoningEffort } } as SdkModelSettings }
+      ...(reasoningEffort || serverManagedSettings
+        ? {
+            modelSettings: {
+              ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+              ...(chatCompletionsThinking ?? {}),
+              ...(serverManagedSettings ?? {}),
+            } as SdkModelSettings,
+          }
         : {}),
     });
 
-    const inputs = buildInputItems(opts);
+    const inputs = buildInputItems(opts, { continueFrom });
     // The messages below report `sessionId`, the id `query` minted for the whole
     // turn: minting one here would give the assistant/result messages a session
     // that system/init (and, on a fallback, the other attempt) never named.
@@ -387,7 +436,14 @@ async function* runTurnOnce(
 
     let finalText = "";
     let rounds = 0;
-    const MAX_INTERRUPT_ROUNDS = 32;
+    // The bound on the approval loop is OBSERVABLE, not a round budget. A turn
+    // that keeps making progress (different calls, different arguments) is not
+    // bounded here at all: the plan's `maxModelTurns` is null on purpose, and
+    // what ends a runaway is the user's cancel, the wall-clock deadline and the
+    // liveness state machine. What this catches is the one shape a clock cannot
+    // see: the SAME call, with the SAME arguments, coming back for approval over
+    // and over while every round looks alive.
+    const approvalLoop = makeApprovalLoopTracker();
     // What a retry on another transport would cost the user: re-running a turn
     // that already streamed text would show that text twice, so a failure after
     // either of these is surfaced rather than retried.
@@ -412,6 +468,12 @@ async function* runTurnOnce(
     // response reflects the true current window occupancy.
     let lastUsage: ReturnType<typeof readResponseUsage> = null;
 
+    // The newest server-side response id this turn produced, when the route
+    // issued one. Reported to SessionManager, which is the ONLY writer of the
+    // stored continuation (see capability/server-conversation.ts) — the runtime
+    // observes an id, it does not decide what to do with it.
+    let serverResponseId: string | null = null;
+
     try {
       // Slice 4.2 interrupt-resume loop. Each iteration runs the agent until
       // the SDK pauses for tool approval (or completes). When interruptions
@@ -426,15 +488,44 @@ async function* runTurnOnce(
       // carriers to any — the runtime API surface we use is well-defined.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let runInput: any = inputs;
-      while (rounds++ < MAX_INTERRUPT_ROUNDS) {
+      let loopedApproval: { tool: string; count: number } | null = null;
+      for (;;) {
         if (opts.abortController.signal.aborted) break;
+        rounds++;
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const result: any = await runner.run(
           agent as any,
           runInput,
-          buildRunnerRunOptions(opts.abortController.signal),
+          // The continuation id goes on the FIRST call only: from round two on we
+          // hand the SDK its own RunState, which already carries the newest
+          // response id, and repeating the opening id would rewind the server
+          // conversation to the response the turn started from.
+          buildRunnerRunOptions(
+            opts.abortController.signal,
+            rounds === 1 ? (continueFrom ?? undefined) : undefined,
+          ),
         );
+        // The newest server-side response id, when the route has one. Read after
+        // every round: the last one belongs to the response this turn ends on,
+        // which is the id the next turn continues from.
+        //
+        // Only from the Responses attempt: this same function runs the
+        // chat-completions fallback, and an id issued by THAT route must never be
+        // stored as a server-side conversation (it would be replayed as
+        // `previous_response_id` on a route that never issued one).
+        const roundResponseId = useResponses
+          ? (result as { lastResponseId?: unknown }).lastResponseId
+          : undefined;
+        if (typeof roundResponseId === "string" && roundResponseId.length > 0) {
+          serverResponseId = roundResponseId;
+        }
+
+        // One Claude-shaped tool_use per call id, matching Codex. Without this
+        // the frontend only ever sees assistant text — openai-compat used to
+        // render ToolCards, then this stream path stopped forwarding the
+        // SDK's tool_called / approval events.
+        const emittedToolCallIds = new Set<string>();
 
         for await (const event of result) {
           if (opts.abortController.signal.aborted) break;
@@ -455,6 +546,23 @@ async function* runTurnOnce(
                   },
                 },
               };
+            } else if (
+              typeof data?.type === "string" &&
+              data.type.includes("reasoning") &&
+              typeof data.delta === "string" &&
+              data.delta.length > 0
+            ) {
+              yield {
+                type: "sdk_message",
+                payload: {
+                  type: "stream_event",
+                  session_id: sessionId,
+                  event: {
+                    type: "content_block_delta",
+                    delta: { type: "thinking_delta", thinking: data.delta },
+                  },
+                },
+              };
             } else if (data?.type === "response_done" && data.response) {
               // W17.1: capture final per-response usage. `response.usage` is
               // populated only at completion; tool-loop runs surface multiple
@@ -468,20 +576,35 @@ async function* runTurnOnce(
                 lastUsage = rec;
               }
             }
-          } else if (event.type === "run_item_stream_event" && event.name === "message_output_created") {
-            const text = extractItemText(event.item) || finalText;
-            if (text) {
-              emittedOutput = true;
-              yield {
-                type: "sdk_message",
-                payload: {
-                  type: "assistant",
-                  session_id: sessionId,
-                  message: {
-                    content: [{ type: "text" as const, text }],
+          } else if (event.type === "run_item_stream_event") {
+            if (event.name === "message_output_created") {
+              const text = extractItemText(event.item) || finalText;
+              if (text) {
+                emittedOutput = true;
+                yield {
+                  type: "sdk_message",
+                  payload: {
+                    type: "assistant",
+                    session_id: sessionId,
+                    message: {
+                      content: [{ type: "text" as const, text }],
+                    },
                   },
-                },
-              };
+                };
+              }
+            } else if (event.name === "tool_called" || event.name === "tool_approval_requested") {
+              const call = extractToolCallFromItem(event.item);
+              if (call && !emittedToolCallIds.has(call.id)) {
+                emittedToolCallIds.add(call.id);
+                emittedOutput = true;
+                opts.liveness?.toolProgress();
+                yield {
+                  type: "sdk_message",
+                  payload: assistantToolUseMessage(sessionId, call),
+                };
+              }
+            } else if (event.name === "tool_output") {
+              opts.liveness?.toolProgress();
             }
           }
         }
@@ -495,23 +618,45 @@ async function* runTurnOnce(
         // SDK's approve/reject and resume the run.
         for (const item of interruptions) {
           if (opts.abortController.signal.aborted) break;
-          const rawItem = item.rawItem as { name?: string; arguments?: string };
-          const toolName = rawItem.name ?? item.toolName ?? "unknown";
-          let parsedArgs: Record<string, unknown> = {};
-          if (rawItem.arguments) {
-            try {
-              parsedArgs = JSON.parse(rawItem.arguments) as Record<string, unknown>;
-            } catch {
-              parsedArgs = { _raw: rawItem.arguments };
-            }
+          const call = extractToolCallFromItem(item);
+          const toolName = call?.name ?? item.toolName ?? "unknown";
+          const parsedArgs = (call?.input && typeof call.input === "object"
+            ? call.input
+            : {}) as Record<string, unknown>;
+          if (call && !emittedToolCallIds.has(call.id)) {
+            emittedToolCallIds.add(call.id);
+            emittedOutput = true;
+            yield {
+              type: "sdk_message",
+              payload: assistantToolUseMessage(sessionId, call),
+            };
           }
+          // Proof of life: an approval round is work in progress, so the liveness
+          // controller must not read a run waiting on the user as a stall. It is
+          // also the observable that a loop detector needs and that a round
+          // counter never had — WHO is being asked for WHAT, not just how many.
+          const repetition = approvalLoop.record(toolName, parsedArgs);
+          if (repetition.loop) {
+            loopedApproval = { tool: toolName, count: repetition.count };
+            break;
+          }
+          if (repetition.count > 1) {
+            // Visible before it trips, not only when it trips: a repeat that is
+            // legitimate (the user denied the first one and the model retried)
+            // looks the same as the start of a loop, and the log is where the
+            // two can be told apart by a human.
+            console.warn(
+              `[openai-runtime] approval request repeated ${repetition.count}× in one turn: ${repetition.key}`,
+            );
+          }
+          opts.liveness?.toolProgress();
           const decision = await opts.canUseTool(toolName, parsedArgs, {
             signal: opts.abortController.signal,
             suggestions: [],
             // The Claude SDK's CanUseTool extra-options shape requires
             // toolUseID; OpenAI runtime synthesizes one since the SDK's
             // raw item doesn't surface a stable call id we can borrow.
-            toolUseID: item.rawItem.id ?? randomUUID(),
+            toolUseID: call?.id ?? item.rawItem.id ?? randomUUID(),
             // SDK 0.3.x added a required requestId (control-response
             // correlation id for out-of-band responses). The OpenAI runtime
             // resolves permissions inline and never uses it — synthesize a
@@ -529,13 +674,22 @@ async function* runTurnOnce(
             result.state.reject(item, message ? { message } : undefined);
           }
         }
+        if (loopedApproval) break;
         runInput = result.state;
       }
 
-      if (rounds >= MAX_INTERRUPT_ROUNDS) {
+      if (loopedApproval) {
+        // The structured reason, not a round count: which call repeated, how
+        // many times, and what the user can do about it. The previous message
+        // named a number nobody could act on and said nothing about the tool.
         yield {
           type: "error",
-          message: `agent exceeded ${MAX_INTERRUPT_ROUNDS} approval rounds in one turn — aborted to prevent infinite tool loop`,
+          code: "RUNTIME_TOOL_APPROVAL_LOOP",
+          recoverable: false,
+          message:
+            `the model asked to run "${loopedApproval.tool}" with identical arguments ` +
+            `${loopedApproval.count} times in this turn — stopping here rather than repeating it again. ` +
+            "Deny the call, change the request, or cancel the turn if this is not what you wanted.",
         };
         return { emittedOutput, sawResponseDone };
       }
@@ -556,12 +710,13 @@ async function* runTurnOnce(
         inputTokensLocal?: number;
         outputTokensLocal?: number;
       }> = {};
+      const contextWindow = openaiResultContextWindow(opts.runPlan);
       for (const [m, u] of Object.entries(usageAccum)) {
         modelUsage[m] = {
           ...u,
           costUSD: 0,         // ignored by aggregator; pricing.ts is authoritative
           webSearchRequests: 0,
-          contextWindow: 0,   // OpenAI SDK doesn't surface this consistently
+          contextWindow,
         };
       }
       // Attach local counts to the entry matching opts.model. If upstream
@@ -576,7 +731,7 @@ async function* runTurnOnce(
           cacheCreationInputTokens: 0,
           costUSD: 0,
           webSearchRequests: 0,
-          contextWindow: 0,
+          contextWindow,
         };
       }
       const entry = modelUsage[opts.model]!;
@@ -592,6 +747,11 @@ async function* runTurnOnce(
           // W22: last response usage for the context bar. Kept separate from
           // modelUsage (which is accumulated across the tool loop).
           contextUsage: lastUsage ?? undefined,
+          // The id the server issued for this turn's final response, when it
+          // issued one. Absent means "this route has no server-side
+          // conversation", which is a different fact from "we forgot to store
+          // it" — the field's presence is the observation.
+          ...(serverResponseId ? { serverResponseId } : {}),
         },
       };
       return { emittedOutput, sawResponseDone };
@@ -619,16 +779,52 @@ async function* runTurnOnce(
  *  needing a 12th model turn dies mid-flight with "Max turns (10) exceeded".
  *  The run plan forbids a global model-turn cap — the bound on a runaway loop
  *  is cancellation, loop detection and the liveness state machine, not a
- *  number that truncates long work. */
-export function buildRunnerRunOptions(signal: AbortSignal): {
+ *  number that truncates long work.
+ *
+ *  `previousResponseId` is the ONE server-side conversation owner. It is passed
+ *  only on the turn's FIRST model call: the SDK threads the newest id through
+ *  the rest of the turn itself (`ServerConversationTracker.trackServerItems`
+ *  writes each response id back into `RunState`), and re-sending the id we
+ *  started from would point the SDK back at an older response than the state it
+ *  is resuming (its resolution order is `options.previousResponseId ??
+ *  state._previousResponseId`). */
+export function buildRunnerRunOptions(
+  signal: AbortSignal,
+  previousResponseId?: string,
+): {
   stream: true;
   signal: AbortSignal;
   maxTurns: null;
+  previousResponseId?: string;
 } {
-  return { stream: true, signal, maxTurns: null };
+  return {
+    stream: true,
+    signal,
+    maxTurns: null,
+    ...(previousResponseId ? { previousResponseId } : {}),
+  };
 }
 
-function buildInputItems(opts: RuntimeOptions): AgentInputItem[] {
+/** The input items for this turn.
+ *
+ *  TWO shapes, and the difference is the whole point of the continuation:
+ *
+ *   • `local-rebuild` (no continuation) — the transcript travels in the request
+ *     body, exactly as the plan's history budget measured it.
+ *   • server continuation — ONLY this turn's prompt goes over the wire. The
+ *     server already holds the prior items (reasoning, tool calls and their
+ *     outputs included, in their native form), and it recovers them from
+ *     `previous_response_id`. Sending the transcript alongside the id would
+ *     duplicate every prior turn.
+ *
+ *  Instructions are NOT what carries the context here: the Responses API does
+ *  not inherit them from the previous response, so the agent's system prompt is
+ *  re-sent every turn by the SDK (see openaiResponsesModel's `instructions`). */
+export function buildInputItems(
+  opts: RuntimeOptions,
+  args: { continueFrom?: string | null } = {},
+): AgentInputItem[] {
+  if (args.continueFrom) return [user(opts.prompt)];
   const items: AgentInputItem[] = [];
   for (const m of opts.history) {
     if (m.type === "user") {
@@ -645,6 +841,47 @@ function buildInputItems(opts: RuntimeOptions): AgentInputItem[] {
   }
   items.push(user(opts.prompt));
   return items;
+}
+
+/** How many times ONE identical approval request may come back in a single turn.
+ *
+ *  Three, because a legitimate repeat is a thing that happens (re-running the
+ *  same build after a deny, a retried command) while a fourth identical ask is
+ *  the loop. The counter is per (tool, arguments) pair, so a long turn that
+ *  keeps doing NEW work is never touched by it — which is the whole reason this
+ *  replaces a round budget. */
+export const REPEATED_APPROVAL_LIMIT = 3;
+
+export interface ApprovalLoopTracker {
+  /** Record one approval request. `loop` is true when this request is the one
+   *  that exceeds the limit — the caller must not approve it. */
+  record(toolName: string, args: unknown): { key: string; count: number; loop: boolean };
+}
+
+/** Per-turn detector for the approval loop a round budget used to stand in for.
+ *
+ *  The key is the tool name plus the request's own serialized arguments. Two
+ *  requests with the same args in a different key order are the same request as
+ *  far as a model's repetition goes (both are `JSON.parse` of what the model
+ *  sent, so the order follows the model's own text and is stable in practice);
+ *  arguments that fail to parse are keyed by their raw text instead, so an
+ *  unparseable request can still be recognised as repeated. */
+export function makeApprovalLoopTracker(limit = REPEATED_APPROVAL_LIMIT): ApprovalLoopTracker {
+  const seen = new Map<string, number>();
+  return {
+    record(toolName: string, args: unknown) {
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(args ?? null) ?? "null";
+      } catch {
+        serialized = String(args);
+      }
+      const key = `${toolName}(${serialized})`;
+      const count = (seen.get(key) ?? 0) + 1;
+      seen.set(key, count);
+      return { key, count, loop: count >= limit };
+    },
+  };
 }
 
 function extractUserText(msg: { message?: unknown }): string {
@@ -734,4 +971,85 @@ function extractItemText(item: unknown): string {
     .filter((b) => typeof b.text === "string")
     .map((b) => b.text!)
     .join("");
+}
+
+export interface ExtractedToolCall {
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+/** Pull a tool name + arguments out of an Agents SDK run item or interruption.
+ *
+ *  The SDK wraps the protocol `function_call` / `hosted_tool_call` in `rawItem`;
+ *  interruptions also expose `toolName`. Missing arguments stay `{}` rather than
+ *  dropping the card — a nameless call is the one thing we cannot surface. */
+export function extractToolCallFromItem(item: unknown): ExtractedToolCall | null {
+  if (!item || typeof item !== "object") return null;
+  const rec = item as Record<string, unknown>;
+  const raw = (rec.rawItem && typeof rec.rawItem === "object"
+    ? rec.rawItem
+    : rec) as Record<string, unknown>;
+  const name =
+    (typeof raw.name === "string" && raw.name) ||
+    (typeof rec.toolName === "string" && rec.toolName) ||
+    null;
+  if (!name) return null;
+  const id =
+    (typeof raw.callId === "string" && raw.callId) ||
+    (typeof raw.id === "string" && raw.id) ||
+    (typeof rec.id === "string" && rec.id) ||
+    randomUUID();
+  let input: unknown = {};
+  const args = raw.arguments;
+  if (typeof args === "string" && args.length > 0) {
+    try {
+      input = JSON.parse(args) as unknown;
+    } catch {
+      input = { _raw: args };
+    }
+  } else if (args && typeof args === "object") {
+    input = args;
+  }
+  return { id, name, input };
+}
+
+export function assistantToolUseMessage(
+  sessionId: string,
+  call: ExtractedToolCall,
+): {
+  type: "assistant";
+  session_id: string;
+  message: { content: Array<{ type: "tool_use"; id: string; name: string; input: unknown }> };
+} {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [{ type: "tool_use", id: call.id, name: call.name, input: call.input }],
+    },
+  };
+}
+
+/** Window published on the OpenAI result's modelUsage.
+ *
+ *  The Agents SDK does not surface a context window. This in-process runtime
+ *  also does not clamp, so a confirmed advertised figure IS the session window
+ *  when the plan has no effective/requested value. Unverified advertised
+ *  numbers stay 0 — the bar then shows used tokens against an unknown ceiling
+ *  rather than presenting a community snapshot as the denominator. */
+export function openaiResultContextWindow(plan: ResolvedRunPlan): number {
+  const effective = plan.context.effectiveWindow;
+  if (typeof effective === "number" && effective > 0) return effective;
+  const requested = plan.context.requestedRuntimeWindow;
+  if (typeof requested === "number" && requested > 0) return requested;
+  const advertised = plan.facts.advertisedContextWindow;
+  if (
+    advertised.confidence === "confirmed" &&
+    typeof advertised.value === "number" &&
+    advertised.value > 0
+  ) {
+    return advertised.value;
+  }
+  return 0;
 }

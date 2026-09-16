@@ -1,8 +1,8 @@
-// Phase 4 gate, part 3 — the ANTI-gate.
+// Phase 4 gate, part 3 鈥?the ANTI-gate.
 //
 // Parts 1 and 2 test the liveness code in isolation. Both would stay green if
 // nothing in production ever constructed a controller, registered a run or fed
-// it a signal — which is precisely the state the phase started from, and a green
+// it a signal 鈥?which is precisely the state the phase started from, and a green
 // suite in that state is worse than no suite, because it certifies a behaviour
 // no user can have.
 //
@@ -10,7 +10,7 @@
 // `sendMessage` turn:
 //   * a run is registered with the one controller and is visible on `/status`;
 //   * the runtime is handed a real liveness reporter (not `undefined`, and not
-//     an empty object — calling it moves the run's signals);
+//     an empty object 鈥?calling it moves the run's signals);
 //   * the session layer itself feeds signals as the turn progresses;
 //   * the run is recorded as finished, with the reason the turn actually ended.
 
@@ -80,7 +80,7 @@ let SessionManager: typeof import("../SessionManager.js").SessionManager;
 
 class StubHub {
   events: Array<{ kind: "session" | "broadcast"; msg: Record<string, unknown> }> = [];
-  /** Messages addressed to ONE socket — what a fresh subscription receives. */
+  /** Messages addressed to ONE socket 鈥?what a fresh subscription receives. */
   socketMessages: Record<string, unknown>[] = [];
   sendTo(_socket: unknown, msg: Record<string, unknown>): void {
     this.socketMessages.push(msg);
@@ -178,8 +178,8 @@ describe("a real turn is registered with the one liveness controller", () => {
     expect(opts.runPlan.liveness.status).toBe("resolved");
 
     // 2. The controller is holding this run, and `/status` reads it from there.
-    //    `live` non-null is the controller's own map answering — the same map
-    //    `liveRunIds()` walks — not a re-derivation from the session bookkeeping.
+    //    `live` non-null is the controller's own map answering 鈥?the same map
+    //    `liveRunIds()` walks 鈥?not a re-derivation from the session bookkeeping.
     const live = sessions.livenessReportFor(agent.id).live;
     expect(live).not.toBeNull();
     expect(live!.runId).toBeTruthy();
@@ -204,14 +204,14 @@ describe("a real turn is registered with the one liveness controller", () => {
     const afterReporter = sessions.livenessReportFor(agent.id).live;
     expect(afterReporter!.fed).toContain("tool-progress");
     // A live run has no probe registered by the MOCK runtime (it never calls
-    // registerProbe) — the snapshot must say so rather than imply a check ran.
+    // registerProbe) 鈥?the snapshot must say so rather than imply a check ran.
     expect(afterReporter!.probeRegistered).toBe(false);
 
     // Let the turn finish.
     gate.open();
     await turn;
 
-    // The run is gone from the live set, and its ending is on the record — as
+    // The run is gone from the live set, and its ending is on the record 鈥?as
     // `completed`, not as any of the evidence codes.
     expect(sessions.livenessReportFor(agent.id).live).toBeNull();
     const last = sessions.livenessReportFor(agent.id).last;
@@ -299,8 +299,8 @@ describe("the wall-clock ceiling travels from the agent to the running policy", 
 // agent. The warning therefore consumed the number the turn's next event was
 // about to persist, and that write hit the `(agentId, seq)` unique index.
 //
-// The regression tests below provoke exactly that interleaving — a warning while
-// the turn is parked mid-stream, then another model event and the result — and
+// The regression tests below provoke exactly that interleaving 鈥?a warning while
+// the turn is parked mid-stream, then another model event and the result 鈥?and
 // pin the two halves of the fix: no message row from liveness, and a typed
 // update on the wire for every transition.
 
@@ -403,8 +403,8 @@ describe("a liveness verdict never enters the transcript", () => {
 // The plan half of the context bar is SERVER-OWNED state, and these two are the
 // ways it used to go missing: a plan broadcast before the turn's own history and
 // skills were attached (which every client rendered as degraded), and a
-// reconnect that never got the last one back (which left the plan half — and
-// everything `planView` feeds, `/status` included — empty until the next turn).
+// reconnect that never got the last one back (which left the plan half 鈥?and
+// everything `planView` feeds, `/status` included 鈥?empty until the next turn).
 describe("the run plan is broadcast once, and resynced to a fresh subscriber", () => {
   it("sends the plan the runtime was DISPATCHED with, and re-sends it on subscribe", async () => {
     const agent = await makeAgent("resync-run-plan");
@@ -416,7 +416,7 @@ describe("the run plan is broadcast once, and resynced to a fresh subscriber", (
     gate.open();
     await turn;
 
-    // (a) One broadcast, and it is the dispatched plan — not the pre-history
+    // (a) One broadcast, and it is the dispatched plan 鈥?not the pre-history
     //     placeholder, whose `history`/`skills` are not attached yet. Every
     //     `run_plan` for this turn must carry the same hash the runtime held.
     const broadcastHashes = hub.events
@@ -427,7 +427,7 @@ describe("the run plan is broadcast once, and resynced to a fresh subscriber", (
 
     // (b) The client drops its plan when the connection goes (a finished turn's
     //     limits must not read as the next turn's), so a fresh subscription has
-    //     to get it back from the server — it holds no copy and cannot derive
+    //     to get it back from the server 鈥?it holds no copy and cannot derive
     //     one.
     hub.socketMessages.length = 0;
     await sessions.replaySubscriptionStateFor(agent.id, {} as never);
@@ -457,10 +457,87 @@ describe("the run plan is broadcast once, and resynced to a fresh subscriber", (
     await sessions.replaySubscriptionStateFor(agent.id, {} as never);
 
     // "Resolved nothing" and "resolved an empty route" are different states, and
-    // only the first one is true here — inventing a plan would give the UI a
+    // only the first one is true here 鈥?inventing a plan would give the UI a
     // route to render that no turn ever ran under.
     expect(hub.socketMessages.map((m) => m.type)).not.toContain("run_plan");
     // The rest of the resync still happens.
     expect(hub.socketMessages.map((m) => m.type)).toContain("context_usage");
   });
+});
+
+// The regression that killed a real turn (2026-09-16): a job finished while the
+// agent's turn was still running, the terminal notice was appended to the
+// transcript, and the turn -- which holds its own local sequence cursor -- landed
+// its next message on the same `(agentId, seq)`. The turn aborted with a UNIQUE
+// constraint error, and that abort was then reported to the user as a dead
+// runtime (`RUNTIME_STREAM_CLOSED`), so a job doing its job looked like a model
+// that had crashed.
+//
+// The contract, in order: nothing may touch the transcript while a turn owns the
+// sequence; the user still sees the job settle live; the durable row lands after
+// the run releases the cursor, exactly once, on a sequence nobody else holds.
+describe("a job that settles mid-turn does not steal the turn's sequence", () => {
+  it("defers the transcript row until the run releases the cursor", async () => {
+    const agent = await makeAgent("job-settles-mid-turn");
+    const hub = new StubHub();
+    const sessions = new SessionManager(hub as never);
+
+    const turn = sessions.sendMessage(agent.id, "keep working while the job ends");
+    await waitForTurnStart();
+
+    // A real job, started the way a tool call starts one, that finishes while the
+    // turn is parked.
+    const job = sessions.jobs.start({
+      agentId: agent.id,
+      agentName: agent.name,
+      command: "echo job-done",
+      cwd: process.cwd(),
+    });
+    for (let i = 0; i < 600 && sessions.jobs.get(job.id)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(sessions.jobs.get(job.id)?.status).not.toBe("running");
+
+    const messageRows = async (): Promise<
+      Array<{ seq: number; payload: { subtype?: string } | null }>
+    > =>
+      (await prisma.message.findMany({ where: { agentId: agent.id } })) as unknown as Array<{
+        seq: number;
+        payload: { subtype?: string } | null;
+      }>;
+    const jobRows = async () =>
+      (await messageRows()).filter((r) => r.payload?.subtype === "job_settled");
+
+    // 1. The turn still owns the sequence: NOTHING was written for this job yet.
+    //    This is the assertion the old code failed -- it inserted here, and the
+    //    turn's next payload landed on the same seq.
+    expect(await jobRows()).toHaveLength(0);
+
+    // 2. It is not silent either: the session was told live, with no transcript
+    //    row and no sequence of its own.
+    const live = hub.events
+      .filter((e) => e.msg.type === "message" && (e.msg as { seq?: number }).seq === -1)
+      .map((e) => e.msg as unknown as { seq: number; msg: { subtype?: string; jobId?: string } });
+    expect(live.some((m) => m.msg.subtype === "job_settled" && m.msg.jobId === job.id)).toBe(true);
+
+    // 3. The turn survives the job entirely.
+    gate.open();
+    await expect(turn).resolves.toBeDefined();
+
+    // 4. Now the durable notice lands, exactly once.
+    for (let i = 0; i < 200 && (await jobRows()).length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const rows = await messageRows();
+    const after = rows.filter((r) => r.payload?.subtype === "job_settled");
+    expect(after).toHaveLength(1);
+    // No message lost its place to the job: every sequence in the transcript is
+    // still unique, and the notice sits at the end of it.
+    const seqs = rows.map((r) => r.seq);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect(after[0].seq).toBe(Math.max(...seqs));
+    // And the run was not reported as a dead runtime: a job is never evidence
+    // about the model.
+    expect(sessions.livenessReportFor(agent.id).last?.state).toBe("completed");
+  }, 60_000);
 });

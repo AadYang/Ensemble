@@ -15,7 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { LivenessProbeKind, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOptions } from "./types.js";
@@ -86,41 +86,33 @@ export function makeClaudeSpawner(liveness: RuntimeLivenessReporter | null): {
   return { spawner, probe };
 }
 
-/** The levels THIS runtime can express, and the thinking budget each maps to.
+/** The levels THIS runtime can express.
  *
- *  This is a statement about the Claude Code adapter, not about any model: the
- *  SDK's only reasoning knob is `maxThinkingTokens`, so the adapter can carry
- *  exactly these six levels. A level from the plan that is absent here is
- *  unrepresentable on this runtime — reported, never dropped. Keyed by plain
- *  string because the protocol's level type is open. */
-const THINKING_TOKEN_BUDGETS: Readonly<Record<string, number>> = {
-  minimal: 1024,
-  low: 4096,
-  medium: 8192,
-  high: 16384,
-  xhigh: 32768,
-  max: 64000,
-};
+ *  Claude Agent SDK's live knob is `effort` (`output_config.effort` on the
+ *  Messages API). `maxThinkingTokens` is deprecated: on Opus 4.6+ it is
+ *  treated as on/off, so mapping named levels onto token budgets made every
+ *  non-zero choice look the same. A level absent from this list is
+ *  unrepresentable here — reported, never dropped. */
+const CLAUDE_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 
 const CLAUDE_REASONING_SOURCE =
-  "Claude Code runtime: the SDK exposes reasoning only as a thinking-token budget, so this adapter can carry exactly these levels";
+  "Claude Code runtime: the SDK exposes reasoning as Options.effort (https://platform.claude.com/docs/en/build-with-claude/effort)";
 
-type ThinkingBudget =
-  | { ok: true; maxThinkingTokens: number | undefined }
+type EffortChoice =
+  | { ok: true; effort: EffortLevel | undefined }
   | { ok: false; requested: string };
 
 /** `undefined` means `inherit`: nothing was asked for, so no parameter is sent
- *  and the upstream default applies. Every other value must be one this adapter
- *  can actually express. */
-function thinkingBudgetFor(level: string | undefined): ThinkingBudget {
-  if (level === undefined) return { ok: true, maxThinkingTokens: undefined };
-  const maxThinkingTokens = THINKING_TOKEN_BUDGETS[level];
-  if (maxThinkingTokens === undefined) return { ok: false, requested: level };
-  return { ok: true, maxThinkingTokens };
+ *  and the upstream default applies (`high` on current Claude models). */
+function effortFor(level: string | undefined): EffortChoice {
+  if (level === undefined) return { ok: true, effort: undefined };
+  if ((CLAUDE_EFFORT_LEVELS as readonly string[]).includes(level)) {
+    return { ok: true, effort: level as EffortLevel };
+  }
+  return { ok: false, requested: level };
 }
 
-export const CLAUDE_SUPPORTED_REASONING_LEVELS: readonly string[] =
-  Object.keys(THINKING_TOKEN_BUDGETS);
+export const CLAUDE_SUPPORTED_REASONING_LEVELS: readonly string[] = CLAUDE_EFFORT_LEVELS;
 
 const CLAUDE_LOCAL_AUTH_ENV_KEYS = new Set([
   "ANTHROPIC_AUTH_TOKEN",
@@ -207,13 +199,13 @@ function mergeContextWindowEnv(
   opts: RuntimeOptions,
   env: Record<string, string>,
 ): Record<string, string> {
-  // Read from the PLAN, not from a second resolution. The window and the
-  // compaction trigger are the same two numbers the turn's history budget was
-  // derived from, so the CLI's auto-compact cannot fire at a point the plan
-  // believes is still inside the budget (or vice versa). Re-deriving them here
-  // was a second answer to a question the plan had already answered.
-  const window =
-    opts.runPlan.context.effectiveWindow ?? opts.runPlan.context.advertisedContextWindow;
+  // Read from the PLAN, not from a second resolution. Capacity declaration,
+  // observed effective window and compaction policy are separate answers; this
+  // adapter consumes only the two policy fields it is allowed to configure.
+  // Runtime configuration is allowed to consume only the policy-gated
+  // declaration value. `advertisedContextWindow` is display metadata and an
+  // observed effective clamp is not a request to redeclare a different value.
+  const window = opts.runPlan.context.requestedRuntimeWindow;
   const compactAt = opts.runPlan.context.compactionThreshold;
   if (!window && !compactAt) return env;
   const merged = { ...env };
@@ -233,18 +225,18 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // agent metadata here; a runtime that resolves its own value is how one turn
     // ends up running two different settings.
     const reasoning = opts.runPlan.execution.reasoningEffort;
-    const budget = thinkingBudgetFor(reasoning);
-    if (!budget.ok) {
+    const chosen = effortFor(reasoning);
+    if (!chosen.ok) {
       // Refuse BEFORE the request. Sending the turn without the setting would
       // silently downgrade what the user asked for — the exact failure this
       // contract exists to prevent — and the SDK has no way to express it.
       yield {
         type: "error",
         code: "REASONING_EFFORT_UNSUPPORTED",
-        message: `reasoning level "${budget.requested}" cannot be expressed on the Claude Code runtime (supported: ${CLAUDE_SUPPORTED_REASONING_LEVELS.join(", ")})`,
+        message: `reasoning level "${chosen.requested}" cannot be expressed on the Claude Code runtime (supported: ${CLAUDE_SUPPORTED_REASONING_LEVELS.join(", ")})`,
         recoverable: false,
         reasoning: {
-          requested: budget.requested,
+          requested: chosen.requested,
           runtime: opts.runPlan.identity.runtime,
           model: opts.runPlan.identity.modelId,
           supportedLevels: [...CLAUDE_SUPPORTED_REASONING_LEVELS],
@@ -253,11 +245,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       };
       return;
     }
-    const maxThinkingTokens = budget.maxThinkingTokens;
+    const effort = chosen.effort;
     // The working directory, from the plan — the same field `/status` shows and
     // the tools resolve against. It is not `process.cwd()` and not a pinned
-    // home directory: the CLI scopes its session files AND its project
-    // instructions (CLAUDE.md / memory files) by this path, so it has to be the
+    // home directory: the CLI scopes its session files by this path, while
+    // SessionManager injects project instructions because this adapter's
+    // custom systemPrompt disables CLAUDE.md walk-up. It still has to be the
     // agent's actual project. A plan whose root is unusable never reaches a
     // runtime (the turn is refused before dispatch), so a null here is a caller
     // that bypassed the type — refused rather than guessed.
@@ -280,7 +273,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       prompt: opts.prompt,
       options: {
         model: opts.model,
-        ...(maxThinkingTokens !== undefined ? { maxThinkingTokens } : {}),
+        ...(effort !== undefined ? { effort } : {}),
         permissionMode: opts.permissionMode,
         ...(opts.permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
         tools: opts.tools,
@@ -319,6 +312,11 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // — not by the loop's exit code, which is normal in both cases.
     let sawResult = false;
     let closedByError: string | null = null;
+    // `for await` invokes the generator's `return()` when its CONSUMER throws
+    // while processing a yielded message. That runs this finally block too,
+    // but says nothing about the producer stream. Only reaching the statement
+    // after the loop proves that the SDK iterator itself drained naturally.
+    let drainedNaturally = false;
     try {
       for await (const msg of stream) {
         if ((msg as { type?: string }).type === "result") {
@@ -329,6 +327,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // (which uses `[k: string]: unknown`). Cast to widen for the protocol type.
         yield { type: "sdk_message", payload: msg as unknown as SdkMessage };
       }
+      drainedNaturally = true;
     } catch (err) {
       closedByError = err instanceof Error ? err.message : String(err);
       throw err;
@@ -338,7 +337,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       // a stream that vanished without a result and without an explanation —
       // the only close that is evidence.
       opts.liveness?.streamClosed(
-        !sawResult && closedByError === null && !opts.abortController.signal.aborted,
+        drainedNaturally && !sawResult && closedByError === null && !opts.abortController.signal.aborted,
       );
     }
   }

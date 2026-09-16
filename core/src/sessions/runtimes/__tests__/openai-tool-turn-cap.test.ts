@@ -11,8 +11,10 @@
 // complete a 16-turn loop. The SDK's cap rule is reproduced in a fake Runner
 // (with a control case below proving the reproduction really does stop at 10),
 // so the test exercises the real runtime path — plan → runTurnOnce → runner.run —
-// without a network. The runtime's own MAX_INTERRUPT_ROUNDS = 32 approval-round
-// protection is untouched by this and still bounded.
+// without a network. The approval loop is bounded by OBSERVATION instead of by a
+// round count now (`makeApprovalLoopTracker`, pinned in
+// openai-responses-transport.test.ts): a turn doing new work on every round is
+// not capped here at all, which is the point of passing `maxTurns: null`.
 //
 // The second block reuses the same fake to pin the OTHER thing this runtime
 // hands the SDK: the plan's reasoning level, forwarded verbatim and omitted
@@ -106,9 +108,10 @@ afterAll(() => {
 });
 
 function optsFor(
-  over: { kind?: string; reasoningEffort?: string; model?: string } = {},
+  over: { kind?: string; reasoningEffort?: string; model?: string; transport?: "responses" | "chat-completions" } = {},
 ): RuntimeOptions {
   const model = over.model ?? "gpt-5.6-sol";
+  const transport = over.transport ?? "chat-completions";
   const provider = {
     id: "prov-1",
     name: "Test Provider",
@@ -139,10 +142,10 @@ function optsFor(
         scratchPath: TMP,
       },
       transportFacts: {
-        value: "chat-completions",
+        value: transport,
         origin: "provider-discovered",
         confidence: "observed",
-        source: "the endpoint answered on /chat/completions",
+        source: `the endpoint answered on /${transport === "responses" ? "responses" : "chat/completions"}`,
         considered: [],
       },
       preferences: { transport: "auto", ...(over.reasoningEffort ? { reasoningEffort: over.reasoningEffort } : {}) },
@@ -220,5 +223,38 @@ describe("openai reasoning passthrough", () => {
 
     expect(events.find((e) => e.type === "error")).toBeUndefined();
     expect(effortOf(mock.state.agentConfigs[0])).toBe("high");
+  });
+
+  it("on chat-completions, an explicit DeepSeek effort also enables thinking", async () => {
+    mock.state.agentConfigs.length = 0;
+    const events = await drain(optsFor({
+      model: "deepseek-flash",
+      reasoningEffort: "max",
+      transport: "chat-completions",
+    }));
+
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const settings = mock.state.agentConfigs[0]?.modelSettings as {
+      reasoning?: { effort?: string };
+      providerData?: { thinking?: { type?: string } };
+    } | undefined;
+    expect(effortOf(mock.state.agentConfigs[0])).toBe("max");
+    expect(settings?.providerData?.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("does not send the Chat Completions thinking extra-body on Responses", async () => {
+    mock.state.agentConfigs.length = 0;
+    await drain(optsFor({
+      model: "deepseek-flash",
+      reasoningEffort: "high",
+      transport: "responses",
+    }));
+
+    const settings = mock.state.agentConfigs[0]?.modelSettings as {
+      reasoning?: { effort?: string };
+      providerData?: unknown;
+    } | undefined;
+    expect(settings?.reasoning?.effort).toBe("high");
+    expect(settings?.providerData).toBeUndefined();
   });
 });

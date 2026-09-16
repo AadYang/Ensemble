@@ -303,6 +303,9 @@ export type LivenessTerminalReason =
   /** The stream closed with background work still outstanding: not a clean
    *  completion, and not proof the process is gone. */
   | "RUNTIME_STREAM_CLOSED"
+  /** Ensemble failed to durably append a turn message. Storage failure is not
+   *  evidence that the provider stream died. */
+  | "MESSAGE_PERSISTENCE_FAILED"
   /** The core process restarted while the run was open. The run did not
    *  finish; that it did not finish is a fact `/status` must keep showing. */
   | "RECOVERED_AFTER_RESTART";
@@ -485,6 +488,13 @@ export interface RunPlanContext {
   /** The runtime's effective ceiling. A preference never writes here: this is
    *  what the session is ACTUALLY running under, not what was asked for. */
   effectiveWindow: number | null;
+  /** Capacity value the policy layer permits a runtime adapter to DECLARE.
+   *  This is deliberately separate from both the observed effective ceiling
+   *  and the vendor-advertised display value. Only confirmed catalog facts on
+   *  a runtime whose declaration key has verified semantics can appear here. */
+  requestedRuntimeWindow: number | null;
+  /** Vendor-advertised capacity, for display and diagnostics only. It must
+   *  never drive runtime configuration or local history/token budgets. */
   advertisedContextWindow: number | null;
   /** Output tokens held back from the input budget. A user `maxOutputTokens`
    *  preference lowers it; it can never raise it above the model's published
@@ -755,6 +765,13 @@ export interface ResolutionRequest {
    *  Omitted = not established, which stays `unknown` rather than defaulting to
    *  chat-completions. */
   transportFacts?: ResolvedCapability<RunPlanTransport> | null;
+  /** Whether this route has been established as able to continue a
+   *  conversation the SERVER stored. Omitted = not established, which stays
+   *  `unknown` rather than defaulting to true: claiming a continuation nobody
+   *  holds is how history gets dropped. The session layer supplies it because
+   *  it is the only layer that knows which endpoint the provider points at and
+   *  what the endpoint last said. */
+  serverConversationFacts?: ResolvedCapability<boolean> | null;
   /** Live reading for THIS turn, already validated against the turn watermark. */
   sessionObservedWindow?: number | null;
   /** Window we asked the runtime to use, when we declared one. Only used to

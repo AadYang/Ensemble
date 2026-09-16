@@ -2938,6 +2938,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
       turnPrompt: "next question",
       context: {
         effectiveWindow: 2_000,
+        requestedRuntimeWindow: 2_000,
         advertisedContextWindow: 2_000,
         outputReserve: 0,
         compactionThreshold: null,
@@ -3034,6 +3035,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
       toolsText: null,
       context: {
         effectiveWindow: 30,
+        requestedRuntimeWindow: null,
         advertisedContextWindow: null,
         outputReserve: 0,
         compactionThreshold: null,

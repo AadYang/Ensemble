@@ -154,7 +154,7 @@ export function windowFractionBudget(
   fraction: number,
 ): number | null {
   if (!context) return null;
-  const window = context.effectiveWindow ?? context.advertisedContextWindow ?? null;
+  const window = context.effectiveWindow;
   if (window === null) return null;
   return Math.max(0, Math.floor((window - (context.outputReserve ?? 0)) * fraction));
 }
@@ -167,7 +167,7 @@ export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOu
   const counts = req.turns.map((t) => measurer.count(t.text));
   const totalTokens = counts.reduce((sum, n) => sum + n, 0);
 
-  const window = req.context.effectiveWindow ?? req.context.advertisedContextWindow ?? null;
+  const window = req.context.effectiveWindow;
   const systemTokens = req.systemPrompt ? measurer.count(req.systemPrompt) : 0;
   const toolTokens = req.toolsText ? measurer.count(req.toolsText) : 0;
   const turnTokens = req.turnPrompt ? measurer.count(req.turnPrompt) : 0;

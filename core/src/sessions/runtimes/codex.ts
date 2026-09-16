@@ -843,12 +843,10 @@ export class CodexCliRuntime implements AgentRuntime {
       resume: canResumeNative ? opts.resume : undefined,
       sandbox,
       reasoningEffort,
-      // The CAPACITY declaration, from the plan — the same window the turn's
-      // history budget and `/status` were derived from. `runPlan.context` is
-      // resolved once by the planner, so this and claude.ts's
-      // CLAUDE_CODE_MAX_CONTEXT_TOKENS can no longer be two different numbers.
-      contextWindow:
-        opts.runPlan.context.advertisedContextWindow ?? opts.runPlan.context.effectiveWindow,
+      // The CAPACITY declaration passed the planner's policy gate. The display-only
+      // advertised value and the observed effective clamp are deliberately
+      // not consulted here.
+      contextWindow: opts.runPlan.context.requestedRuntimeWindow,
     });
     let codexSessionId = canResumeNative ? opts.resume! : randomUUID();
     const resumeSessionFile = canResumeNative

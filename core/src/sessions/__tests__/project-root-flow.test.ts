@@ -494,7 +494,7 @@ describe("project instructions", () => {
     );
   });
 
-  it("does not touch instruction files for the native runtimes", async () => {
+  it("leaves instruction loading to Codex, the native runtime that still loads it", async () => {
     // Load-bearing scope check: the refusal above belongs to the runtime that
     // has to inject them. A native CLI deals with its own instruction files,
     // so the same directory must not stop its turn.
@@ -503,8 +503,9 @@ describe("project instructions", () => {
     const provider = await prisma.provider.create({
       data: {
         name: "unreadable-native-provider",
-        kind: "anthropic-local",
+        kind: "openai-codex",
         models: ["test-model"],
+        metadata: { defaultSandbox: "danger-full-access" },
       },
     });
     const agent = await prisma.agent.create({
@@ -519,10 +520,10 @@ describe("project instructions", () => {
     writeFileSync(join(root, "AGENTS.md"), "INJECTED-PROJECT-RULE");
 
     const expectations = [
-      // Native runtimes read the project's instructions through their own CLI
-      // (spawned with cwd = the plan root), so injecting a second copy here
-      // would double the rules and could disagree with the file the CLI read.
-      { kind: "anthropic-local", expectBlock: false },
+      // Claude's adapter supplies a complete string system prompt and disables
+      // settingSources, so it cannot rely on the SDK's CLAUDE.md walk-up.
+      { kind: "anthropic-local", expectBlock: true },
+      // Codex still reads the project's instructions through its own CLI.
       { kind: "openai-codex", expectBlock: false },
       // The in-process HTTP runtime has no directory awareness at all: this is
       // its only channel.

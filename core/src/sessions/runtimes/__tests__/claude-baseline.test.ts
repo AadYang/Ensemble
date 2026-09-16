@@ -45,10 +45,10 @@ const stubProvider: Provider = {
   updatedAt: new Date(0),
 };
 
-const baseOpts = (): RuntimeOptions => ({
+const baseOpts = (model = "claude-opus-4-8"): RuntimeOptions => ({
   sessionId: "test-session",
   prompt: "hello",
-  model: "claude-opus-4-8",
+  model,
   permissionMode: "default",
   tools: [],
   allowedTools: [],
@@ -61,7 +61,7 @@ const baseOpts = (): RuntimeOptions => ({
   // working directory — there is no `cwd` option any more. The real resolver
   // produces the answer the runtime reads.
   runPlan: resolveRunPlan({
-    model: "claude-opus-4-8",
+    model,
     runtime: "claude",
     providerId: stubProvider.id,
     projectRoot: {
@@ -218,7 +218,7 @@ describe("ClaudeAgentRuntime baseline", () => {
     ]);
   });
 
-  it("passes explicit thinking mode as Claude Code max thinking tokens", async () => {
+  it("passes explicit thinking mode as Claude Code effort", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
     for await (const _ of rt.query({
@@ -232,19 +232,33 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(call).toBeDefined();
     const queryArgs = call![0]!;
     const options = queryArgs.options!;
-    expect(options.maxThinkingTokens).toBe(16384);
+    expect(options.effort).toBe("high");
+    expect(options).not.toHaveProperty("maxThinkingTokens");
+  });
+
+  it("forwards max as the SDK effort token, not as a thinking-token budget", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({
+      ...baseOpts(),
+      runPlan: planWithReasoning("max"),
+    })) {
+      // consume stream
+    }
+    expect(lastQueryOptions().effort).toBe("max");
+    expect(lastQueryOptions()).not.toHaveProperty("maxThinkingTokens");
   });
 
   // The level reaches the adapter from the plan (that is the only channel now),
-  // and a level this adapter cannot turn into a budget is REFUSED before the
+  // and a level this adapter cannot turn into `effort` is REFUSED before the
   // request — the alternative is sending the turn while silently ignoring what
   // the user asked for, which is the exact failure the contract forbids.
   it("refuses an unexpressible level before calling the SDK instead of dropping it", async () => {
     const rt = new ClaudeAgentRuntime();
     const events: unknown[] = [];
     for await (const ev of rt.query({
-      ...baseOpts(),
-      runPlan: planWithReasoning("ultra"),
+      ...baseOpts("claude-opus-4-1"),
+      runPlan: planWithReasoning("ultra", "claude-opus-4-1"),
     })) {
       events.push(ev);
     }
@@ -259,14 +273,15 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(err.type).toBe("error");
     expect(err.code).toBe("REASONING_EFFORT_UNSUPPORTED");
     expect(err.reasoning?.requested).toBe("ultra");
-    expect(err.reasoning?.model).toBe("claude-opus-4-8");
+    expect(err.reasoning?.model).toBe("claude-opus-4-1");
     // What it CAN express, as data — not only as prose in the message.
     expect(err.reasoning?.supportedLevels).toContain("high");
+    expect(err.reasoning?.supportedLevels).toContain("xhigh");
     expect(err.reasoning?.supportedLevels).not.toContain("ultra");
-    expect(err.reasoning?.source).toContain("thinking-token budget");
+    expect(err.reasoning?.source).toContain("effort");
   });
 
-  it("omits max thinking tokens when thinking mode inherits runtime defaults", async () => {
+  it("omits effort when thinking mode inherits runtime defaults", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
     // A plan that resolved `inherit` (the default `baseOpts()` already is one):
@@ -281,6 +296,7 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(call).toBeDefined();
     const queryArgs = call![0]!;
     const options = queryArgs.options!;
+    expect(options).not.toHaveProperty("effort");
     expect(options).not.toHaveProperty("maxThinkingTokens");
   });
 
@@ -341,7 +357,7 @@ describe("ClaudeAgentRuntime baseline", () => {
     // away ~1.1M tokens of context across six measured compactions.
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
-    for await (const _ of rt.query({ ...baseOpts(), model: "deepseek-flash" })) {
+    for await (const _ of rt.query(baseOpts("deepseek-flash"))) {
       // consume stream
     }
 
@@ -356,7 +372,7 @@ describe("ClaudeAgentRuntime baseline", () => {
   it("does NOT pin the compaction policy to the model maximum", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
-    for await (const _ of rt.query({ ...baseOpts(), model: "deepseek-flash" })) {
+    for await (const _ of rt.query(baseOpts("deepseek-flash"))) {
       // consume stream
     }
 
@@ -367,7 +383,7 @@ describe("ClaudeAgentRuntime baseline", () => {
   it("declares a smaller documented window too (glm-4.5 documents 128k)", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
-    for await (const _ of rt.query({ ...baseOpts(), model: "glm-4.5" })) {
+    for await (const _ of rt.query(baseOpts("glm-4.5"))) {
       // consume stream
     }
 
@@ -382,7 +398,7 @@ describe("ClaudeAgentRuntime baseline", () => {
   it("does not declare a window we have not confirmed", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
-    for await (const _ of rt.query({ ...baseOpts(), model: "deepseek-chat" })) {
+    for await (const _ of rt.query(baseOpts("deepseek-chat"))) {
       // consume stream
     }
 
@@ -400,7 +416,7 @@ describe("ClaudeAgentRuntime baseline", () => {
     ] as const) {
       queuedMessages.push([]);
       const rt = new ClaudeAgentRuntime();
-      for await (const _ of rt.query({ ...baseOpts(), model })) {
+      for await (const _ of rt.query(baseOpts(model))) {
         // consume stream
       }
       expect((lastQueryOptions().env ?? {}) as Record<string, string>, model)
@@ -411,7 +427,7 @@ describe("ClaudeAgentRuntime baseline", () => {
   it("leaves the SDK's own window alone for models we have no verified value for", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
-    for await (const _ of rt.query({ ...baseOpts(), model: "claude-opus-4-8" })) {
+    for await (const _ of rt.query(baseOpts("claude-opus-4-8"))) {
       // consume stream
     }
 
@@ -424,8 +440,7 @@ describe("ClaudeAgentRuntime baseline", () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();
     for await (const _ of rt.query({
-      ...baseOpts(),
-      model: "deepseek-flash",
+      ...baseOpts("deepseek-flash"),
       env: {
         CLAUDE_CODE_MAX_CONTEXT_TOKENS: "750000",
         CLAUDE_CODE_AUTO_COMPACT_WINDOW: "250000",

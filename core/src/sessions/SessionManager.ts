@@ -26,10 +26,13 @@ import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
 import {
   contextUsageFromTranscript,
   contextUsageFromUsedTokens,
+  liveOccupancy,
+  occupancyDeltaFromStreamEvent,
+  occupancyTokensFromLastCall,
+  occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
-  promptTokensFromLastCall,
-  promptTokensFromResultContextUsage,
   reportedContextWindowFromResult,
+  shouldPublishLiveContext,
 } from "../context-usage.js";
 import {
   compactionThreshold,
@@ -37,6 +40,7 @@ import {
   requestedRuntimeWindow,
   scopeForAgent,
   vendorScopeForModel,
+  type EffectiveWindowContext,
 } from "../context-window.js";
 import { probeCodexVersion } from "../cli-config.js";
 import { chooseRuntime, runtimeScopeForKind } from "./runtimes/index.js";
@@ -180,7 +184,7 @@ import {
   sourceHashOf,
   summarizerTextOf,
 } from "../message-archive.js";
-import { countTokens } from "../local-tokenizer.js";
+import { countTokens, countTokensMany } from "../local-tokenizer.js";
 import {
   makeTokenMeasurer,
   resolveHistoryBudget,
@@ -191,6 +195,9 @@ import type { RunPlanHistoryStrategy } from "@agentorch/shared";
 import {
   resolveServerConversation,
   serverConversationSignature,
+  serverConversationSupportFact,
+  withServerConversation,
+  withServerConversationRejection,
   withoutServerConversation,
 } from "../capability/server-conversation.js";
 import { summarizeLayered, type CompactSourceTurn } from "../capability/layered-compact.js";
@@ -387,6 +394,15 @@ interface RunningSession {
 interface LiveTranscript {
   current: string;
   finalized: string[];
+}
+
+interface LiveContextState {
+  model: string;
+  windowInput: EffectiveWindowContext;
+  promptTokens: number;
+  streamedText: string;
+  lastEmitAt: number;
+  lastEmittedUsed: number;
 }
 
 interface InterruptedTurnPayload {
@@ -806,9 +822,15 @@ export const hashStableSystemPrompt = (opts: {
   permissionMode: PermissionMode;
   teamContext: string;
   baseSystemPrompt: string;
+  projectInstructions?: string | null;
 }): string => {
   const tailRole = opts.teamContext || opts.baseSystemPrompt;
-  const promptStableSig = [buildEnsemblePrimer(), planModeNotice(opts.permissionMode), tailRole].join("\n\n---\n\n");
+  const promptStableSig = [
+    buildEnsemblePrimer(),
+    planModeNotice(opts.permissionMode),
+    opts.projectInstructions ?? "",
+    tailRole,
+  ].join("\n\n---\n\n");
   return createHash("sha1").update(promptStableSig).digest("hex").slice(0, 16);
 };
 
@@ -878,6 +900,18 @@ type RuntimeErrorDetails = {
   upstreamType?: string | null;
   transport?: string;
 };
+
+class MessagePersistenceError extends Error {
+  readonly code = "MESSAGE_PERSISTENCE_FAILED" as const;
+
+  constructor(stage: string, cause: unknown) {
+    super(
+      `could not persist the ${stage} message: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
+    this.name = "MessagePersistenceError";
+  }
+}
 
 const runtimeErrorFromEvent = (event: RuntimeErrorEvent): Error & RuntimeErrorDetails => {
   const err = new Error(event.message) as Error & RuntimeErrorDetails;
@@ -1143,26 +1177,29 @@ function toolSchemaOverheadText(toolNames: string[]): string {
  *  conversation for this plan.
  *
  *  This is a claim about IMPLEMENTATION, not about the provider's family. The
- *  core's Responses path does not currently obtain or store a reusable
- *  response/session id, so the honest answer today is "no" for every plan; when
- *  it does, the id will be bound to the resolved provider + model + project root
- *  + system-prompt hash and this function will read that binding. Until then
- *  the strategy is `local-rebuild` and the plan says so, rather than naming a
- *  continuation the request never carried. */
+ *  Responses path now does obtain and reuse a response id (`previous_response_id`,
+ *  see runtimes/openai.ts), and that id is bound to the resolved provider +
+ *  model + project root + system-prompt hash by
+ *  `capability/server-conversation.ts`. Whether the ROUTE earns the claim is
+ *  decided by evidence the endpoint itself provides (`serverConversationFacts`),
+ *  never by the provider's family name. */
 function supportsServerConversationFor(plan: ResolvedRunPlan): boolean {
   if (plan.identity.runtime !== "openai") return false;
   // A server-side conversation only exists on an HTTP route. The native CLIs
   // resume their own sessions (a different strategy with a different owner), and
   // `unknown` is not a route anyone can continue.
   if (plan.transport.resolved !== "responses") return false;
-  // `runtime-observed` or `catalog-confirmed` only: a value that came from a
-  // user preference or from the `unknown` rung is a wish, not a finding, and a
-  // continuation named on the strength of a wish would silently drop the
-  // transcript the route never stored.
+  // `runtime-observed`, `provider-discovered` or `catalog-confirmed` only: a
+  // value that came from a user preference or from the `unknown` rung is a wish,
+  // not a finding, and a continuation named on the strength of a wish would
+  // silently drop the transcript the route never stored. `provider-discovered`
+  // qualifies here for the same reason it qualifies in transport.ts: it is what
+  // the endpoint's own identity (api.openai.com over Responses) establishes,
+  // not something a user asked for.
+  const origin = plan.facts.supportsServerConversation.origin;
   return (
     plan.facts.supportsServerConversation.value === true &&
-    (plan.facts.supportsServerConversation.origin === "runtime-observed" ||
-      plan.facts.supportsServerConversation.origin === "catalog-confirmed")
+    (origin === "runtime-observed" || origin === "provider-discovered" || origin === "catalog-confirmed")
   );
 }
 
@@ -1189,7 +1226,7 @@ function historyStrategyReasonFor(args: {
 }
 
 function compactChunkBudgets(context: RunPlanContext | null): { chunkTokens: number; mergeTokens: number } {
-  const window = context?.effectiveWindow ?? context?.advertisedContextWindow ?? null;
+  const window = context?.effectiveWindow ?? null;
   if (window === null) {
     return { chunkTokens: COMPACT_CHUNK_FALLBACK_TOKENS, mergeTokens: COMPACT_CHUNK_FALLBACK_TOKENS };
   }
@@ -1377,6 +1414,7 @@ export class SessionManager {
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
   private contextUsageByAgent = new Map<string, ContextUsage>();
+  private liveContextByAgent = new Map<string, LiveContextState>();
   /** The plan the LAST turn actually ran under, per agent. `/status` reads this
    *  rather than resolving its own: a status report that re-derives the
    *  transport can disagree with the request the runtime sent, which is the
@@ -1396,7 +1434,7 @@ export class SessionManager {
    *  place a transcript notice is emitted from. */
   readonly jobs = new JobManager({
     onUpdate: (job) => {
-      void this.notifyJobSettled(job);
+      this.notifyJobSettled(job);
     },
   });
 
@@ -1633,6 +1671,17 @@ export class SessionManager {
         configured: input.projectRoot ?? null,
         scratchPath: scratchDirFor(input.agentId),
       },
+      // Whether this route can continue a SERVER-stored conversation. Resolved
+      // here because this is the layer that holds the provider row (its base URL
+      // and the rejection it last gave us); the planner only carries the answer.
+      // The transport value read is the one the plan will report, so the fact and
+      // the route it describes cannot disagree.
+      serverConversationFacts: serverConversationSupportFact({
+        runtime,
+        transport: transportFacts.value ?? "unknown",
+        baseUrl: input.provider?.baseUrl ?? null,
+        providerMetadata: input.provider?.metadata ?? null,
+      }),
     });
   }
 
@@ -2596,6 +2645,7 @@ export class SessionManager {
       data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
     });
     this.hub.broadcast({ type: "agent_history_reset", sessionId: id, reason: "clear" });
+    this.clearLiveContext(id);
     this.setContextUsage(id, null);
     return true;
   }
@@ -2887,6 +2937,7 @@ export class SessionManager {
       reason: "compact",
       summary: layered.text,
     });
+    this.clearLiveContext(id);
     this.setContextUsage(id, null);
     return { summary: layered.text };
   }
@@ -2987,11 +3038,6 @@ export class SessionManager {
     // recomputed here.
     const configuredProjectRoot = projectRootOf(a);
     const teamContext = await this.buildTeamContext(id);
-    const systemPromptHash = hashStableSystemPrompt({
-      permissionMode,
-      teamContext,
-      baseSystemPrompt: a.systemPrompt ?? "",
-    });
     const storedSystemPromptHash = readMetaString(a.metadata, "systemPromptHash");
     const storedReasoning = readReasoningOverride(a.metadata);
     const roleSource = a.teamId ? "team" : a.systemPrompt?.trim() ? "base" : "empty";
@@ -3023,6 +3069,31 @@ export class SessionManager {
         plan = null;
       }
     }
+    let statusProjectInstructions: string | null = null;
+    if (
+      plan &&
+      (plan.identity.runtime === "openai" || plan.identity.runtime === "claude") &&
+      plan.execution.projectRoot.source === "agent"
+    ) {
+      try {
+        statusProjectInstructions = renderProjectInstructionsBlock(
+          loadProjectInstructions(plan.execution.projectRoot.value),
+        );
+      } catch (err) {
+        // Status remains readable even when the next turn will refuse to run.
+        // Hash the failure marker so a cached native session is never reported
+        // as current after its project instructions became unreadable.
+        statusProjectInstructions = `<project-instructions-unreadable>${
+          err instanceof Error ? err.message : String(err)
+        }</project-instructions-unreadable>`;
+      }
+    }
+    const systemPromptHash = hashStableSystemPrompt({
+      permissionMode,
+      teamContext,
+      baseSystemPrompt: a.systemPrompt ?? "",
+      projectInstructions: statusProjectInstructions,
+    });
     // THE projection, built once here and reused by every field below. Two
     // consumers (this report and the `run_plan` broadcast a turn sends) call the
     // same function on the same plan, which is what makes the settings page and
@@ -4040,47 +4111,117 @@ export class SessionManager {
    *
    *  A `lost` job is reported as lost. Terminal-and-unknown is never rendered
    *  as terminal-and-fine. */
-  private async notifyJobSettled(job: DbJob): Promise<void> {
-    try {
-      // A job outlives its SESSION, not its agent's existence: the message row
-      // has a foreign key, and a deleted agent has no transcript to write to.
-      // The `Job` row survives either way.
-      if (!job.agentId) return;
-      const agent = await prisma.agent.findUnique({ where: { id: job.agentId } });
-      if (!agent) return;
+  private jobSettledPayload(job: DbJob): Record<string, unknown> {
+    const short = job.id.slice(0, 8);
+    const where = `job ${short} (\`${job.command}\`)`;
+    let text: string;
+    switch (job.status) {
+      case "exited":
+        text = `${where} finished: exit 0.`;
+        break;
+      case "failed":
+        text = `${where} failed: exit ${job.exitCode ?? "unknown"}.`;
+        break;
+      case "cancelled":
+        text = `${where} was cancelled${job.exitCode === null ? "" : ` (exit ${job.exitCode})`}.`;
+        break;
+      default:
+        text = `${where} was LOST: ${job.lostReason ?? "the process is gone and no exit was recorded"}.`;
+        break;
+    }
+    text += ` Full output: ${job.logPath}`;
+    return {
+      type: "system",
+      subtype: "job_settled",
+      jobId: job.id,
+      status: job.status,
+      exitCode: job.exitCode,
+      command: job.command,
+      logPath: job.logPath,
+      text,
+    };
+  }
 
-      const short = job.id.slice(0, 8);
-      const where = `job ${short} (\`${job.command}\`)`;
-      let text: string;
-      switch (job.status) {
-        case "exited":
-          text = `${where} finished: exit 0.`;
-          break;
-        case "failed":
-          text = `${where} failed: exit ${job.exitCode ?? "unknown"}.`;
-          break;
-        case "cancelled":
-          text = `${where} was cancelled${job.exitCode === null ? "" : ` (exit ${job.exitCode})`}.`;
-          break;
-        default:
-          text = `${where} was LOST: ${job.lostReason ?? "the process is gone and no exit was recorded"}.`;
-          break;
+  /** Atomically append one terminal job notice and mark it delivered.
+   *
+   * The Message insert and Job marker share a BEGIN IMMEDIATE transaction, so
+   * a crash can leave neither or both, never a duplicate-on-restart half-state.
+   * This runs only while the agent has no active turn: a turn owns a local
+   * sequence cursor, and inserting between two yielded runtime messages was the
+   * exact race that used to abort the turn with Message(agentId,seq) UNIQUE. */
+  private persistJobSettledNotice(job: DbJob): void {
+    const agentId = job.agentId;
+    if (!agentId || this.running.has(agentId)) return;
+    const payload = this.jobSettledPayload(job);
+    let insertedSeq: number | null = null;
+    transaction(() => {
+      const fresh = sqliteDb
+        .prepare("SELECT status, transcriptNotifiedAt FROM Job WHERE id = ? LIMIT 1")
+        .get(job.id) as { status?: string; transcriptNotifiedAt?: number | null } | undefined;
+      if (!fresh || fresh.status === "running" || fresh.transcriptNotifiedAt != null) return;
+      const agentExists = sqliteDb
+        .prepare("SELECT 1 AS ok FROM Agent WHERE id = ? LIMIT 1")
+        .get(agentId) as { ok?: number } | undefined;
+      if (!agentExists?.ok) return;
+      const latest = sqliteDb
+        .prepare("SELECT COALESCE(MAX(seq), -1) AS seq FROM Message WHERE agentId = ?")
+        .get(agentId) as { seq: number };
+      insertedSeq = Number(latest.seq) + 1;
+      const now = Math.floor(Date.now() / 1000);
+      sqliteDb
+        .prepare("INSERT INTO Message (agentId, seq, type, payload, createdAt) VALUES (?, ?, 'system', ?, ?)")
+        .run(agentId, insertedSeq, JSON.stringify(payload), now);
+      const updated = sqliteDb
+        .prepare("UPDATE Job SET transcriptNotifiedAt = ? WHERE id = ? AND transcriptNotifiedAt IS NULL")
+        .run(now, job.id);
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`job ${job.id} transcript marker was concurrently claimed`);
       }
-      text += ` Full output: ${job.logPath}`;
-
-      await this.appendBackgroundTaskNotice(job.agentId, {
-        type: "system",
-        subtype: "job_settled",
-        jobId: job.id,
-        status: job.status,
-        exitCode: job.exitCode,
-        command: job.command,
-        logPath: job.logPath,
-        text,
+    });
+    if (insertedSeq !== null) {
+      this.hub.sendToSession(agentId, {
+        type: "message",
+        sessionId: agentId,
+        seq: insertedSeq,
+        msg: payload as never,
       });
+    }
+  }
+
+  /** Flush terminal notices that were deferred while an agent turn owned the
+   * transcript sequence, including notices left pending by a core restart. */
+  flushSettledJobNotices(agentId?: string): void {
+    const rows = sqliteDb
+      .prepare(
+        `SELECT * FROM Job
+         WHERE status <> 'running' AND transcriptNotifiedAt IS NULL
+           AND (? IS NULL OR agentId = ?)
+         ORDER BY endedAt ASC, startedAt ASC`,
+      )
+      .all(agentId ?? null, agentId ?? null) as unknown as DbJob[];
+    for (const raw of rows) {
+      const job = prisma.job.findUnique({ where: { id: raw.id } });
+      if (job) this.persistJobSettledNotice(job);
+    }
+  }
+
+  private notifyJobSettled(job: DbJob): void {
+    try {
+      if (!job.agentId) return;
+      if (this.running.has(job.agentId)) {
+        // Live visibility without mutating the transcript. The durable Job row
+        // remains pending and is appended after the run releases its sequence.
+        this.hub.sendToSession(job.agentId, {
+          type: "message",
+          sessionId: job.agentId,
+          seq: -1,
+          msg: this.jobSettledPayload(job) as never,
+        });
+        return;
+      }
+      this.persistJobSettledNotice(job);
     } catch (err) {
-      // Fire-and-forget from a child-process event: a rejection here would
-      // take down core, and the Job row is already written either way.
+      // The Job row remains unnotified and the next flush/restart retries it.
       console.error(`[jobs] could not report job ${job.id} to its agent: ${String(err)}`);
     }
   }
@@ -4117,6 +4258,106 @@ export class SessionManager {
     this.hub.sendToSession(sessionId, { type: "context_usage", sessionId, usage });
   }
 
+  private clearLiveContext(sessionId: string): void {
+    this.liveContextByAgent.delete(sessionId);
+  }
+
+  private async contextWindowInput(
+    model: string,
+    providerKind: string,
+    providerId: string | null,
+    sessionObserved: number | null,
+  ): Promise<EffectiveWindowContext> {
+    const windowCtx = scopeForAgent(
+      model,
+      providerKind,
+      await this.runtimeVersionFor(providerKind),
+      providerId,
+    );
+    return {
+      ...windowCtx,
+      sessionObserved,
+      requested: requestedRuntimeWindow(model, windowCtx),
+    };
+  }
+
+  private async seedLiveContext(
+    sessionId: string,
+    model: string,
+    windowInput: EffectiveWindowContext,
+    systemPrompt: string | null | undefined,
+  ): Promise<void> {
+    const texts = await this.contextTranscriptTexts(sessionId, systemPrompt);
+    this.liveContextByAgent.set(sessionId, {
+      model,
+      windowInput,
+      promptTokens: countTokensMany(model, texts),
+      streamedText: "",
+      lastEmitAt: 0,
+      lastEmittedUsed: 0,
+    });
+    this.publishLiveContext(sessionId, { force: true });
+  }
+
+  private publishLiveContext(sessionId: string, opts: { force: boolean }): void {
+    const live = this.liveContextByAgent.get(sessionId);
+    if (!live) return;
+    const used = liveOccupancy(live.promptTokens, countTokens(live.model, live.streamedText));
+    const now = Date.now();
+    if (
+      !shouldPublishLiveContext({
+        force: opts.force,
+        now,
+        lastEmitAt: live.lastEmitAt,
+        lastUsed: live.lastEmittedUsed,
+        nextUsed: used,
+      })
+    ) {
+      return;
+    }
+    const usage = contextUsageFromUsedTokens(live.model, live.windowInput, used);
+    live.lastEmitAt = now;
+    live.lastEmittedUsed = used;
+    this.setContextUsage(sessionId, usage);
+  }
+
+  private noteLiveStreamOccupancy(sessionId: string, msg: unknown): void {
+    const delta = occupancyDeltaFromStreamEvent(msg);
+    if (delta === null) return;
+    const live = this.liveContextByAgent.get(sessionId);
+    if (!live) return;
+    const firstStream = live.streamedText.length === 0;
+    live.streamedText += delta;
+    this.publishLiveContext(sessionId, { force: firstStream });
+  }
+
+  private async refreshLiveContextAfterPersist(
+    sessionId: string,
+    msg: unknown,
+    sinceSeq: number,
+    systemPrompt: string | null | undefined,
+  ): Promise<void> {
+    const live = this.liveContextByAgent.get(sessionId);
+    if (!live) return;
+    const type = (msg as { type?: unknown }).type;
+    if (type === "assistant") {
+      const occ = await this.latestOccupancyTokens(sessionId, sinceSeq);
+      live.promptTokens =
+        occ ?? countTokensMany(live.model, await this.contextTranscriptTexts(sessionId, systemPrompt));
+      live.streamedText = "";
+      this.publishLiveContext(sessionId, { force: true });
+      return;
+    }
+    if (type === "user") {
+      live.promptTokens = countTokensMany(
+        live.model,
+        await this.contextTranscriptTexts(sessionId, systemPrompt),
+      );
+      live.streamedText = "";
+      this.publishLiveContext(sessionId, { force: true });
+    }
+  }
+
   /** Cached runtime/CLI version per provider kind, for the window-profile
    *  match. An observed effective window is only reused on the SAME runtime
    *  version: a CLI upgrade (or a server-side policy change) can move it, and a
@@ -4139,24 +4380,23 @@ export class SessionManager {
     })();
   }
 
-  /** Provider-reported prompt size of the most recent API call, when the
-   *  runtime writes per-call usage onto its assistant rows (Claude, including
-   *  third-party anthropic-compat upstreams). Null → caller falls back to the
-   *  local count. See promptTokensFromLastCall for why this is exact and why
-   *  the *result* row's aggregated usage must not be used instead.
+  /** Occupancy of the most recent API call (prompt + that call's output), when
+   *  the runtime writes per-call usage onto its assistant rows (Claude,
+   *  including third-party anthropic-compat upstreams). Null → caller falls
+   *  back to live occupancy or a local count.
    *
    *  Bounded to the CURRENT turn (rows from the user message that started it):
    *  an agent whose provider kind changed leaves older assistant rows carrying
    *  another runtime's usage behind, and a scan across turns would freeze the
    *  bar on that stale number forever. A turn persists one row per content
    *  block, so the newest 24 rows are still enough to reach the last call. */
-  private async latestPromptTokens(agentId: string, sinceSeq: number): Promise<number | null> {
+  private async latestOccupancyTokens(agentId: string, sinceSeq: number): Promise<number | null> {
     const rows = await prisma.message.findMany({
       where: { agentId, type: "assistant" },
       orderBy: { seq: "desc" },
       take: 24,
     });
-    return promptTokensFromLastCall(
+    return occupancyTokensFromLastCall(
       [...rows].reverse().filter((row) => (row.seq ?? 0) >= sinceSeq),
     );
   }
@@ -4301,6 +4541,7 @@ export class SessionManager {
     const pendingTurnHighWaterId = this.pendingTurnHighWaterId(sessionId);
     let staleResume = false;
     let usedResumeSessionId: string | null = null;
+    let usedServerConversationId: string | null = null;
     let resumeInvalidReasonForRun: string | null = null;
     let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
     let autoRecoveryPromise: Promise<{ finalText: string } | null> | null = null;
@@ -4341,16 +4582,21 @@ export class SessionManager {
           message: { role: "user", content: userInput },
           ...(opts?.peerOrigin ? { _peerOrigin: opts.peerOrigin } : {}),
         };
-    const userPersisted = userMsgPayload
-      ? await prisma.message.create({
+    let userPersisted: DbMessage | null = null;
+    if (userMsgPayload) {
+      try {
+        userPersisted = await prisma.message.create({
           data: {
             agentId: sessionId,
             seq,
             type: "user",
             payload: userMsgPayload,
           },
-        })
-      : null;
+        });
+      } catch (cause) {
+        throw new MessagePersistenceError("user", cause);
+      }
+    }
     if (userPersisted && userMsgPayload) {
       this.hub.sendToSession(sessionId, {
         type: "message",
@@ -4632,12 +4878,12 @@ export class SessionManager {
       const primer = buildEnsemblePrimer();
       const base = agent.systemPrompt ?? "";
       const teamContext = teamContextSync;
-      // Project instructions, ONCE and only for the runtime that cannot read
-      // them itself. Claude/Codex are spawned with cwd = the plan's project
-      // root and load their own project instruction files there; injecting a
-      // second copy here would double them and could disagree with the file
-      // the CLI actually read. The OpenAI/API runtime has no directory
-      // awareness at all, so for it this is the only channel. An unbound
+      // Project instructions, ONCE, for runtimes whose adapter does not load
+      // them while using Ensemble's custom system prompt. Codex reads project
+      // rules from its cwd itself. OpenAI has no directory awareness, while
+      // Claude's SDK stops CLAUDE.md walk-up when a string systemPrompt and
+      // `settingSources: []` are used, so Ensemble must inject the same complete
+      // block for both OpenAI and Claude. An unbound
       // agent (scratch) gets nothing: scratch is not the user's project.
       // The gate is the RUNTIME the plan resolved, not the provider's family:
       // `openai-codex` is an OpenAI-branded provider that runs the native Codex
@@ -4646,7 +4892,7 @@ export class SessionManager {
       // directory awareness of their own. Reading the plan's runtime keeps this
       // decision and the executor's on the same field.
       let projectInstructions: string | null = null;
-      if (turnPlan.identity.runtime === "openai") {
+      if (turnPlan.identity.runtime === "openai" || turnPlan.identity.runtime === "claude") {
         try {
           projectInstructions = renderProjectInstructionsBlock(
             loadProjectInstructions(projectRoot.source === "agent" ? projectRoot.value : null),
@@ -4676,6 +4922,7 @@ export class SessionManager {
         permissionMode,
         teamContext,
         baseSystemPrompt: base,
+        projectInstructions,
       });
       const storedPromptHash = readMetaString(agent.metadata, "systemPromptHash");
       const codexReasoningEffort = readReasoningEffortOverride(agent.metadata);
@@ -4814,6 +5061,10 @@ export class SessionManager {
           data: { metadata: withoutServerConversation(agent.metadata) as never },
         });
       }
+      // The id this turn hands the runtime, and the signature it was validated
+      // against — kept here because the turn's END is what decides the stored
+      // value: the new id when the server issued one, nothing when it did not.
+      usedServerConversationId = serverConversation.id;
       const historyStrategy: RunPlanHistoryStrategy = resumed
         ? "runtime-session"
         : serverConversation.id
@@ -5027,6 +5278,13 @@ export class SessionManager {
         // there is exactly one value in play and no second channel that could
         // carry a different one.
         ...(effectiveLastSessionId ? { resume: effectiveLastSessionId } : {}),
+        // The server-side conversation to CONTINUE, already validated against
+        // this turn's signature (`serverConversation.id` is null unless the
+        // stored id was issued for this exact provider/model/root/prompt/
+        // transport). The runtime hands it to the Responses API as
+        // `previous_response_id` and sends only this turn's input; a runtime
+        // that does not speak that API never sees a value here.
+        ...(serverConversation.id ? { serverConversationId: serverConversation.id } : {}),
         mcpServers: allMcpServers,
         env: Object.keys(providerEnv).length > 0 ? mergedEnv : {},
         ...(mergedSystemPrompt ? { systemPrompt: mergedSystemPrompt } : {}),
@@ -5122,12 +5380,29 @@ export class SessionManager {
         jobs: { jobs: this.jobs, agentId: sessionId, agentName: agent.name, defaultCwd: runtimeCwd },
       };
       const stream = runtime.query(runtimeOpts);
+      const providerKindForContext = resolvedProvider?.kind ?? "anthropic-local";
+      await this.seedLiveContext(
+        sessionId,
+        agent.model,
+        await this.contextWindowInput(
+          agent.model,
+          providerKindForContext,
+          resolvedProvider?.id ?? null,
+          this.contextUsageByAgent.get(sessionId)?.contextWindow ?? null,
+        ),
+        mergedSystemPrompt,
+      );
 
       let firstMsg = true;
       // Slice 1 (method A): keep the turn alive after `result` until every
       // drain-blocking Claude background task reports terminal, instead of the
       // old unconditional `break` that silently killed background subagents.
       let sawResultForDrain = false;
+      // The server-side response id this turn produced, from the runtime's own
+      // result payload. SessionManager is the only writer of the stored
+      // continuation: the runtime observes an id, this layer decides whether it
+      // may be reused (it is bound to the turn's signature).
+      let serverResponseIdFromResult: string | null = null;
       const liveBackgroundTasks = new Map<string, BackgroundTaskInfo>();
       // Ids the SDK currently reports as live background tasks, plus the subset
       // that is genuinely DETACHED. Claude Code emits `task_started` for a
@@ -5170,6 +5445,7 @@ export class SessionManager {
         this.recordLiveTranscript(sessionId, msg);
 
         if (msg.type === "stream_event") {
+          this.noteLiveStreamOccupancy(sessionId, msg);
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
           continue;
         }
@@ -5238,14 +5514,19 @@ export class SessionManager {
           if (text) finalText = text;
         }
 
-        const persisted = await prisma.message.create({
-          data: {
-            agentId: sessionId,
-            seq,
-            type: msg.type,
-            payload: msg as object,
-          },
-        });
+        let persisted: DbMessage;
+        try {
+          persisted = await prisma.message.create({
+            data: {
+              agentId: sessionId,
+              seq,
+              type: msg.type,
+              payload: msg as object,
+            },
+          });
+        } catch (cause) {
+          throw new MessagePersistenceError(msg.type, cause);
+        }
 
         // W17.3: double-write usage events on every result message. Pure
         // helper; emits one row per model in the result's modelUsage map.
@@ -5278,52 +5559,50 @@ export class SessionManager {
             }
           }
 
-          // Refresh the live context-usage indicator from this result. Prefer
-          // the runtime's own per-call prompt size — from the assistant rows
-          // when the runtime writes usage there (Claude), else from the result
-          // payload's `contextUsage` (in-process OpenAI runtime). Fall back to a
-          // local count of the history the runtime replays. Null (unknown window
-          // / nothing countable) clears the indicator until a later turn can
-          // compute it.
+          // Refresh the live context-usage indicator from this result. Occupancy
+          // is prompt + this call's output, so the bar does not drop when the
+          // stream ends. Prefer per-call usage on assistant rows (Claude), else
+          // the result payload's `contextUsage` (OpenAI / Codex). Live occupancy
+          // wins when the provider number is smaller (Codex currently reports
+          // outputTokens: 0). Fall back to a local count of the replayed history.
           const providerKind = resolvedProvider?.kind ?? "anthropic-local";
-          // Real provider scope: runtime + model vendor + version + provider row.
-          //
-          // The vendor is part of the key so a documented capacity cannot be
-          // answered from another vendor's row, and the provider id lets a user
-          // pin an OVERRIDE to one provider (`...#<providerId>`), which matters
-          // because two compat providers can expose the same model id with
-          // different real limits. Built-in values stay provider-agnostic: a
-          // vendor's documented capacity and a CLI's observed clamp are facts
-          // about the model and the runtime build rather than about one provider
-          // row — see runtimeWindowProfile().
-          const windowCtx = scopeForAgent(
+          const windowInput = await this.contextWindowInput(
             agent.model,
             providerKind,
-            await this.runtimeVersionFor(providerKind),
             resolvedProvider?.id ?? null,
+            reportedContextWindowFromResult(msg, agent.model) ?? null,
           );
-          const windowInput = {
-            ...windowCtx,
-            // The runtime's own reported window for THIS session — a live
-            // observation (Claude's SDK field, or codex's rollout
-            // model_context_window), so it outranks any static profile.
-            sessionObserved: reportedContextWindowFromResult(msg, agent.model) ?? null,
-            // What (if anything) we asked this runtime to use. Only ever used to
-            // flag "clamped" — never as the denominator.
-            requested: requestedRuntimeWindow(agent.model, windowCtx),
-          };
+          const live = this.liveContextByAgent.get(sessionId);
+          if (live) live.windowInput = windowInput;
+          const liveUsed = live
+            ? liveOccupancy(live.promptTokens, countTokens(live.model, live.streamedText))
+            : 0;
           const providerTokens =
-            (await this.latestPromptTokens(sessionId, userPersisted?.seq ?? 0)) ??
-            promptTokensFromResultContextUsage(msg);
+            (await this.latestOccupancyTokens(sessionId, userPersisted?.seq ?? 0)) ??
+            occupancyTokensFromResultContextUsage(msg);
+          const used =
+            providerTokens !== null
+              ? Math.max(providerTokens, liveUsed)
+              : liveUsed > 0
+                ? liveUsed
+                : null;
           this.setContextUsage(
             sessionId,
-            providerTokens !== null
-              ? contextUsageFromUsedTokens(agent.model, windowInput, providerTokens)
+            used !== null
+              ? contextUsageFromUsedTokens(agent.model, windowInput, used)
               : contextUsageFromTranscript(
                   agent.model,
                   windowInput,
                   await this.contextTranscriptTexts(sessionId, mergedSystemPrompt),
                 ),
+          );
+          this.clearLiveContext(sessionId);
+        } else {
+          await this.refreshLiveContextAfterPersist(
+            sessionId,
+            msg,
+            userPersisted?.seq ?? 0,
+            mergedSystemPrompt,
           );
         }
 
@@ -5344,7 +5623,13 @@ export class SessionManager {
         // the run"): a silent background task with a live child is exactly the
         // case the liveness rule protects, so the drain waits for an ACTUAL
         // terminal event rather than for a clock.
-        if (msg.type === "result") sawResultForDrain = true;
+        if (msg.type === "result") {
+          sawResultForDrain = true;
+          const responseId = (msg as { serverResponseId?: unknown }).serverResponseId;
+          if (typeof responseId === "string" && responseId.length > 0) {
+            serverResponseIdFromResult = responseId;
+          }
+        }
         if (shouldFinalizeTurn(sawResultForDrain, liveBackgroundTasks)) break;
       }
       // Phase 4: the stream ended from the consumer's side. `noteStopRequested`
@@ -5416,12 +5701,29 @@ export class SessionManager {
         if (codexResumeSignature && storedCodexResumeSignature !== codexResumeSignature) {
           metaPatch[CODEX_RESUME_SIGNATURE_KEY] = codexResumeSignature;
         }
-        if (resumeInvalidReasonForRun !== null || Object.keys(metaPatch).length > 0) {
+        if (
+          resumeInvalidReasonForRun !== null ||
+          Object.keys(metaPatch).length > 0 ||
+          serverResponseIdFromResult !== null
+        ) {
           const baseMetadata =
             resumeInvalidReasonForRun !== null
               ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
               : agent.metadata;
-          persistData.metadata = mergeMetadata(baseMetadata, metaPatch);
+          let nextMetadata = mergeMetadata(baseMetadata, metaPatch);
+          // Only a route that earned the continuation may store the id it
+          // issued. On a route that did not, an id in hand would be an
+          // invitation to name a continuation the endpoint never agreed to —
+          // and `storedAt` is seconds, purely so a reader can see its age.
+          if (serverResponseIdFromResult !== null && supportsServerConversationFor(turnPlan)) {
+            nextMetadata = withServerConversation(
+              nextMetadata,
+              serverResponseIdFromResult,
+              continuationSignature,
+              Math.floor(Date.now() / 1000),
+            );
+          }
+          persistData.metadata = nextMetadata;
         }
       }
       // Guard: cancel() may have already force-cleared state and set status
@@ -5440,9 +5742,12 @@ export class SessionManager {
       // abort is the user's own decision (`user-cancelled`), anything else is a
       // run that stopped before it completed (`interrupted`) — neither is a
       // confirmed death, and neither may be reported as a completion.
+      const persistenceFailure = err instanceof MessagePersistenceError;
       this.liveness.noteStopRequested(runId);
       if (abort.signal.aborted) {
         this.liveness.end(runId, "user-cancelled", "user-cancelled");
+      } else if (persistenceFailure) {
+        this.liveness.end(runId, "MESSAGE_PERSISTENCE_FAILED", "interrupted");
       } else {
         this.liveness.end(runId, "RUNTIME_STREAM_CLOSED", "interrupted");
       }
@@ -5493,6 +5798,44 @@ export class SessionManager {
             `codexEventStreamFailure=${recoverableCodexEventStreamFailure}`,
         );
       }
+      // A continuation the endpoint REJECTED is a verdict about the route, not
+      // an incident to retry. Recorded against the provider (24h, like every
+      // other capability verdict) and the id is dropped with it, so the next
+      // turn rebuilds the transcript locally instead of failing the same way.
+      //
+      // The test is STRUCTURED, never prose (see capability/transport-errors.ts):
+      // a request-shaped status or an "unsupported" classification, on a turn
+      // that actually carried a continuation id. A 400 from this endpoint for
+      // some unrelated field therefore downgrades us too — the safe direction,
+      // and the recorded status/code says what happened.
+      if (!aborted && usedServerConversationId !== null) {
+        const status = runtimeDetails.httpStatus ?? null;
+        const requestShaped =
+          runtimeDetails.transportClassification === "request" ||
+          runtimeDetails.transportClassification === "unsupported" ||
+          status === 400 ||
+          status === 404 ||
+          status === 422;
+        if (requestShaped) {
+          const rejectionBase =
+            (persistData.metadata as Record<string, unknown> | undefined) ??
+            (agent.metadata as Record<string, unknown>);
+          persistData.metadata = withServerConversationRejection(
+            rejectionBase,
+            {
+              reason: firstLine(rawMsg),
+              httpStatus: status,
+              upstreamCode: runtimeDetails.upstreamCode ?? null,
+            },
+            new Date(),
+          );
+          console.warn(
+            `[sendMessage] server-side conversation rejected agent=${sessionId.slice(0, 8)} ` +
+              `run=${runId.slice(0, 8)} status=${status ?? "(none)"} ` +
+              `code=${runtimeDetails.upstreamCode ?? "(none)"} — dropping the continuation id`,
+          );
+        }
+      }
       const shouldAutoRecoverCodexEventStream =
         !aborted &&
         recoverableCodexEventStreamFailure &&
@@ -5541,7 +5884,9 @@ export class SessionManager {
         if (activeRun?.runId === runId && !activeRun.sawResult) {
           const reason = aborted
             ? "aborted"
-            : String(runtimeDetails.runtimeCode ?? (staleResume ? "SESSION_LOST" : "QUERY_FAILED"));
+            : persistenceFailure
+              ? "MESSAGE_PERSISTENCE_FAILED"
+              : String(runtimeDetails.runtimeCode ?? (staleResume ? "SESSION_LOST" : "QUERY_FAILED"));
           await this.persistInterruptedTurn(sessionId, activeRun, reason);
         }
         const updated = await prisma.agent.update({ where: { id: sessionId }, data: persistData });
@@ -5564,7 +5909,9 @@ export class SessionManager {
               ? "CODEX_EVENT_STREAM_RECOVERING"
               : shouldAutoRecoverThreadWriterConflict
                 ? "CODEX_THREAD_WRITER_CONFLICT_RECOVERING"
-                : staleResume ? "SESSION_LOST" : "QUERY_FAILED",
+                : persistenceFailure
+                  ? "MESSAGE_PERSISTENCE_FAILED"
+                  : staleResume ? "SESSION_LOST" : "QUERY_FAILED",
             message: friendly,
           });
         }
@@ -5592,6 +5939,7 @@ export class SessionManager {
         // controller's live map from outliving the run it describes.
         this.liveness.noteStopRequested(runId);
         this.liveness.end(runId, "completed", "completed");
+        this.clearLiveContext(sessionId);
         this.running.delete(sessionId);
         this.pending.delete(sessionId);
         const qb = this.pendingQuestions.get(sessionId);
@@ -5634,6 +5982,11 @@ export class SessionManager {
           );
         });
       }
+      // Job settlements that arrived during this run were shown live but not
+      // inserted into Message: the turn's local sequence cursor owned that
+      // namespace until its iterator fully unwound. Persist them now. If a new
+      // run already won the race, flushSettledJobNotices sees it and defers.
+      if (!this.running.has(sessionId)) this.flushSettledJobNotices(sessionId);
     }
     return autoRecoveryPromise ? await autoRecoveryPromise : null;
   }
@@ -6418,6 +6771,7 @@ export class SessionManager {
     this.drainingQueues.delete(sessionId);
     this.pendingDrainOptions.delete(sessionId);
     this.liveTranscripts.delete(sessionId);
+    this.clearLiveContext(sessionId);
     const sessionPending = this.pending.get(sessionId);
     if (sessionPending) {
       for (const [, p] of sessionPending) {
@@ -6526,6 +6880,7 @@ export class SessionManager {
       console.log(`[cancel] no live run for agent=${sessionId.slice(0, 8)}; cleaning stale state`);
     }
     this.liveTranscripts.delete(sessionId);
+    this.clearLiveContext(sessionId);
 
     // Drop in-memory state synchronously so sendMessage's runId guard fires
     // and a fresh send_message can be accepted without races.
