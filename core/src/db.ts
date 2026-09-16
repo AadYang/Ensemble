@@ -118,7 +118,7 @@ CREATE INDEX IF NOT EXISTS msg_archive_gen_idx ON MessageArchive(agentId, genera
 -- Artifact table from an earlier project-orchestration experiment (projectId /
 -- workItemId, no agentId). CREATE TABLE IF NOT EXISTS would no-op, and the
 -- next CREATE INDEX ON Artifact(agentId) crashed sidecar boot with
--- `no such column: agentId` — the 0.0.30 white screen.
+-- "no such column: agentId" — the 0.0.30 white screen.
 --
 -- Why a table rather than a bigger constant: the previous design capped those
 -- results with layered character limits (1 600 / 4 000 / 5 000 / 8 000 / 12 000)
@@ -350,7 +350,8 @@ CREATE TABLE IF NOT EXISTS Job (
   lastOutputAt INTEGER,
   startedAt INTEGER NOT NULL DEFAULT (unixepoch()),
   endedAt INTEGER,
-  lostReason TEXT
+  lostReason TEXT,
+  transcriptNotifiedAt INTEGER
 );
 CREATE INDEX IF NOT EXISTS job_agent_idx ON Job(agentId);
 CREATE INDEX IF NOT EXISTS job_status_idx ON Job(status);
@@ -364,11 +365,13 @@ sqliteDb.exec(SCHEMA);
 // tables, so we check PRAGMA table_info and ALTER for each missing column.
 // ─────────────────────────────────────────────────────────────
 
-function ensureColumn(table: string, column: string, decl: string): void {
+function ensureColumn(table: string, column: string, decl: string): boolean {
   const cols = sqliteDb.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   if (!cols.some((c) => c.name === column)) {
     sqliteDb.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+    return true;
   }
+  return false;
 }
 
 /** Run `fn` inside a real SQLite transaction.
@@ -428,6 +431,19 @@ ensureColumn("Agent", "teamId", "TEXT");
 // 0 means the body is in `ResultArtifact.body` — which is every row written
 // before chunked bodies existed, so the default is also the migration.
 ensureColumn("ResultArtifact", "chunkCount", "INTEGER NOT NULL DEFAULT 0");
+// A job may settle while its owning agent is still streaming a turn. Its
+// transcript notice is therefore committed only after that turn releases the
+// message sequence. This marker makes the deferred write durable and
+// idempotent across retries/restarts.
+const addedJobTranscriptMarker = ensureColumn("Job", "transcriptNotifiedAt", "INTEGER");
+if (addedJobTranscriptMarker) {
+  // Rows created before this mechanism already emitted their old best-effort
+  // notices (or are too old to replay safely). Do not flood transcripts on the
+  // migration boot; only jobs settling under the new contract start pending.
+  sqliteDb.exec(
+    "UPDATE Job SET transcriptNotifiedAt = COALESCE(endedAt, unixepoch()) WHERE status <> 'running'",
+  );
+}
 
 // ─────────────────────────────────────────────────────────────
 // W16 Slice 1.2: deprecated provider migration.
@@ -661,6 +677,8 @@ export interface Job {
   endedAt: Date | null;
   /** Why the row is `lost`, in the reconciler's own words. Null otherwise. */
   lostReason: string | null;
+  /** When the terminal job notice was atomically appended to Message. */
+  transcriptNotifiedAt: Date | null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -786,6 +804,7 @@ const mapJob = (r: Record<string, unknown>): Job => ({
   startedAt: dateOf(r.startedAt as number),
   endedAt: dateOrNull(r.endedAt as number | null),
   lostReason: (r.lostReason as string | null) ?? null,
+  transcriptNotifiedAt: dateOrNull(r.transcriptNotifiedAt as number | null),
 });
 
 const mapUsageEvent = (r: Record<string, unknown>): UsageEvent => ({

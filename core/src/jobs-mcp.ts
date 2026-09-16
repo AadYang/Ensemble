@@ -58,7 +58,14 @@ export function makeJobsMcpServer(ctx: JobToolContext): McpSdkServerConfigWithIn
     "job_start",
     JOB_START_DESCRIPTION,
     {
-      command: z.string().min(1).describe("Shell command to run. Windows runs PowerShell; macOS/Linux runs sh."),
+      command: z
+        .string()
+        .min(1)
+        .describe("Shell command. Auto detects common Git-Bash syntax on Windows; otherwise uses PowerShell."),
+      shell: z
+        .enum(["auto", "powershell", "sh"])
+        .optional()
+        .describe('Shell contract. Default auto; use "sh" for Git-Bash syntax on Windows.'),
       cwd: z.string().optional().describe("Working directory; defaults to the agent's project root."),
       timeout_ms: z
         .number()

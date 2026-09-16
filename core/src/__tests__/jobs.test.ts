@@ -32,7 +32,14 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobManager, isProcessAlive, renderJobView, jobStatusToolText } from "../jobs.js";
+import {
+  JobManager,
+  isProcessAlive,
+  renderJobView,
+  jobStatusToolText,
+  looksLikePosixJobCommand,
+  shellForJob,
+} from "../jobs.js";
 import { prisma, type Job } from "../db.js";
 
 const fixtureDir = mkdtempSync(join(tmpdir(), "ensemble-jobs-fixture-"));
@@ -203,6 +210,7 @@ describe("an unobserved end is reported as unknown, never as success", () => {
       startedAt: new Date(),
       endedAt: new Date(),
       lostReason: "process 1 is gone and no exit was recorded",
+      transcriptNotifiedAt: null,
     });
     const text = renderJobView(view);
     expect(text).toContain("status: lost");
@@ -259,6 +267,31 @@ describe("every end is recorded once, with the code it ended by", () => {
     // The reconciler judges `running` rows only: a shutdown that recorded its
     // jobs must not be re-read a boot later as a crash.
     expect(new JobManager().reconcile()).toEqual([]);
+  });
+});
+
+describe("the job shell contract", () => {
+  it.runIf(process.platform === "win32")(
+    "routes the POSIX command shape that failed in production to Git Bash",
+    async () => {
+      const command = `printf 'first\\nsecond\\n' | tail -1`;
+      expect(looksLikePosixJobCommand(command)).toBe(true);
+      const resolved = shellForJob(command);
+      expect(resolved.shell).toBe("sh");
+      expect(resolved.cmd.toLowerCase()).toContain("git");
+
+      const mgr = new JobManager();
+      const job = mgr.start({ ...forSession("session-posix"), command });
+      const done = await settle(mgr, job.id);
+      expect(done.status).toBe("exited");
+      expect(done.exitCode).toBe(0);
+      expect(readFileSync(done.logPath, "utf8").trim()).toBe("second");
+    },
+  );
+
+  it("keeps ordinary commands on the documented platform shell", () => {
+    const resolved = shellForJob(run("print", "ordinary"));
+    expect(resolved.shell).toBe(process.platform === "win32" ? "powershell" : "sh");
   });
 });
 

@@ -291,6 +291,9 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
     case "job_start":
       return jobStartToolText(jobsCtx(handlers), {
         command: String(args.command ?? ""),
+        ...(args.shell === "auto" || args.shell === "powershell" || args.shell === "sh"
+          ? { shell: args.shell }
+          : {}),
         ...(args.cwd === undefined ? {} : { cwd: String(args.cwd) }),
         ...(typeof args.timeout_ms === "number" ? { timeout_ms: args.timeout_ms } : {}),
       });
@@ -419,6 +422,7 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
       "a job survives that, keeps writing to a log file, and always ends with a recorded status.",
     {
       command: z.string().min(1),
+      shell: z.enum(["auto", "powershell", "sh"]).optional(),
       cwd: z.string().optional(),
       timeout_ms: z.number().int().min(1).optional(),
     },
@@ -692,6 +696,7 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
           "a job survives that, keeps writing to a log file, and always ends with a recorded status.",
         {
           command: z.string().min(1),
+          shell: z.enum(["auto", "powershell", "sh"]).optional(),
           cwd: z.string().optional(),
           timeout_ms: z.number().int().min(1).optional(),
         },

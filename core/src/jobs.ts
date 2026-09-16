@@ -65,6 +65,8 @@ export const JOB_TAIL_BYTES = 4_096;
  *  turn indefinitely. Matches the Bash tool's ceiling. */
 export const JOB_WAIT_MAX_MS = 600_000;
 
+export type JobShell = "auto" | "powershell" | "sh";
+
 /** How often `lastOutputAt` is written to the DB while a job streams output.
  *  A build printing thousands of lines must not issue thousands of writes. */
 const OUTPUT_TOUCH_INTERVAL_MS = 2_000;
@@ -96,11 +98,61 @@ export interface JobStartArgs {
   agentName: string;
   command: string;
   cwd: string;
+  /** Shell contract for the command. `auto` uses the platform shell, except
+   *  that unmistakably POSIX syntax on Windows is routed to Git Bash when it
+   *  is installed. Callers can select explicitly to avoid any inference. */
+  shell?: JobShell;
   /** Optional hard ceiling. ABSENT BY DEFAULT ON PURPOSE: a job exists because
    *  the work is longer than a turn, so imposing the Bash tool's 120s default
    *  here would defeat the point. When it does fire, the exit code is reported
    *  as 124 — the GNU timeout convention the Bash tool already uses. */
   timeoutMs?: number;
+}
+
+const WINDOWS_GIT_BASH_CANDIDATES = [
+  "C:\\Program Files\\Git\\bin\\bash.exe",
+  "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+  "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+];
+
+/** Syntax that PowerShell 5 cannot parse or commands it does not provide.
+ *  This is intentionally narrow: ordinary commands keep the documented
+ *  platform shell, while the exact Git-Bash shape agents commonly produce
+ *  (`cd /d/... && ... | tail`) is no longer launched into a guaranteed parser
+ *  error. */
+export function looksLikePosixJobCommand(command: string): boolean {
+  return (
+    /(?:^|[\s;])cd\s+\/[a-zA-Z]\//.test(command) ||
+    /(?:^|[\s|;&])(tail|head|grep|sed|awk|cat)\s+(?:-|\d|['"])/.test(command) ||
+    /(?:^|[\s;])export\s+[A-Za-z_][A-Za-z0-9_]*=/.test(command) ||
+    /(?:^|[\s;])set\s+-[a-zA-Z]*e/.test(command)
+  );
+}
+
+export function shellForJob(
+  command: string,
+  preference: JobShell = "auto",
+): { cmd: string; args: string[]; shell: Exclude<JobShell, "auto"> } {
+  if (process.platform !== "win32") {
+    if (preference === "powershell") {
+      throw new Error('job shell "powershell" is only available on Windows');
+    }
+    return { cmd: "sh", args: ["-c", command], shell: "sh" };
+  }
+
+  const wantsSh = preference === "sh" || (preference === "auto" && looksLikePosixJobCommand(command));
+  if (wantsSh) {
+    const gitBash = WINDOWS_GIT_BASH_CANDIDATES.find((candidate) => existsSync(candidate));
+    if (!gitBash) {
+      throw new Error(
+        'this job uses POSIX shell syntax, but Git Bash was not found; install Git for Windows or pass shell="powershell" with PowerShell syntax',
+      );
+    }
+    return { cmd: gitBash, args: ["--noprofile", "--norc", "-c", command], shell: "sh" };
+  }
+
+  const resolved = shellFor(command);
+  return { ...resolved, shell: "powershell" };
 }
 
 export interface JobManagerOptions {
@@ -243,13 +295,14 @@ export interface JobToolResult {
 
 export function jobStartToolText(
   ctx: JobToolContext,
-  args: { command: string; cwd?: string; timeout_ms?: number },
+  args: { command: string; cwd?: string; timeout_ms?: number; shell?: JobShell },
 ): string {
   const view = ctx.jobs.start({
     agentId: ctx.agentId,
     agentName: ctx.agentName,
     command: args.command,
     cwd: args.cwd ?? ctx.defaultCwd,
+    ...(args.shell === undefined ? {} : { shell: args.shell }),
     ...(args.timeout_ms === undefined ? {} : { timeoutMs: args.timeout_ms }),
   });
   return renderJobView(view);
@@ -310,7 +363,7 @@ export class JobManager {
     }
     const id = randomUUID();
     const logPath = join(JobManager.logDir(), `${id}.log`);
-    const { cmd, args: shellArgs } = shellFor(args.command);
+    const { cmd, args: shellArgs } = shellForJob(args.command, args.shell);
 
     // Not `detached`: core still OWNS this child, so a core crash cannot leave
     // an untracked process behind. What lets the job outlive a session is that
