@@ -18,6 +18,11 @@
     "mysql2": "^3.22.3",
     "zod": "^4.4.3"
   },
+  "dependenciesMeta": {
+    "@agentorch/shared": {
+      "injected": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^22",
     "tsx": "^4.20.0",
