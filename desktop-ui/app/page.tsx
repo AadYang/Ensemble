@@ -57,6 +57,7 @@ import { CliInstallReminder } from "@/components/CliInstallReminder";
 import { McpServerPanel } from "@/components/McpServerPanel";
 import { SkillPanel } from "@/components/SkillPanel";
 import { ProviderPanel } from "@/components/ProviderPanel";
+import { GitBranchChip } from "@/components/GitBranchChip";
 import { CommandPalette } from "@/components/CommandPalette";
 import { GlobalSettings } from "@/components/GlobalSettings";
 import { UsageStatsDialog } from "@/components/UsageStatsDialog";
@@ -717,6 +718,18 @@ export default function Page() {
   const activeAgent = activeAgentId ? agents[activeAgentId] : null;
   const uptime = useUptime();
 
+  // Is the focused agent mid-turn? Two independent signals, and EITHER one
+  // saying "busy" is enough to refuse a branch switch: `summary.status` is the
+  // agent list's field, and the liveness verdict is the run watchdog's, which
+  // arrives on its own channel. `terminalReason === null` is the server saying
+  // the run is still live — the vocabulary stays the server's, so the UI never
+  // keeps its own copy of which states count as finished.
+  const activeLiveness = useStore((s) => (activeAgentId ? s.livenessByAgent[activeAgentId] : undefined));
+  const activeAgentRunning =
+    activeAgent?.summary.status === "running" ||
+    activeAgent?.summary.status === "awaiting_permission" ||
+    (activeLiveness !== undefined && activeLiveness.terminalReason === null);
+
   const boundAgentIds = useMemo(() => {
     const set = new Set<string>();
     const visit = (n: LayoutNode): void => {
@@ -776,10 +789,17 @@ export default function Page() {
             <span className={`status-dot ${connected ? "running" : "error"}`} />
             {connected ? t("header.ws.connected") : t("header.ws.disconnected")}
           </span>
+          {/* The branch of the project the FOCUSED pane works in, next to the
+              sidebar toggle rather than among the status counters: it is a
+              control with a menu, not a number. It carries its own separator,
+              so a project that is not a repository leaves no empty divider. */}
+          <GitBranchChip agentId={activeAgentId} running={activeAgentRunning} />
           <button
+            type="button"
+            aria-expanded={!sidebarCollapsed}
             title={sidebarCollapsed ? t("header.sidebar.show") : t("header.sidebar.hide")}
             onClick={toggleSidebar}
-            className="px-1.5 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
+            className="px-1.5 py-0.5 border border-[var(--border)] text-[var(--text)] hover:text-[var(--accent)] hover:border-[var(--accent)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)] transition-colors"
           >
             {sidebarCollapsed ? "▶" : "◀"}
           </button>
@@ -865,7 +885,7 @@ export default function Page() {
               </div>
             </div>
           )}
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 min-h-0 overflow-y-auto">
             {showingCloudWorkspace ? (
               <CloudAgentTree
                 agents={cloudSnapshot?.agents ?? []}
@@ -884,9 +904,17 @@ export default function Page() {
               />
             )}
           </div>
-          <ProviderPanel />
-          <McpServerPanel />
-          <SkillPanel agentId={activeId} />
+          {/* The section stack is a sibling of the tree because it belongs to
+              the SIDEBAR, but it is bounded and scrolls on its own: an expanded
+              panel used to grow unbounded and push the sections below it out of
+              the viewport with nothing able to scroll them back. The tree above
+              keeps `flex-1 min-h-0`, so neither half can squeeze the other to
+              zero. */}
+          <div className="shrink-0 min-h-0 max-h-[50%] overflow-y-auto overscroll-contain border-t border-[var(--border)]">
+            <ProviderPanel />
+            <McpServerPanel />
+            <SkillPanel agentId={activeId} />
+          </div>
           <div
             onMouseDown={(e) => {
               sidebarDraggingRef.current = true;

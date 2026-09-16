@@ -14,4 +14,5 @@ export * from "./update-manifest";
 export * from "./telemetry";
 export * from "./chat-input";
 export * from "./workspace-selection";
+export * from "./git";
 export * from "./cloud-remote-bridge";
