@@ -17,17 +17,14 @@ const EXIT_PLAN_MODE_SCHEMA = z.object({
     .string()
     .min(1)
     .describe(
-      "Markdown-formatted plan to present to the user. Use headings, bullet lists, and code " +
-        "blocks where appropriate — the frontend renders this as rich text.",
+      "Plan body shown to the user as an HTML document. Prefer markdown with headings, lists, and sections; a full HTML document is also accepted.",
     ),
 });
 
 export const exitPlanModeTool: NormalizedTool<typeof EXIT_PLAN_MODE_SCHEMA> = {
   name: "ExitPlanMode",
   description:
-    "Exit plan mode after presenting your plan. The user will be asked to approve the plan " +
-    "before any code is written. Use this when you've finished reasoning through how to " +
-    "tackle a problem and want to confirm the approach before doing real work.",
+    "Exit plan mode after presenting your plan as a document. Pass markdown with headings and sections (or a full HTML document). The user reads it as a page, not a tool dump, and in plan mode must approve before any code is written.",
   parameters: EXIT_PLAN_MODE_SCHEMA,
   async execute({ plan }) {
     // No-op execute: returning the plan as the tool result means the model

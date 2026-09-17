@@ -181,7 +181,78 @@ html, body {
   box-shadow: 0 0 16px -6px rgba(0, 217, 255, 0.5);
 }
 
-/* ----- markdown rendering inside ExitPlanMode permission dialog (Slice 5.5) ----- */
+/* ----- plan as an HTML document, not a tool-card dump ----- */
+.plan-document {
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.7;
+  padding: 0;
+}
+.plan-document-kicker {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding: 0.55rem 1.1rem 0.4rem;
+  border-bottom: 1px solid var(--border);
+}
+.plan-document-body {
+  padding: 1.15rem 1.4rem 1.4rem;
+  background: #f7f4ec;
+  color: #1c1917;
+}
+.plan-document-empty {
+  margin: 0;
+  padding: 0.9rem 1.2rem 1.2rem;
+  color: var(--text-dim);
+}
+.plan-document-frame {
+  display: block;
+  width: 100%;
+  min-height: 280px;
+  height: 60vh;
+  max-height: 560px;
+  border: 0;
+  background: #f7f4ec;
+}
+
+.plan-document-body.markdown-plan h1,
+.plan-document-body.markdown-plan h2,
+.plan-document-body.markdown-plan h3 {
+  color: #1c1917;
+}
+.plan-document-body.markdown-plan h1 { font-size: 1.45em; margin: 0.15em 0 0.55em; }
+.plan-document-body.markdown-plan h2 { font-size: 1.22em; margin: 1.15em 0 0.4em; }
+.plan-document-body.markdown-plan h3 { font-size: 1.08em; margin: 0.95em 0 0.35em; }
+.plan-document-body.markdown-plan p { margin: 0.8em 0; color: #1c1917; }
+.plan-document-body.markdown-plan ul,
+.plan-document-body.markdown-plan ol { margin: 0.7em 0; padding-left: 1.6em; }
+.plan-document-body.markdown-plan li { margin: 0.3em 0; color: #1c1917; }
+.plan-document-body.markdown-plan strong { color: #0c0a09; }
+.plan-document-body.markdown-plan a { color: #0f766e; }
+.plan-document-body.markdown-plan code {
+  background: #efe8d8;
+  border-color: #d6cbb3;
+  color: #1c1917;
+}
+.plan-document-body.markdown-plan pre {
+  background: #efe8d8;
+  border-color: #d6cbb3;
+}
+.plan-document-body.markdown-plan th,
+.plan-document-body.markdown-plan td {
+  border-color: #d6cbb3;
+  color: #1c1917;
+}
+.plan-document-body.markdown-plan th { color: #0c0a09; }
+.plan-document-body.markdown-plan blockquote {
+  border-left-color: #0f766e;
+  color: #44403c;
+}
+
+/* ----- markdown rendering inside chat / leftover dialogs ----- */
 .markdown-plan h1, .markdown-plan h2, .markdown-plan h3 {
   color: var(--accent); font-weight: bold;
   margin: 0.5em 0 0.25em;

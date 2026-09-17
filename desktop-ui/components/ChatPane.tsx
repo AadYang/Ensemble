@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, memo } from "react";
 import {
   capabilityView,
   countSubagentStartsThisTurn,
@@ -24,6 +24,12 @@ import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useStore, type ChatTurn } from "@/store/agents";
 import { useT, type TranslateFn } from "@/i18n/useT";
 import { ToolCard } from "./ToolCard";
+import { PlanDocument } from "./PlanDocument";
+import { isExitPlanModeTool, planBodyFromToolInput } from "@/lib/plan-document";
+import {
+  documentBodyFromToolInput,
+  documentTitleFromToolInput,
+} from "@/lib/tool-card-facts";
 import { PeerSendPopover } from "./PeerSendPopover";
 import { ContextBar } from "./ContextBar";
 import ReactMarkdown from "react-markdown";
@@ -1190,12 +1196,50 @@ export function ChatPane({ agentId }: { agentId: string }) {
   );
 }
 
-function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
+const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
   if (t.kind === "tool_use") {
+    if (isExitPlanModeTool(t.toolName)) {
+      return <PlanDocument plan={planBodyFromToolInput(t.toolInput)} title={tr("chat.plan.title")} />;
+    }
+    const doc = documentBodyFromToolInput(t.toolName, t.toolInput);
+    if (doc) {
+      return (
+        <div className="flex flex-col gap-2">
+          <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} />
+          <PlanDocument
+            plan={doc}
+            title={documentTitleFromToolInput(t.toolInput, tr("chat.plan.title"))}
+          />
+        </div>
+      );
+    }
     return <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} />;
   }
 
+  if (t.kind === "thinking") {
+    const body =
+      t.liveKey === "thinking_tokens"
+        ? tr("chat.thinkingProgress", { n: t.text })
+        : t.text;
+    return (
+      <div className="border-l-2 border-[var(--accent)]/40 pl-2 text-[12px] text-[var(--text-dim)] whitespace-pre-wrap break-words leading-relaxed">
+        <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.thinking")}</div>
+        {body}
+      </div>
+    );
+  }
+
   if (t.kind === "assistant_text") {
+    // Incomplete markdown (unclosed ** / `) plus remarkGfm on every 1-char
+    // delta is what made Flash answers look like 2–3 tok/s. Paint raw text
+    // while the row is still streaming; parse once it commits.
+    if (t.streaming) {
+      return (
+        <div className="markdown-plan markdown-chat text-[var(--text)] whitespace-pre-wrap break-words leading-relaxed">
+          {t.text}
+        </div>
+      );
+    }
     return (
       <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{t.text}</ReactMarkdown>
@@ -1253,4 +1297,4 @@ function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
       {prefix}{body}
     </div>
   );
-}
+});

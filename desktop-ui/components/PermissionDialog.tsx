@@ -1,13 +1,19 @@
 "use client";
 
 import { useEffect } from "react";
-import ReactMarkdown from "react-markdown";
 import type { PermissionDecision } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import { patchAgent } from "@/lib/agent-api";
 import { useStore, type PendingPermission } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { displayToolName } from "@/lib/tool-display";
+import { isExitPlanModeTool, planBodyFromToolInput } from "@/lib/plan-document";
+import {
+  documentBodyFromToolInput,
+  documentTitleFromToolInput,
+  toolCardOperationLines,
+} from "@/lib/tool-card-facts";
+import { PlanDocument } from "./PlanDocument";
 
 export function PermissionDialog() {
   const ws = getWS();
@@ -41,14 +47,11 @@ export function PermissionDialog() {
   const agent = agents[head.sessionId];
   const agentName = agent?.summary.name ?? head.sessionId.slice(0, 8);
   const displayedToolName = displayToolName(head.toolName);
-  // W16 Slice 5.5: ExitPlanMode is special — its `plan` arg is markdown the
-  // user must approve before code is written. Render it rich rather than as
-  // raw JSON so headings / lists / code blocks come through readably.
-  const isExitPlanMode = head.toolName === "ExitPlanMode";
-  const planText =
-    isExitPlanMode && head.input && typeof head.input === "object" && "plan" in head.input
-      ? String((head.input as { plan: unknown }).plan ?? "")
-      : "";
+  const isExitPlanMode = isExitPlanModeTool(head.toolName);
+  const planText = isExitPlanMode ? planBodyFromToolInput(head.input) : "";
+  const htmlDoc = isExitPlanMode ? "" : documentBodyFromToolInput(head.toolName, head.input);
+  const opLines = isExitPlanMode ? [] : toolCardOperationLines(head.input);
+  const wide = isExitPlanMode || Boolean(htmlDoc);
 
   const respond = (entry: PendingPermission, decision: PermissionDecision) => {
     ws.send({
@@ -69,7 +72,7 @@ export function PermissionDialog() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-6">
-      <div className="tool-card max-w-2xl w-full bg-[var(--bg-elevated)]">
+      <div className={`tool-card w-full bg-[var(--bg-elevated)] ${wide ? "max-w-4xl" : "max-w-2xl"}`}>
         <div className="flex items-center gap-2 mb-2 text-xs">
           <span className="status-dot awaiting_permission" />
           <span className="text-[var(--warn)] tracking-wider">{t("perm.title")}</span>
@@ -87,12 +90,22 @@ export function PermissionDialog() {
         </div>
 
         {isExitPlanMode ? (
-          <div className="markdown-plan text-xs text-[var(--text)] bg-[var(--bg-pane)] border border-[var(--border)] p-3 max-h-96 overflow-auto leading-relaxed">
-            <ReactMarkdown>{planText}</ReactMarkdown>
+          <div className="max-h-[70vh] overflow-auto">
+            <PlanDocument plan={planText} title={t("chat.plan.title")} />
+          </div>
+        ) : htmlDoc ? (
+          <div className="max-h-[70vh] overflow-auto space-y-2">
+            {opLines.map((line, i) => (
+              <div key={i} className="text-sm text-[var(--text)] break-all">{line}</div>
+            ))}
+            <PlanDocument
+              plan={htmlDoc}
+              title={documentTitleFromToolInput(head.input, t("chat.plan.title"))}
+            />
           </div>
         ) : (
-          <pre className="text-xs text-[var(--text-dim)] bg-[var(--bg-pane)] border border-[var(--border)] p-2 max-h-64 overflow-auto whitespace-pre-wrap break-words">
-            {JSON.stringify(head.input, null, 2)}
+          <pre className="text-xs text-[var(--text)] bg-[var(--bg-pane)] border border-[var(--border)] p-2 max-h-64 overflow-auto whitespace-pre-wrap break-words">
+            {opLines.join("\n")}
           </pre>
         )}
 

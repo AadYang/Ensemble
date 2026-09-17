@@ -2,6 +2,7 @@
 
 import { isSubagentToolName } from "@agentorch/shared";
 import { displayToolName } from "@/lib/tool-display";
+import { toolCardOperationLines } from "@/lib/tool-card-facts";
 
 export type ToolCardStatus = "pending" | "approved" | "denied" | "ran";
 
@@ -36,6 +37,7 @@ export function ToolCard({
   const displayName = displayToolName(name);
   const isSubagent = isSubagentToolName(name);
   const facts = isSubagent ? subagentCardFacts(input) : undefined;
+  const opLines = isSubagent ? [] : toolCardOperationLines(input);
   const statusTone = (s: ToolCardStatus | undefined): string => {
     switch (s) {
       case "pending": return "text-[var(--warn)]";
@@ -69,11 +71,11 @@ export function ToolCard({
       {facts?.description && (
         <div className="text-[var(--text-dim)]">→ {facts.description}</div>
       )}
-      {!isSubagent && input !== undefined && input !== null && (
-        <pre className="text-[var(--text-dim)] overflow-x-auto whitespace-pre-wrap break-words leading-snug">
-          {JSON.stringify(input, null, 2)}
-        </pre>
-      )}
+      {opLines.map((line, i) => (
+        <div key={i} className="text-[var(--text)] break-all leading-snug">
+          {line}
+        </div>
+      ))}
     </div>
   );
 }
