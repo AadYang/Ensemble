@@ -217,4 +217,87 @@ describe("openai-compat tool cards", () => {
       | undefined;
     expect(result?.modelUsage?.["deepseek-flash"]?.contextWindow).toBe(1_000_000);
   });
+
+  it("forwards reasoning tokens as thinking_delta and keeps them on the assistant message", async () => {
+    mock.state.interruptions = [];
+    mock.state.liveness = [];
+    mock.state.runs = 0;
+    mock.state.events = [
+      { type: "raw_model_stream_event", data: { type: "response.reasoning.delta", delta: "let me " } },
+      { type: "raw_model_stream_event", data: { type: "reasoning_content", delta: { reasoning_content: "think." } } },
+      { type: "raw_model_stream_event", data: { type: "output_text_delta", delta: "done" } },
+      {
+        type: "run_item_stream_event",
+        name: "message_output_created",
+        item: { rawItem: { content: [{ type: "output_text", text: "done" }] } },
+      },
+      {
+        type: "raw_model_stream_event",
+        data: { type: "response_done", response: { model: "deepseek-flash", usage: { inputTokens: 8, outputTokens: 4 } } },
+      },
+    ];
+
+    const payloads = sdkPayloads(await drain(optsFor())) as Array<{
+      type: string;
+      event?: { delta?: { type?: string; thinking?: string } };
+      message?: { content?: Array<{ type?: string; thinking?: string; text?: string }> };
+    }>;
+    const thinkingDeltas = payloads.filter((p) => p.event?.delta?.type === "thinking_delta");
+    expect(thinkingDeltas.map((p) => p.event?.delta?.thinking)).toEqual(["let me ", "think."]);
+    const assistant = payloads.find((p) => p.message?.content?.some((b) => b.type === "thinking"));
+    expect(assistant?.message?.content).toEqual([
+      { type: "thinking", thinking: "let me think." },
+      { type: "text", text: "done" },
+    ]);
+  });
+
+  it("reads DeepSeek Chat Completions reasoning_content off the raw model chunk", async () => {
+    mock.state.interruptions = [];
+    mock.state.liveness = [];
+    mock.state.runs = 0;
+    mock.state.events = [
+      {
+        type: "raw_model_stream_event",
+        data: {
+          type: "model",
+          event: {
+            choices: [{ index: 0, delta: { reasoning_content: "先看仓库状态" } }],
+          },
+        },
+      },
+      {
+        type: "raw_model_stream_event",
+        data: {
+          type: "model",
+          event: {
+            choices: [{ index: 0, delta: { reasoning_content: "，再派工。" } }],
+          },
+        },
+      },
+      {
+        type: "run_item_stream_event",
+        name: "tool_called",
+        item: {
+          rawItem: {
+            type: "function_call",
+            callId: "call_peer",
+            name: "peer_send",
+            arguments: JSON.stringify({ to: "engineer", text: "go" }),
+          },
+        },
+      },
+    ];
+
+    const payloads = sdkPayloads(await drain(optsFor())) as Array<{
+      type: string;
+      event?: { delta?: { type?: string; thinking?: string } };
+      message?: { content?: Array<{ type?: string; thinking?: string; name?: string }> };
+    }>;
+    const thinkingDeltas = payloads.filter((p) => p.event?.delta?.type === "thinking_delta");
+    expect(thinkingDeltas.map((p) => p.event?.delta?.thinking)).toEqual(["先看仓库状态", "，再派工。"]);
+    const thinking = payloads.find((p) => p.message?.content?.some((b) => b.type === "thinking"));
+    expect(thinking?.message?.content).toEqual([
+      { type: "thinking", thinking: "先看仓库状态，再派工。" },
+    ]);
+  });
 });

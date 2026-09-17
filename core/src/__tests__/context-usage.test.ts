@@ -11,6 +11,7 @@ import {
   promptTokensFromLastCall,
   promptTokensFromResultContextUsage,
   reportedContextWindowFromResult,
+  shouldEncodeLiveStreamOccupancy,
   shouldPublishLiveContext,
 } from "../context-usage.js";
 import { snapshotContextWindow } from "../context-window.js";
@@ -464,6 +465,26 @@ describe("live occupancy helpers", () => {
         nextUsed: 40,
       }),
     ).toBe(false);
+  });
+
+  it("does not re-encode the live stream buffer on every delta", () => {
+    expect(
+      shouldEncodeLiveStreamOccupancy({ force: true, now: 1_000, lastEmitAt: 0 }),
+    ).toBe(true);
+    expect(
+      shouldEncodeLiveStreamOccupancy({
+        force: false,
+        now: 1_000 + LIVE_CONTEXT_MIN_EMIT_MS - 1,
+        lastEmitAt: 1_000,
+      }),
+    ).toBe(false);
+    expect(
+      shouldEncodeLiveStreamOccupancy({
+        force: false,
+        now: 1_000 + LIVE_CONTEXT_MIN_EMIT_MS,
+        lastEmitAt: 1_000,
+      }),
+    ).toBe(true);
   });
 
   it("reads text, thinking, and partial tool JSON from stream events", () => {

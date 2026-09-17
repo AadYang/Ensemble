@@ -76,3 +76,18 @@ describe("translateItem collab_tool_call (native codex subagents)", () => {
     expect(content[0]?.input).toEqual({ tool: "unknown", status: "completed" });
   });
 });
+
+describe("translateItem reasoning", () => {
+  it("surfaces completed reasoning as thinking_delta plus a thinking block", () => {
+    const out = translateItem(
+      { id: "r1", type: "reasoning", text: "consider the tests" },
+      SESSION,
+      MODEL,
+      true,
+    );
+    expect(out.streamEvent).toMatchObject({
+      event: { delta: { type: "thinking_delta", thinking: "consider the tests" } },
+    });
+    expect(singleContent(out)).toEqual([{ type: "thinking", thinking: "consider the tests" }]);
+  });
+});

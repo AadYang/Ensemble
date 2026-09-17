@@ -1588,17 +1588,22 @@ export function translateItem(
       },
     };
   }
-  if (item.type === "reasoning" && isCompleted) {
-    // Reasoning is codex's internal thinking summary. Show as a faint
-    // assistant text block so the user has visibility but it's clearly
-    // distinct from the agent_message reply. v1 simple: prefix with
-    // "[reasoning]" so the frontend doesn't need a new block type.
+  if (item.type === "reasoning") {
     const text = typeof item.text === "string" ? item.text : "";
+    if (!text || !isCompleted) return {};
     return {
+      streamEvent: {
+        type: "stream_event",
+        session_id: synthSessionId,
+        event: {
+          type: "content_block_delta",
+          delta: { type: "thinking_delta", thinking: text },
+        },
+      },
       assistantMessage: {
         type: "assistant",
         session_id: synthSessionId,
-        message: { content: [{ type: "text" as const, text: `[reasoning] ${text}` }] },
+        message: { content: [{ type: "thinking", thinking: text }] },
       },
     };
   }

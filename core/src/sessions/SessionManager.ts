@@ -32,6 +32,7 @@ import {
   occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
   reportedContextWindowFromResult,
+  shouldEncodeLiveStreamOccupancy,
   shouldPublishLiveContext,
 } from "../context-usage.js";
 import {
@@ -4302,8 +4303,17 @@ export class SessionManager {
   private publishLiveContext(sessionId: string, opts: { force: boolean }): void {
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
-    const used = liveOccupancy(live.promptTokens, countTokens(live.model, live.streamedText));
     const now = Date.now();
+    if (
+      !shouldEncodeLiveStreamOccupancy({
+        force: opts.force,
+        now,
+        lastEmitAt: live.lastEmitAt,
+      })
+    ) {
+      return;
+    }
+    const used = liveOccupancy(live.promptTokens, countTokens(live.model, live.streamedText));
     if (
       !shouldPublishLiveContext({
         force: opts.force,
@@ -5439,6 +5449,11 @@ export class SessionManager {
         }
 
         if (isInternalSystemMessage(msg)) {
+          // thinking_tokens is the only live signal during redacted CoT
+          // (the API streams pings, not thinking_delta). Broadcast it so
+          // the pane can show "thinking…" instead of looking idle; do not
+          // persist — it is a heartbeat, not resume context.
+          this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
           continue;
         }
 

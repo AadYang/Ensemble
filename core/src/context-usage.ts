@@ -171,6 +171,18 @@ export function shouldPublishLiveContext(opts: {
   return opts.now - opts.lastEmitAt >= LIVE_CONTEXT_MIN_EMIT_MS;
 }
 
+/** Encode the growing stream buffer only when we might publish. Counting on
+ *  every 1-char delta is O(n²) tiktoken on the Node event loop and delays WS
+ *  forwarding of the tokens the chat pane is waiting to paint. */
+export function shouldEncodeLiveStreamOccupancy(opts: {
+  force: boolean;
+  now: number;
+  lastEmitAt: number;
+}): boolean {
+  if (opts.force || opts.lastEmitAt === 0) return true;
+  return opts.now - opts.lastEmitAt >= LIVE_CONTEXT_MIN_EMIT_MS;
+}
+
 /** Streamed tokens that occupy the window right now: visible text, thinking,
  *  and partial tool-call JSON. Peer live-transcript stays text-only. */
 export function occupancyDeltaFromStreamEvent(msg: unknown): string | null {
@@ -264,7 +276,11 @@ function blockText(block: unknown): string {
   if (!block || typeof block !== "object") return "";
   const b = block as { type?: unknown; text?: unknown; content?: unknown; name?: unknown; input?: unknown };
   const type = typeof b.type === "string" ? b.type : "";
-  if (type === "text" || type === "thinking" || type === "output_text") {
+  if (type === "text" || type === "output_text") {
+    return typeof b.text === "string" ? b.text : "";
+  }
+  if (type === "thinking" || type === "reasoning") {
+    if (typeof (b as { thinking?: unknown }).thinking === "string") return (b as { thinking: string }).thinking;
     return typeof b.text === "string" ? b.text : "";
   }
   if (type === "tool_result") {

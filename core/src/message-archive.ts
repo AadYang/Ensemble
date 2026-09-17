@@ -246,7 +246,15 @@ function textOfBlocks(content: unknown): string {
   if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
   const parts: string[] = [];
   for (const raw of content) {
-    const block = raw as { type?: unknown; text?: unknown; name?: unknown; input?: unknown; content?: unknown; tool_use_id?: unknown };
+    const block = raw as {
+      type?: unknown;
+      text?: unknown;
+      thinking?: unknown;
+      name?: unknown;
+      input?: unknown;
+      content?: unknown;
+      tool_use_id?: unknown;
+    };
     if (!block || typeof block !== "object") {
       parts.push(String(raw));
       continue;
@@ -264,8 +272,14 @@ function textOfBlocks(content: unknown): string {
       parts.push(`[tool_result ${id}] ${textOfBlocks(block.content)}`);
       continue;
     }
-    if (block.type === "thinking" && typeof block.text === "string") {
-      parts.push(`[thinking] ${block.text}`);
+    if (block.type === "thinking" || block.type === "reasoning") {
+      const body =
+        typeof block.thinking === "string"
+          ? block.thinking
+          : typeof block.text === "string"
+            ? block.text
+            : "";
+      if (body) parts.push(`[thinking] ${body}`);
       continue;
     }
     parts.push(JSON.stringify(raw));

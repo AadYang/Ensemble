@@ -435,6 +435,7 @@ async function* runTurnOnce(
     const inputTokensLocal = countTokensMany(opts.model, inputTextsForLocal);
 
     let finalText = "";
+    let thinkingText = "";
     let rounds = 0;
     // The bound on the approval loop is OBSERVABLE, not a round budget. A turn
     // that keeps making progress (different calls, different arguments) is not
@@ -531,7 +532,7 @@ async function* runTurnOnce(
           if (opts.abortController.signal.aborted) break;
 
           if (event.type === "raw_model_stream_event") {
-            const data = event.data as { type?: string; delta?: string; response?: unknown };
+            const data = event.data as { type?: string; delta?: unknown; response?: unknown };
             if (data?.type === "output_text_delta" && typeof data.delta === "string" && data.delta.length > 0) {
               finalText += data.delta;
               emittedOutput = true;
@@ -546,53 +547,58 @@ async function* runTurnOnce(
                   },
                 },
               };
-            } else if (
-              typeof data?.type === "string" &&
-              data.type.includes("reasoning") &&
-              typeof data.delta === "string" &&
-              data.delta.length > 0
-            ) {
-              yield {
-                type: "sdk_message",
-                payload: {
-                  type: "stream_event",
-                  session_id: sessionId,
-                  event: {
-                    type: "content_block_delta",
-                    delta: { type: "thinking_delta", thinking: data.delta },
+            } else {
+              const reason = rawReasoningDelta(data);
+              if (reason) {
+                thinkingText += reason;
+                emittedOutput = true;
+                yield {
+                  type: "sdk_message",
+                  payload: {
+                    type: "stream_event",
+                    session_id: sessionId,
+                    event: {
+                      type: "content_block_delta",
+                      delta: { type: "thinking_delta", thinking: reason },
+                    },
                   },
-                },
-              };
-            } else if (data?.type === "response_done" && data.response) {
-              // W17.1: capture final per-response usage. `response.usage` is
-              // populated only at completion; tool-loop runs surface multiple
-              // response_done events per turn, so accumulate per model rather
-              // than overwrite.
-              sawResponseDone = true;
-              const rec = readResponseUsage(data.response, opts.model);
-              if (rec) {
-                _accumulateUsageForTest(usageAccum, data.response, opts.model);
-                // W22: keep the final response's usage for the context bar.
-                lastUsage = rec;
+                };
+              } else if (data?.type === "response_done" && data.response) {
+                // W17.1: capture final per-response usage. `response.usage` is
+                // populated only at completion; tool-loop runs surface multiple
+                // response_done events per turn, so accumulate per model rather
+                // than overwrite.
+                sawResponseDone = true;
+                const rec = readResponseUsage(data.response, opts.model);
+                if (rec) {
+                  _accumulateUsageForTest(usageAccum, data.response, opts.model);
+                  lastUsage = rec;
+                }
+                // Chat Completions only attaches CoT on the final output item
+                // when the SDK recognized `delta.reasoning`. If live deltas
+                // never arrived, still persist that block so the UI can show it.
+                if (!thinkingText) {
+                  const leftover = reasoningFromResponseOutput(data.response);
+                  if (leftover) thinkingText = leftover;
+                }
               }
             }
           } else if (event.type === "run_item_stream_event") {
             if (event.name === "message_output_created") {
               const text = extractItemText(event.item) || finalText;
-              if (text) {
+              const payload = assistantVisibleMessage(sessionId, thinkingText, text);
+              thinkingText = "";
+              if (payload) {
                 emittedOutput = true;
-                yield {
-                  type: "sdk_message",
-                  payload: {
-                    type: "assistant",
-                    session_id: sessionId,
-                    message: {
-                      content: [{ type: "text" as const, text }],
-                    },
-                  },
-                };
+                yield { type: "sdk_message", payload };
               }
             } else if (event.name === "tool_called" || event.name === "tool_approval_requested") {
+              const thinkingPayload = assistantVisibleMessage(sessionId, thinkingText, "");
+              thinkingText = "";
+              if (thinkingPayload) {
+                emittedOutput = true;
+                yield { type: "sdk_message", payload: thinkingPayload };
+              }
               const call = extractToolCallFromItem(event.item);
               if (call && !emittedToolCallIds.has(call.id)) {
                 emittedToolCallIds.add(call.id);
@@ -623,6 +629,14 @@ async function* runTurnOnce(
           const parsedArgs = (call?.input && typeof call.input === "object"
             ? call.input
             : {}) as Record<string, unknown>;
+          if (thinkingText) {
+            const thinkingPayload = assistantVisibleMessage(sessionId, thinkingText, "");
+            thinkingText = "";
+            if (thinkingPayload) {
+              emittedOutput = true;
+              yield { type: "sdk_message", payload: thinkingPayload };
+            }
+          }
           if (call && !emittedToolCallIds.has(call.id)) {
             emittedToolCallIds.add(call.id);
             emittedOutput = true;
@@ -968,9 +982,80 @@ function extractItemText(item: unknown): string {
   const r = item as { rawItem?: { content?: Array<{ type?: string; text?: string }> } };
   const content = r.rawItem?.content ?? [];
   return content
-    .filter((b) => typeof b.text === "string")
+    .filter((b) => typeof b.text === "string" && b.type !== "thinking" && b.type !== "reasoning")
     .map((b) => b.text!)
     .join("");
+}
+
+function reasoningString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function chatCompletionDelta(data: { type?: unknown; event?: unknown }): Record<string, unknown> | null {
+  if (data.type !== "model") return null;
+  const event = data.event as
+    | { choices?: Array<{ index?: number; delta?: Record<string, unknown> }> }
+    | undefined;
+  const choices = event?.choices;
+  if (!Array.isArray(choices)) return null;
+  const primary = choices.find((c) => (c.index ?? 0) === 0) ?? choices[0];
+  const delta = primary?.delta;
+  return delta && typeof delta === "object" ? delta : null;
+}
+
+function rawReasoningDelta(data: { type?: unknown; delta?: unknown; event?: unknown }): string | null {
+  const type = typeof data.type === "string" ? data.type : "";
+  if (typeof data.delta === "string" && data.delta.length > 0) {
+    if (type.includes("reasoning") || type === "reasoning_content") return data.delta;
+  }
+  if (data.delta && typeof data.delta === "object") {
+    const nested = data.delta as { reasoning_content?: unknown; text?: unknown; reasoning?: unknown };
+    const nestedReason =
+      reasoningString(nested.reasoning_content) ??
+      reasoningString(nested.reasoning) ??
+      (type.includes("reasoning") ? reasoningString(nested.text) : null);
+    if (nestedReason) return nestedReason;
+  }
+  // Chat Completions: @openai/agents yields every chunk as `{ type: "model", event: chunk }`
+  // and never synthesizes a reasoning delta. DeepSeek puts CoT on
+  // `choices[0].delta.reasoning_content`; some gateways use `delta.reasoning`.
+  const chatDelta = chatCompletionDelta(data);
+  if (chatDelta) {
+    return reasoningString(chatDelta.reasoning_content) ?? reasoningString(chatDelta.reasoning);
+  }
+  return null;
+}
+
+function reasoningFromResponseOutput(response: unknown): string | null {
+  const output = (response as { output?: unknown } | null)?.output;
+  if (!Array.isArray(output)) return null;
+  const parts: string[] = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") continue;
+    const it = item as {
+      type?: unknown;
+      rawContent?: Array<{ type?: string; text?: string }>;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    if (it.type !== "reasoning") continue;
+    for (const block of [...(it.rawContent ?? []), ...(it.content ?? [])]) {
+      const text = reasoningString(block.text);
+      if (text) parts.push(text);
+    }
+  }
+  return parts.length > 0 ? parts.join("") : null;
+}
+
+function assistantVisibleMessage(
+  sessionId: string,
+  thinking: string,
+  text: string,
+): { type: "assistant"; session_id: string; message: { content: Array<{ type: string; thinking?: string; text?: string }> } } | null {
+  const content: Array<{ type: string; thinking?: string; text?: string }> = [];
+  if (thinking) content.push({ type: "thinking", thinking });
+  if (text) content.push({ type: "text", text });
+  if (content.length === 0) return null;
+  return { type: "assistant", session_id: sessionId, message: { content } };
 }
 
 export interface ExtractedToolCall {

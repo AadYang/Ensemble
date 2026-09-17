@@ -3,8 +3,9 @@
 // SDKMessage union with many new variants (rate_limit_event, tool_progress,
 // system/thinking_tokens, …). SessionManager must never crash on a type it
 // doesn't special-case: unknown top-level types are passed through (persisted +
-// broadcast) and the reserved internal system/thinking_tokens message is
-// silently ignored — either way the turn still completes at `result`.
+// broadcast). system/thinking_tokens is not persisted (heartbeat) but is
+// forwarded so the UI can show a live thinking indicator. Either way the
+// turn still completes at `result`.
 
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime, RuntimeOptions } from "../runtimes/types.js";
@@ -53,7 +54,7 @@ describe("SessionManager sdk_message passthrough", () => {
 
     // Yields new/unknown 0.3.x message variants interleaved with the normal
     // assistant + result flow. None of these are special-cased by name in the
-    // adapter loop except system/thinking_tokens (explicitly ignored).
+    // adapter loop except system/thinking_tokens (broadcast, not persisted).
     const runtime: AgentRuntime = {
       async *query(_opts: RuntimeOptions) {
         yield {
@@ -66,7 +67,7 @@ describe("SessionManager sdk_message passthrough", () => {
         };
         yield {
           type: "sdk_message" as const,
-          payload: { type: "system", subtype: "thinking_tokens", session_id: "sess-pt" } as never,
+          payload: { type: "system", subtype: "thinking_tokens", session_id: "sess-pt", estimated_tokens: 800 } as never,
         };
         yield {
           type: "sdk_message" as const,
@@ -106,14 +107,14 @@ describe("SessionManager sdk_message passthrough", () => {
     expect(persistedTypes).toContain("result");
     expect(persistedTypes).not.toContain("system");
 
-    // Unknown types are also broadcast to the session; thinking_tokens is
-    // filtered, but the heartbeat still reaches the UI (which updates one live
-    // row in place instead of appending).
+    // Unknown types are also broadcast to the session. thinking_tokens is not
+    // persisted (heartbeat) but it IS forwarded so the chat pane can show a
+    // live thinking indicator during redacted CoT.
     const broadcastMsgTypes = hub.events
       .filter((e) => e.kind === "session" && e.msg.type === "message")
       .map((e) => (e.msg.msg as { type?: string })?.type);
     expect(broadcastMsgTypes).toContain("rate_limit_event");
     expect(broadcastMsgTypes).toContain("tool_progress");
-    expect(broadcastMsgTypes).not.toContain("system");
+    expect(broadcastMsgTypes).toContain("system");
   });
 });
