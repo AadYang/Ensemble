@@ -288,8 +288,15 @@ function messageText(payload: unknown): string {
     return blocks.map(blockText).filter(Boolean).join("\n");
   }
   if (value.type === "stream_event") {
-    const delta = ((value.event as { delta?: unknown } | undefined)?.delta ?? {}) as { type?: string; text?: string };
+    const delta = ((value.event as { delta?: unknown } | undefined)?.delta ?? {}) as {
+      type?: string;
+      text?: string;
+      thinking?: string;
+    };
     if (delta.type === "text_delta") return delta.text ?? "";
+    if (delta.type === "thinking_delta" || delta.type === "reasoning_delta") {
+      return delta.thinking ?? delta.text ?? "";
+    }
   }
   if (value.type === "result") return String(value.subtype ?? "result");
   if (value.subtype === "interrupted_turn") return "Interrupted turn context saved.";
@@ -299,8 +306,11 @@ function messageText(payload: unknown): string {
 function blockText(block: unknown): string {
   if (typeof block === "string") return block;
   if (!block || typeof block !== "object") return "";
-  const value = block as { type?: string; text?: string; name?: string };
+  const value = block as { type?: string; text?: string; thinking?: string; name?: string };
   if (value.type === "text") return value.text ?? "";
+  if (value.type === "thinking" || value.type === "reasoning") {
+    return value.thinking ?? value.text ?? "";
+  }
   if (value.type === "tool_use") return `[tool: ${value.name ?? "tool"}]`;
   return "";
 }

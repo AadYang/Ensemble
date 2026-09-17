@@ -221,6 +221,10 @@ const en: Dict = {
   "chat.subagents.count": "◈ {n}",
   "chat.subagents.tip":
     "{n} subagent(s) started this turn. Native ones stay in this transcript and do not appear in the sidebar.",
+  "chat.thinking": "thinking",
+  "chat.thinkingProgress": "thinking · {n} tokens",
+  "chat.plan.title": "PLAN",
+  "chat.plan.empty": "empty plan",
 
   // pane shell
   "pane.empty": "empty pane",
@@ -836,6 +840,10 @@ const zh: Dict = {
   "chat.subagents.count": "◈ {n}",
   "chat.subagents.tip":
     "本轮已启动 {n} 个子代理。Claude/Codex 原生子代理的结果会回到这条对话，不会在侧栏另开 agent。",
+  "chat.thinking": "思考",
+  "chat.thinkingProgress": "思考中 · {n} tokens",
+  "chat.plan.title": "方案",
+  "chat.plan.empty": "空方案",
 
   // pane shell
   "pane.empty": "空 pane",

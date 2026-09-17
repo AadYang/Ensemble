@@ -19,6 +19,9 @@ import {
   type LivenessUpdate,
   type PeerMode,
   type RunPlanStatusView,
+  streamDisplayDeltaFromSdkMessage,
+  thinkingTextFromContentBlocks,
+  thinkingTokensEstimate,
   type SdkMessage,
   type SplitDir,
   type TeamSummary,
@@ -36,7 +39,7 @@ export interface PeerOrigin {
 
 export interface ChatTurn {
   seq: number;
-  kind: "user" | "assistant_text" | "tool_use" | "system" | "result" | "raw";
+  kind: "user" | "assistant_text" | "thinking" | "tool_use" | "system" | "result" | "raw";
   text: string;
   toolName?: string;
   toolInput?: unknown;
@@ -167,6 +170,10 @@ interface Store {
   appendUserTurn: (id: string, text: string, peerOrigin?: PeerOrigin) => void;
   appendNotice: (id: string, text: string) => void;
   ingestSdkMessage: (id: string, seq: number, msg: SdkMessage) => void;
+  ingestStreamDisplayChunks: (
+    id: string,
+    chunks: ReadonlyArray<{ seq: number; kind: "assistant_text" | "thinking"; text: string }>,
+  ) => void;
   appendError: (id: string | null, code: string, message: string) => void;
 
   /** Per-agent buffer of user-typed inputs (only what was sent via the
@@ -402,7 +409,7 @@ const backgroundTaskTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   };
 };
 
-type AssistantBlock = { type: string; text?: string; name?: string; input?: unknown };
+type AssistantBlock = { type: string; text?: string; thinking?: string; name?: string; input?: unknown };
 
 const assistantBlocks = (msg: SdkMessage): AssistantBlock[] =>
   (msg as { message?: { content?: AssistantBlock[] } }).message?.content ?? [];
@@ -424,15 +431,83 @@ const toolUseTurns = (seq: number, blocks: AssistantBlock[]): ChatTurn[] =>
       toolInput: b.input,
     }));
 
+const THINKING_PROGRESS_KEY = "thinking_tokens";
+
+function appendStreamDisplay(turns: ChatTurn[], seq: number, kind: "assistant_text" | "thinking", text: string): ChatTurn[] {
+  const next = turns.slice();
+  const last = next[next.length - 1];
+  if (last && last.kind === kind && last.streaming) {
+    if (kind === "thinking" && last.liveKey === THINKING_PROGRESS_KEY) {
+      next[next.length - 1] = { seq, kind, text, streaming: true };
+      return next;
+    }
+    next[next.length - 1] = { ...last, text: last.text + text };
+    return next;
+  }
+  next.push({ seq, kind, text, streaming: true });
+  return next;
+}
+
+function upsertThinkingProgress(turns: ChatTurn[], estimated: number): ChatTurn[] {
+  const text = String(Math.round(estimated));
+  const next = turns.slice();
+  for (let i = next.length - 1; i >= 0; i--) {
+    const row = next[i]!;
+    if (row.kind === "user") break;
+    if (row.kind === "thinking" && row.streaming && row.liveKey !== THINKING_PROGRESS_KEY) {
+      return turns;
+    }
+    if (row.liveKey === THINKING_PROGRESS_KEY) {
+      if (row.text === text) return turns;
+      next[i] = { ...row, text, streaming: true };
+      return next;
+    }
+  }
+  next.push({
+    seq: -1,
+    kind: "thinking",
+    text,
+    streaming: true,
+    liveKey: THINKING_PROGRESS_KEY,
+  });
+  return next;
+}
+
+function upsertDisplayTurn(turns: ChatTurn[], seq: number, kind: "assistant_text" | "thinking", text: string): void {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const row = turns[i]!;
+    if (row.kind === "user") break;
+    if (row.kind === kind && row.streaming) {
+      turns[i] = { seq, kind, text };
+      return;
+    }
+    if (row.kind === kind && row.text === text) return;
+  }
+  turns.push({ seq, kind, text });
+}
+
+function finalizeStreamingKind(turns: ChatTurn[], kind: "thinking"): void {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const row = turns[i]!;
+    if (row.kind === "user") break;
+    if (row.kind === kind && row.streaming) {
+      turns[i] = { ...row, streaming: false };
+      return;
+    }
+  }
+}
+
 const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   switch (msg.type) {
     case "assistant": {
       const blocks = assistantBlocks(msg);
       const text = assistantTextOf(blocks);
+      const thinking = thinkingTextFromContentBlocks(blocks);
       const tools = toolUseTurns(seq, blocks);
       // Text used to win and drop co-located tool_use, which is how openai-compat
       // cards vanished after a model switch: one assistant payload carried both.
       if (text) return { seq, kind: "assistant_text", text };
+      if (thinking) return { seq, kind: "thinking", text: thinking };
       if (tools[0]) return tools[0];
       return { seq, kind: "raw", text: `[assistant]` };
     }
@@ -799,45 +874,52 @@ export const useStore = create<Store>((set) => ({
       return { inputSelections: { ...s.inputSelections, [agentId]: selection } };
     }),
 
+  ingestStreamDisplayChunks: (id, chunks) =>
+    set((s) => {
+      const ag = s.agents[id];
+      if (!ag || chunks.length === 0) return s;
+      let turns = ag.turns;
+      for (const chunk of chunks) {
+        if (!chunk.text && chunk.kind !== "thinking") continue;
+        turns = appendStreamDisplay(turns, chunk.seq, chunk.kind, chunk.text);
+      }
+      if (turns === ag.turns) return s;
+      return { agents: { ...s.agents, [id]: { ...ag, turns } } };
+    }),
+
   ingestSdkMessage: (id, seq, msg) =>
     set((s) => {
       const ag = s.agents[id];
       if (!ag) return s;
 
       if (msg.type === "stream_event") {
-        const ev = (msg as { event?: { type?: string; delta?: { type?: string; text?: string } } }).event;
-        if (
-          ev?.type === "content_block_delta" &&
-          ev.delta?.type === "text_delta" &&
-          typeof ev.delta.text === "string"
-        ) {
-          const turns = ag.turns.slice();
-          const last = turns[turns.length - 1];
-          if (last && last.kind === "assistant_text" && last.streaming) {
-            turns[turns.length - 1] = { ...last, text: last.text + ev.delta.text };
-          } else {
-            turns.push({ seq, kind: "assistant_text", text: ev.delta.text, streaming: true });
-          }
-          return { agents: { ...s.agents, [id]: { ...ag, turns } } };
-        }
-        return s;
+        const delta = streamDisplayDeltaFromSdkMessage(msg);
+        if (!delta) return s;
+        return {
+          agents: {
+            ...s.agents,
+            [id]: { ...ag, turns: appendStreamDisplay(ag.turns, seq, delta.kind, delta.text) },
+          },
+        };
+      }
+
+      const thinkingTokens = thinkingTokensEstimate(msg);
+      if (thinkingTokens !== null) {
+        const turns = upsertThinkingProgress(ag.turns, thinkingTokens);
+        if (turns === ag.turns) return s;
+        return { agents: { ...s.agents, [id]: { ...ag, turns } } };
       }
 
       if (msg.type === "assistant") {
         const blocks = assistantBlocks(msg);
         const text = assistantTextOf(blocks);
+        const thinking = thinkingTextFromContentBlocks(blocks);
         const tools = toolUseTurns(seq, blocks);
-        if (text || tools.length > 0) {
+        if (text || thinking || tools.length > 0) {
           const turns = ag.turns.slice();
-          if (text) {
-            const last = turns[turns.length - 1];
-            const finalized: ChatTurn = { seq, kind: "assistant_text", text };
-            if (last && last.kind === "assistant_text" && last.streaming) {
-              turns[turns.length - 1] = finalized;
-            } else {
-              turns.push(finalized);
-            }
-          }
+          if (thinking) upsertDisplayTurn(turns, seq, "thinking", thinking);
+          else finalizeStreamingKind(turns, "thinking");
+          if (text) upsertDisplayTurn(turns, seq, "assistant_text", text);
           turns.push(...tools);
           return { agents: { ...s.agents, [id]: { ...ag, turns } } };
         }

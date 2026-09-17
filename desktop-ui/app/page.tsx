@@ -43,6 +43,7 @@ import {
   resolveCloudRefreshSelection,
 } from "@agentorch/shared";
 import { hydrateLocaleFromStorage, selectActiveWindow, useStore } from "@/store/agents";
+import { ingestLiveSdkMessage } from "@/store/stream-batch";
 import { LayoutRenderer } from "@/components/LayoutRenderer";
 import { PermissionDialog } from "@/components/PermissionDialog";
 import { AskUserDialog } from "@/components/AskUserDialog";
@@ -405,7 +406,7 @@ export default function Page() {
           setRunPlan(msg.sessionId, msg.plan);
           break;
         case "message":
-          ingestSdkMessage(msg.sessionId, msg.seq, msg.msg);
+          ingestLiveSdkMessage(msg.sessionId, msg.seq, msg.msg);
           break;
         case "permission_request":
           addPermissionRequest({
@@ -445,7 +446,6 @@ export default function Page() {
     clearLiveness,
     setRunPlan,
     clearRunPlan,
-    ingestSdkMessage,
     addPermissionRequest,
     addUserQuestion,
     appendError,

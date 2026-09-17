@@ -14,6 +14,8 @@ export * from "./update-manifest";
 export * from "./telemetry";
 export * from "./chat-input";
 export * from "./subagent-tool";
+export * from "./thinking-display";
+export * from "./stream-display-batch";
 export * from "./workspace-selection";
 export * from "./git";
 export * from "./cloud-remote-bridge";
