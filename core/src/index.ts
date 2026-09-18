@@ -2286,21 +2286,18 @@ fastify.get<{
   }
 
   // Half-open [since, until). SQLite stores createdAt as unixepoch seconds.
+  // Range belongs in SQL: loading every UsageEvent then filtering in JS used
+  // to park this request on the event loop (and on any in-flight write) long
+  // enough that the stats dialog sat on "加载中…" until the user gave up.
   const sinceUnix = Math.floor(sinceMs / 1000);
   const untilUnix = Math.ceil(untilMs / 1000);
-  // The current makeRepo WHERE builder doesn't support range operators, so
-  // filter after-fetch. Volumes are small (one row per assistant turn);
-  // the index `usage_time_idx` will help once we wire a proper range query
-  // builder, but for now this is fine.
-  const rows = await prisma.usageEvent.findMany({});
-  const inRange = rows.filter((r) => {
-    const t = Math.floor(r.createdAt.getTime() / 1000);
-    return t >= sinceUnix && t < untilUnix;
+  const rows = await prisma.usageEvent.findMany({
+    where: { createdAt: { gte: sinceUnix, lt: untilUnix } },
   });
 
   const tz = q.tz || "UTC";
   const includeDescendants = q.includeDescendants === "true";
-  const agg = aggregateUsage(inRange, { tz, includeDescendants });
+  const agg = aggregateUsage(rows, { tz, includeDescendants });
 
   return {
     range: {

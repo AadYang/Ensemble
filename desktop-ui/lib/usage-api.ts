@@ -1,5 +1,7 @@
 // W17 client: thin REST wrapper for /api/usage/summary.
 
+import { apiError, apiFetch } from "@/lib/api";
+
 export interface UsageBucket {
   costUSD: number;
   inputTokens: number;
@@ -61,7 +63,9 @@ export async function fetchUsageSummary(params: {
   if (params.tz) qs.set("tz", params.tz);
   if (params.includeDescendants) qs.set("includeDescendants", "true");
   const url = `/api/usage/summary${qs.toString() ? `?${qs}` : ""}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetchUsageSummary: ${res.status} ${await res.text().catch(() => "")}`);
+  // apiFetch resolves the sidecar origin. Bare fetch("/api/...") on
+  // tauri://localhost never reaches core, so the dialog stays on 加载中.
+  const res = await apiFetch(url, { signal: AbortSignal.timeout(20_000) });
+  if (!res.ok) throw await apiError(res, "fetchUsageSummary");
   return (await res.json()) as UsageSummary;
 }

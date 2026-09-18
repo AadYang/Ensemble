@@ -291,7 +291,7 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
                 <AreaChart data={chartRows}>
                   <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" />
                   <XAxis dataKey="date" tick={{ fontSize: 10, fill: "var(--text-faint)" }} />
-                  <YAxis tick={{ fontSize: 10, fill: "var(--text-faint)" }} tickFormatter={(v) => fmtToken(Number(v))} />
+                  <YAxis tickCount={5} tick={{ fontSize: 10, fill: "var(--text-faint)" }} tickFormatter={(v) => fmtToken(Number(v))} />
                   <Tooltip
                     contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", fontSize: 11 }}
                     formatter={(v, name) => [fmtToken(Number(v)), seriesLabel(String(name))]}
@@ -324,7 +324,7 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
                 <LineChart data={chartRows}>
                   <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" />
                   <XAxis dataKey="date" tick={{ fontSize: 10, fill: "var(--text-faint)" }} />
-                  <YAxis tick={{ fontSize: 10, fill: "var(--text-faint)" }} tickFormatter={(v) => fmtToken(Number(v))} />
+                  <YAxis tickCount={5} tick={{ fontSize: 10, fill: "var(--text-faint)" }} tickFormatter={(v) => fmtToken(Number(v))} />
                   <Tooltip
                     contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", fontSize: 11 }}
                     formatter={(v, name) => [fmtToken(Number(v)), seriesLabel(String(name))]}

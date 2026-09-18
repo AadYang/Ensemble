@@ -46,4 +46,44 @@ describe("db where-clause", () => {
     });
     expect(found?.id).toBe(c.id);
   });
+
+  it("createdAt gte/lt filters UsageEvent in SQL", async () => {
+    const t0 = Math.floor(Date.now() / 1000);
+    await prisma.usageEvent.create({
+      data: {
+        agentName: "range-a",
+        providerName: "p",
+        providerKind: "openai-compat",
+        model: "deepseek-flash",
+        source: "result",
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        costUSD: 0,
+        costKnown: 0,
+        createdAt: t0 - 100,
+      },
+    });
+    await prisma.usageEvent.create({
+      data: {
+        agentName: "range-b",
+        providerName: "p",
+        providerKind: "openai-compat",
+        model: "deepseek-flash",
+        source: "result",
+        inputTokens: 2,
+        outputTokens: 2,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        costUSD: 0,
+        costKnown: 0,
+        createdAt: t0 - 10,
+      },
+    });
+    const hit = prisma.usageEvent.findMany({
+      where: { createdAt: { gte: t0 - 20, lt: t0 } },
+    });
+    expect(hit.map((r) => r.agentName)).toEqual(["range-b"]);
+  });
 });

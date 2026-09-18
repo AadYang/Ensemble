@@ -886,7 +886,12 @@ function buildClauses(where: WhereClause | undefined): { sql: string; params: un
     if (val === null) {
       parts.push(`${key} IS NULL`);
     } else if (typeof val === "object" && !Array.isArray(val)) {
-      const obj = val as { equals?: unknown; mode?: "insensitive" };
+      const obj = val as {
+        equals?: unknown;
+        mode?: "insensitive";
+        gte?: unknown;
+        lt?: unknown;
+      };
       if ("equals" in obj) {
         if (obj.mode === "insensitive") {
           parts.push(`LOWER(${key}) = LOWER(?)`);
@@ -894,6 +899,14 @@ function buildClauses(where: WhereClause | undefined): { sql: string; params: un
           parts.push(`${key} = ?`);
         }
         params.push(obj.equals);
+      }
+      if (obj.gte != null) {
+        parts.push(`${key} >= ?`);
+        params.push(obj.gte instanceof Date ? Math.floor(obj.gte.getTime() / 1000) : obj.gte);
+      }
+      if (obj.lt != null) {
+        parts.push(`${key} < ?`);
+        params.push(obj.lt instanceof Date ? Math.floor(obj.lt.getTime() / 1000) : obj.lt);
       }
     } else if (typeof val === "boolean") {
       parts.push(`${key} = ?`);
