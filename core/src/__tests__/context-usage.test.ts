@@ -4,6 +4,7 @@ import {
   contextUsageFromUsedTokens,
   LIVE_CONTEXT_MIN_EMIT_MS,
   liveOccupancy,
+  occupancyAfterPersistedMessage,
   occupancyDeltaFromStreamEvent,
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
@@ -420,12 +421,46 @@ describe("occupancyTokensFromResultContextUsage", () => {
       occupancyTokensFromResultContextUsage({ type: "result", contextUsage: { outputTokens: 12 } }),
     ).toBeNull();
   });
+
+  it("reads Claude SDK result.usage when contextUsage is absent", () => {
+    expect(
+      occupancyTokensFromResultContextUsage({
+        type: "result",
+        usage: {
+          input_tokens: 268,
+          cache_read_input_tokens: 127_744,
+          cache_creation_input_tokens: 0,
+          output_tokens: 40,
+        },
+      }),
+    ).toBe(128_052);
+  });
 });
 
 describe("live occupancy helpers", () => {
   it("sums prompt and streamed output", () => {
     expect(liveOccupancy(100, 7)).toBe(107);
     expect(liveOccupancy(-1, 5)).toBe(5);
+  });
+
+  it("keeps the live running count when the persisted row has no usage", () => {
+    expect(
+      occupancyAfterPersistedMessage({
+        providerOccupancy: null,
+        livePromptTokens: 539_000,
+        streamedTokens: 12,
+      }),
+    ).toBe(539_012);
+  });
+
+  it("prefers provider occupancy over the live count", () => {
+    expect(
+      occupancyAfterPersistedMessage({
+        providerOccupancy: 100,
+        livePromptTokens: 50,
+        streamedTokens: 3,
+      }),
+    ).toBe(100);
   });
 
   it("throttles unchanged or too-frequent live publishes", () => {

@@ -158,6 +158,23 @@ export function liveOccupancy(promptTokens: number, streamedTokens: number): num
   return Math.max(0, promptTokens) + Math.max(0, streamedTokens);
 }
 
+/** Occupancy after persisting an assistant/user row mid-turn.
+ *
+ *  Provider per-call usage wins when the row carries it (Claude). Otherwise
+ *  keep the live running count: recounting `buildRuntimeHistoryForTurn` here
+ *  is tiktoken on the Node event loop per tool_use, which is how a large
+ *  openai-compat session stops answering cancel and WS until restart. */
+export function occupancyAfterPersistedMessage(opts: {
+  providerOccupancy: number | null;
+  livePromptTokens: number;
+  streamedTokens: number;
+}): number {
+  if (opts.providerOccupancy != null && opts.providerOccupancy > 0) {
+    return opts.providerOccupancy;
+  }
+  return liveOccupancy(opts.livePromptTokens, opts.streamedTokens);
+}
+
 export function shouldPublishLiveContext(opts: {
   force: boolean;
   now: number;
@@ -238,9 +255,22 @@ export function promptTokensFromResultContextUsage(msg: unknown): number | null 
 
 export function occupancyTokensFromResultContextUsage(msg: unknown): number | null {
   const prompt = promptTokensFromResultContextUsage(msg);
-  if (prompt === null) return null;
-  const usage = (msg as ResultPayload).contextUsage;
-  return prompt + num(usage?.outputTokens);
+  if (prompt !== null) {
+    const usage = (msg as ResultPayload).contextUsage;
+    return prompt + num(usage?.outputTokens);
+  }
+  // Claude SDK results carry Anthropic `usage`, not W22 `contextUsage`.
+  // Treating those as "no number" forced a full-transcript tiktoken at every
+  // turn start — the bar froze the Node event loop on a long DeepSeek session.
+  const payload = msg as { type?: unknown; usage?: Record<string, unknown> } | null;
+  if (!payload || payload.type !== "result" || !payload.usage || typeof payload.usage !== "object") {
+    return null;
+  }
+  const u = payload.usage;
+  const anthropic =
+    num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens);
+  if (anthropic <= 0) return null;
+  return anthropic + num(u.output_tokens);
 }
 
 /** Text of one history message as the model receives it: user content (string)
