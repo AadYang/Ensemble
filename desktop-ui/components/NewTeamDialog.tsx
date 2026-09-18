@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { createTeam } from "@/lib/team-api";
 import { getWS } from "@/lib/ws";
 import { useT } from "@/i18n/useT";
 import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
+import { MenuSelect } from "./MenuSelect";
 
 // Same fallback that AgentSettings uses. anthropic-local provider rows live
 // in the DB with empty `models[]` because the actual model id list comes from
@@ -77,16 +78,6 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
       .then((rows) => setProviders(rows.filter((p) => !p.disabled)))
       .catch((err) => console.warn("listProviders failed", err));
   }, []);
-
-  // Group providers by kind for the dropdown — makes "pick a different model
-  // for each role" feel like a first-class action rather than an afterthought.
-  const providersByKind = useMemo(() => {
-    const groups: Record<string, ProviderDTO[]> = {};
-    for (const p of providers) {
-      (groups[p.kind] ??= []).push(p);
-    }
-    return groups;
-  }, [providers]);
 
   // Auto-fill: when a member has no provider selected yet, default to the
   // default provider once it loads. Each member is independent — no
@@ -268,33 +259,23 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
                     )}
                   </div>
                   <div className="flex items-stretch gap-1">
-                    <select
+                    <MenuSelect
+                      className="flex-1"
                       value={m.providerId ?? ""}
-                      onChange={(e) => updateMember(idx, { providerId: e.target.value || null })}
-                      className="flex-1 bg-[var(--bg)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)] text-[var(--text-dim)]"
-                    >
-                      {Object.entries(providersByKind).map(([kind, list]) => (
-                        <optgroup key={kind} label={kind}>
-                          {list.map((pp) => (
-                            <option key={pp.id} value={pp.id}>
-                              {pp.name}
-                            </option>
-                          ))}
-                        </optgroup>
-                      ))}
-                    </select>
-                    <select
+                      onChange={(id) => updateMember(idx, { providerId: id || null })}
+                      items={providers.map((pp) => ({
+                        value: pp.id,
+                        label: pp.name,
+                        group: pp.kind,
+                      }))}
+                    />
+                    <MenuSelect
+                      className="flex-1"
                       value={m.model}
-                      onChange={(e) => updateMember(idx, { model: e.target.value })}
-                      className="flex-1 bg-[var(--bg)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)] text-[var(--text-dim)]"
-                    >
-                      {availableModels.length === 0 && <option value="">{t("team.new.noModels")}</option>}
-                      {availableModels.map((mm) => (
-                        <option key={mm} value={mm}>
-                          {mm}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={(model) => updateMember(idx, { model })}
+                      placeholder={t("team.new.noModels")}
+                      items={availableModels.map((mm) => ({ value: mm, label: mm }))}
+                    />
                   </div>
                   <input
                     value={m.projectRoot}

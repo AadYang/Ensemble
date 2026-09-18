@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { getWS } from "@/lib/ws";
 import { useT } from "@/i18n/useT";
 import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
+import { MenuSelect } from "./MenuSelect";
 
 // Same FALLBACK_MODELS treatment NewTeamDialog uses — anthropic-local rows
 // have empty `models[]` in the DB; without this fallback the model dropdown
@@ -67,12 +68,6 @@ export function AddTeamMemberDialog({
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
-
-  const providersByKind = useMemo(() => {
-    const groups: Record<string, ProviderDTO[]> = {};
-    for (const p of providers) (groups[p.kind] ??= []).push(p);
-    return groups;
-  }, [providers]);
 
   const selectedProvider = providers.find((p) => p.id === providerId);
   const availableModels = availableModelsFor(selectedProvider);
@@ -176,31 +171,23 @@ export function AddTeamMemberDialog({
             />
           </label>
           <div className="flex gap-1">
-            <select
+            <MenuSelect
+              className="flex-1"
               value={providerId ?? ""}
-              onChange={(e) => onProviderChange(e.target.value)}
-              className="flex-1 bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)] text-[var(--text-dim)]"
-            >
-              {Object.entries(providersByKind).map(([kind, list]) => (
-                <optgroup key={kind} label={kind}>
-                  {list.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            <select
+              onChange={onProviderChange}
+              items={providers.map((p) => ({
+                value: p.id,
+                label: p.name,
+                group: p.kind,
+              }))}
+            />
+            <MenuSelect
+              className="flex-1"
               value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="flex-1 bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)] text-[var(--text-dim)]"
-            >
-              {availableModels.length === 0 && <option value="">{t("team.new.noModels")}</option>}
-              {availableModels.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
+              onChange={setModel}
+              placeholder={t("team.new.noModels")}
+              items={availableModels.map((m) => ({ value: m, label: m }))}
+            />
           </div>
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">

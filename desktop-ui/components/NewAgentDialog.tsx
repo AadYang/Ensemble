@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useT } from "@/i18n/useT";
 import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
+import { MenuSelect } from "./MenuSelect";
 
 export function NewAgentDialog({
   defaultName,
@@ -102,7 +103,9 @@ export function NewAgentDialog({
   const dialog = (
     <div
       className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50"
-      onClick={onClose}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div
         className="tool-card bg-[var(--bg-elevated)] w-[420px] max-w-full text-xs shadow-2xl shadow-black/50"
@@ -143,38 +146,27 @@ export function NewAgentDialog({
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
               {t("agent.new.label.provider")}
             </span>
-            <select
+            <MenuSelect
               value={providerId ?? ""}
-              onChange={(e) => setProviderId(e.target.value || null)}
-              className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
-            >
-              {providers.length === 0 && (
-                <option value="" disabled>{t("agent.new.providerEmpty")}</option>
-              )}
-              {providers.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} · {p.kind}
-                </option>
-              ))}
-            </select>
+              onChange={(id) => setProviderId(id || null)}
+              placeholder={t("agent.new.providerEmpty")}
+              items={providers.map((p) => ({
+                value: p.id,
+                label: `${p.name} · ${p.kind}`,
+              }))}
+            />
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
               {t("agent.new.label.model")}
             </span>
-            <select
+            <MenuSelect
               value={model}
-              onChange={(e) => setModel(e.target.value)}
+              onChange={setModel}
               disabled={availableModels.length === 0}
-              className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)] disabled:opacity-50"
-            >
-              {availableModels.length === 0 && (
-                <option value="" disabled>{t("agent.new.modelEmpty")}</option>
-              )}
-              {availableModels.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
+              placeholder={t("agent.new.modelEmpty")}
+              items={availableModels.map((m) => ({ value: m, label: m }))}
+            />
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
