@@ -39,4 +39,13 @@ describe("ensemble_help teams topic", () => {
     const out = formatEnsembleHelp("teams");
     expect(out).toMatch(/different providers\/models|cross-model is a first-class/i);
   });
+
+  it("locks peer_send to teammates and same-name outsiders", () => {
+    const teams = formatEnsembleHelp("teams");
+    expect(teams).toMatch(/same name on another team/i);
+    const peer = formatEnsembleHelp("peer_messaging");
+    expect(peer).toContain("TEAM BOUNDARY");
+    expect(peer).toMatch(/same name/i);
+    expect(peer).toContain("TEAM CONTEXT");
+  });
 });

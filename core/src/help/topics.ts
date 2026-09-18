@@ -31,7 +31,10 @@ Delegation — you can spawn your OWN subagents / background tasks (see subagent
     user can watch it). background=true runs it detached; omit to wait for the result.
 
 Inter-agent communication (you have these tools):
-  - peer_send (push: continue / review / fork / raw modes)
+  - peer_send (push: continue / review / fork / raw modes). TEAM BOUNDARY:
+    teamed agents may only reach teammates listed in TEAM CONTEXT — never an
+    agent outside the team, even one with the same name.
+  - peer_query (read-only history pull, doesn't run the peer; same team boundary)
   - peer_query (read-only history pull, doesn't run the peer)
   - conversation_search (read-only keyword search over prior user/assistant text;
     default scope team, fallback self when unteamed)
@@ -202,6 +205,12 @@ that turn, or add the toolchain dirs to the workspace.
 `,
 
   peer_messaging: `Two tools for cross-agent communication:
+
+TEAM BOUNDARY (enforced — the tool refuses anything else):
+  - If you are on a team, peer_send / peer_query reach ONLY teammates listed in
+    your TEAM CONTEXT. An agent on another team is unreachable, even if it has
+    the same name (that is a different agent). Do not guess outsider UUIDs.
+  - Ungrouped agents may only contact other ungrouped agents.
 
 peer_send (async push — recipient processes as a new user turn):
   modes:
@@ -378,6 +387,8 @@ What "being on a team" gives an agent:
   - A TEAM CONTEXT block injected into the systemPrompt (before user prompt,
     after primer): lists teammates by name + model + role hint. The agent
     knows who to call via peer_send when it needs help.
+  - peer_send / peer_query are locked to that teammate list. An agent with the
+    same name on another team is a different agent and cannot be messaged.
   - Sidebar grouping: members appear under a collapsible team header.
   - That's it — no orchestrator. Coordination is voluntary, agents must
     decide for themselves when to ping a teammate.

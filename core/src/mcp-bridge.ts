@@ -323,7 +323,7 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   const mcp = new McpServer({ name: "agentorch-internal", version: "1.0.0" });
   mcp.tool(
     "peer_send",
-    "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
+    "Send a chat message to another agent. If you are on a team, ONLY teammates listed in TEAM CONTEXT — never an agent outside the team, even one with the same name (that is a different agent; the tool refuses it). Ungrouped agents may only contact other ungrouped agents. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
     {
       target: z.string().min(1),
       message: z.string().min(1),
@@ -341,7 +341,7 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   );
   mcp.tool(
     "peer_query",
-    "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). The transcript is stored whole as an artifact and returned verbatim when it fits the turn budget; otherwise you get a first page plus an <<<artifact id=... sha256=...>>> handle to continue with artifact_read. A subagent is private to the agent that spawned it: another agent's subagent cannot be queried — ask its parent instead.",
+    "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). Same team boundary as peer_send: teammates only; never an agent outside the team, even one with the same name. The transcript is stored whole as an artifact and returned verbatim when it fits the turn budget; otherwise you get a first page plus an <<<artifact id=... sha256=...>>> handle to continue with artifact_read. A subagent is private to the agent that spawned it: another agent's subagent cannot be queried — ask its parent instead.",
     {
       target: z.string().min(1),
       limit: z.number().int().min(1).max(50).optional(),
@@ -515,7 +515,7 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const peerSend = handlers.peerSend;
       mcp.tool(
         "peer_send",
-        "Send a chat message to another agent in this workspace. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
+        "Send a chat message to another agent. If you are on a team, ONLY teammates listed in TEAM CONTEXT — never an agent outside the team, even one with the same name (that is a different agent; the tool refuses it). Ungrouped agents may only contact other ungrouped agents. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
         {
           target: z.string().min(1),
           message: z.string().min(1),
@@ -539,7 +539,7 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const peerQuery = handlers.peerQuery;
       mcp.tool(
         "peer_query",
-        "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). The transcript is stored whole as an artifact and returned verbatim when it fits the turn budget; otherwise you get a first page plus an <<<artifact id=... sha256=...>>> handle to continue with artifact_read. A subagent is private to the agent that spawned it: another agent's subagent cannot be queried — ask its parent instead.",
+        "Pull another agent's recent text turns (read-only, synchronous, does NOT run the target). Same team boundary as peer_send: teammates only; never an agent outside the team, even one with the same name. The transcript is stored whole as an artifact and returned verbatim when it fits the turn budget; otherwise you get a first page plus an <<<artifact id=... sha256=...>>> handle to continue with artifact_read. A subagent is private to the agent that spawned it: another agent's subagent cannot be queried — ask its parent instead.",
         {
           target: z.string().min(1),
           limit: z.number().int().min(1).max(50).optional(),

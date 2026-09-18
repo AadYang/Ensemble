@@ -73,9 +73,12 @@ export function makePeerMcpServer(
   const peerSend = tool(
     "peer_send",
     [
-      "Send a chat message to another agent in this workspace. Bidirectional: anyone can",
-      "send to anyone. If you received a peer-handoff and need more info, you can peer_send",
-      "back to the source agent; their reply arrives as a new turn in your chat.",
+      "Send a chat message to another agent. If you are on a team, ONLY teammates",
+      "listed in TEAM CONTEXT — never an agent outside the team, even one with the",
+      "same name (that is a different agent; the tool refuses it). Ungrouped agents",
+      "may only contact other ungrouped agents. If you received a peer-handoff and",
+      "need more info, you can peer_send back to the source agent; their reply arrives",
+      "as a new turn in your chat.",
       "",
       "Modes, from the sender's perspective:",
       "  - continue: hand off your work-in-progress; recipient continues from your trajectory.",
@@ -105,7 +108,7 @@ export function makePeerMcpServer(
       target: z
         .string()
         .min(1)
-        .describe("Name (preferred) or UUID of the recipient agent."),
+        .describe("Name of a teammate (preferred) or UUID. Outside your team is refused."),
       message: z.string().min(1).describe("Body of the message to send."),
       mode: z
         .enum(PEER_MODES)
@@ -147,7 +150,8 @@ export function makePeerMcpServer(
       "a peer agent before sending them work.",
       "",
       "A subagent is private to the agent that spawned it: another agent's subagent cannot be",
-      "queried — ask its parent instead.",
+      "queried — ask its parent instead. Same team boundary as peer_send: teammates only,",
+      "never an agent outside the team (same name on another team is a different agent).",
       "",
       "Does NOT cause the target agent to run; it is a pure DB read. The returned text",
       "is chronological (oldest to newest), interleaving [user] and [assistant] markers.",

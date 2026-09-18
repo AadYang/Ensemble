@@ -22,12 +22,11 @@ export function PeerSendPopover({
   const appendUserTurn = useStore((s) => s.appendUserTurn);
   const fromAgent = agents[fromAgentId];
 
-  // Only targets this agent can actually reach. A subagent is private to the
-  // agent that spawned it (core refuses everyone else, and refuses a subagent
-  // contacting anyone but its own parent), so offering one here would be
-  // offering an option whose only outcome is an error. The rule is NOT restated
-  // here: `peerContactAllowed` is the same function core enforces with, and the
-  // relationship comes from the summary's own parentId/subagentKind.
+  // Only targets this agent can actually reach. Team circle first (teammates
+  // only, or other ungrouped agents), then the subagent privacy rule. Core
+  // refuses anything else; offering it here would be offering an option whose
+  // only outcome is an error. `peerContactAllowed` is the same function core
+  // enforces.
   const peers = useMemo(() => {
     if (!fromAgent) return [];
     const from = peerIdentityFromSummary(fromAgent.summary);

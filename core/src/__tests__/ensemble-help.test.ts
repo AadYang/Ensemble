@@ -64,6 +64,12 @@ describe("buildEnsemblePrimer", () => {
     expect(p).toContain("conversation_search");
   });
 
+  it("tells the agent peer_send cannot reach outside the team", () => {
+    const p = buildEnsemblePrimer();
+    expect(p).toMatch(/TEAM BOUNDARY/i);
+    expect(p).toMatch(/same name/i);
+  });
+
   it("guides subagent usage without encouraging overuse", () => {
     const p = buildEnsemblePrimer();
     expect(p).toMatch(/subagent/i);
