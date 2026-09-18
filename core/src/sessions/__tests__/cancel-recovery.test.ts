@@ -264,6 +264,73 @@ describe("SessionManager cancel + stale-session recovery", () => {
   // (the controller, on a fake clock) and `src/capability/__tests__/liveness.test.ts`
   // (the pure transition) — and nothing here asserts a timer any more.
 
+  it("cancel() aborts even when interrupted_turn persist throws", async () => {
+    const agent = await prisma.agent.create({ data: { name: "cancel-persist-throw" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-persist-throw",
+      abort,
+      seq: 1,
+      userInput: "keep going",
+      startedSeq: 0,
+      userMessageSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).persistInterruptedTurn = async () => {
+      throw new Error("UNIQUE constraint failed: Message.agentId, Message.seq");
+    };
+
+    await sessions.cancel(agent.id);
+
+    expect(abort.signal.aborted).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("IDLE");
+    const updateEvent = hub.broadcasts.find(
+      (b) => b.type === "agent_updated" && (b.agent as { id?: string })?.id === agent.id,
+    );
+    expect((updateEvent?.agent as { status?: string })?.status).toBe("idle");
+  });
+
+  it("cancel() fires abort before interrupted_turn persist returns", async () => {
+    const agent = await prisma.agent.create({ data: { name: "cancel-abort-first" } });
+    await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    const abort = new AbortController();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-abort-first",
+      abort,
+      seq: 1,
+      userInput: "keep going",
+      startedSeq: 0,
+      userMessageSeq: 0,
+      startedAt: new Date().toISOString(),
+      autoAllowedTools: new Set<string>(),
+    });
+    let abortedDuringPersist = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).persistInterruptedTurn = async () => {
+      abortedDuringPersist = abort.signal.aborted;
+      return null;
+    };
+
+    await sessions.cancel(agent.id);
+
+    expect(abortedDuringPersist).toBe(true);
+    expect(abort.signal.aborted).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).toBe("IDLE");
+  });
+
   it("cancel persists interrupted_turn so continue can recover the active request", async () => {
     const agent = await prisma.agent.create({ data: { name: "cancel-interrupted-agent" } });
     await prisma.agent.update({ where: { id: agent.id }, data: { status: "RUNNING" } });

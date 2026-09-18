@@ -13,6 +13,7 @@ export interface StreamDisplayChunk {
 export interface StreamDisplayBatcher {
   push(sessionId: string, chunk: StreamDisplayChunk): void;
   flushSession(sessionId: string): void;
+  dropSession(sessionId: string): void;
   flushAll(): void;
 }
 
@@ -79,9 +80,19 @@ export function createStreamDisplayBatcher(opts: {
     }
   }
 
+  function dropSession(sessionId: string): void {
+    const buf = buffers.get(sessionId);
+    if (!buf) return;
+    if (buf.timer != null) {
+      cancel(buf.timer);
+      buf.timer = null;
+    }
+    buffers.delete(sessionId);
+  }
+
   function flushAll(): void {
     for (const sessionId of [...buffers.keys()]) flushSession(sessionId);
   }
 
-  return { push, flushSession, flushAll };
+  return { push, flushSession, dropSession, flushAll };
 }

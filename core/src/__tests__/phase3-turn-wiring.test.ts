@@ -373,6 +373,47 @@ describe("gate 6 (wiring): the runtime's history matches the plan's decision", (
     cleanup();
   });
 
+  it("openai HTTP with a stored lastSessionId still rebuilds the transcript locally", async () => {
+    const agent = await makeAgent({ kind: "openai-local", model: "deepseek-flash" });
+    const promptHash = hashStableSystemPrompt({
+      permissionMode: "default",
+      teamContext: "",
+      baseSystemPrompt: agent.systemPrompt ?? "",
+    });
+    await prisma.agent.update({
+      where: { id: agent.id },
+      data: {
+        metadata: {
+          lastSessionId: "8cdf3d05-33a0-4f98-a3ca-15d4b6428481",
+          systemPromptHash: promptHash,
+        },
+      },
+    });
+    for (let i = 1; i <= 6; i++) {
+      await prisma.message.create({
+        data: {
+          agentId: agent.id,
+          seq: i,
+          type: i % 2 === 0 ? "assistant" : "user",
+          payload:
+            i % 2 === 0
+              ? { type: "assistant", message: { content: [{ type: "text", text: `answer ${i}` }] } }
+              : { type: "user", message: { role: "user", content: `question ${i}` } },
+        },
+      });
+    }
+    const sessions = new SessionManager(new StubHub() as never);
+    await sessions.sendMessage(agent.id, "what did I just ask?");
+
+    const opts = capturedRuntimeOptions[0]!;
+    expect(opts.runPlan.identity.runtime).toBe("openai");
+    expect(opts.resume).toBeUndefined();
+    expect(opts.runPlan.history.strategy).toBe("local-rebuild");
+    expect(JSON.stringify(opts.history)).toContain("question 1");
+    expect(opts.history.length).toBeGreaterThanOrEqual(6);
+    cleanup();
+  });
+
   it("codex gets the same history structure, with its version taken from the plan", async () => {
     const agent = await makeAgent({ kind: "openai-codex" });
     const sessions = new SessionManager(new StubHub() as never);

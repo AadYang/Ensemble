@@ -86,6 +86,7 @@ function optsFor(model = "deepseek-flash"): RuntimeOptions {
       childProcessStarted() {},
       childProcessExited() {},
       streamClosed() {},
+      resultSeen: () => mock.state.liveness.push("resultSeen"),
       toolProgress: () => mock.state.liveness.push("toolProgress"),
     },
     runPlan: resolveRunPlan({
@@ -216,6 +217,7 @@ describe("openai-compat tool cards", () => {
       | { type: "result"; modelUsage?: Record<string, { contextWindow?: number }> }
       | undefined;
     expect(result?.modelUsage?.["deepseek-flash"]?.contextWindow).toBe(1_000_000);
+    expect(mock.state.liveness).toContain("resultSeen");
   });
 
   it("forwards reasoning tokens as thinking_delta and keeps them on the assistant message", async () => {

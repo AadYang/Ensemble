@@ -12,13 +12,14 @@
 // SessionManager so OpenAIAgentRuntime (Slice 2+) doesn't need to duplicate it.
 
 import { existsSync, readFileSync } from "node:fs";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
 import { query, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { LivenessProbeKind, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOptions } from "./types.js";
+import { takeUntilAbort } from "../abort-iterable.js";
 
 /** Phase 4: spawn the Claude Code child ourselves, so the run has a PROCESS we
  *  can observe.
@@ -41,7 +42,10 @@ import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOption
  *  has to show that this route really hands over a child handle and that the
  *  probe really answers from it, and a `claude.ts` private helper could only
  *  ever be asserted by reading the file. */
-export function makeClaudeSpawner(liveness: RuntimeLivenessReporter | null): {
+export function makeClaudeSpawner(
+  liveness: RuntimeLivenessReporter | null,
+  abortSignal?: AbortSignal,
+): {
   /** Typed as the SDK's own return type: a real `ChildProcess` satisfies
    *  `SpawnedProcess` (the SDK says as much), but the two differ on whether
    *  `stdin` can be null, so the widening is stated here rather than at the
@@ -75,6 +79,13 @@ export function makeClaudeSpawner(liveness: RuntimeLivenessReporter | null): {
       exited = true;
       liveness.childProcessExited({ pid: proc.pid ?? null, exitCode: null, signal: null });
     });
+    // The SDK's spawn `signal` fires only after a stdin-EOF graceful window.
+    // User cancel must not wait for that: kill the tree the moment our
+    // AbortController aborts, the same way Codex does.
+    const hardKill = () => killClaudeChildTree(proc);
+    if (abortSignal?.aborted) hardKill();
+    else abortSignal?.addEventListener("abort", hardKill, { once: true });
+    proc.once("exit", () => abortSignal?.removeEventListener("abort", hardKill));
     return proc as unknown as SpawnedProcess;
   };
 
@@ -84,6 +95,27 @@ export function makeClaudeSpawner(liveness: RuntimeLivenessReporter | null): {
   // the flags above are what a spawn failure sets.
   const probe = (): LivenessProbeKind => (!started ? "unknown" : exited ? "dead" : "alive");
   return { spawner, probe };
+}
+
+function killClaudeChildTree(child: ChildProcess): void {
+  if (child.killed || child.exitCode !== null) return;
+  if (process.platform === "win32" && typeof child.pid === "number") {
+    try {
+      execSync(`taskkill /F /T /PID ${child.pid}`, {
+        stdio: "ignore",
+        timeout: 5000,
+        windowsHide: true,
+      });
+      return;
+    } catch {
+      /* fall through */
+    }
+  }
+  try {
+    child.kill();
+  } catch {
+    /* already gone */
+  }
 }
 
 /** The levels THIS runtime can express.
@@ -267,7 +299,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     const env = mergeContextWindowEnv(opts, mergeClaudeLocalAuthEnv(opts));
     // The child-process observer, when there is a run to report to. `probe` is
     // handed to the controller by the caller, not used here.
-    const observer = makeClaudeSpawner(opts.liveness ?? null);
+    const observer = makeClaudeSpawner(opts.liveness ?? null, opts.abortController.signal);
     if (observer) opts.liveness?.registerProbe?.(observer.probe);
     const stream = query({
       prompt: opts.prompt,
@@ -318,7 +350,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // after the loop proves that the SDK iterator itself drained naturally.
     let drainedNaturally = false;
     try {
-      for await (const msg of stream) {
+      for await (const msg of takeUntilAbort(stream, opts.abortController.signal)) {
         if ((msg as { type?: string }).type === "result") {
           sawResult = true;
           opts.liveness?.resultSeen();

@@ -16,7 +16,7 @@ import type {
   SettingsImpactReport,
   SettingsImpactRequest,
 } from "@agentorch/shared";
-import { peerContactAllowed, reasoningReport, runPlanStatusView } from "@agentorch/shared";
+import { peerContactAllowed, reasoningReport, runPlanStatusView, samePeerCircle } from "@agentorch/shared";
 import type { ReasoningReport } from "@agentorch/shared";
 import { LivenessController } from "../liveness-controller.js";
 import type { LivenessRunHooks } from "../liveness-controller.js";
@@ -28,6 +28,7 @@ import {
   contextUsageFromUsedTokens,
   liveOccupancy,
   occupancyDeltaFromStreamEvent,
+  occupancyAfterPersistedMessage,
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
@@ -45,6 +46,7 @@ import {
 } from "../context-window.js";
 import { probeCodexVersion } from "../cli-config.js";
 import { chooseRuntime, runtimeScopeForKind } from "./runtimes/index.js";
+import { takeUntilAbort } from "./abort-iterable.js";
 import type {
   AgentRuntime,
   RuntimeErrorCode,
@@ -185,7 +187,7 @@ import {
   sourceHashOf,
   summarizerTextOf,
 } from "../message-archive.js";
-import { countTokens, countTokensMany } from "../local-tokenizer.js";
+import { countTokens } from "../local-tokenizer.js";
 import {
   makeTokenMeasurer,
   resolveHistoryBudget,
@@ -401,7 +403,7 @@ interface LiveContextState {
   model: string;
   windowInput: EffectiveWindowContext;
   promptTokens: number;
-  streamedText: string;
+  streamedTokens: number;
   lastEmitAt: number;
   lastEmittedUsed: number;
 }
@@ -1955,7 +1957,12 @@ export class SessionManager {
       lines.push("");
     }
 
-    lines.push("─── TEAMMATE INTERACTION (READ CAREFULLY) ───");
+      lines.push("─── TEAMMATE INTERACTION (READ CAREFULLY) ───");
+    lines.push("");
+    lines.push("HARD BOUNDARY: peer_send / peer_query reach ONLY the teammates listed");
+    lines.push("above. Never message an agent outside this team — even one with the");
+    lines.push("same name. Same name, other team = a different agent. The tool refuses");
+    lines.push("it. Do not guess UUIDs of outsiders.");
     lines.push("");
     lines.push("Teammates DO NOT read your replies. They run only when you call a");
     lines.push("tool. Any text addressed at a teammate — @-mentions, \"@X 请回复\",");
@@ -4286,14 +4293,19 @@ export class SessionManager {
     sessionId: string,
     model: string,
     windowInput: EffectiveWindowContext,
-    systemPrompt: string | null | undefined,
+    _systemPrompt: string | null | undefined,
   ): Promise<void> {
-    const texts = await this.contextTranscriptTexts(sessionId, systemPrompt);
+    const stored = this.contextUsageByAgent.get(sessionId)?.usedTokens ?? null;
+    const fromLastResult =
+      stored != null && stored > 0
+        ? stored
+        : ((await this.latestResultOccupancy(sessionId)) ?? (await this.latestOccupancyTokens(sessionId, 0)));
+    const promptTokens = fromLastResult != null && fromLastResult > 0 ? fromLastResult : 0;
     this.liveContextByAgent.set(sessionId, {
       model,
       windowInput,
-      promptTokens: countTokensMany(model, texts),
-      streamedText: "",
+      promptTokens,
+      streamedTokens: 0,
       lastEmitAt: 0,
       lastEmittedUsed: 0,
     });
@@ -4313,7 +4325,7 @@ export class SessionManager {
     ) {
       return;
     }
-    const used = liveOccupancy(live.promptTokens, countTokens(live.model, live.streamedText));
+    const used = liveOccupancy(live.promptTokens, live.streamedTokens);
     if (
       !shouldPublishLiveContext({
         force: opts.force,
@@ -4336,8 +4348,8 @@ export class SessionManager {
     if (delta === null) return;
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
-    const firstStream = live.streamedText.length === 0;
-    live.streamedText += delta;
+    const firstStream = live.streamedTokens === 0;
+    live.streamedTokens += countTokens(live.model, delta);
     this.publishLiveContext(sessionId, { force: firstStream });
   }
 
@@ -4345,25 +4357,27 @@ export class SessionManager {
     sessionId: string,
     msg: unknown,
     sinceSeq: number,
-    systemPrompt: string | null | undefined,
   ): Promise<void> {
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
     const type = (msg as { type?: unknown }).type;
     if (type === "assistant") {
-      const occ = await this.latestOccupancyTokens(sessionId, sinceSeq);
-      live.promptTokens =
-        occ ?? countTokensMany(live.model, await this.contextTranscriptTexts(sessionId, systemPrompt));
-      live.streamedText = "";
+      live.promptTokens = occupancyAfterPersistedMessage({
+        providerOccupancy: await this.latestOccupancyTokens(sessionId, sinceSeq),
+        livePromptTokens: live.promptTokens,
+        streamedTokens: live.streamedTokens,
+      });
+      live.streamedTokens = 0;
       this.publishLiveContext(sessionId, { force: true });
       return;
     }
     if (type === "user") {
-      live.promptTokens = countTokensMany(
-        live.model,
-        await this.contextTranscriptTexts(sessionId, systemPrompt),
-      );
-      live.streamedText = "";
+      live.promptTokens = occupancyAfterPersistedMessage({
+        providerOccupancy: null,
+        livePromptTokens: live.promptTokens,
+        streamedTokens: live.streamedTokens,
+      });
+      live.streamedTokens = 0;
       this.publishLiveContext(sessionId, { force: true });
     }
   }
@@ -4411,6 +4425,17 @@ export class SessionManager {
     );
   }
 
+  /** Last result's provider occupancy, for seeding the live bar without
+   *  re-tokenizing the whole transcript at the start of every turn. */
+  private async latestResultOccupancy(agentId: string): Promise<number | null> {
+    const row = await prisma.message.findFirst({
+      where: { agentId, type: "result" },
+      orderBy: { seq: "desc" },
+      select: { payload: true },
+    });
+    return occupancyTokensFromResultContextUsage(row?.payload);
+  }
+
   /** Text the runtime will REPLAY as the next prompt, for the local fallback
    *  count used when no provider-side number exists (Codex today, or any
    *  runtime whose result carried no usage). Counting `buildRuntimeHistoryForTurn` — the same
@@ -4453,6 +4478,7 @@ export class SessionManager {
     sessionId: string,
     run: RunningSession,
     reason: string,
+    liveTextOverride?: string | null,
   ): Promise<InterruptedTurnPayload | null> {
     if (run.interruptedPersisted || run.sawResult || run.userMessageSeq === undefined) return null;
     if (this.interruptedTurnAlreadyPersisted(sessionId, run)) {
@@ -4465,7 +4491,7 @@ export class SessionManager {
     // had never been shown. The turn budget decides what fits, visibly.
     const userRequest = run.userInput.trim();
     if (!userRequest) return null;
-    const liveText = this.liveAssistantText(sessionId);
+    const liveText = liveTextOverride !== undefined ? liveTextOverride : this.liveAssistantText(sessionId);
     const payload: InterruptedTurnPayload = {
       type: "system",
       subtype: "interrupted_turn",
@@ -5028,7 +5054,14 @@ export class SessionManager {
       // must NOT also be left in `systemPrompt`, which is how the same skill
       // bodies used to be sent twice in one turn.
       const tailRole = teamContext || base;
-      const resumed = effectiveLastSessionId !== null;
+      // lastSessionId is only a native session for runtimes that actually
+      // resume one (Claude CLI / Codex thread). OpenAI HTTP mints a fresh
+      // UUID every turn and stores it in the same field — treating that as
+      // `runtime-session` hands the next turn an empty history, which is
+      // how DeepSeek openai-compat agents forgot the previous turn.
+      const nativeSessionRuntime =
+        turnPlan.identity.runtime === "claude" || turnPlan.identity.runtime === "codex";
+      const resumed = nativeSessionRuntime && effectiveLastSessionId !== null;
       const promptParts = [
         primer,
         planNotice,
@@ -5287,7 +5320,7 @@ export class SessionManager {
         // `runPlan.execution.projectRoot` by every runtime and every tool, so
         // there is exactly one value in play and no second channel that could
         // carry a different one.
-        ...(effectiveLastSessionId ? { resume: effectiveLastSessionId } : {}),
+        ...(resumed && effectiveLastSessionId ? { resume: effectiveLastSessionId } : {}),
         // The server-side conversation to CONTINUE, already validated against
         // this turn's signature (`serverConversation.id` is null unless the
         // stored id was issued for this exact provider/model/root/prompt/
@@ -5389,7 +5422,7 @@ export class SessionManager {
         // job, addressable from the other.
         jobs: { jobs: this.jobs, agentId: sessionId, agentName: agent.name, defaultCwd: runtimeCwd },
       };
-      const stream = runtime.query(runtimeOpts);
+      const stream = takeUntilAbort(runtime.query(runtimeOpts), abort.signal);
       const providerKindForContext = resolvedProvider?.kind ?? "anthropic-local";
       await this.seedLiveContext(
         sessionId,
@@ -5550,6 +5583,7 @@ export class SessionManager {
         if (msg.type === "result") {
           const activeRun = this.running.get(sessionId);
           if (activeRun?.runId === runId) activeRun.sawResult = true;
+          this.liveness.noteResultSeen(runId);
           latestCodexUsageSnapshot = normalizeCodexUsageSnapshot(
             (msg as { _codexUsageSnapshot?: unknown })._codexUsageSnapshot,
           );
@@ -5590,7 +5624,7 @@ export class SessionManager {
           const live = this.liveContextByAgent.get(sessionId);
           if (live) live.windowInput = windowInput;
           const liveUsed = live
-            ? liveOccupancy(live.promptTokens, countTokens(live.model, live.streamedText))
+            ? liveOccupancy(live.promptTokens, live.streamedTokens)
             : 0;
           const providerTokens =
             (await this.latestOccupancyTokens(sessionId, userPersisted?.seq ?? 0)) ??
@@ -5617,7 +5651,6 @@ export class SessionManager {
             sessionId,
             msg,
             userPersisted?.seq ?? 0,
-            mergedSystemPrompt,
           );
         }
 
@@ -6364,22 +6397,29 @@ export class SessionManager {
   /** Resolve a peer-target string to an agent id. Tries id-equality first
    * (only when target looks like a UUID, since Prisma rejects malformed UUIDs
    * even on read), then exact name match, then case-insensitive name match.
-   * Excludes self. */
+   * Excludes self. Name lookup is confined to the sender's peer circle
+   * (same team, or other ungrouped agents) so a same-named agent on another
+   * team cannot win. UUID hits are still returned so the refusal can name
+   * the outsider instead of pretending they do not exist. */
   async resolvePeerTarget(fromAgentId: string, target: string): Promise<string | null> {
     const trimmed = target.trim();
     if (!trimmed || trimmed === fromAgentId) return null;
+    const from = await prisma.agent.findUnique({ where: { id: fromAgentId } });
+    if (!from) return null;
     if (UUID_RE.test(trimmed)) {
       const byId = await prisma.agent.findUnique({ where: { id: trimmed } });
       if (byId && byId.id !== fromAgentId) return byId.id;
     }
+    const circle = { teamId: from.teamId };
     const byName = await prisma.agent.findFirst({
-      where: { name: trimmed, NOT: { id: fromAgentId } },
+      where: { name: trimmed, ...circle, NOT: { id: fromAgentId } },
       orderBy: { createdAt: "desc" },
     });
     if (byName) return byName.id;
     const ci = await prisma.agent.findFirst({
       where: {
         name: { equals: trimmed, mode: "insensitive" },
+        ...circle,
         NOT: { id: fromAgentId },
       },
       orderBy: { createdAt: "desc" },
@@ -6409,11 +6449,25 @@ export class SessionManager {
     const from = await prisma.agent.findUnique({ where: { id: fromAgentId } });
     const fromSpawner = from ? readMetaString(from.metadata, "spawnedAsTaskFor") : null;
     const targetSpawner = readMetaString(target.metadata, "spawnedAsTaskFor");
-    const identity = (id: string, spawnedBy: string | null): PeerContactIdentity => ({ id, spawnedBy });
-    const allowed = peerContactAllowed(
-      identity(fromAgentId, fromSpawner),
-      identity(target.id, targetSpawner),
-    );
+    const identity = (id: string, spawnedBy: string | null, teamId: string | null): PeerContactIdentity => ({
+      id,
+      spawnedBy,
+      teamId,
+    });
+    const fromId = identity(fromAgentId, fromSpawner, from?.teamId ?? null);
+    const targetId = identity(target.id, targetSpawner, target.teamId);
+    if (!samePeerCircle(fromId, targetId)) {
+      if (from?.teamId) {
+        return (
+          `error: "${target.name}" is not on your team. peer_send / peer_query only reach teammates ` +
+          `listed in TEAM CONTEXT. An agent with the same name on another team is a different agent.`
+        );
+      }
+      return (
+        `error: "${target.name}" belongs to a team. Ungrouped agents can only message other ungrouped agents.`
+      );
+    }
+    const allowed = peerContactAllowed(fromId, targetId);
     if (allowed) return null;
     // A subagent reaching outside its one link (checked in the same order as the
     // rule itself, so the message names the side that actually decided it).
@@ -6769,13 +6823,9 @@ export class SessionManager {
       return false;
     }
 
+    const liveText = r ? this.liveAssistantText(sessionId) : null;
     if (r) {
       console.log(`[${opts.logPrefix}] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
-      await this.persistInterruptedTurn(sessionId, r, opts.interruptedReason ?? opts.error?.code ?? opts.logPrefix);
-      // Phase 4: whatever the caller's reason, the run stops BECAUSE WE ASKED.
-      // Telling the controller so is what stops the runtime's own teardown —
-      // the child exiting, the stream closing — from being read as evidence of
-      // a death we caused.
       this.liveness.noteStopRequested(r.runId);
       try { r.abort.abort(); } catch { /* signal already aborted */ }
     } else {
@@ -6802,6 +6852,21 @@ export class SessionManager {
       }
       sessionQuestions.clear();
       this.pendingQuestions.delete(sessionId);
+    }
+
+    if (r) {
+      try {
+        await this.persistInterruptedTurn(
+          sessionId,
+          r,
+          opts.interruptedReason ?? opts.error?.code ?? opts.logPrefix,
+          liveText,
+        );
+      } catch (err) {
+        console.warn(
+          `[${opts.logPrefix}] interrupted_turn persist for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`,
+        );
+      }
     }
 
     try {
@@ -6838,10 +6903,14 @@ export class SessionManager {
     dbStatus: "IDLE" | "RUNNING" | "AWAITING_PERMISSION" | "AWAITING_USER_INPUT",
     protoStatus: "idle" | "running" | "awaiting_permission" | "awaiting_user_input",
   ): Promise<void> {
+    const owner = this.running.get(sessionId);
+    if (!owner) return;
+    const runId = owner.runId;
     const updated = await prisma.agent.update({
       where: { id: sessionId },
       data: { status: dbStatus },
     });
+    if (this.running.get(sessionId)?.runId !== runId) return;
     this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
     this.hub.sendToSession(sessionId, { type: "status", sessionId, status: protoStatus });
     // Phase 4: the agent status IS the session's own statement about what this
@@ -6850,8 +6919,6 @@ export class SessionManager {
     // question — is not quiet, it is waiting, and the old pause/resume pair of a
     // per-session timer could not say that: it could only stop counting silence
     // without recording why.
-    const runId = this.running.get(sessionId)?.runId;
-    if (!runId) return;
     if (dbStatus === "AWAITING_PERMISSION") {
       this.liveness.notePermissionWait(runId, Date.now());
     } else if (dbStatus === "AWAITING_USER_INPUT") {
@@ -6878,12 +6945,14 @@ export class SessionManager {
    *  updates so they can't undo the IDLE state. */
   async cancel(sessionId: string): Promise<void> {
     const r = this.running.get(sessionId);
+    const liveText = r ? this.liveAssistantText(sessionId) : null;
     if (r) {
       console.log(`[cancel] abort agent=${sessionId.slice(0, 8)} run=${r.runId.slice(0, 8)}`);
-      await this.persistInterruptedTurn(sessionId, r, "cancelled");
-      // A user cancel has its OWN terminal state and its own code. It must never
-      // be recorded as a confirmed death — those mean different things to
-      // whoever reads the record later, and only one of them is a bug.
+      // Abort and drop the owner synchronously. persistInterruptedTurn used to
+      // run first, and a UNIQUE(agentId, seq) collision — the live turn writing
+      // the same seq — threw out of cancel() so the signal never fired and the
+      // UI stayed RUNNING. Stopping the run is the contract; the interrupted_turn
+      // row is best-effort context for /continue.
       this.liveness.noteStopRequested(r.runId);
       this.liveness.end(r.runId, "user-cancelled", "user-cancelled");
       try { r.abort.abort(); } catch { /* signal already aborted */ }
@@ -6917,6 +6986,16 @@ export class SessionManager {
       }
       sessionQuestions.clear();
       this.pendingQuestions.delete(sessionId);
+    }
+
+    if (r) {
+      try {
+        await this.persistInterruptedTurn(sessionId, r, "cancelled", liveText);
+      } catch (err) {
+        console.warn(
+          `[cancel] interrupted_turn persist for agent=${sessionId.slice(0, 8)} failed: ${(err as Error).message}`,
+        );
+      }
     }
 
     // Authoritative DB reset. We deliberately do NOT touch metadata — only the

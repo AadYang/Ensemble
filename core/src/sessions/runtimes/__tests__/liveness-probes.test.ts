@@ -94,6 +94,23 @@ describe("claude: the child handle is really held", () => {
     expect(events.some((e) => e.kind === "exited")).toBe(true);
   });
 
+  it("kills the child when the user abort signal fires", async () => {
+    const { reporter, events } = recordingReporter();
+    const ac = new AbortController();
+    const observer = makeClaudeSpawner(reporter, ac.signal)!;
+    const proc = observer.spawner({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: process.cwd(),
+      env: {},
+    } as never);
+    expect(observer.probe()).toBe("alive");
+    ac.abort();
+    await new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+    expect(observer.probe()).toBe("dead");
+    expect(events.some((e) => e.kind === "exited")).toBe(true);
+  });
+
   it("treats a spawn failure as an exit, not as a live child", async () => {
     const { reporter, events } = recordingReporter();
     const observer = makeClaudeSpawner(reporter)!;

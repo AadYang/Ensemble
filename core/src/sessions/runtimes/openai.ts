@@ -48,6 +48,7 @@ import {
 import type { AnyNormalizedTool } from "../tools/types.js";
 import { toOpenAIMcpServers, connectAll, closeAll } from "./mcp-adapter.js";
 import { countTokens, countTokensMany } from "../../local-tokenizer.js";
+import { rejectWhenAborted, takeUntilAbort } from "../abort-iterable.js";
 
 /** The SDK's own `modelSettings` type, taken from the `Agent` constructor rather
  *  than restated: the SDK does not export the effort union from its umbrella
@@ -495,16 +496,19 @@ async function* runTurnOnce(
         rounds++;
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result: any = await runner.run(
-          agent as any,
-          runInput,
-          // The continuation id goes on the FIRST call only: from round two on we
-          // hand the SDK its own RunState, which already carries the newest
-          // response id, and repeating the opening id would rewind the server
-          // conversation to the response the turn started from.
-          buildRunnerRunOptions(
-            opts.abortController.signal,
-            rounds === 1 ? (continueFrom ?? undefined) : undefined,
+        const result: any = await rejectWhenAborted(
+          opts.abortController.signal,
+          runner.run(
+            agent as any,
+            runInput,
+            // The continuation id goes on the FIRST call only: from round two on we
+            // hand the SDK its own RunState, which already carries the newest
+            // response id, and repeating the opening id would rewind the server
+            // conversation to the response the turn started from.
+            buildRunnerRunOptions(
+              opts.abortController.signal,
+              rounds === 1 ? (continueFrom ?? undefined) : undefined,
+            ),
           ),
         );
         // The newest server-side response id, when the route has one. Read after
@@ -528,7 +532,7 @@ async function* runTurnOnce(
         // SDK's tool_called / approval events.
         const emittedToolCallIds = new Set<string>();
 
-        for await (const event of result) {
+        for await (const event of takeUntilAbort(result, opts.abortController.signal)) {
           if (opts.abortController.signal.aborted) break;
 
           if (event.type === "raw_model_stream_event") {
@@ -751,6 +755,7 @@ async function* runTurnOnce(
       const entry = modelUsage[opts.model]!;
       entry.inputTokensLocal = inputTokensLocal;
       entry.outputTokensLocal = outputTokensLocal;
+      opts.liveness?.resultSeen();
       yield {
         type: "sdk_message",
         payload: {

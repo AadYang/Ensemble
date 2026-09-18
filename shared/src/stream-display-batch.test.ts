@@ -68,4 +68,13 @@ describe("createStreamDisplayBatcher", () => {
     batcher.flushSession("agent-a");
     expect(emitted).toHaveLength(2);
   });
+
+  it("dropSession discards pending tokens instead of painting them after cancel", () => {
+    const { batcher, emitted, timers } = makeBatcher();
+    batcher.push("agent-a", { seq: -1, kind: "assistant_text", text: "派" });
+    expect(timers).toHaveLength(1);
+    batcher.dropSession("agent-a");
+    expect(timers).toHaveLength(0);
+    expect(emitted).toEqual([]);
+  });
 });

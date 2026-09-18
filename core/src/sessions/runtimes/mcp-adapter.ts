@@ -57,15 +57,25 @@ export async function connectAll(servers: MCPServer[]): Promise<void> {
 
 /** Close all MCPServers, swallowing per-server errors so one stuck server
  *  doesn't block teardown of the others. Errors logged via the logger
- *  injected at construction (default: console.warn). */
+ *  injected at construction (default: console.warn).
+ *
+ *  `close()` that never settles used to park the OpenAI generator's `finally`
+ *  after the turn had already produced a result — DB said DONE, WS never
+ *  flushed, the pane looked frozen until Ensemble was killed. */
+export const CLOSE_ALL_TIMEOUT_MS = 2_000;
+
 export async function closeAll(servers: MCPServer[]): Promise<void> {
-  await Promise.all(
-    servers.map(async (s) => {
-      try {
-        await s.close();
-      } catch {
-        // Best-effort cleanup; per-server logger already surfaced details.
-      }
-    }),
-  );
+  if (servers.length === 0) return;
+  await Promise.race([
+    Promise.all(
+      servers.map(async (s) => {
+        try {
+          await s.close();
+        } catch {
+          // Best-effort cleanup; per-server logger already surfaced details.
+        }
+      }),
+    ),
+    new Promise<void>((resolve) => setTimeout(resolve, CLOSE_ALL_TIMEOUT_MS)),
+  ]);
 }
