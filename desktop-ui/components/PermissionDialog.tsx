@@ -8,11 +8,7 @@ import { useStore, type PendingPermission } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { displayToolName } from "@/lib/tool-display";
 import { isExitPlanModeTool, planBodyFromToolInput } from "@/lib/plan-document";
-import {
-  documentBodyFromToolInput,
-  documentTitleFromToolInput,
-  toolCardOperationLines,
-} from "@/lib/tool-card-facts";
+import { isHtmlFilePath, toolCardContent, toolCardOperationLines, toolPathFromInput } from "@/lib/tool-card-facts";
 import { PlanDocument } from "./PlanDocument";
 
 export function PermissionDialog() {
@@ -49,9 +45,13 @@ export function PermissionDialog() {
   const displayedToolName = displayToolName(head.toolName);
   const isExitPlanMode = isExitPlanModeTool(head.toolName);
   const planText = isExitPlanMode ? planBodyFromToolInput(head.input) : "";
-  const htmlDoc = isExitPlanMode ? "" : documentBodyFromToolInput(head.toolName, head.input);
   const opLines = isExitPlanMode ? [] : toolCardOperationLines(head.input);
-  const wide = isExitPlanMode || Boolean(htmlDoc);
+  const content = isExitPlanMode ? undefined : toolCardContent(head.toolName, head.input);
+  const preview = [...opLines, content].filter((s): s is string => !!s).join("\n\n");
+  const htmlPath =
+    !content && isHtmlFilePath(toolPathFromInput(head.input))
+      ? toolPathFromInput(head.input)
+      : undefined;
 
   const respond = (entry: PendingPermission, decision: PermissionDecision) => {
     ws.send({
@@ -72,7 +72,7 @@ export function PermissionDialog() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-6">
-      <div className={`tool-card w-full bg-[var(--bg-elevated)] ${wide ? "max-w-4xl" : "max-w-2xl"}`}>
+      <div className="tool-card max-w-2xl w-full bg-[var(--bg-elevated)]">
         <div className="flex items-center gap-2 mb-2 text-xs">
           <span className="status-dot awaiting_permission" />
           <span className="text-[var(--warn)] tracking-wider">{t("perm.title")}</span>
@@ -91,21 +91,13 @@ export function PermissionDialog() {
 
         {isExitPlanMode ? (
           <div className="max-h-[70vh] overflow-auto">
-            <PlanDocument plan={planText} title={t("chat.plan.title")} />
+            <PlanDocument plan={planText} />
           </div>
-        ) : htmlDoc ? (
-          <div className="max-h-[70vh] overflow-auto space-y-2">
-            {opLines.map((line, i) => (
-              <div key={i} className="text-sm text-[var(--text)] break-all">{line}</div>
-            ))}
-            <PlanDocument
-              plan={htmlDoc}
-              title={documentTitleFromToolInput(head.input, t("chat.plan.title"))}
-            />
-          </div>
+        ) : htmlPath ? (
+          <div className="text-sm text-[var(--text)] break-all">{htmlPath}</div>
         ) : (
           <pre className="text-xs text-[var(--text)] bg-[var(--bg-pane)] border border-[var(--border)] p-2 max-h-64 overflow-auto whitespace-pre-wrap break-words">
-            {opLines.join("\n")}
+            {preview}
           </pre>
         )}
 

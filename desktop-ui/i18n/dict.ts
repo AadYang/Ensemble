@@ -225,6 +225,7 @@ const en: Dict = {
   "chat.thinkingProgress": "thinking · {n} tokens",
   "chat.plan.title": "PLAN",
   "chat.plan.empty": "empty plan",
+  "chat.plan.html": "HTML {path}",
 
   // pane shell
   "pane.empty": "empty pane",
@@ -346,6 +347,7 @@ const en: Dict = {
   "git.detached": "detached",
   "git.unbound": "no project",
   "git.unavailable": "git unavailable",
+  "git.notARepo": "not a git repo",
   "git.tip.detached": "detached HEAD at {sha}",
   "git.tip.tracking": "tracking {upstream} · {ahead} ahead, {behind} behind",
   "git.tip.noUpstream": "no upstream configured",
@@ -844,6 +846,7 @@ const zh: Dict = {
   "chat.thinkingProgress": "思考中 · {n} tokens",
   "chat.plan.title": "方案",
   "chat.plan.empty": "空方案",
+  "chat.plan.html": "HTML {path}",
 
   // pane shell
   "pane.empty": "空 pane",
@@ -965,6 +968,7 @@ const zh: Dict = {
   "git.detached": "游离",
   "git.unbound": "无项目",
   "git.unavailable": "git 不可用",
+  "git.notARepo": "不是 git 仓库",
   "git.tip.detached": "游离 HEAD，位于 {sha}",
   "git.tip.tracking": "跟踪 {upstream} · 领先 {ahead}，落后 {behind}",
   "git.tip.noUpstream": "未设置上游分支",

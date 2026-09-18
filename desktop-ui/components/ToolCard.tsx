@@ -2,7 +2,7 @@
 
 import { isSubagentToolName } from "@agentorch/shared";
 import { displayToolName } from "@/lib/tool-display";
-import { toolCardOperationLines } from "@/lib/tool-card-facts";
+import { toolCardContent, toolCardOperationLines } from "@/lib/tool-card-facts";
 
 export type ToolCardStatus = "pending" | "approved" | "denied" | "ran";
 
@@ -38,6 +38,7 @@ export function ToolCard({
   const isSubagent = isSubagentToolName(name);
   const facts = isSubagent ? subagentCardFacts(input) : undefined;
   const opLines = isSubagent ? [] : toolCardOperationLines(input);
+  const content = isSubagent ? undefined : toolCardContent(name, input);
   const statusTone = (s: ToolCardStatus | undefined): string => {
     switch (s) {
       case "pending": return "text-[var(--warn)]";
@@ -76,6 +77,11 @@ export function ToolCard({
           {line}
         </div>
       ))}
+      {content && (
+        <div className="text-[var(--text)] whitespace-pre-wrap break-words leading-snug">
+          {content}
+        </div>
+      )}
     </div>
   );
 }

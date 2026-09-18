@@ -16,19 +16,34 @@ export function planBodyFromToolInput(input: unknown): string {
 export function isHtmlPlanDocument(body: string): boolean {
   const t = body.trimStart();
   if (/^<!doctype html/i.test(t) || /^<html[\s>]/i.test(t)) return true;
-  return /^<(h[1-6]|p|div|section|article|ul|ol|table|header|main|blockquote|pre)[\s>]/i.test(t);
+  return /^<[a-zA-Z][\s\S]*<\/[a-zA-Z]/.test(t);
 }
 
-const PLAN_DOC_CSS =
-  "body{margin:0;padding:20px 24px;background:#f7f4ec;color:#1c1917;" +
-  "font:15px/1.7 ui-sans-serif,system-ui,sans-serif}" +
-  "h1,h2,h3{color:#1c1917;line-height:1.3}" +
-  "h1{font-size:1.45em}h2{font-size:1.22em;margin-top:1.15em}h3{font-size:1.08em}" +
-  "p,li{color:#1c1917}a{color:#0f766e}" +
-  "code{background:#efe8d8;padding:0 4px}pre{background:#efe8d8;padding:12px;overflow:auto}";
+export function htmlToReadableText(html: string): string {
+  let s = html.replace(/\r\n/g, "\n");
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<\/(p|div|h[1-6]|tr|blockquote|pre)>/gi, "\n\n");
+  s = s.replace(/<li[^>]*>/gi, "• ");
+  s = s.replace(/<\/li>/gi, "\n");
+  s = s.replace(/<\/?(ul|ol)[^>]*>/gi, "\n");
+  s = s.replace(/<\/?h[1-6][^>]*>/gi, "\n");
+  s = s.replace(/<\/?code[^>]*>/gi, "`");
+  s = s.replace(/<\/?(strong|b)[^>]*>/gi, "**");
+  s = s.replace(/<\/?(em|i)[^>]*>/gi, "*");
+  s = s.replace(/<[^>]+>/g, "");
+  s = s
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, "&");
+  s = s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  return s.trim();
+}
 
-export function htmlDocumentSrcDoc(body: string): string {
-  const t = body.trim();
-  if (/^<!doctype html/i.test(t) || /^<html[\s>]/i.test(t)) return t;
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>${PLAN_DOC_CSS}</style></head><body>${t}</body></html>`;
+export function planAsChatText(plan: string): string {
+  const body = plan.trim();
+  if (!body) return "";
+  return isHtmlPlanDocument(body) ? htmlToReadableText(body) : body;
 }
