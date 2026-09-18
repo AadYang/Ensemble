@@ -30,6 +30,38 @@ import type { Locale } from "@/i18n/dict";
 import type { CloudAccount, CloudSession, CloudSnapshot, CloudWorkspace } from "@/lib/cloud-api";
 
 const LOCALE_KEY = "ensemble:locale";
+const INPUT_HISTORY_KEY = "ensemble:input-history";
+const INPUT_HISTORY_CAP = 30;
+
+function readInputHistory(): Record<string, string[]> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(INPUT_HISTORY_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Record<string, string[]> = {};
+    for (const [id, rows] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(rows)) continue;
+      const texts = rows
+        .filter((x): x is string => typeof x === "string" && x.length > 0)
+        .slice(-INPUT_HISTORY_CAP);
+      if (texts.length > 0) out[id] = texts;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistInputHistory(map: Record<string, string[]>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(INPUT_HISTORY_KEY, JSON.stringify(map));
+  } catch {
+    // quota / private mode — history still lives in memory this session
+  }
+}
 
 export interface PeerOrigin {
   direction: "in" | "out";
@@ -174,12 +206,13 @@ interface Store {
     id: string,
     chunks: ReadonlyArray<{ seq: number; kind: "assistant_text" | "thinking"; text: string }>,
   ) => void;
+  stopStreaming: (id: string) => void;
   appendError: (id: string | null, code: string, message: string) => void;
 
   /** Per-agent buffer of user-typed inputs (only what was sent via the
    *  ChatPane input field — NOT peer-handoff incoming or system notices).
-   *  Used for CLI-style Up/Down history walking. In-memory only; resets on
-   *  page reload. */
+   *  Used for CLI-style Up/Down history walking. Survives clear / compact /
+   *  restart / settings changes; persisted per agent, capped at 30. */
   inputHistory: Record<string, string[]>;
   pushInputHistory: (agentId: string, text: string) => void;
   inputDrafts: Record<string, string>;
@@ -765,6 +798,7 @@ export const useStore = create<Store>((set) => ({
       const { [id]: _, ...rest } = s.agents;
       const { [id]: _draft, ...inputDrafts } = s.inputDrafts;
       const { [id]: _selection, ...inputSelections } = s.inputSelections;
+      const { [id]: _hist, ...inputHistory } = s.inputHistory;
       // The liveness verdict goes with the agent: a map entry for a session
       // that no longer exists is a verdict with nothing to be true about.
       const { [id]: _liveness, ...livenessByAgent } = s.livenessByAgent;
@@ -772,6 +806,7 @@ export const useStore = create<Store>((set) => ({
       const { [id]: _plan, ...planByAgent } = s.planByAgent;
       void _draft;
       void _selection;
+      void _hist;
       void _liveness;
       void _plan;
       // Detach from every pane in every window.
@@ -779,8 +814,10 @@ export const useStore = create<Store>((set) => ({
         const nextRoot = clearAgentFromTree(w.root, id);
         return nextRoot === w.root ? w : { ...w, root: nextRoot };
       });
+      persistInputHistory(inputHistory);
       return {
         agents: rest,
+        inputHistory,
         inputDrafts,
         inputSelections,
         livenessByAgent,
@@ -843,13 +880,14 @@ export const useStore = create<Store>((set) => ({
   inputHistory: {},
   pushInputHistory: (agentId, text) =>
     set((s) => {
-      const HISTORY_CAP = 200;
       const prev = s.inputHistory[agentId] ?? [];
       // Skip consecutive duplicates (bash HISTCONTROL=ignoredups semantic).
       if (prev.length > 0 && prev[prev.length - 1] === text) return s;
       const next = [...prev, text];
-      const trimmed = next.length > HISTORY_CAP ? next.slice(-HISTORY_CAP) : next;
-      return { inputHistory: { ...s.inputHistory, [agentId]: trimmed } };
+      const trimmed = next.length > INPUT_HISTORY_CAP ? next.slice(-INPUT_HISTORY_CAP) : next;
+      const inputHistory = { ...s.inputHistory, [agentId]: trimmed };
+      persistInputHistory(inputHistory);
+      return { inputHistory };
     }),
   inputDrafts: {},
   inputSelections: {},
@@ -884,6 +922,20 @@ export const useStore = create<Store>((set) => ({
         turns = appendStreamDisplay(turns, chunk.seq, chunk.kind, chunk.text);
       }
       if (turns === ag.turns) return s;
+      return { agents: { ...s.agents, [id]: { ...ag, turns } } };
+    }),
+
+  stopStreaming: (id) =>
+    set((s) => {
+      const ag = s.agents[id];
+      if (!ag) return s;
+      let changed = false;
+      const turns = ag.turns.map((t) => {
+        if (!t.streaming) return t;
+        changed = true;
+        return { ...t, streaming: false };
+      });
+      if (!changed) return s;
       return { agents: { ...s.agents, [id]: { ...ag, turns } } };
     }),
 
@@ -1069,7 +1121,6 @@ export const useStore = create<Store>((set) => ({
             summary: { ...ag.summary, status: summaryStatus, hasResumeInfo: false },
           },
         },
-        inputHistory: { ...s.inputHistory, [id]: [] },
         inputDrafts: { ...s.inputDrafts, [id]: "" },
         inputSelections: { ...s.inputSelections, [id]: { start: 0, end: 0 } },
       };
@@ -1102,4 +1153,13 @@ export const hydrateLocaleFromStorage = (): void => {
   if (stored === "zh" || stored === "en") {
     useStore.getState().setLocale(stored);
   }
+};
+
+export const hydrateInputHistoryFromStorage = (): void => {
+  if (typeof window === "undefined") return;
+  const loaded = readInputHistory();
+  if (Object.keys(loaded).length === 0) return;
+  useStore.setState((s) => ({
+    inputHistory: { ...loaded, ...s.inputHistory },
+  }));
 };
