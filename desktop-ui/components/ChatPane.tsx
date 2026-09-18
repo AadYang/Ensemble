@@ -22,15 +22,14 @@ import { fetchCloudAgentStatus } from "@/lib/cloud-api";
 import { listSkills, toggleAgentSkill } from "@/lib/skill-api";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useStore, type ChatTurn } from "@/store/agents";
+import { dropLiveStream } from "@/store/stream-batch";
 import { useT, type TranslateFn } from "@/i18n/useT";
 import { ToolCard } from "./ToolCard";
 import { PlanDocument } from "./PlanDocument";
-import { isExitPlanModeTool, planBodyFromToolInput } from "@/lib/plan-document";
-import {
-  documentBodyFromToolInput,
-  documentTitleFromToolInput,
-} from "@/lib/tool-card-facts";
+import { isExitPlanModeTool, isHtmlPlanDocument, planAsChatText, planBodyFromToolInput } from "@/lib/plan-document";
+import { isHtmlFilePath, toolCardContent, toolPathFromInput } from "@/lib/tool-card-facts";
 import { PeerSendPopover } from "./PeerSendPopover";
+import { GitBranchChip } from "./GitBranchChip";
 import { ContextBar } from "./ContextBar";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -563,6 +562,10 @@ export function ChatPane({ agentId }: { agentId: string }) {
   }
 
   const { summary, turns, contextUsage } = agent;
+  const running =
+    summary.status === "running" ||
+    summary.status === "awaiting_permission" ||
+    (liveness !== undefined && liveness.terminalReason === null);
 
   const handleSlash = async (raw: string): Promise<void> => {
     // raw includes leading "/"
@@ -850,7 +853,12 @@ export function ChatPane({ agentId }: { agentId: string }) {
     if (summary.status !== "running") appendUserTurn(agentId, text);
     ws.send({ type: "send_message", sessionId: agentId, text });
   };
-  const onCancel = () => ws.send({ type: "cancel", sessionId: agentId });
+  const onCancel = () => {
+    dropLiveStream(agentId);
+    useStore.getState().stopStreaming(agentId);
+    useStore.getState().setStatus(agentId, "idle");
+    ws.send({ type: "cancel", sessionId: agentId });
+  };
 
   const applyPickerSelection = async () => {
     if (!picker) return;
@@ -1016,6 +1024,9 @@ export function ChatPane({ agentId }: { agentId: string }) {
           >
             {basename(plan.projectRoot.value)}
           </span>
+        )}
+        {summary.projectRoot && (
+          <GitBranchChip agentId={agentId} running={running} />
         )}
         {/* The run's liveness, in the server's own words. Rendered ONLY when the
             server has said something: the state, the quiet time and the sentence
@@ -1198,20 +1209,16 @@ export function ChatPane({ agentId }: { agentId: string }) {
 
 const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
   if (t.kind === "tool_use") {
-    if (isExitPlanModeTool(t.toolName)) {
-      return <PlanDocument plan={planBodyFromToolInput(t.toolInput)} title={tr("chat.plan.title")} />;
-    }
-    const doc = documentBodyFromToolInput(t.toolName, t.toolInput);
-    if (doc) {
+    const path = toolPathFromInput(t.toolInput);
+    if (path && isHtmlFilePath(path) && !toolCardContent(t.toolName ?? "", t.toolInput)) {
       return (
-        <div className="flex flex-col gap-2">
-          <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} />
-          <PlanDocument
-            plan={doc}
-            title={documentTitleFromToolInput(t.toolInput, tr("chat.plan.title"))}
-          />
+        <div className="markdown-plan markdown-chat text-[var(--text)] break-all leading-relaxed">
+          {tr("chat.plan.html", { path })}
         </div>
       );
+    }
+    if (isExitPlanModeTool(t.toolName)) {
+      return <PlanDocument plan={planBodyFromToolInput(t.toolInput)} />;
     }
     return <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} />;
   }
@@ -1222,27 +1229,32 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
         ? tr("chat.thinkingProgress", { n: t.text })
         : t.text;
     return (
-      <div className="border-l-2 border-[var(--accent)]/40 pl-2 text-[12px] text-[var(--text-dim)] whitespace-pre-wrap break-words leading-relaxed">
+      <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
         <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.thinking")}</div>
-        {body}
+        {t.liveKey === "thinking_tokens" || t.streaming ? (
+          <div className="whitespace-pre-wrap">{body}</div>
+        ) : (
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+        )}
       </div>
     );
   }
 
   if (t.kind === "assistant_text") {
+    const display = isHtmlPlanDocument(t.text) ? planAsChatText(t.text) : t.text;
     // Incomplete markdown (unclosed ** / `) plus remarkGfm on every 1-char
     // delta is what made Flash answers look like 2–3 tok/s. Paint raw text
     // while the row is still streaming; parse once it commits.
     if (t.streaming) {
       return (
         <div className="markdown-plan markdown-chat text-[var(--text)] whitespace-pre-wrap break-words leading-relaxed">
-          {t.text}
+          {display}
         </div>
       );
     }
     return (
       <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{t.text}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{display}</ReactMarkdown>
       </div>
     );
   }

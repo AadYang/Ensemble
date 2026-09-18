@@ -172,12 +172,14 @@ describe("readGitState", () => {
     const emptyPath = join(TMP, `empty-path-${counter++}`);
     mkdirSync(emptyPath, { recursive: true });
     process.env.PATH = emptyPath;
+    const savedExtra = git.GIT_EXTRA_BIN_DIRS.splice(0, git.GIT_EXTRA_BIN_DIRS.length);
     try {
       const state = await git.readGitState(dir);
       expect(state.state).toBe("unavailable");
       expect(state.code).toBe("GIT_UNAVAILABLE");
       expect(state.dirty).toBeNull();
     } finally {
+      git.GIT_EXTRA_BIN_DIRS.push(...savedExtra);
       process.env.PATH = savedPath;
     }
   });

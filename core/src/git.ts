@@ -20,6 +20,8 @@
 // with git's own stderr, and the user decides what to do about their changes.
 
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { inspectProjectRoot } from "./sessions/project-root.js";
 import {
   localNameForRemoteRef,
@@ -49,6 +51,27 @@ export interface GitRunOptions {
   timeoutMs?: number;
 }
 
+/** Directories to search when `git` is not on PATH.
+ *
+ *  A Tauri-spawned sidecar inherits the GUI app's PATH, which on Windows often
+ *  omits Git for Windows and on macOS omits Homebrew. The chip then reports
+ *  `GIT_UNAVAILABLE` and refuses to switch. Tests may empty this array so an
+ *  empty PATH still means "git cannot be run". */
+export const GIT_EXTRA_BIN_DIRS: string[] =
+  process.platform === "win32"
+    ? [
+        join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "cmd"),
+        join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "bin"),
+        join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "Git", "cmd"),
+        process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Programs", "Git", "cmd") : "",
+      ].filter(Boolean)
+    : ["/opt/homebrew/bin", "/usr/local/bin"];
+
+function gitFallbackExecutable(): string | null {
+  const name = process.platform === "win32" ? "git.exe" : "git";
+  return GIT_EXTRA_BIN_DIRS.map((dir) => join(dir, name)).find((p) => existsSync(p)) ?? null;
+}
+
 interface GitRun {
   ok: boolean;
   stdout: string;
@@ -61,13 +84,10 @@ interface GitRun {
   message: string | null;
 }
 
-/** One git invocation. Never throws: every outcome is a value, because
- *  "git is not installed" and "git said no" are answers the API has to
- *  distinguish and an exception would flatten them. */
-function runGit(cwd: string, args: string[], timeoutMs: number): Promise<GitRun> {
+function invokeGit(bin: string, cwd: string, args: string[], timeoutMs: number): Promise<GitRun> {
   return new Promise((resolve) => {
     execFile(
-      "git",
+      bin,
       args,
       { cwd, timeout: timeoutMs, maxBuffer: GIT_MAX_OUTPUT_BYTES, windowsHide: true, encoding: "utf8" },
       (err, stdout, stderr) => {
@@ -121,6 +141,17 @@ function runGit(cwd: string, args: string[], timeoutMs: number): Promise<GitRun>
       },
     );
   });
+}
+
+/** One git invocation. Never throws: every outcome is a value, because
+ *  "git is not installed" and "git said no" are answers the API has to
+ *  distinguish and an exception would flatten them. */
+async function runGit(cwd: string, args: string[], timeoutMs: number): Promise<GitRun> {
+  const first = await invokeGit("git", cwd, args, timeoutMs);
+  if (first.message !== "git could not be found on PATH") return first;
+  const fallback = gitFallbackExecutable();
+  if (!fallback) return first;
+  return invokeGit(fallback, cwd, args, timeoutMs);
 }
 
 const stateForCode = (code: GitErrorCode): GitRepoState =>

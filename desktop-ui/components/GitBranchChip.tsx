@@ -57,10 +57,22 @@ export function GitBranchChip({ agentId, running }: { agentId: string | null; ru
     try {
       setStatus(await getGitStatus(agentId));
     } catch {
-      // A transport failure is "we do not know", and an unknown repository is
-      // not a repository: the chip disappears rather than showing the branch
-      // it happened to show a moment ago.
-      setStatus(null);
+      // Do not keep a stale branch. A transport failure is still a state the
+      // chip can show — hiding it looks like "this project has no git".
+      setStatus({
+        state: "unavailable",
+        code: "GIT_UNAVAILABLE",
+        root: null,
+        branch: null,
+        detached: false,
+        head: null,
+        upstream: null,
+        ahead: null,
+        behind: null,
+        dirty: null,
+        error: "could not reach the git API",
+        detail: null,
+      });
     }
   }, [agentId]);
 
@@ -150,9 +162,10 @@ export function GitBranchChip({ agentId, running }: { agentId: string | null; ru
     }
   };
 
-  // "Not a repository" is silent: most projects are not repositories, and a
-  // permanent "no git here" badge in the window header is noise, not news.
-  if (!status || status.state === "not-a-repo") return null;
+  // Bound folders that are not a repository still get a chip: hiding them
+  // looks identical to "the git API never answered", and a user who just set
+  // a project folder has no way to tell those apart.
+  if (!status) return null;
 
   const block = gitSwitchBlock(status.state, running);
   const readable = status.state === "ok";
@@ -165,7 +178,9 @@ export function GitBranchChip({ agentId, running }: { agentId: string | null; ru
     ? (label ?? t("git.unborn"))
     : status.state === "unbound"
       ? t("git.unbound")
-      : t("git.unavailable");
+      : status.state === "not-a-repo"
+        ? t("git.notARepo")
+        : t("git.unavailable");
 
   const chipTitle = readable
     ? [
