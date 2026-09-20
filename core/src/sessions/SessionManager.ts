@@ -24,14 +24,12 @@ import type { LivenessSnapshot } from "../capability/liveness.js";
 import { newLivenessSignals, resolveLivenessPolicy } from "../capability/liveness.js";
 import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
 import {
-  contextUsageFromTranscript,
   contextUsageFromUsedTokens,
   liveOccupancy,
   occupancyDeltaFromStreamEvent,
   occupancyAfterPersistedMessage,
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
-  promptTextFromMessage,
   reportedContextWindowFromResult,
   shouldEncodeLiveStreamOccupancy,
   shouldPublishLiveContext,
@@ -404,6 +402,7 @@ interface LiveContextState {
   windowInput: EffectiveWindowContext;
   promptTokens: number;
   streamedTokens: number;
+  pendingStreamText: string;
   lastEmitAt: number;
   lastEmittedUsed: number;
 }
@@ -4306,10 +4305,17 @@ export class SessionManager {
       windowInput,
       promptTokens,
       streamedTokens: 0,
+      pendingStreamText: "",
       lastEmitAt: 0,
       lastEmittedUsed: 0,
     });
     this.publishLiveContext(sessionId, { force: true });
+  }
+
+  private flushPendingStreamOccupancy(live: LiveContextState): void {
+    if (!live.pendingStreamText) return;
+    live.streamedTokens += countTokens(live.model, live.pendingStreamText);
+    live.pendingStreamText = "";
   }
 
   private publishLiveContext(sessionId: string, opts: { force: boolean }): void {
@@ -4325,6 +4331,7 @@ export class SessionManager {
     ) {
       return;
     }
+    this.flushPendingStreamOccupancy(live);
     const used = liveOccupancy(live.promptTokens, live.streamedTokens);
     if (
       !shouldPublishLiveContext({
@@ -4348,8 +4355,8 @@ export class SessionManager {
     if (delta === null) return;
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
-    const firstStream = live.streamedTokens === 0;
-    live.streamedTokens += countTokens(live.model, delta);
+    const firstStream = live.streamedTokens === 0 && live.pendingStreamText.length === 0;
+    live.pendingStreamText += delta;
     this.publishLiveContext(sessionId, { force: firstStream });
   }
 
@@ -4360,6 +4367,7 @@ export class SessionManager {
   ): Promise<void> {
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
+    this.flushPendingStreamOccupancy(live);
     const type = (msg as { type?: unknown }).type;
     if (type === "assistant") {
       live.promptTokens = occupancyAfterPersistedMessage({
@@ -4434,31 +4442,6 @@ export class SessionManager {
       select: { payload: true },
     });
     return occupancyTokensFromResultContextUsage(row?.payload);
-  }
-
-  /** Text the runtime will REPLAY as the next prompt, for the local fallback
-   *  count used when no provider-side number exists (Codex today, or any
-   *  runtime whose result carried no usage). Counting `buildRuntimeHistoryForTurn` — the same
-   *  trimmed history those runtimes are handed — keeps the number faithful to
-   *  what is actually sent, and includes the tool traffic (file reads, command
-   *  output, tool arguments) that dominates a coding prompt. Counting raw rows
-   *  would over-report (it ignores the trim) and counting only visible prose
-   *  under-reports by ~95% (the bug this replaced). */
-  private async contextTranscriptTexts(
-    agentId: string,
-    systemPrompt: string | null | undefined,
-  ): Promise<string[]> {
-    const texts: string[] = [];
-    if (systemPrompt && systemPrompt.trim()) texts.push(systemPrompt.trim());
-    const rows = await prisma.message.findMany({
-      where: { agentId },
-      orderBy: { seq: "asc" },
-    });
-    for (const msg of buildRuntimeHistoryForTurn(rows)) {
-      const text = promptTextFromMessage(msg).trim();
-      if (text) texts.push(text);
-    }
-    return texts;
   }
 
   private interruptedTurnAlreadyPersisted(sessionId: string, run: RunningSession): boolean {
@@ -5454,6 +5437,13 @@ export class SessionManager {
       // label foreground commands as "background task started".
       let liveBackgroundTaskIds = new Set<string>();
       const detachedBackgroundTaskIds = new Set<string>();
+      let lastEventLoopYieldAt = 0;
+      const yieldEventLoop = async (): Promise<void> => {
+        const now = Date.now();
+        if (now - lastEventLoopYieldAt < 50) return;
+        lastEventLoopYieldAt = now;
+        await flushVisibleState();
+      };
       for await (const event of stream) {
         // Every runtime event is proof of life on the model AND on the wire —
         // this is the signal that used to be an idle-timer reset, which had only
@@ -5495,6 +5485,7 @@ export class SessionManager {
         if (msg.type === "stream_event") {
           this.noteLiveStreamOccupancy(sessionId, msg);
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
+          await yieldEventLoop();
           continue;
         }
 
@@ -5622,7 +5613,10 @@ export class SessionManager {
             reportedContextWindowFromResult(msg, agent.model) ?? null,
           );
           const live = this.liveContextByAgent.get(sessionId);
-          if (live) live.windowInput = windowInput;
+          if (live) {
+            live.windowInput = windowInput;
+            this.flushPendingStreamOccupancy(live);
+          }
           const liveUsed = live
             ? liveOccupancy(live.promptTokens, live.streamedTokens)
             : 0;
@@ -5635,16 +5629,15 @@ export class SessionManager {
               : liveUsed > 0
                 ? liveUsed
                 : null;
-          this.setContextUsage(
-            sessionId,
-            used !== null
-              ? contextUsageFromUsedTokens(agent.model, windowInput, used)
-              : contextUsageFromTranscript(
-                  agent.model,
-                  windowInput,
-                  await this.contextTranscriptTexts(sessionId, mergedSystemPrompt),
-                ),
-          );
+          // Never tokenize the full transcript here: a long DeepSeek session
+          // (thousands of rows) freezes the Node event loop, so every other
+          // agent stops answering and settings HTTP never returns.
+          if (used !== null) {
+            this.setContextUsage(
+              sessionId,
+              contextUsageFromUsedTokens(agent.model, windowInput, used),
+            );
+          }
           this.clearLiveContext(sessionId);
         } else {
           await this.refreshLiveContextAfterPersist(
@@ -5660,6 +5653,7 @@ export class SessionManager {
           seq: persisted.seq,
           msg: msg as never,
         });
+        await yieldEventLoop();
 
         seq++;
         // A result message ends the *foreground* turn, but Claude background
