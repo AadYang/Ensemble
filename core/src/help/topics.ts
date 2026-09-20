@@ -272,7 +272,7 @@ Typical pattern:
 
   /help                 show full help (overlaps with this topic)
   /clear                drop this agent's message history, start fresh
-  /compact              ask the model to summarize prior context, then truncate
+  /compact              ask the native CLI to compact this session when one exists; otherwise summarize locally
   /model [name]         switch model (picker if no arg)
   /provider [name]      switch provider (picker if no arg)
   /cost                 open the usage/cost dialog

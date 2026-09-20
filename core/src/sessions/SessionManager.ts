@@ -183,6 +183,7 @@ import {
   type RestoreOutcome,
   renderArchivedTranscript,
   sourceHashOf,
+  contentHashOf,
   summarizerTextOf,
 } from "../message-archive.js";
 import { countTokens } from "../local-tokenizer.js";
@@ -255,6 +256,8 @@ export type SubagentRetirementReason = "task-completed" | "task-failed" | "inter
 // does not fit is reported as overflow for the ranged compact path to cover.
 const COMPACT_START_TEXT = "Compacting conversation context...";
 const COMPACT_FAILURE_PREFIX = "Context compact failed:";
+/** Claude Code / Codex treat this as their own slash, not as a user sentence. */
+const NATIVE_COMPACT_SLASH = "/compact";
 // Phase 4: these are SUSPICION thresholds. They used to be kill deadlines —
 // crossing one called forceStopRun and persisted the turn as an ERROR, which
 // meant silence alone could end a run. Now crossing one produces a visible
@@ -1238,6 +1241,10 @@ function compactChunkBudgets(context: RunPlanContext | null): { chunkTokens: num
     Math.max(COMPACT_CHUNK_MIN_TOKENS, Math.floor(usable * COMPACT_CHUNK_FRACTION)),
   );
   return { chunkTokens, mergeTokens: chunkTokens };
+}
+
+function runtimeOwnsNativeCompact(runtime: string): boolean {
+  return runtime === "claude" || runtime === "codex";
 }
 
 /** The compact generation a summary row carries, when it has one. Summaries
@@ -2657,11 +2664,9 @@ export class SessionManager {
     return true;
   }
 
-  /** /compact — ask the model to summarize the conversation so far, then
-   *  replace prior messages with that summary as a single system row and
-   *  clear lastSessionId. Runtime-agnostic: pulls text from Message rows
-   *  (the same view all three runtimes use one way or another) and calls
-   *  quickQuery (which doesn't resume — clean fresh turn). */
+  /** /compact — ask the native CLI to compact when a session exists; otherwise
+   *  summarize locally. The pane is then replaced with that summary and the
+   *  originals move to MessageArchive. */
   async compactAgent(id: string): Promise<{ summary: string } | null> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
@@ -2738,7 +2743,7 @@ export class SessionManager {
           compactPlan?.liveness ??
           resolveLivenessPolicy({ runtime: "unknown", hardDeadlineMs: null }),
       });
-      const out = await this.compactAgentHistory(cur, compactPlan, () => this.isRunOwner(id, runId));
+      const out = await this.compactNow(cur, compactPlan, () => this.isRunOwner(id, runId));
       if (this.isRunOwner(id, runId)) {
         const updated = await prisma.agent.update({ where: { id }, data: { status: "IDLE" } });
         this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
@@ -2765,6 +2770,308 @@ export class SessionManager {
         this.drainQueuedTurns(id);
       }
     }
+  }
+
+  /** Prefer the CLI's own compact when a native session exists. Ensemble only
+   *  summarizes when there is no compact owner (OpenAI in-process, or no
+   *  lastSessionId). */
+  private async compactNow(
+    cur: DbAgent,
+    plan: ResolvedRunPlan | null,
+    shouldContinue?: () => boolean,
+    upperBoundSeq?: number,
+  ): Promise<{ summary: string }> {
+    const resumeId = readMetaString(cur.metadata, "lastSessionId");
+    if (plan && runtimeOwnsNativeCompact(plan.identity.runtime) && resumeId) {
+      try {
+        const native = await this.compactViaNativeSession(cur, plan, resumeId, shouldContinue, upperBoundSeq);
+        if (native) return native;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const code = (err as { code?: string }).code;
+        if (code === "NATIVE_COMPACT_FAILED" || code === "RUNTIME_WALL_CLOCK_LIMIT") throw err;
+        console.error(
+          `[compact] native CLI compact did not complete for agent=${cur.id.slice(0, 8)}: ${message} — falling back to local summary`,
+        );
+      }
+    }
+    return this.compactAgentHistory(cur, plan, shouldContinue, upperBoundSeq);
+  }
+
+  private async compactViaNativeSession(
+    cur: DbAgent,
+    plan: ResolvedRunPlan,
+    resumeId: string,
+    shouldContinue?: () => boolean,
+    upperBoundSeq?: number,
+  ): Promise<{ summary: string } | null> {
+    const id = cur.id;
+    const messages = (
+      await prisma.message.findMany({
+        where: { agentId: id },
+        orderBy: { seq: "asc" },
+      })
+    ).filter((row) => upperBoundSeq === undefined || row.seq <= upperBoundSeq);
+    if (messages.length === 0) {
+      return { summary: "(nothing in range — no row was archived and no summary was written)" };
+    }
+
+    let resolvedProvider: Awaited<ReturnType<typeof prisma.provider.findUnique>> = null;
+    if (cur.providerId) {
+      resolvedProvider = await prisma.provider.findUnique({ where: { id: cur.providerId } });
+      if (resolvedProvider?.disabled) {
+        throw new Error(`provider "${resolvedProvider.name}" is disabled`);
+      }
+    }
+    const providerEnv: Record<string, string> = {};
+    if (resolvedProvider) {
+      if (resolvedProvider.baseUrl) providerEnv.ANTHROPIC_BASE_URL = resolvedProvider.baseUrl;
+      if (resolvedProvider.apiKey) providerEnv.ANTHROPIC_API_KEY = resolvedProvider.apiKey;
+    }
+    const mergedEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (typeof v === "string") mergedEnv[k] = v;
+    }
+    Object.assign(mergedEnv, providerEnv);
+
+    const run = this.running.get(id);
+    const abort = run?.abort ?? new AbortController();
+    let capturedSummary = "";
+    const runtime = this.runtimeResolver(resolvedProvider?.kind ?? "anthropic-local");
+    const runtimeOpts: RuntimeOptions = {
+      sessionId: id,
+      prompt: NATIVE_COMPACT_SLASH,
+      model: cur.model,
+      permissionMode: "bypassPermissions",
+      tools: [],
+      allowedTools: [],
+      canUseTool: async () => ({ behavior: "allow", updatedInput: {} }),
+      includePartialMessages: false,
+      abortController: abort,
+      claudeCliPath: await getClaudeCliPath(),
+      codexCliPath: await getCodexCliPath(),
+      mcpServers: {},
+      env: Object.keys(providerEnv).length > 0 ? mergedEnv : {},
+      provider: resolvedProvider ?? {
+        id: "",
+        name: "anthropic-default",
+        kind: "anthropic-local",
+        baseUrl: null,
+        apiKey: null,
+        autoManaged: false,
+        upstreamProvider: null,
+        upstreamModel: null,
+        models: [],
+        isDefault: true,
+        disabled: false,
+        metadata: {},
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+      history: [],
+      resume: resumeId,
+      runPlan: plan,
+      captureCompactSummary: (text) => {
+        capturedSummary = text;
+      },
+    };
+
+    const deadlineMs = plan.liveness.hardDeadlineMs;
+    let abortReason: string | null = null;
+    const timer =
+      deadlineMs === null
+        ? null
+        : setTimeout(() => {
+            abortReason = `this compact reached the user's maxRunDurationMs of ${deadlineMs}ms (RUNTIME_WALL_CLOCK_LIMIT)`;
+            abort.abort();
+          }, deadlineMs);
+
+    let assistantText = "";
+    let commandText = "";
+    let boundary = false;
+    let compactOk = false;
+    let compactFailed: string | null = null;
+    let resultMsg: unknown = null;
+    try {
+      for await (const event of runtime.query(runtimeOpts)) {
+        if (event.type === "error") {
+          if (event.code === "PROJECT_ROOT_NOT_FOUND") return null;
+          throw Object.assign(new Error(event.message), { code: event.code });
+        }
+        const msg = event.payload as Record<string, unknown> | null;
+        if (!msg || typeof msg !== "object") continue;
+        if (msg.type === "system" && msg.subtype === "compact_boundary") boundary = true;
+        if (msg.type === "system" && msg.subtype === "status") {
+          if (msg.compact_result === "success") compactOk = true;
+          if (msg.compact_result === "failed") {
+            compactFailed = typeof msg.compact_error === "string" ? msg.compact_error : "CLI compact failed";
+          }
+        }
+        if (
+          msg.type === "system" &&
+          (msg.subtype === "local_command_output" || msg.subtype === "informational") &&
+          typeof msg.content === "string" &&
+          msg.content.trim()
+        ) {
+          commandText = msg.content.trim();
+        }
+        if (msg.type === "assistant") {
+          const text = assistantTextFromMessage(msg).trim();
+          if (text) assistantText = text;
+        }
+        if (msg.type === "result") resultMsg = msg;
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (abortReason !== null) {
+      const err = new Error(abortReason) as Error & { code?: string };
+      err.code = "RUNTIME_WALL_CLOCK_LIMIT";
+      throw err;
+    }
+    if (compactFailed) {
+      const err = new Error(compactFailed) as Error & { code?: string };
+      err.code = "NATIVE_COMPACT_FAILED";
+      throw err;
+    }
+    const cliDidCompact = compactOk || boundary || capturedSummary.trim().length > 0;
+    if (!cliDidCompact) return null;
+    if (shouldContinue && !shouldContinue()) {
+      return { summary: capturedSummary || assistantText || commandText || "(compact cancelled)" };
+    }
+
+    if (resultMsg) {
+      const events = extractUsageEvents(
+        {
+          agentId: id,
+          agentName: cur.name,
+          parentId: cur.parentId,
+          providerId: resolvedProvider?.id ?? null,
+          providerName: resolvedProvider?.name ?? "anthropic-default",
+          providerKind: resolvedProvider?.kind ?? "anthropic-local",
+        },
+        resultMsg,
+        "meta",
+      );
+      for (const ev of events) {
+        try {
+          await prisma.usageEvent.create({ data: ev });
+        } catch (err) {
+          console.warn(`[usage:compact] failed to persist UsageEvent: ${(err as Error).message}`);
+        }
+      }
+    }
+
+    const summary =
+      capturedSummary.trim() ||
+      commandText ||
+      assistantText ||
+      "Conversation compacted by the native CLI. Originals are in the Ensemble archive.";
+    return this.commitCompactReplacement(cur, messages, summary, {
+      diagnostics: [
+        `native ${plan.identity.runtime} CLI compacted session ${resumeId.slice(0, 8)} (slash ${NATIVE_COMPACT_SLASH})`,
+      ],
+      chunkCount: 1,
+      layers: [
+        {
+          level: 0,
+          index: 0,
+          fromSeq: messages[0]!.seq,
+          toSeq: messages[messages.length - 1]!.seq,
+          count: messages.length,
+          sourceHash: "",
+          summaryVersion: SUMMARY_VERSION,
+          text: summary,
+        },
+      ],
+      keepResume: true,
+    });
+  }
+
+  private async commitCompactReplacement(
+    cur: DbAgent,
+    messages: DbMessage[],
+    summary: string,
+    extras: {
+      diagnostics: string[];
+      chunkCount: number;
+      layers: unknown[];
+      keepResume: boolean;
+      sourceHash?: string;
+      messageRange?: { fromSeq: number; toSeq: number; count: number };
+    },
+  ): Promise<{ summary: string }> {
+    const id = cur.id;
+    const generation = nextGeneration(id);
+    const archivedAt = Math.floor(Date.now() / 1000);
+    const lastSeq = messages[messages.length - 1]!.seq;
+    const fromSeq = messages[0]!.seq;
+    const sourceHash =
+      extras.sourceHash ??
+      sourceHashOf(
+        messages.map((row) => ({
+          originalSeq: row.seq,
+          contentHash: contentHashOf({
+            originalMessageId: row.id,
+            originalSeq: row.seq,
+            type: row.type,
+            payload: row.payload,
+            createdAt: Math.floor(row.createdAt.getTime() / 1000),
+          }),
+        })),
+      );
+    const messageRange = extras.messageRange ?? { fromSeq, toSeq: lastSeq, count: messages.length };
+    const layers = (extras.layers as Array<Record<string, unknown>>).map((layer) =>
+      layer.sourceHash ? layer : { ...layer, sourceHash },
+    );
+    const summaryPayload = {
+      type: "system" as const,
+      subtype: "compact" as const,
+      text: summary,
+      generation,
+      messageRange,
+      sourceHash,
+      summaryVersion: SUMMARY_VERSION,
+      chunkCount: extras.chunkCount,
+      layers,
+      diagnostics: extras.diagnostics,
+    };
+    transaction(() => {
+      archiveRows(id, generation, messages, archivedAt);
+      const stored = readGeneration(id, generation);
+      const recomputed = sourceHashOf(stored);
+      if (recomputed !== sourceHash) {
+        throw new Error(
+          `compact refused: the archived records do not reproduce the summarized range ` +
+            `(${recomputed.slice(0, 12)} ≠ ${sourceHash.slice(0, 12)})`,
+        );
+      }
+      sqliteDb
+        .prepare("DELETE FROM Message WHERE agentId = ? AND seq <= ? AND seq >= ?")
+        .run(id, lastSeq, fromSeq);
+      sqliteDb.prepare("INSERT INTO Message (agentId, seq, type, payload, createdAt) VALUES (?, ?, ?, ?, ?)").run(
+        id,
+        lastSeq,
+        "system",
+        JSON.stringify(summaryPayload),
+        archivedAt,
+      );
+    });
+    if (!extras.keepResume) {
+      await prisma.agent.update({
+        where: { id },
+        data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
+      });
+    }
+    this.hub.broadcast({
+      type: "agent_history_reset",
+      sessionId: id,
+      reason: "compact",
+      summary,
+    });
+    this.clearLiveContext(id);
+    this.setContextUsage(id, null);
+    return { summary };
   }
 
   /** Summarize the whole conversation, in layers that provably cover it, and
@@ -2839,7 +3146,6 @@ export class SessionManager {
 
     const measurer = makeTokenMeasurer((text) => countTokens(cur.model, text));
     const budgets = compactChunkBudgets(plan?.context ?? null);
-    const generation = nextGeneration(id);
     // ONE absolute deadline for the whole compact, fixed here and never
     // re-derived. `plan.liveness.hardDeadlineMs` is a DURATION, so handing it
     // to every layer is how each summarizer call used to get a fresh full
@@ -2882,71 +3188,19 @@ export class SessionManager {
       return { summary: layered.text };
     }
 
-    const archivedAt = Math.floor(Date.now() / 1000);
-    const lastSeq = messages[messages.length - 1]!.seq;
-    const summaryPayload = {
-      type: "system" as const,
-      subtype: "compact" as const,
-      text: layered.text,
-      generation,
-      messageRange: layered.messageRange,
-      sourceHash: layered.sourceHash,
-      summaryVersion: SUMMARY_VERSION,
-      chunkCount: layered.chunkCount,
-      layers: layered.layers,
+    return this.commitCompactReplacement(cur, messages, layered.text, {
       diagnostics: [
         ...layered.diagnostics,
         ...(plan === null
           ? ["no run plan was resolved for this compact, so the chunk budget came from the fallback"]
           : []),
       ],
-    };
-
-    // ONE transaction. Archive → verify the archive reproduces exactly the
-    // records that were summarized → write the summary → remove the archived
-    // rows. A failure anywhere rolls the whole thing back, so the conversation
-    // is never left with neither its messages nor a summary of them.
-    //
-    // The summary takes `lastSeq` — the last seq this compact is DELETING — not
-    // lastSeq+1. On the automatic path that is the row immediately below the
-    // current user turn, so the summary lands INSIDE the range it replaces and
-    // before the request being dispatched; `lastSeq + 1` would sit past the
-    // current user row and collide with the seq the runtime's next event takes.
-    transaction(() => {
-      archiveRows(id, generation, messages, archivedAt);
-      const stored = readGeneration(id, generation);
-      const recomputed = sourceHashOf(stored);
-      if (recomputed !== layered.sourceHash) {
-        throw new Error(
-          `compact refused: the archived records do not reproduce the summarized range ` +
-            `(${recomputed.slice(0, 12)} ≠ ${layered.sourceHash.slice(0, 12)})`,
-        );
-      }
-      sqliteDb
-        .prepare("DELETE FROM Message WHERE agentId = ? AND seq <= ? AND seq >= ?")
-        .run(id, lastSeq, messages[0]!.seq);
-      sqliteDb.prepare("INSERT INTO Message (agentId, seq, type, payload, createdAt) VALUES (?, ?, ?, ?, ?)").run(
-        id,
-        lastSeq,
-        "system",
-        JSON.stringify(summaryPayload),
-        archivedAt,
-      );
+      chunkCount: layered.chunkCount,
+      layers: layered.layers,
+      keepResume: false,
+      sourceHash: layered.sourceHash,
+      messageRange: layered.messageRange,
     });
-
-    await prisma.agent.update({
-      where: { id },
-      data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
-    });
-    this.hub.broadcast({
-      type: "agent_history_reset",
-      sessionId: id,
-      reason: "compact",
-      summary: layered.text,
-    });
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
-    return { summary: layered.text };
   }
 
   /** The archived originals of one compaction generation, verbatim.
@@ -5152,7 +5406,7 @@ export class SessionManager {
           // would read every active row, archive the request being dispatched
           // (deleting it) and then write its summary at a seq the runtime's own
           // events are about to want.
-          await this.compactAgentHistory(agent, turnPlan, undefined, priorCutSeq - 1);
+          await this.compactNow(agent, turnPlan, undefined, priorCutSeq - 1);
           const reread = await prisma.message.findMany({
             where: { agentId: sessionId },
             orderBy: { seq: "asc" },

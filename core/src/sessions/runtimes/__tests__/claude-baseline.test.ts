@@ -185,6 +185,30 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(claudePromptForTurn({ prompt: "hello", history: [], resume: "x" })).toBe("hello");
   });
 
+  it("registers a PostCompact hook when the session layer asks to capture a CLI summary", async () => {
+    queuedMessages.push([]);
+    const captured: Array<{ summary: string; trigger: string }> = [];
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({
+      ...baseOpts(),
+      resume: "native-session",
+      prompt: "/compact",
+      captureCompactSummary: (summary, meta) => captured.push({ summary, trigger: meta.trigger }),
+    })) {
+      // consume stream
+    }
+    const hooks = lastQueryOptions().hooks as {
+      PostCompact?: Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }>;
+    };
+    expect(hooks.PostCompact?.length).toBe(1);
+    await hooks.PostCompact![0]!.hooks[0]!({
+      hook_event_name: "PostCompact",
+      compact_summary: "CLI folded the transcript",
+      trigger: "manual",
+    });
+    expect(captured).toEqual([{ summary: "CLI folded the transcript", trigger: "manual" }]);
+  });
+
   it("yields nothing when the SDK stream is empty (e.g. immediate abort)", async () => {
     queuedMessages.push([]);
     const rt = new ClaudeAgentRuntime();

@@ -4,6 +4,16 @@
 
 ---
 
+## 2026-09-20 · `/compact` 交给 native CLI
+
+**触发**：墨水屏APP工程师点 `/compact` 对 3500+ 行本地 Message 做分层 `quickQuery`，DeepSeek high thinking 串行几十轮；同一会话里 Claude CLI 自己的 compact 很快。Ensemble 是编排层，不该抢 CLI 的活。
+
+**改动**：有 Claude / Codex `lastSessionId` 时 resume 后发 `/compact`，用 `compact_boundary` / `compact_result` / PostCompact 摘要同步活表进 `MessageArchive`，**保留** resume。OpenAI in-process 或 CLI 未真正 compact 时才走原来的本地分层摘要。
+
+**留下的规则**：能用 CLI 的 compact 就用 CLI；Ensemble 只同步面板与归档。anthropic-compat 的 turn 仍 local-rebuild（遗忘修复），但 compact 可以 resume CLI session。
+
+---
+
 ## 2026-05-11 · W20 Codex CLI 第三 runtime（10 个 Slice）
 
 **目标**：让 Ensemble 通过本地 `codex login` 的 ChatGPT-account OAuth 跑 codex turn，作为继 Claude / OpenAI 之后的第三个 runtime。设计稿：[`codex-cli-runtime.md`](codex-cli-runtime.md) v2.1（C 方案 · 含完整 MCP），[`codex-cli-spike.md`](codex-cli-spike.md) 落实 SDK 形态。

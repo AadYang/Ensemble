@@ -333,6 +333,30 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // no auto-memory and no CLAUDE.md walk-up. Our prompt is the WHOLE
         // system prompt the model sees.
         ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
+        ...(opts.captureCompactSummary
+          ? {
+              hooks: {
+                PostCompact: [
+                  {
+                    hooks: [
+                      async (input: { hook_event_name?: string; compact_summary?: string; trigger?: string }) => {
+                        if (
+                          input.hook_event_name === "PostCompact" &&
+                          typeof input.compact_summary === "string" &&
+                          input.compact_summary.trim()
+                        ) {
+                          opts.captureCompactSummary!(input.compact_summary, {
+                            trigger: input.trigger === "auto" ? "auto" : "manual",
+                          });
+                        }
+                        return { continue: true };
+                      },
+                    ],
+                  },
+                ],
+              },
+            }
+          : {}),
         // Explicitly disable SDK filesystem settings loading. We restore only
         // a small auth-env allowlist from user settings above, so agent
         // identity, memory, hooks, and MCP stay controlled by Ensemble.

@@ -564,7 +564,7 @@ const en: Dict = {
   /model [name]        switch model. no arg → pick from list. arg → direct switch.
   /provider [name]     switch provider; model auto-resets to first available
   /clear               drop this agent's history and start fresh
-  /compact             ask the model to summarize prior context, then truncate
+  /compact             ask the native CLI to compact this session when one exists; otherwise summarize locally
   /cost                open usage / token-cost dialog
   /status              print provider / model / mode / sandbox / counts
   /mcp                 list enabled MCP servers
@@ -590,7 +590,7 @@ const en: Dict = {
   "slash.close.applied": "agent closed",
   "slash.restart.applied": "agent restarted",
   "slash.resetRuntime.applied": "runtime session reset (history and settings kept)",
-  "slash.compact.starting": "[compact] asking model to summarize prior context...",
+  "slash.compact.starting": "[compact] asking the native CLI to compact this session...",
   "slash.mcp.empty": "no MCP servers enabled",
   "slash.skills.empty": "no skills loaded — drop SKILL.md into ~/.claude/skills/ or use the Skills panel",
   "slash.skill.usage": "usage: /skill <enable|disable|auto> <name>",
@@ -1182,7 +1182,7 @@ const zh: Dict = {
   /model [名称]        切换模型。不带参数 → 弹选择器；带参数 → 直接切。
   /provider [名称]     切换供应商；模型自动选第一个可用
   /clear               清空当前 agent 的历史，从零开始
-  /compact             让模型总结之前的上下文并替换原始历史
+  /compact             有 CLI 会话时交给 CLI 压缩；否则本地总结并替换历史
   /cost                打开 token / 费用统计弹窗
   /status              打印 provider / model / 模式 / sandbox / 计数
   /mcp                 列出已启用的 MCP servers
@@ -1206,7 +1206,7 @@ const zh: Dict = {
   "slash.provider.empty": "尚未配置供应商——去供应商面板添加",
   "slash.close.applied": "agent 已关闭",
   "slash.restart.applied": "agent 已重启",
-  "slash.compact.starting": "[compact] 正在让模型总结之前的对话...",
+  "slash.compact.starting": "[compact] 正在请 CLI 压缩当前会话...",
   "slash.mcp.empty": "未启用任何 MCP server",
   "slash.skills.empty": "未加载任何 skill — 把 SKILL.md 放入 ~/.claude/skills/ 或用 Skills 面板",
   "slash.skill.usage": "用法：/skill <enable|disable|auto> <名称>",

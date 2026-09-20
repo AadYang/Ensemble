@@ -174,6 +174,9 @@ export interface RuntimeOptions {
    *  disagree with the plan. */
   /** Forward partial assistant token deltas. Default true. */
   includePartialMessages?: boolean;
+  /** Claude Code PostCompact hook. Only the Claude runtime honors this; used
+   *  when Ensemble asks the CLI to `/compact` rather than summarizing locally. */
+  captureCompactSummary?: (summary: string, meta: { trigger: "manual" | "auto" }) => void;
 
   /** Phase 4: how this runtime reports what it can see about its own run (see
    *  `RuntimeLivenessReporter`). Optional so a runtime that observes nothing —
