@@ -5038,12 +5038,15 @@ export class SessionManager {
       // bodies used to be sent twice in one turn.
       const tailRole = teamContext || base;
       // lastSessionId is only a native session for runtimes that actually
-      // resume one (Claude CLI / Codex thread). OpenAI HTTP mints a fresh
-      // UUID every turn and stores it in the same field — treating that as
-      // `runtime-session` hands the next turn an empty history, which is
-      // how DeepSeek openai-compat agents forgot the previous turn.
+      // resume one (official Claude CLI / Codex thread). OpenAI HTTP mints a
+      // fresh UUID every turn; third-party anthropic-compat (DeepSeek etc.)
+      // goes through Claude CLI but does not keep a Claude session file the
+      // next turn can resume. Treating either as `runtime-session` hands the
+      // model an empty history, which is how those agents forgot the previous turn.
       const nativeSessionRuntime =
-        turnPlan.identity.runtime === "claude" || turnPlan.identity.runtime === "codex";
+        turnPlan.identity.runtime === "codex" ||
+        (turnPlan.identity.runtime === "claude" &&
+          (!resolvedProvider || resolvedProvider.kind === "anthropic-local"));
       const resumed = nativeSessionRuntime && effectiveLastSessionId !== null;
       const promptParts = [
         primer,

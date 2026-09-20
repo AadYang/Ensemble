@@ -20,6 +20,7 @@ import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sd
 import type { LivenessProbeKind, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOptions } from "./types.js";
 import { takeUntilAbort } from "../abort-iterable.js";
+import { promptTextFromMessage } from "../../context-usage.js";
 
 /** Phase 4: spawn the Claude Code child ourselves, so the run has a PROCESS we
  *  can observe.
@@ -302,7 +303,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     const observer = makeClaudeSpawner(opts.liveness ?? null, opts.abortController.signal);
     if (observer) opts.liveness?.registerProbe?.(observer.probe);
     const stream = query({
-      prompt: opts.prompt,
+      prompt: claudePromptForTurn(opts),
       options: {
         model: opts.model,
         ...(effort !== undefined ? { effort } : {}),
@@ -373,4 +374,30 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       );
     }
   }
+}
+
+/** When the CLI is not resuming a session file, `opts.history` is the only
+ *  prior context the model will see. The SDK `query()` prompt is a string, so
+ *  the local-rebuild transcript has to ride in that string — leaving it in
+ *  `history` unused is how DeepSeek-via-Claude-CLI forgot every previous turn. */
+export function claudePromptForTurn(opts: Pick<RuntimeOptions, "prompt" | "history" | "resume">): string {
+  if (opts.resume || opts.history.length === 0) return opts.prompt;
+  const turns: string[] = [];
+  for (const msg of opts.history) {
+    const text = promptTextFromMessage(msg).trim();
+    if (!text) continue;
+    if (msg.type === "user") turns.push(`User:\n${text}`);
+    else if (msg.type === "assistant") turns.push(`Assistant:\n${text}`);
+  }
+  if (turns.length === 0) return opts.prompt;
+  return [
+    "This is an Ensemble pane transcript reconstructed from local history because no native Claude CLI session is being resumed.",
+    "The transcript is background only. The final <current-user-request> block is the active task for this turn.",
+    "",
+    turns.join("\n\n---\n\n"),
+    "",
+    "<current-user-request>",
+    opts.prompt,
+    "</current-user-request>",
+  ].join("\n");
 }

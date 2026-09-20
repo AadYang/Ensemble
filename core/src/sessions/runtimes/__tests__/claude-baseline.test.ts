@@ -17,7 +17,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   }),
 }));
 
-import { ClaudeAgentRuntime } from "../claude.js";
+import { ClaudeAgentRuntime, claudePromptForTurn } from "../claude.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Provider } from "../../../db.js";
 import type { RuntimeOptions } from "../types.js";
@@ -146,6 +146,43 @@ describe("ClaudeAgentRuntime baseline", () => {
     }
 
     expect(events).toEqual(["system", "stream_event", "assistant", "result"]);
+  });
+
+  it("puts local-rebuild history into the SDK prompt when no CLI session is resumed", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    const history = [
+      { type: "user" as const, message: { role: "user", content: "install the baseline apk" } },
+      {
+        type: "assistant" as const,
+        message: { content: [{ type: "text", text: "I will use the existing env flag." }] },
+      },
+    ];
+    for await (const _ of rt.query({ ...baseOpts(), history })) {
+      // consume stream
+    }
+    const call = vi.mocked(query).mock.calls.at(-1);
+    const prompt = (call?.[0] as { prompt?: string } | undefined)?.prompt ?? "";
+    expect(prompt).toContain("install the baseline apk");
+    expect(prompt).toContain("existing env flag");
+    expect(prompt).toContain("<current-user-request>");
+    expect(prompt).toContain("hello");
+  });
+
+  it("does not duplicate history into the prompt when resuming a CLI session", async () => {
+    queuedMessages.push([]);
+    const rt = new ClaudeAgentRuntime();
+    for await (const _ of rt.query({
+      ...baseOpts(),
+      resume: "019ea530-56b8-7163-8b3c-5bd5ae5c2c79",
+      history: [{ type: "user", message: { role: "user", content: "should not appear" } }],
+    })) {
+      // consume stream
+    }
+    const call = vi.mocked(query).mock.calls.at(-1);
+    const prompt = (call?.[0] as { prompt?: string } | undefined)?.prompt ?? "";
+    expect(prompt).toBe("hello");
+    expect(claudePromptForTurn({ prompt: "hello", history: [], resume: "x" })).toBe("hello");
   });
 
   it("yields nothing when the SDK stream is empty (e.g. immediate abort)", async () => {

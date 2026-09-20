@@ -159,9 +159,10 @@ export interface RuntimeOptions {
    *  a switch is permitted; this says one occurred, so `/status` can show the
    *  user a route change they did not ask for. */
   onTransportFallback?: (info: TransportFallbackInfo) => void;
-  /** Persisted prior messages — feed for runtimes that maintain conversation
-   *  state outside the SDK (OpenAI). Claude side ignores; the CLI's
-   *  ~/.claude session file holds Claude's history. */
+  /** Persisted prior messages. OpenAI always consumes these. Claude consumes
+   *  them when it is NOT resuming a CLI session file (local-rebuild / third-party
+   *  anthropic-compat). A resumed official Claude CLI session still ignores them
+   *  because ~/.claude holds that transcript. */
   history: SdkMessage[];
   /** Opaque agent metadata blob (Agent.metadata) — runtimes that care about
    *  per-agent settings (e.g. CodexCliRuntime reading sandboxMode override)
