@@ -1228,13 +1228,17 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
       t.liveKey === "thinking_tokens"
         ? tr("chat.thinkingProgress", { n: t.text })
         : t.text;
+    const open = t.streaming || t.liveKey === "thinking_tokens";
     return (
-      <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
-        <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.thinking")}</div>
-        {t.liveKey === "thinking_tokens" || t.streaming ? (
+      <div className="markdown-plan markdown-chat markdown-thinking text-[var(--text-dim)] break-words leading-relaxed">
+        <div className="tracking-wider mb-0.5 text-[10px] text-[var(--text-dim)]">{tr("chat.thinking")}</div>
+        {open ? (
           <div className="whitespace-pre-wrap">{body}</div>
         ) : (
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+        )}
+        {!open && (
+          <div className="tracking-wider mt-0.5 text-[10px] text-[var(--text-dim)]">{tr("chat.thinkingEnd")}</div>
         )}
       </div>
     );
@@ -1248,12 +1252,14 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
     if (t.streaming) {
       return (
         <div className="markdown-plan markdown-chat text-[var(--text)] whitespace-pre-wrap break-words leading-relaxed">
+          <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.answer")}</div>
           {display}
         </div>
       );
     }
     return (
       <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
+        <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.answer")}</div>
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{display}</ReactMarkdown>
       </div>
     );
