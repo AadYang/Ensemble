@@ -3,13 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getWS } from "@/lib/ws";
-import { useStore, type PendingUserQuestion } from "@/store/agents";
+import { useAgentDirectory, useStore, type PendingUserQuestion } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 
 export function AskUserDialog() {
   const ws = getWS();
   const queue = useStore((s) => s.pendingUserQuestions);
-  const agents = useStore((s) => s.agents);
+  const agents = useAgentDirectory();
   const clearUserQuestion = useStore((s) => s.clearUserQuestion);
   const t = useT();
 

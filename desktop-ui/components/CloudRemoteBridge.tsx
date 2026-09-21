@@ -16,7 +16,7 @@ import {
   type CloudSnapshot,
 } from "@/lib/cloud-api";
 import { getWS } from "@/lib/ws";
-import { useStore } from "@/store/agents";
+import { useAgentDirectory, useStore } from "@/store/agents";
 
 interface RemoteRequest {
   workspaceId: string;
@@ -27,7 +27,7 @@ export function CloudRemoteBridge() {
   const cloudSession = useStore((s) => s.cloudSession);
   const cloudCurrentWorkspaceId = useStore((s) => s.cloudCurrentWorkspaceId);
   const cloudSnapshot = useStore((s) => s.cloudSnapshot);
-  const localAgents = useStore((s) => s.agents);
+  const localAgents = useAgentDirectory();
   const localWs = getWS();
 
   const cloudAgentIds = useMemo(

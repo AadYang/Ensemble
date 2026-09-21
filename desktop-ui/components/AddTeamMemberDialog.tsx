@@ -41,7 +41,6 @@ export function AddTeamMemberDialog({
   // Empty = unbound project (the member works in its own scratch dir).
   const [projectRoot, setProjectRoot] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     setMounted(true);
@@ -94,62 +93,35 @@ export function AddTeamMemberDialog({
       setError(t("team.add.err.model"));
       return;
     }
-    setBusy(true);
-    const expectedName = role.trim();
     const wsClient = getWS();
-
-    // Defensive close: wait for the server's agent_created (matching teamId
-    // + role name) before dismissing the dialog. If the WS frame got dropped
-    // or the server rejected the create_agent payload, we'd otherwise close
-    // the dialog and the user would think it succeeded.
-    let settled = false;
-    const unsub = wsClient.subscribe((msg) => {
-      if (settled) return;
-      if (msg.type === "agent_created" && msg.agent.teamId === teamId && msg.agent.name === expectedName) {
-        settled = true;
-        unsub();
-        clearTimeout(timeoutId);
-        onClose();
-      } else if (msg.type === "error") {
-        settled = true;
-        unsub();
-        clearTimeout(timeoutId);
-        setError(msg.message);
-        setBusy(false);
-      }
-    });
-    const timeoutId = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      unsub();
-      setError(t("team.add.err.timeout"));
-      setBusy(false);
-    }, 4000);
-
+    if (!wsClient.isOpen()) {
+      setError(t("team.add.err.ws"));
+      return;
+    }
     wsClient.send({
       type: "create_agent",
-      name: expectedName,
+      name: role.trim(),
       systemPrompt: systemPrompt.trim() || undefined,
       providerId,
       model: model.trim(),
       teamId,
-      // Omitted when empty → created unbound rather than inheriting a
-      // directory the user never named.
       ...(projectRoot.trim() ? { projectRoot: projectRoot.trim() } : {}),
     });
+    onClose();
   };
 
   if (!mounted) return null;
 
   const dialog = (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-      <div className="tool-card bg-[var(--bg-elevated)] w-full max-w-[560px] flex flex-col text-xs">
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+      <div className="tool-card bg-[var(--bg-elevated)] w-full max-w-[560px] max-h-[92vh] flex flex-col text-xs">
         <div className="px-3 py-2 border-b border-[var(--border)] flex items-center gap-2">
           <span className="text-[var(--text-dim)] tracking-wider">
             {t("team.add.title", { team: teamName })}
           </span>
           <span className="flex-1" />
           <button
+            type="button"
             onClick={onClose}
             className="px-2 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--err)] hover:border-[var(--err)]"
           >
@@ -157,7 +129,7 @@ export function AddTeamMemberDialog({
           </button>
         </div>
 
-        <div className="p-3 flex flex-col gap-3">
+        <div className="p-3 flex-1 overflow-y-auto flex flex-col gap-3">
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
               {t("team.add.label.role")}
@@ -220,15 +192,16 @@ export function AddTeamMemberDialog({
 
         <div className="px-3 py-2 border-t border-[var(--border)] flex justify-end gap-2">
           <button
+            type="button"
             onClick={onClose}
             className="px-3 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)]"
           >
             {t("team.add.cancel")}
           </button>
           <button
+            type="button"
             onClick={handleSubmit}
-            disabled={busy}
-            className="px-3 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+            className="px-3 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black transition-colors"
           >
             {t("team.add.create")}
           </button>

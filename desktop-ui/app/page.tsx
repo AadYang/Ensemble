@@ -42,7 +42,7 @@ import {
   parseWorkspaceSelectionKey,
   resolveCloudRefreshSelection,
 } from "@agentorch/shared";
-import { hydrateInputHistoryFromStorage, hydrateLocaleFromStorage, selectActiveWindow, useStore } from "@/store/agents";
+import { hydrateInputHistoryFromStorage, hydrateLocaleFromStorage, selectActiveWindow, useAgentDirectory, useStore } from "@/store/agents";
 import { ingestLiveSdkMessage } from "@/store/stream-batch";
 import { LayoutRenderer } from "@/components/LayoutRenderer";
 import { PermissionDialog } from "@/components/PermissionDialog";
@@ -91,7 +91,7 @@ export default function Page() {
   const clearRunPlan = useStore((s) => s.clearRunPlan);
   const ingestSdkMessage = useStore((s) => s.ingestSdkMessage);
   const appendError = useStore((s) => s.appendError);
-  const agents = useStore((s) => s.agents);
+  const agents = useAgentDirectory();
   const activeId = useStore((s) => s.activeId);
   const setActive = useStore((s) => s.setActive);
 

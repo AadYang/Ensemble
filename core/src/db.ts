@@ -29,6 +29,7 @@ export const DB_PATH = process.env.AGENTORCH_DB_PATH ?? join(ensureDataDir(), "a
 
 export const sqliteDb = new DatabaseSync(DB_PATH);
 sqliteDb.exec("PRAGMA journal_mode = WAL");
+sqliteDb.exec("PRAGMA busy_timeout = 1000");
 sqliteDb.exec("PRAGMA foreign_keys = ON");
 
 const SCHEMA = `

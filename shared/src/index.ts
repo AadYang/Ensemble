@@ -15,6 +15,7 @@ export * from "./telemetry";
 export * from "./chat-input";
 export * from "./subagent-tool";
 export * from "./thinking-display";
+export * from "./agent-directory-eq";
 export * from "./stream-display-batch";
 export * from "./workspace-selection";
 export * from "./git";

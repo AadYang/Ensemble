@@ -4,7 +4,7 @@ import { useEffect } from "react";
 import type { PermissionDecision } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import { patchAgent } from "@/lib/agent-api";
-import { useStore, type PendingPermission } from "@/store/agents";
+import { useAgentDirectory, useStore, type PendingPermission } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { displayToolName } from "@/lib/tool-display";
 import { isExitPlanModeTool, planBodyFromToolInput } from "@/lib/plan-document";
@@ -14,7 +14,7 @@ import { PlanDocument } from "./PlanDocument";
 export function PermissionDialog() {
   const ws = getWS();
   const queue = useStore((s) => s.pendingPermissions);
-  const agents = useStore((s) => s.agents);
+  const agents = useAgentDirectory();
   const clearPermissionRequest = useStore((s) => s.clearPermissionRequest);
   const t = useT();
 

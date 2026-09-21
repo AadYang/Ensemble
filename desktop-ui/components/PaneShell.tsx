@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { selectActiveWindow, useStore } from "@/store/agents";
+import { useState, memo } from "react";
+import { selectActiveWindow, useAgentDirectory, useStore } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { deleteAgent } from "@/lib/agent-api";
 import { getDialog } from "@/lib/dialog";
@@ -13,7 +13,7 @@ import { AgentSettings } from "./AgentSettings";
  *  deleting it would kill it mid-flight, so that path asks first. */
 const TERMINAL_STATUSES = new Set(["done", "error", "idle"]);
 
-export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string | null }) {
+export const PaneShell = memo(function PaneShell({ paneId, agentId }: { paneId: string; agentId: string | null }) {
   const isActive = useStore((s) => selectActiveWindow(s)?.activePaneId === paneId);
   const setActivePane = useStore((s) => s.setActivePane);
   const splitActive = useStore((s) => s.splitActive);
@@ -22,7 +22,7 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
   const appendError = useStore((s) => s.appendError);
   const attachAgentToPane = useStore((s) => s.attachAgentToPane);
   const agent = useStore((s) => (agentId ? s.agents[agentId] : null));
-  const agents = useStore((s) => s.agents);
+  const agents = useAgentDirectory();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const t = useT();
 
@@ -211,7 +211,7 @@ export function PaneShell({ paneId, agentId }: { paneId: string; agentId: string
       )}
     </div>
   );
-}
+});
 
 function PaneBtn({
   children,

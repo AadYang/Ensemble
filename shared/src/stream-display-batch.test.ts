@@ -77,4 +77,29 @@ describe("createStreamDisplayBatcher", () => {
     expect(timers).toHaveLength(0);
     expect(emitted).toEqual([]);
   });
+
+  it("uses flushMsFor so a hidden session can wait longer before emit", () => {
+    const emitted: Array<{ sessionId: string; chunks: StreamDisplayChunk[] }> = [];
+    const timers: Array<{ id: number; fn: () => void; ms: number }> = [];
+    let nextId = 1;
+    const batcher = createStreamDisplayBatcher({
+      flushMs: 32,
+      flushMsFor: (id) => (id === "hidden" ? 200 : 32),
+      schedule: (fn, ms) => {
+        const id = nextId++;
+        timers.push({ id, fn, ms });
+        return id;
+      },
+      cancel: (id) => {
+        const idx = timers.findIndex((t) => t.id === id);
+        if (idx >= 0) timers.splice(idx, 1);
+      },
+      emit: (sessionId, chunks) => {
+        emitted.push({ sessionId, chunks: chunks.map((c) => ({ ...c })) });
+      },
+    });
+    batcher.push("hidden", { seq: -1, kind: "thinking", text: "x" });
+    batcher.push("shown", { seq: -1, kind: "thinking", text: "y" });
+    expect(timers.map((t) => t.ms)).toEqual([200, 32]);
+  });
 });

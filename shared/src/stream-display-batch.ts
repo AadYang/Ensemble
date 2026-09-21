@@ -3,6 +3,8 @@ import type { StreamDisplayKind } from "./thinking-display.js";
 /** One paint of coalesced stream text. 32ms is ~2 frames — enough to fold
  *  1-char DeepSeek/Claude deltas without looking buffered. */
 export const STREAM_DISPLAY_FLUSH_MS = 32;
+/** Off-screen agents: keep occupancy/status moving, don't paint 32ms. */
+export const STREAM_DISPLAY_HIDDEN_FLUSH_MS = 200;
 
 export interface StreamDisplayChunk {
   seq: number;
@@ -38,6 +40,7 @@ function concatChunk(pending: StreamDisplayChunk[], next: StreamDisplayChunk): v
 export function createStreamDisplayBatcher(opts: {
   emit: (sessionId: string, chunks: readonly StreamDisplayChunk[]) => void;
   flushMs?: number;
+  flushMsFor?: (sessionId: string) => number;
   schedule?: (fn: () => void, ms: number) => number;
   cancel?: (id: number) => void;
 }): StreamDisplayBatcher {
@@ -73,10 +76,11 @@ export function createStreamDisplayBatcher(opts: {
     }
     concatChunk(buf.chunks, chunk);
     if (buf.timer == null) {
+      const wait = opts.flushMsFor?.(sessionId) ?? flushMs;
       buf.timer = schedule(() => {
         buf!.timer = null;
         flushSession(sessionId);
-      }, flushMs);
+      }, wait);
     }
   }
 

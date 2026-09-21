@@ -154,6 +154,12 @@ export function occupancyTokensFromLastCall(rows: readonly Row[]): number | null
 
 export const LIVE_CONTEXT_MIN_EMIT_MS = 200;
 
+/** Occupancy bar is decoration. Never tiktoken on the stream hot path. */
+export function estimateStreamTokens(charCount: number): number {
+  if (charCount <= 0) return 0;
+  return Math.ceil(charCount / 4);
+}
+
 export function liveOccupancy(promptTokens: number, streamedTokens: number): number {
   return Math.max(0, promptTokens) + Math.max(0, streamedTokens);
 }
@@ -188,9 +194,7 @@ export function shouldPublishLiveContext(opts: {
   return opts.now - opts.lastEmitAt >= LIVE_CONTEXT_MIN_EMIT_MS;
 }
 
-/** Encode the growing stream buffer only when we might publish. Counting on
- *  every 1-char delta is O(n²) tiktoken on the Node event loop and delays WS
- *  forwarding of the tokens the chat pane is waiting to paint. */
+/** Flush the growing stream buffer only when we might publish. */
 export function shouldEncodeLiveStreamOccupancy(opts: {
   force: boolean;
   now: number;

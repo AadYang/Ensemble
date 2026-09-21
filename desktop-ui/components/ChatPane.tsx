@@ -6,7 +6,9 @@ import {
   countSubagentStartsThisTurn,
   formatCapabilityFieldLines,
   measureChatInputHeight,
+  thinkingDomText,
   type RunPlanStatusView,
+  type SdkMessage,
 } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import {
@@ -14,6 +16,7 @@ import {
   closeAgent,
   compactAgent,
   getAgentStatusReport,
+  listMessages,
   patchAgent,
   resetRuntimeSession,
   restartAgent,
@@ -22,7 +25,7 @@ import { fetchCloudAgentStatus } from "@/lib/cloud-api";
 import { listSkills, toggleAgentSkill } from "@/lib/skill-api";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useStore, type ChatTurn } from "@/store/agents";
-import { dropLiveStream } from "@/store/stream-batch";
+import { dropLiveStream, flushLiveStream } from "@/store/stream-batch";
 import { useT, type TranslateFn } from "@/i18n/useT";
 import { ToolCard } from "./ToolCard";
 import { PlanDocument } from "./PlanDocument";
@@ -49,6 +52,7 @@ const EMPTY_HISTORY: readonly string[] = Object.freeze([]);
 const CHAT_INPUT_MAX_ROWS = 6;
 const AUTO_FOLLOW_PAUSE_PX = 64;
 const AUTO_FOLLOW_RESUME_PX = 64;
+const HISTORY_TAIL_TURNS = 200;
 
 const PEER_INCOMING_RE = /^\[(?:from|来自) ([^\]]+)\]\s*([\s\S]*)$/;
 const PEER_OUTGOING_RE = /^→\s*(?:to|发往)\s+([^:]+):\s*([\s\S]*)$/;
@@ -286,7 +290,7 @@ function makeScrollFollowSignal(turns: readonly ChatTurn[], status: string): str
   ].join("|");
 }
 
-export function ChatPane({ agentId }: { agentId: string }) {
+export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string }) {
   const ws = getWS();
   const agent = useStore((s) => s.agents[agentId]);
   const totalAgents = useStore((s) => Object.keys(s.agents).length);
@@ -306,6 +310,10 @@ export function ChatPane({ agentId }: { agentId: string }) {
   // The server's last word on this agent's run. Absent = nothing has been said
   // for it since the connection opened, which renders as nothing at all.
   const liveness = useStore((s) => s.livenessByAgent[agentId]);
+  const ingestOlderTurns = useStore((s) => s.ingestOlderTurns);
+  const [historyExtra, setHistoryExtra] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyExhausted, setHistoryExhausted] = useState(false);
   const [peerOpen, setPeerOpen] = useState(false);
   const [picker, setPicker] = useState<PickerState | null>(null);
   const [providers, setProviders] = useState<ProviderDTO[]>([]);
@@ -341,6 +349,9 @@ export function ChatPane({ agentId }: { agentId: string }) {
     draftRef.current = "";
     setNextStepHint(null);
     lastSeenResultSeqRef.current = -Infinity;
+    setHistoryExtra(0);
+    setHistoryExhausted(false);
+    flushLiveStream(agentId);
   }, [agentId]);
 
   // Reader-speed auto-scroll. The old "jump to bottom on every update" felt
@@ -553,6 +564,54 @@ export function ChatPane({ agentId }: { agentId: string }) {
     [plan, agent?.contextUsage?.contextWindow],
   );
 
+  const loadEarlier = useCallback(async () => {
+    const ag = useStore.getState().agents[agentId];
+    if (!ag || historyLoading) return;
+    const { turns } = ag;
+    const localHidden = Math.max(0, turns.length - HISTORY_TAIL_TURNS - historyExtra);
+    const el = scrollRef.current;
+    const prevHeight = el?.scrollHeight ?? 0;
+    const prevTop = el?.scrollTop ?? 0;
+    followBottomRef.current = false;
+    const restoreScroll = () => {
+      requestAnimationFrame(() => {
+        if (!el) return;
+        el.scrollTop = prevTop + (el.scrollHeight - prevHeight);
+      });
+    };
+    if (localHidden > 0) {
+      setHistoryExtra((n) => n + HISTORY_TAIL_TURNS);
+      restoreScroll();
+      return;
+    }
+    const minSeq = turns[0]?.seq;
+    if (minSeq === undefined) {
+      setHistoryExhausted(true);
+      return;
+    }
+    setHistoryLoading(true);
+    try {
+      const rows = await listMessages(agentId, HISTORY_TAIL_TURNS, undefined, minSeq);
+      const extra = rows.flatMap((r) => {
+        if (!r.msg || typeof r.msg !== "object") return [];
+        return [{ seq: r.seq, msg: r.msg as SdkMessage }];
+      });
+      if (extra.length === 0) {
+        setHistoryExhausted(true);
+        return;
+      }
+      const before = useStore.getState().agents[agentId]?.turns.length ?? 0;
+      ingestOlderTurns(agentId, extra);
+      const after = useStore.getState().agents[agentId]?.turns.length ?? 0;
+      setHistoryExtra((n) => n + Math.max(0, after - before));
+      restoreScroll();
+    } catch {
+      setHistoryExhausted(true);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [agentId, historyExtra, historyLoading, ingestOlderTurns]);
+
   if (!agent) {
     return (
       <div className="flex-1 flex items-center justify-center text-[var(--text-dim)] text-xs">
@@ -562,6 +621,9 @@ export function ChatPane({ agentId }: { agentId: string }) {
   }
 
   const { summary, turns, contextUsage } = agent;
+  const historyStart = Math.max(0, turns.length - HISTORY_TAIL_TURNS - historyExtra);
+  const visibleTurns = turns.slice(historyStart);
+  const showLoadEarlier = !historyExhausted && (historyStart > 0 || turns.length >= HISTORY_TAIL_TURNS);
   const running =
     summary.status === "running" ||
     summary.status === "awaiting_permission" ||
@@ -1094,8 +1156,18 @@ export function ChatPane({ agentId }: { agentId: string }) {
           {turns.length === 0 && (
             <div className="text-[var(--text-dim)] text-xs">{t("chat.empty")}</div>
           )}
-          {turns.map((turn, i) => (
-            <Turn key={i} t={turn} tr={t} />
+          {showLoadEarlier && (
+            <button
+              type="button"
+              disabled={historyLoading}
+              onClick={() => void loadEarlier()}
+              className="self-center px-2 py-1 text-[10px] tracking-wider text-[var(--text-dim)] border border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-50"
+            >
+              {historyLoading ? t("chat.history.loading") : t("chat.history.older")}
+            </button>
+          )}
+          {visibleTurns.map((turn, i) => (
+            <Turn key={`${turn.seq}:${turn.kind}:${turn.liveKey ?? ""}:${historyStart + i}`} t={turn} tr={t} />
           ))}
           {summary.status === "running" && <div className="stream-cursor h-4" />}
         </div>
@@ -1205,7 +1277,7 @@ export function ChatPane({ agentId }: { agentId: string }) {
       )}
     </div>
   );
-}
+});
 
 const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
   if (t.kind === "tool_use") {
@@ -1224,18 +1296,22 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
   }
 
   if (t.kind === "thinking") {
-    const body =
-      t.liveKey === "thinking_tokens"
-        ? tr("chat.thinkingProgress", { n: t.text })
-        : t.text;
-    const open = t.streaming || t.liveKey === "thinking_tokens";
+    const isProgress = t.liveKey === "thinking_tokens";
+    const raw = isProgress ? tr("chat.thinkingProgress", { n: t.text }) : t.text;
+    const open = Boolean(t.streaming);
+    const painted = isProgress ? { omitted: 0, body: raw } : thinkingDomText(raw, open);
     return (
       <div className="markdown-plan markdown-chat markdown-thinking text-[var(--text-dim)] break-words leading-relaxed">
         <div className="tracking-wider mb-0.5 text-[10px] text-[var(--text-dim)]">{tr("chat.thinking")}</div>
+        {painted.omitted > 0 && (
+          <div className="text-[10px] text-[var(--text-faint)] mb-0.5">
+            {tr("chat.thinkingOmitted", { n: painted.omitted })}
+          </div>
+        )}
         {open ? (
-          <div className="whitespace-pre-wrap">{body}</div>
+          <div className="whitespace-pre-wrap">{painted.body}</div>
         ) : (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{painted.body}</ReactMarkdown>
         )}
         {!open && (
           <div className="tracking-wider mt-0.5 text-[10px] text-[var(--text-dim)]">{tr("chat.thinkingEnd")}</div>

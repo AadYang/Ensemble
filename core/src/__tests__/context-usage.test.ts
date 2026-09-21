@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   contextUsageFromTranscript,
   contextUsageFromUsedTokens,
+  estimateStreamTokens,
   LIVE_CONTEXT_MIN_EMIT_MS,
   liveOccupancy,
   occupancyAfterPersistedMessage,
@@ -441,6 +442,13 @@ describe("live occupancy helpers", () => {
   it("sums prompt and streamed output", () => {
     expect(liveOccupancy(100, 7)).toBe(107);
     expect(liveOccupancy(-1, 5)).toBe(5);
+  });
+
+  it("estimates stream occupancy from characters, not BPE", () => {
+    expect(estimateStreamTokens(0)).toBe(0);
+    expect(estimateStreamTokens(1)).toBe(1);
+    expect(estimateStreamTokens(4)).toBe(1);
+    expect(estimateStreamTokens(5)).toBe(2);
   });
 
   it("keeps the live running count when the persisted row has no usage", () => {

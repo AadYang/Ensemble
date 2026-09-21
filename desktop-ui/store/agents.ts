@@ -1,7 +1,9 @@
 "use client";
 
+import { useSyncExternalStore } from "react";
 import { create } from "zustand";
 import {
+  agentDirectoryUnchanged,
   clearAgentFromTree,
   closePane,
   listLeaves,
@@ -206,6 +208,7 @@ interface Store {
     id: string,
     chunks: ReadonlyArray<{ seq: number; kind: "assistant_text" | "thinking"; text: string }>,
   ) => void;
+  ingestOlderTurns: (id: string, rows: ReadonlyArray<{ seq: number; msg: SdkMessage }>) => void;
   stopStreaming: (id: string) => void;
   appendError: (id: string | null, code: string, message: string) => void;
 
@@ -576,6 +579,42 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   }
 };
 
+function sdkHistoryTurns(seq: number, msg: SdkMessage): ChatTurn[] {
+  if (msg.type === "stream_event") return [];
+  if (thinkingTokensEstimate(msg) !== null) return [];
+  if (msg.type === "assistant") {
+    const blocks = assistantBlocks(msg);
+    const text = assistantTextOf(blocks);
+    const thinking = thinkingTextFromContentBlocks(blocks);
+    const tools = toolUseTurns(seq, blocks);
+    const out: ChatTurn[] = [];
+    if (thinking) out.push({ seq, kind: "thinking", text: thinking });
+    if (text) out.push({ seq, kind: "assistant_text", text });
+    out.push(...tools);
+    return out;
+  }
+  if (msg.type === "user") {
+    const content = (msg as { message?: { content?: unknown } }).message?.content;
+    let text = "";
+    if (typeof content === "string") text = content;
+    else if (Array.isArray(content)) {
+      text = content
+        .map((b) =>
+          typeof b === "string"
+            ? b
+            : b && typeof b === "object" && "type" in b && (b as { type: string }).type === "text"
+              ? ((b as { text?: string }).text ?? "")
+              : "",
+        )
+        .join("");
+    }
+    if (!text) return [];
+    return [{ seq, kind: "user", text }];
+  }
+  const turn = sdkMessageToTurn(seq, msg);
+  return turn ? [turn] : [];
+}
+
 const updateActiveWindow = (
   s: { windows: LayoutWindow[]; activeWindowId: string },
   mutator: (w: LayoutWindow) => LayoutWindow,
@@ -916,6 +955,10 @@ export const useStore = create<Store>((set) => ({
     set((s) => {
       const ag = s.agents[id];
       if (!ag || chunks.length === 0) return s;
+      const status = ag.summary.status;
+      if (status !== "running" && status !== "awaiting_permission" && status !== "awaiting_user_input") {
+        return s;
+      }
       let turns = ag.turns;
       for (const chunk of chunks) {
         if (!chunk.text && chunk.kind !== "thinking") continue;
@@ -937,6 +980,21 @@ export const useStore = create<Store>((set) => ({
       });
       if (!changed) return s;
       return { agents: { ...s.agents, [id]: { ...ag, turns } } };
+    }),
+
+  ingestOlderTurns: (id, rows) =>
+    set((s) => {
+      const ag = s.agents[id];
+      if (!ag || rows.length === 0) return s;
+      const have = new Set(ag.turns.map((t) => t.seq));
+      const extra: ChatTurn[] = [];
+      for (const row of rows) {
+        if (have.has(row.seq)) continue;
+        extra.push(...sdkHistoryTurns(row.seq, row.msg));
+      }
+      if (extra.length === 0) return s;
+      extra.sort((a, b) => a.seq - b.seq);
+      return { agents: { ...s.agents, [id]: { ...ag, turns: [...extra, ...ag.turns] } } };
     }),
 
   ingestSdkMessage: (id, seq, msg) =>
@@ -1144,6 +1202,32 @@ export const useStore = create<Store>((set) => ({
 
 export const selectActiveWindow = (s: Store): LayoutWindow | undefined =>
   s.windows.find((w) => w.id === s.activeWindowId);
+
+/** Sidebar / page chrome: ignore stream turn flushes, re-render only when an
+ *  agent's summary object identity changes (create/delete/status/rename). */
+export function useAgentDirectory(): Record<string, AgentState> {
+  return useSyncExternalStore(subscribeAgentDirectory, readAgentDirectory, readAgentDirectory);
+}
+
+let agentDirectorySnapshot: Record<string, AgentState> | null = null;
+
+function readAgentDirectory(): Record<string, AgentState> {
+  const next = useStore.getState().agents;
+  if (agentDirectorySnapshot && agentDirectoryUnchanged(agentDirectorySnapshot, next)) {
+    return agentDirectorySnapshot;
+  }
+  agentDirectorySnapshot = next;
+  return next;
+}
+
+function subscribeAgentDirectory(onChange: () => void): () => void {
+  return useStore.subscribe(() => {
+    const next = useStore.getState().agents;
+    if (agentDirectorySnapshot && agentDirectoryUnchanged(agentDirectorySnapshot, next)) return;
+    agentDirectorySnapshot = next;
+    onChange();
+  });
+}
 
 /** Read the persisted locale from localStorage and apply it. Call ONCE on mount
  * from a top-level client component — never during render or SSR. */

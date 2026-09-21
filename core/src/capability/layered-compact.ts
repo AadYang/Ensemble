@@ -350,6 +350,7 @@ export async function summarizeLayered(opts: LayeredCompactOpts): Promise<Layere
       toSeq: chunk.toSeq,
       count: chunk.count,
     });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const layer: CompactLayer = {
       level,
       index: chunk.index,
@@ -391,6 +392,7 @@ export async function summarizeLayered(opts: LayeredCompactOpts): Promise<Layere
         toSeq,
         count,
       }), { level, index, fromSeq, toSeq, count });
+      await new Promise<void>((resolve) => setImmediate(resolve));
       const layer: CompactLayer = {
         level,
         index,

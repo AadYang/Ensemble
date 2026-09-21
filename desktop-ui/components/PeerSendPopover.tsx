@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import type { AgentSummary, PeerMode } from "@agentorch/shared";
 import { peerContactAllowed, peerIdentityFromSummary } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
-import { useStore } from "@/store/agents";
+import { useAgentDirectory, useStore } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 
 const PEER_MODE_OPTIONS: PeerMode[] = ["raw", "continue", "review", "fork"];
@@ -18,7 +18,7 @@ export function PeerSendPopover({
   onClose: () => void;
 }) {
   const t = useT();
-  const agents = useStore((s) => s.agents);
+  const agents = useAgentDirectory();
   const appendUserTurn = useStore((s) => s.appendUserTurn);
   const fromAgent = agents[fromAgentId];
 

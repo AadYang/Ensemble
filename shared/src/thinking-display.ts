@@ -74,3 +74,31 @@ export function thinkingTokensEstimate(msg: unknown): number | null {
   const n = rec.estimated_tokens;
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : null;
 }
+
+const LIVE_PANE_STATUSES = new Set(["running", "awaiting_permission", "awaiting_user_input"]);
+
+/** After cancel the pane is idle, but the WS buffer can still hold thinking_tokens
+ *  heartbeats and assistant snapshots from the killed turn. Only the interrupted
+ *  notice should land; everything else would look like the model kept going. */
+export function admitLivePaneMessage(
+  status: string | undefined,
+  msg: { type?: unknown; subtype?: unknown },
+): boolean {
+  if (status && LIVE_PANE_STATUSES.has(status)) return true;
+  return msg.type === "system" && msg.subtype === "interrupted_turn";
+}
+
+/** Streaming thinking can be tens of thousands of characters. Keep the live
+ *  DOM to a tail; the store still holds the full string and a finished row
+ *  renders once. */
+export const THINKING_DOM_TAIL_CHARS = 8_000;
+
+export function thinkingDomText(
+  text: string,
+  streaming: boolean,
+): { omitted: number; body: string } {
+  if (!streaming || text.length <= THINKING_DOM_TAIL_CHARS) {
+    return { omitted: 0, body: text };
+  }
+  return { omitted: text.length - THINKING_DOM_TAIL_CHARS, body: text.slice(-THINKING_DOM_TAIL_CHARS) };
+}

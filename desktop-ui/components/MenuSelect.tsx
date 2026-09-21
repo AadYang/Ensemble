@@ -81,43 +81,53 @@ export function MenuSelect({
 
   const menu =
     open && anchor ? (
-      <div
-        ref={menuRef}
-        role="listbox"
-        style={{ top: anchor.top, left: anchor.left, width: Math.max(anchor.width, 160) }}
-        className="fixed z-[10050] max-h-48 overflow-y-auto border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl shadow-black/50 text-xs"
-      >
-        {items.length === 0 && (
-          <div className="px-1.5 py-1 text-[var(--text-faint)]">{placeholder}</div>
-        )}
-        {groups.map((g, gi) => (
-          <div key={g.name ?? `g${gi}`}>
-            {g.name && (
-              <div className="px-1.5 py-0.5 text-[10px] tracking-wider text-[var(--text-faint)]">
-                {g.name}
-              </div>
-            )}
-            {g.items.map((item) => (
-              <button
-                key={item.value}
-                type="button"
-                role="option"
-                aria-selected={item.value === value}
-                onClick={() => {
-                  onChange(item.value);
-                  setOpen(false);
-                }}
-                className={
-                  "w-full text-left px-1.5 py-1 hover:bg-[var(--bg-pane)] hover:text-[var(--accent)] " +
-                  (item.value === value ? "text-[var(--accent)]" : "text-[var(--text)]")
-                }
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        ))}
-      </div>
+      <>
+        <div
+          className="fixed inset-0 z-[10049]"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setOpen(false);
+          }}
+        />
+        <div
+          ref={menuRef}
+          role="listbox"
+          style={{ top: anchor.top, left: anchor.left, width: Math.max(anchor.width, 160) }}
+          className="fixed z-[10050] max-h-48 overflow-y-auto border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl shadow-black/50 text-xs"
+        >
+          {items.length === 0 && (
+            <div className="px-1.5 py-1 text-[var(--text-faint)]">{placeholder}</div>
+          )}
+          {groups.map((g, gi) => (
+            <div key={g.name ?? `g${gi}`}>
+              {g.name && (
+                <div className="px-1.5 py-0.5 text-[10px] tracking-wider text-[var(--text-faint)]">
+                  {g.name}
+                </div>
+              )}
+              {g.items.map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  role="option"
+                  aria-selected={item.value === value}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    onChange(item.value);
+                    setOpen(false);
+                  }}
+                  className={
+                    "w-full text-left px-1.5 py-1 hover:bg-[var(--bg-pane)] hover:text-[var(--accent)] " +
+                    (item.value === value ? "text-[var(--accent)]" : "text-[var(--text)]")
+                  }
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      </>
     ) : null;
 
   return (

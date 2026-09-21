@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  admitLivePaneMessage,
   streamDisplayDeltaFromSdkMessage,
+  THINKING_DOM_TAIL_CHARS,
+  thinkingDomText,
   thinkingTextFromContentBlocks,
   thinkingTokensEstimate,
 } from "./thinking-display.js";
@@ -68,6 +71,16 @@ describe("thinkingTokensEstimate", () => {
   });
 });
 
+describe("admitLivePaneMessage", () => {
+  it("drops thinking and answer traffic once the pane is no longer live", () => {
+    expect(admitLivePaneMessage("idle", { type: "stream_event" })).toBe(false);
+    expect(admitLivePaneMessage("done", { type: "system", subtype: "thinking_tokens" })).toBe(false);
+    expect(admitLivePaneMessage("idle", { type: "assistant" })).toBe(false);
+    expect(admitLivePaneMessage("running", { type: "stream_event" })).toBe(true);
+    expect(admitLivePaneMessage("idle", { type: "system", subtype: "interrupted_turn" })).toBe(true);
+  });
+});
+
 describe("thinkingTextFromContentBlocks", () => {
   it("reads Anthropic thinking blocks and ignores answer text", () => {
     expect(
@@ -77,5 +90,20 @@ describe("thinkingTextFromContentBlocks", () => {
         { type: "thinking", text: " then B" },
       ]),
     ).toBe("plan A then B");
+  });
+});
+
+describe("thinkingDomText", () => {
+  it("returns the full body when not streaming", () => {
+    const text = "x".repeat(THINKING_DOM_TAIL_CHARS + 50);
+    expect(thinkingDomText(text, false)).toEqual({ omitted: 0, body: text });
+  });
+
+  it("keeps only the tail while streaming a long thought", () => {
+    const text = "head-" + "y".repeat(THINKING_DOM_TAIL_CHARS);
+    const out = thinkingDomText(text, true);
+    expect(out.omitted).toBe(5);
+    expect(out.body).toBe(text.slice(-THINKING_DOM_TAIL_CHARS));
+    expect(out.body.startsWith("head-")).toBe(false);
   });
 });

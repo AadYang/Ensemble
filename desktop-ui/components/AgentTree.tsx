@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { AgentSummary, TeamSummary } from "@agentorch/shared";
-import { useStore, type AgentState } from "@/store/agents";
+import { useAgentDirectory, useStore, type AgentState } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { AgentSettings } from "./AgentSettings";
 import { AddTeamMemberDialog } from "./AddTeamMemberDialog";
@@ -65,7 +65,7 @@ export function AgentTree({
   activeId: string | null;
   boundAgentIds: ReadonlySet<string>;
 }) {
-  const agents = useStore((s) => s.agents);
+  const agents = useAgentDirectory();
   const teams = useStore((s) => s.teams);
   const grouped = useMemo(() => groupAgents(agents, teams), [agents, teams]);
   const t = useT();

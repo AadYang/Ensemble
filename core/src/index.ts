@@ -1403,11 +1403,12 @@ fastify.get("/agents", async () => {
   return rows.map(agentRowToSummary);
 });
 
-fastify.get<{ Params: { id: string }; Querystring: { limit?: string; afterSeq?: string } }>(
+fastify.get<{ Params: { id: string }; Querystring: { limit?: string; afterSeq?: string; beforeSeq?: string } }>(
   "/agents/:id/messages",
   async (req) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 200) || 200));
     const afterSeq = Number(req.query.afterSeq);
+    const beforeSeq = Number(req.query.beforeSeq);
     if (Number.isFinite(afterSeq)) {
       const rows = sqliteDb
         .prepare(
@@ -1418,6 +1419,27 @@ fastify.get<{ Params: { id: string }; Querystring: { limit?: string; afterSeq?: 
            LIMIT ?`,
         )
         .all(req.params.id, afterSeq, limit) as Array<{ seq: number; payload: string }>;
+      return rows.map((r) => {
+        let msg: unknown = null;
+        try {
+          msg = JSON.parse(r.payload);
+        } catch {
+          msg = null;
+        }
+        return { seq: r.seq, msg };
+      });
+    }
+    if (Number.isFinite(beforeSeq)) {
+      const rows = sqliteDb
+        .prepare(
+          `SELECT seq, payload
+           FROM Message
+           WHERE agentId = ? AND seq < ?
+           ORDER BY seq DESC
+           LIMIT ?`,
+        )
+        .all(req.params.id, beforeSeq, limit) as Array<{ seq: number; payload: string }>;
+      rows.reverse();
       return rows.map((r) => {
         let msg: unknown = null;
         try {
