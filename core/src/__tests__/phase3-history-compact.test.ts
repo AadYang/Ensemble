@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  LOCAL_REBUILD_CHAT_TAIL_TOKENS,
   makeTokenMeasurer,
   resolveHistoryBudget,
   unavailablePlanHistory,
@@ -112,6 +113,27 @@ describe("gate 1: a marker past the old 18 000-char limit is reachable, with a b
     expect(outcome.history.diagnostics.join("\n")).toContain("do not fit the budget");
     // What DID fit is the newest content.
     expect(outcome.included.at(-1)!.seq).toBe(39);
+  });
+
+  it("does not tokenizer-count overflow turns once the budget is full", () => {
+    const measure = vi.fn((t: string) => Math.ceil(t.length / 4));
+    const turns = Array.from({ length: 40 }, (_, i) => ({
+      seq: i,
+      kind: "user" as const,
+      text: `turn ${i} ${"x".repeat(2_000)}`,
+    }));
+    const outcome = resolveHistoryBudget({
+      turns,
+      systemPrompt: null,
+      toolsText: null,
+      context: ctx({ effectiveWindow: 20_000 }),
+      strategy: "local-rebuild",
+      strategyReason: "test",
+      measure,
+    });
+    expect(outcome.history.counts.dropped).toBeGreaterThan(0);
+    expect(measure.mock.calls.length).toBeLessThan(turns.length);
+    expect(outcome.history.diagnostics.join("\n")).toContain("were not tokenizer-counted");
   });
 });
 
@@ -537,8 +559,8 @@ describe("gate 5: an unmeasurable tokenizer is reported, never silently zero", (
       turns: Array.from({ length: 500 }, (_, i) => ({ seq: i, kind: "user" as const, text: "x".repeat(500) })),
       systemPrompt: null,
       toolsText: null,
-      context: ctx({ effectiveWindow: null, advertisedContextWindow: 1_000_000 }),
-      strategy: "local-rebuild",
+      context: ctx({ effectiveWindow: null, requestedRuntimeWindow: null, advertisedContextWindow: 1_000_000 }),
+      strategy: "runtime-session",
       strategyReason: "test",
       measure: (t) => Math.ceil(t.length / 4),
     });
@@ -546,6 +568,62 @@ describe("gate 5: an unmeasurable tokenizer is reported, never silently zero", (
     expect(outcome.history.counts.dropped).toBe(0);
     expect(outcome.history.counts.included).toBe(500);
     expect(outcome.history.diagnostics.join("\n")).toContain("nothing was dropped on a guess");
+    expect(outcome.history.diagnostics.join("\n")).not.toContain("window 1000000");
+  });
+
+  it("local-rebuild keeps pinned summaries plus a recent chat tail, without overflow compact", () => {
+    const turns = [
+      {
+        seq: 0,
+        kind: "summary" as const,
+        text: "PINNED_SUMMARY_TEXT",
+        pinned: true,
+        covers: 10,
+      },
+      ...Array.from({ length: 80 }, (_, i) => ({
+        seq: i + 1,
+        kind: "user" as const,
+        text: `turn ${i + 1} ${"x".repeat(2_000)}`,
+      })),
+    ];
+    const outcome = resolveHistoryBudget({
+      turns,
+      systemPrompt: null,
+      toolsText: null,
+      context: ctx({ effectiveWindow: 1_000_000, advertisedContextWindow: 1_000_000 }),
+      strategy: "local-rebuild",
+      strategyReason: "test",
+      measure: (t) => Math.ceil(t.length / 4),
+    });
+    expect(outcome.history.overflow).toBeNull();
+    expect(outcome.history.counts.dropped).toBeGreaterThan(0);
+    expect(outcome.included.some((t) => t.text.includes("PINNED_SUMMARY_TEXT"))).toBe(true);
+    expect(outcome.included.at(-1)!.seq).toBe(80);
+    expect(outcome.included.some((t) => t.seq === 1)).toBe(false);
+    const chatTokens = outcome.included
+      .filter((t) => !t.pinned)
+      .reduce((n, t) => n + Math.ceil(t.text.length / 4), 0);
+    expect(chatTokens).toBeLessThanOrEqual(LOCAL_REBUILD_CHAT_TAIL_TOKENS);
+    expect(outcome.history.diagnostics.join("\n")).toContain("conversation_search");
+  });
+
+  it("caps local-rebuild by the declared runtime window when the live ceiling is unknown", () => {
+    const outcome = resolveHistoryBudget({
+      turns: Array.from({ length: 40 }, (_, i) => ({
+        seq: i,
+        kind: "user" as const,
+        text: `turn ${i} ${"x".repeat(2_000)}`,
+      })),
+      systemPrompt: null,
+      toolsText: null,
+      context: ctx({ effectiveWindow: null, requestedRuntimeWindow: 20_000, advertisedContextWindow: 1_000_000 }),
+      strategy: "local-rebuild",
+      strategyReason: "test",
+      measure: (t) => Math.ceil(t.length / 4),
+    });
+    expect(outcome.history.tokenBudget).not.toBeNull();
+    expect(outcome.history.counts.dropped).toBeGreaterThan(0);
+    expect(outcome.history.diagnostics.join("\n")).toContain("declared runtime window of 20000");
     expect(outcome.history.diagnostics.join("\n")).not.toContain("window 1000000");
   });
 });

@@ -61,6 +61,22 @@ describe("claude: the child handle is really held", () => {
     expect(makeClaudeSpawner(null)).toBeNull();
   });
 
+  it("still holds a child handle when cancel must work without a liveness reporter", async () => {
+    const ac = new AbortController();
+    const observer = makeClaudeSpawner(null, ac.signal);
+    expect(observer).not.toBeNull();
+    const proc = observer!.spawner({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: process.cwd(),
+      env: {},
+    } as never);
+    expect(observer!.probe()).toBe("alive");
+    ac.abort();
+    await new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+    expect(observer!.probe()).toBe("dead");
+  });
+
   it("reports the child it spawned, and answers from its handle", async () => {
     const { reporter, events, probe } = recordingReporter();
     const observer = makeClaudeSpawner(reporter)!;

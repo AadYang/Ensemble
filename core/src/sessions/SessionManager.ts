@@ -31,6 +31,7 @@ import {
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
   reportedContextWindowFromResult,
+  estimateStreamTokens,
   shouldEncodeLiveStreamOccupancy,
   shouldPublishLiveContext,
 } from "../context-usage.js";
@@ -193,6 +194,7 @@ import {
   windowFractionBudget,
   type HistoryTurn,
 } from "../capability/history-budget.js";
+import { chatTextForLocalRebuild } from "./local-rebuild-prompt.js";
 import type { RunPlanHistoryStrategy } from "@agentorch/shared";
 import {
   resolveServerConversation,
@@ -205,6 +207,7 @@ import {
 import { summarizeLayered, type CompactSourceTurn } from "../capability/layered-compact.js";
 import type { WebSocket } from "@fastify/websocket";
 import type { WSHub } from "../ws/hub.js";
+import { createStreamEventWsBatcher } from "../ws/stream-event-batch.js";
 import { CLI_INSTALL_INFO, getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
 import { ensureDataDir } from "../paths.js";
 import {
@@ -273,6 +276,11 @@ const flushVisibleState = (): Promise<void> =>
   new Promise((resolve) => {
     setImmediate(resolve);
   });
+/** `await` of a resolved async return only drains microtasks. Fastify WS/HTTP
+ *  sit in the poll phase — without setImmediate, create_agent waits behind
+ *  every thinking delta. */
+const EVENT_LOOP_YIELD_EVERY_N = 8;
+const EVENT_LOOP_YIELD_MIN_MS = 16;
 
 function readPositiveMs(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
@@ -1043,7 +1051,9 @@ function runtimeHistoryTurns(
   for (const row of rows) {
     const message = rowToRuntimeHistoryMessage(row);
     if (!message) continue;
-    out.push({ turn: historyTurnForRow(row, message), message });
+    const turn = historyTurnForRow(row, message);
+    if (!turn.pinned && !turn.text.trim()) continue;
+    out.push({ turn, message });
   }
   return out;
 }
@@ -1208,6 +1218,11 @@ function supportsServerConversationFor(plan: ResolvedRunPlan): boolean {
   );
 }
 
+function isPromptTooLongResult(msg: { type?: string; is_error?: unknown; result?: unknown }): boolean {
+  if (msg.type !== "result" || msg.is_error !== true) return false;
+  return typeof msg.result === "string" && /prompt is too long/i.test(msg.result);
+}
+
 /** Why the turn is using the strategy it is. Printed by /status verbatim, so a
  *  reader can tell a genuine native session from a local rebuild. */
 function historyStrategyReasonFor(args: {
@@ -1273,14 +1288,7 @@ function compactRangeOf(payload: unknown): {
 }
 
 function runtimeHistoryMessageText(msg: SdkMessage): string {
-  if (msg.type === "user") {
-    const content = (msg as { message?: { content?: unknown } }).message?.content;
-    return typeof content === "string" ? content : "";
-  }
-  if (msg.type === "assistant") {
-    return assistantTextFromMessage(msg);
-  }
-  return "";
+  return chatTextForLocalRebuild(msg)?.text ?? "";
 }
 
 function messageRowText(row: { type: string; payload: unknown }): string {
@@ -1420,6 +1428,9 @@ export class SessionManager {
   private drainingQueues = new Map<string, string>();
   private pendingDrainOptions = new Map<string, DrainQueuedOptions>();
   private liveTranscripts = new Map<string, LiveTranscript>();
+  private readonly streamWs = createStreamEventWsBatcher({
+    send: (sessionId, payload) => this.hub.sendToSession(sessionId, payload),
+  });
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
   private contextUsageByAgent = new Map<string, ContextUsage>();
@@ -1490,6 +1501,7 @@ export class SessionManager {
    *  `recoverOrphans` is what says so — writing `completed` here would make a
    *  killed process indistinguishable from a turn that produced its result. */
   dispose(): void {
+    this.streamWs.flushAll();
     this.liveness.stop();
   }
 
@@ -4568,7 +4580,7 @@ export class SessionManager {
 
   private flushPendingStreamOccupancy(live: LiveContextState): void {
     if (!live.pendingStreamText) return;
-    live.streamedTokens += countTokens(live.model, live.pendingStreamText);
+    live.streamedTokens += estimateStreamTokens(live.pendingStreamText.length);
     live.pendingStreamText = "";
   }
 
@@ -4816,6 +4828,7 @@ export class SessionManager {
     let usedResumeSessionId: string | null = null;
     let usedServerConversationId: string | null = null;
     let resumeInvalidReasonForRun: string | null = null;
+    let promptTooLong = false;
     let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
     let autoRecoveryPromise: Promise<{ finalText: string } | null> | null = null;
     // Declared outside the try so the detached-subagent notification in the
@@ -5291,16 +5304,18 @@ export class SessionManager {
       // must NOT also be left in `systemPrompt`, which is how the same skill
       // bodies used to be sent twice in one turn.
       const tailRole = teamContext || base;
-      // lastSessionId is only a native session for runtimes that actually
-      // resume one (official Claude CLI / Codex thread). OpenAI HTTP mints a
-      // fresh UUID every turn; third-party anthropic-compat (DeepSeek etc.)
-      // goes through Claude CLI but does not keep a Claude session file the
-      // next turn can resume. Treating either as `runtime-session` hands the
-      // model an empty history, which is how those agents forgot the previous turn.
+      // Claude CLI keeps a session file for official OAuth and for third-party
+      // Anthropic-compat (DeepSeek etc.). OpenAI HTTP mints a fresh UUID every
+      // turn — that UUID is not a CLI session. Lumping compat in with OpenAI
+      // forced a local-rebuild of the whole transcript into one new prompt;
+      // CLI compact then failed (`too_few_groups`) and the API returned
+      // "Prompt is too long".
       const nativeSessionRuntime =
         turnPlan.identity.runtime === "codex" ||
         (turnPlan.identity.runtime === "claude" &&
-          (!resolvedProvider || resolvedProvider.kind === "anthropic-local"));
+          (!resolvedProvider ||
+            resolvedProvider.kind === "anthropic-local" ||
+            resolvedProvider.kind === "anthropic"));
       const resumed = nativeSessionRuntime && effectiveLastSessionId !== null;
       const promptParts = [
         primer,
@@ -5695,13 +5710,19 @@ export class SessionManager {
       let liveBackgroundTaskIds = new Set<string>();
       const detachedBackgroundTaskIds = new Set<string>();
       let lastEventLoopYieldAt = 0;
+      let eventsSinceYield = 0;
       const yieldEventLoop = async (): Promise<void> => {
+        eventsSinceYield++;
         const now = Date.now();
-        if (now - lastEventLoopYieldAt < 50) return;
+        if (eventsSinceYield < EVENT_LOOP_YIELD_EVERY_N && now - lastEventLoopYieldAt < EVENT_LOOP_YIELD_MIN_MS) {
+          return;
+        }
+        eventsSinceYield = 0;
         lastEventLoopYieldAt = now;
         await flushVisibleState();
       };
       for await (const event of stream) {
+        if (abort.signal.aborted || !this.isRunOwner(sessionId, runId)) break;
         // Every runtime event is proof of life on the model AND on the wire —
         // this is the signal that used to be an idle-timer reset, which had only
         // the power to POSTPONE a kill. It now has the power to END the
@@ -5719,7 +5740,6 @@ export class SessionManager {
           console.log(`[sendMessage] first SDK msg type=${msg.type}`);
           firstMsg = false;
         }
-        if (abort.signal.aborted) break;
 
         // Capture SDK session_id from the first message that exposes one,
         // so the next sendMessage can resume the conversation context.
@@ -5733,7 +5753,9 @@ export class SessionManager {
           // (the API streams pings, not thinking_delta). Broadcast it so
           // the pane can show "thinking…" instead of looking idle; do not
           // persist — it is a heartbeat, not resume context.
+          this.streamWs.flush(sessionId);
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
+          await yieldEventLoop();
           continue;
         }
 
@@ -5741,8 +5763,9 @@ export class SessionManager {
 
         if (msg.type === "stream_event") {
           this.noteLiveStreamOccupancy(sessionId, msg);
-          this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
+          this.streamWs.push(sessionId, msg);
           await yieldEventLoop();
+          if (abort.signal.aborted || !this.isRunOwner(sessionId, runId)) break;
           continue;
         }
 
@@ -5812,6 +5835,7 @@ export class SessionManager {
 
         let persisted: DbMessage;
         try {
+          this.streamWs.flush(sessionId);
           persisted = await prisma.message.create({
             data: {
               agentId: sessionId,
@@ -5832,6 +5856,7 @@ export class SessionManager {
           const activeRun = this.running.get(sessionId);
           if (activeRun?.runId === runId) activeRun.sawResult = true;
           this.liveness.noteResultSeen(runId);
+          if (isPromptTooLongResult(msg)) promptTooLong = true;
           latestCodexUsageSnapshot = normalizeCodexUsageSnapshot(
             (msg as { _codexUsageSnapshot?: unknown })._codexUsageSnapshot,
           );
@@ -5986,7 +6011,7 @@ export class SessionManager {
       }
       if (!opts?.suppressRuntimeMetadata) {
         const metaPatch: Record<string, unknown> = {};
-        if (capturedSessionId && capturedSessionId !== effectiveLastSessionId) {
+        if (!promptTooLong && capturedSessionId && capturedSessionId !== effectiveLastSessionId) {
           metaPatch.lastSessionId = capturedSessionId;
         }
         // Always persist the current promptHash on success so the next turn can
@@ -6002,11 +6027,12 @@ export class SessionManager {
         }
         if (
           resumeInvalidReasonForRun !== null ||
+          promptTooLong ||
           Object.keys(metaPatch).length > 0 ||
           serverResponseIdFromResult !== null
         ) {
           const baseMetadata =
-            resumeInvalidReasonForRun !== null
+            resumeInvalidReasonForRun !== null || promptTooLong
               ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
               : agent.metadata;
           let nextMetadata = mergeMetadata(baseMetadata, metaPatch);
@@ -6226,6 +6252,7 @@ export class SessionManager {
         console.log(`[sendMessage] run=${runId.slice(0, 8)} error post-cancel; skipping DB update`);
       }
     } finally {
+      this.streamWs.flush(sessionId);
       // Only clear state if we're still the owner. After cancel() the entry
       // is gone; a brand-new sendMessage could already have set its own entry.
       // Without this guard a wedged old run's finally would corrupt the new run.

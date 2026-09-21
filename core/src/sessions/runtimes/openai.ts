@@ -47,6 +47,7 @@ import {
 } from "../tools/index.js";
 import type { AnyNormalizedTool } from "../tools/types.js";
 import { toOpenAIMcpServers, connectAll, closeAll } from "./mcp-adapter.js";
+import { chatTextForLocalRebuild } from "../local-rebuild-prompt.js";
 import { countTokens, countTokensMany } from "../../local-tokenizer.js";
 import { rejectWhenAborted, takeUntilAbort } from "../abort-iterable.js";
 
@@ -419,21 +420,13 @@ async function* runTurnOnce(
     const inputTextsForLocal: string[] = [];
     if (opts.systemPrompt) inputTextsForLocal.push(opts.systemPrompt);
     for (const m of opts.history) {
-      if (m.type === "user") {
-        const c = extractUserText(m);
-        if (c) inputTextsForLocal.push(c);
-      } else if (m.type === "assistant") {
-        const blocks =
-          (m as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content ?? [];
-        for (const b of blocks) {
-          if (b.type === "text" && typeof b.text === "string" && b.text) {
-            inputTextsForLocal.push(b.text);
-          }
-        }
-      }
+      const row = chatTextForLocalRebuild(m);
+      if (row) inputTextsForLocal.push(row.text);
     }
     inputTextsForLocal.push(opts.prompt);
-    const inputTokensLocal = countTokensMany(opts.model, inputTextsForLocal);
+    const auditChars = inputTextsForLocal.reduce((n, t) => n + t.length, 0);
+    const inputTokensLocal =
+      auditChars > 80_000 ? 0 : countTokensMany(opts.model, inputTextsForLocal);
 
     let finalText = "";
     let thinkingText = "";
@@ -846,17 +839,9 @@ export function buildInputItems(
   if (args.continueFrom) return [user(opts.prompt)];
   const items: AgentInputItem[] = [];
   for (const m of opts.history) {
-    if (m.type === "user") {
-      const text = extractUserText(m);
-      if (text) items.push(user(text));
-    } else if (m.type === "assistant") {
-      const blocks = (m as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content ?? [];
-      const text = blocks
-        .filter((b) => b.type === "text" && typeof b.text === "string")
-        .map((b) => b.text!)
-        .join("");
-      if (text) items.push(assistant(text));
-    }
+    const row = chatTextForLocalRebuild(m);
+    if (!row) continue;
+    items.push(row.role === "user" ? user(row.text) : assistant(row.text));
   }
   items.push(user(opts.prompt));
   return items;
@@ -901,15 +886,6 @@ export function makeApprovalLoopTracker(limit = REPEATED_APPROVAL_LIMIT): Approv
       return { key, count, loop: count >= limit };
     },
   };
-}
-
-function extractUserText(msg: { message?: unknown }): string {
-  // SessionManager persists user messages as { type: "user", message: { role, content } }
-  // where content is a string. Extract defensively in case shape evolves.
-  const m = msg.message as { content?: unknown } | undefined;
-  if (!m) return "";
-  if (typeof m.content === "string") return m.content;
-  return "";
 }
 
 /** W17.1: pull a final per-response usage record out of a

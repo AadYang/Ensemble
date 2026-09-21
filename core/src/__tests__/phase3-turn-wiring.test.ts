@@ -18,6 +18,7 @@ import type { RuntimeOptions } from "../sessions/runtimes/types.js";
 process.env.AGENTORCH_DB_PATH = ":memory:";
 
 const capturedRuntimeOptions: RuntimeOptions[] = [];
+const mockCtl = { promptTooLong: false };
 const MARKER = "PHASE3_SKILL_BODY_MARKER";
 
 vi.mock("../sessions/runtimes/index.js", async (importOriginal) => ({
@@ -25,6 +26,20 @@ vi.mock("../sessions/runtimes/index.js", async (importOriginal) => ({
   chooseRuntime: () => ({
     async *query(opts: RuntimeOptions) {
       capturedRuntimeOptions.push(opts);
+      if (mockCtl.promptTooLong) {
+        yield {
+          type: "sdk_message" as const,
+          payload: {
+            type: "result" as const,
+            subtype: "success",
+            is_error: true,
+            result: "Prompt is too long",
+            session_id: "too-long-session",
+            modelUsage: {},
+          },
+        };
+        return;
+      }
       yield {
         type: "sdk_message" as const,
         payload: {
@@ -66,6 +81,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   capturedRuntimeOptions.length = 0;
+  mockCtl.promptTooLong = false;
   projectRoot = mkdtempSync(join(tmpdir(), "phase3-wiring-"));
   mkdirSync(join(projectRoot, ".agents", "skills", "reviewer"), { recursive: true });
   writeFileSync(
@@ -414,7 +430,7 @@ describe("gate 6 (wiring): the runtime's history matches the plan's decision", (
     cleanup();
   });
 
-  it("anthropic-compat with a stored lastSessionId still rebuilds the transcript locally", async () => {
+  it("anthropic-compat with a stored lastSessionId resumes the Claude CLI session", async () => {
     const provider = await prisma.provider.create({
       data: {
         name: `p-${Math.random().toString(36).slice(2)}`,
@@ -465,10 +481,55 @@ describe("gate 6 (wiring): the runtime's history matches the plan's decision", (
 
     const opts = capturedRuntimeOptions[0]!;
     expect(opts.runPlan.identity.runtime).toBe("claude");
-    expect(opts.resume).toBeUndefined();
-    expect(opts.runPlan.history.strategy).toBe("local-rebuild");
-    expect(JSON.stringify(opts.history)).toContain("question 1");
-    expect(opts.history.length).toBeGreaterThanOrEqual(6);
+    expect(opts.resume).toBe("4044724a-cd87-4c3f-8c0f-e43afc9a16a4");
+    expect(opts.runPlan.history.strategy).toBe("runtime-session");
+    expect(opts.history).toEqual([]);
+    cleanup();
+  });
+
+  it("does not keep a Prompt-is-too-long CLI session as the next resume pointer", async () => {
+    mockCtl.promptTooLong = true;
+    const provider = await prisma.provider.create({
+      data: {
+        name: `p-${Math.random().toString(36).slice(2)}`,
+        kind: "anthropic",
+        baseUrl: "https://api.deepseek.com/anthropic",
+        apiKey: "sk-test",
+        models: ["deepseek-flash"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: `a-${Math.random().toString(36).slice(2)}`,
+        providerId: provider.id,
+        model: "deepseek-flash",
+        projectRoot,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    const promptHash = hashStableSystemPrompt({
+      permissionMode: "default",
+      teamContext: "",
+      baseSystemPrompt: agent.systemPrompt ?? "",
+    });
+    await prisma.agent.update({
+      where: { id: agent.id },
+      data: {
+        metadata: {
+          lastSessionId: "4044724a-cd87-4c3f-8c0f-e43afc9a16a4",
+          systemPromptHash: promptHash,
+        },
+      },
+    });
+    const sessions = new SessionManager(new StubHub() as never);
+    await sessions.sendMessage(agent.id, "continue");
+    expect(capturedRuntimeOptions[0]?.resume).toBe("4044724a-cd87-4c3f-8c0f-e43afc9a16a4");
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<
+      string,
+      unknown
+    >;
+    expect(meta.lastSessionId).toBeUndefined();
     cleanup();
   });
 

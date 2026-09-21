@@ -20,7 +20,7 @@ import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sd
 import type { LivenessProbeKind, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOptions } from "./types.js";
 import { takeUntilAbort } from "../abort-iterable.js";
-import { promptTextFromMessage } from "../../context-usage.js";
+import { claudeLocalRebuildPrompt } from "../local-rebuild-prompt.js";
 
 /** Phase 4: spawn the Claude Code child ourselves, so the run has a PROCESS we
  *  can observe.
@@ -54,7 +54,7 @@ export function makeClaudeSpawner(
   spawner: (options: SpawnOptions) => SpawnedProcess;
   probe: () => LivenessProbeKind;
 } | null {
-  if (!liveness) return null;
+  if (!liveness && !abortSignal) return null;
   let started = false;
   let exited = false;
 
@@ -67,10 +67,10 @@ export function makeClaudeSpawner(
       windowsHide: true,
     });
     started = true;
-    liveness.childProcessStarted({ pid: proc.pid ?? null });
+    liveness?.childProcessStarted({ pid: proc.pid ?? null });
     proc.once("exit", (code, signal) => {
       exited = true;
-      liveness.childProcessExited({ pid: proc.pid ?? null, exitCode: code, signal: signal ?? null });
+      liveness?.childProcessExited({ pid: proc.pid ?? null, exitCode: code, signal: signal ?? null });
     });
     // A spawn failure means there is no live child, which is the same
     // observation as an exit as far as liveness goes — recorded as one, with no
@@ -78,7 +78,7 @@ export function makeClaudeSpawner(
     proc.once("error", () => {
       if (exited) return;
       exited = true;
-      liveness.childProcessExited({ pid: proc.pid ?? null, exitCode: null, signal: null });
+      liveness?.childProcessExited({ pid: proc.pid ?? null, exitCode: null, signal: null });
     });
     // The SDK's spawn `signal` fires only after a stdin-EOF graceful window.
     // User cancel must not wait for that: kill the tree the moment our
@@ -99,7 +99,7 @@ export function makeClaudeSpawner(
 }
 
 function killClaudeChildTree(child: ChildProcess): void {
-  if (child.killed || child.exitCode !== null) return;
+  if (child.exitCode !== null) return;
   if (process.platform === "win32" && typeof child.pid === "number") {
     try {
       execSync(`taskkill /F /T /PID ${child.pid}`, {
@@ -402,26 +402,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
 /** When the CLI is not resuming a session file, `opts.history` is the only
  *  prior context the model will see. The SDK `query()` prompt is a string, so
- *  the local-rebuild transcript has to ride in that string — leaving it in
- *  `history` unused is how DeepSeek-via-Claude-CLI forgot every previous turn. */
+ *  the working set has to ride in that string — leaving it in `history` unused
+ *  is how DeepSeek-via-Claude-CLI forgot every previous turn. SessionManager
+ *  already narrowed history to compact summaries plus recent chat. */
 export function claudePromptForTurn(opts: Pick<RuntimeOptions, "prompt" | "history" | "resume">): string {
   if (opts.resume || opts.history.length === 0) return opts.prompt;
-  const turns: string[] = [];
-  for (const msg of opts.history) {
-    const text = promptTextFromMessage(msg).trim();
-    if (!text) continue;
-    if (msg.type === "user") turns.push(`User:\n${text}`);
-    else if (msg.type === "assistant") turns.push(`Assistant:\n${text}`);
-  }
-  if (turns.length === 0) return opts.prompt;
-  return [
-    "This is an Ensemble pane transcript reconstructed from local history because no native Claude CLI session is being resumed.",
-    "The transcript is background only. The final <current-user-request> block is the active task for this turn.",
-    "",
-    turns.join("\n\n---\n\n"),
-    "",
-    "<current-user-request>",
-    opts.prompt,
-    "</current-user-request>",
-  ].join("\n");
+  return claudeLocalRebuildPrompt(opts.prompt, opts.history);
 }

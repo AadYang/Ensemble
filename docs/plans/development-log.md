@@ -4,13 +4,47 @@
 
 ---
 
+## 2026-09-21 · local-rebuild 工作集：摘要 + 最近对话，不灌全量
+
+**触发**：Claude local-rebuild 用 `promptTextFromMessage` 把 thinking / tool_use / tool_result 和整张 Message 表塞进一条 prompt。Jumpo 实测 budget 按「用户字符串 + 助手正文」只算 ~22 万字符，真正发出去接近 1950 万。全量只该给 UI 和 `conversation_search`。
+
+**改动**：三 runtime 共用 `chatTextForLocalRebuild`（只要用户字符串和助手 `text`）。local-rebuild 预算固定为 pinned compact 摘要 + 最近约 32k token 对话；裁掉的旧对话不走 overflow compact。有 CLI session 仍 resume，不抢 CLI 的 compact。安装包 0.0.49（同包含 anthropic-compat 恢复 CLI resume）。
+
+**留下的规则**：有全量不代表下一轮请求要用全量。官方 agent 上下文是 working set，不是 archive dump。
+
+---
+
+## 2026-09-21 · anthropic-compat 禁止 resume 导致 Prompt is too long
+
+**触发**：Jumpo工程师改供应商之前无法运行，CLI 合成「Prompt is too long」。
+
+**根因**：0.0.45 把第三方 Anthropic 口和 OpenAI HTTP UUID 一并禁止 resume。Claude CLI 其实给 DeepSeek 也留了 session 文件（同一 session 连 resume 数天、cache_read 上百万）。禁止后每轮新开 CLI，把本地历史塞进一条 prompt；compact 因 `too_few_groups` 失败，API `invalid_request`。
+
+**改动**：`kind=anthropic` 与 official Claude 一样 resume CLI session。OpenAI HTTP 仍不 resume。local-rebuild 在没有 live 窗口时用 `requestedRuntimeWindow` 做发送上限。API 回 Prompt is too long 时丢掉该次 session 指针，避免下一轮继续 resume 坏 session。
+
+**留下的规则**：Claude CLI 能握 session 就交给它。OpenAI 的 UUID 不是 CLI session。不要为了修失忆把 compat 的 resume 一起砍掉。
+
+---
+
+## 2026-09-21 · 思考期间交互卡死 P0–P2
+
+**触发**：墨水屏 DeepSeek high 按字 thinking 时，加成员超时、切换 agent、在另一个框打字都卡死。
+
+**根因**：sidecar 事件循环被一字 delta 占满；WebView 整表订阅 `agents` 导致每次 thinking flush 重绘整窗。超长会话一次拉全表、预算测量先 `map(measure)`。
+
+**改动**：P0 合批/真 yield + 目录订阅切断；P1 不可见 session 200ms 合批、流式 thinking DOM 只画尾 8k；P2 消息 `beforeSeq` 向前翻、预算测量早停、OpenAI 本地审计超 80k 跳过、分层 compact 层间 `setImmediate`。安装包 0.0.48。
+
+**留下的规则**：思考可见但不能拿整窗假死换一条会动的字。Fastify 在思考中仍须 200ms 内应答。未证实 P0–P2 仍 >200ms 前不加 worker / 第二 sidecar。
+
+---
+
 ## 2026-09-20 · `/compact` 交给 native CLI
 
 **触发**：墨水屏APP工程师点 `/compact` 对 3500+ 行本地 Message 做分层 `quickQuery`，DeepSeek high thinking 串行几十轮；同一会话里 Claude CLI 自己的 compact 很快。Ensemble 是编排层，不该抢 CLI 的活。
 
 **改动**：有 Claude / Codex `lastSessionId` 时 resume 后发 `/compact`，用 `compact_boundary` / `compact_result` / PostCompact 摘要同步活表进 `MessageArchive`，**保留** resume。OpenAI in-process 或 CLI 未真正 compact 时才走原来的本地分层摘要。
 
-**留下的规则**：能用 CLI 的 compact 就用 CLI；Ensemble 只同步面板与归档。anthropic-compat 的 turn 仍 local-rebuild（遗忘修复），但 compact 可以 resume CLI session。
+**留下的规则**：能用 CLI 的 compact 就用 CLI；Ensemble 只同步面板与归档。anthropic-compat 的 turn 有 CLI session 时同样 resume，不要把整表塞进一条新 prompt。
 
 ---
 

@@ -90,6 +90,33 @@ describe("buildInputItems", () => {
     expect(JSON.stringify(delta)).toContain("hello");
     expect(JSON.stringify(delta)).not.toContain("first");
   });
+
+  it("does not replay thinking or tool_result blobs", () => {
+    const rebuilt = buildInputItems({
+      ...optsFor(),
+      history: [
+        { type: "user", message: { role: "user", content: "first" } },
+        {
+          type: "assistant",
+          message: {
+            content: [
+              { type: "thinking", thinking: "hidden reasoning" },
+              { type: "text", text: "answer" },
+            ],
+          },
+        },
+        {
+          type: "user",
+          message: { role: "user", content: [{ type: "tool_result", content: "blob" }] },
+        },
+      ],
+    } as unknown as RuntimeOptions);
+    const text = JSON.stringify(rebuilt);
+    expect(text).toContain("first");
+    expect(text).toContain("answer");
+    expect(text).not.toContain("hidden reasoning");
+    expect(text).not.toContain("blob");
+  });
 });
 
 // ── the approval loop, observed instead of counted ────────────────────────

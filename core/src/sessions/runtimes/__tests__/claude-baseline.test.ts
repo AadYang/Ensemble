@@ -167,6 +167,37 @@ describe("ClaudeAgentRuntime baseline", () => {
     expect(prompt).toContain("existing env flag");
     expect(prompt).toContain("<current-user-request>");
     expect(prompt).toContain("hello");
+    expect(prompt).toContain("conversation_search");
+  });
+
+  it("does not dump thinking or tool results into a local-rebuild prompt", () => {
+    const prompt = claudePromptForTurn({
+      prompt: "continue",
+      resume: undefined,
+      history: [
+        { type: "user", message: { role: "user", content: "install the apk" } },
+        {
+          type: "assistant",
+          message: {
+            content: [
+              { type: "thinking", thinking: "long private chain of thought" },
+              { type: "text", text: "done" },
+            ],
+          },
+        },
+        {
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", content: "entire file body" }],
+          },
+        },
+      ],
+    });
+    expect(prompt).toContain("install the apk");
+    expect(prompt).toContain("done");
+    expect(prompt).not.toContain("long private chain of thought");
+    expect(prompt).not.toContain("entire file body");
   });
 
   it("does not duplicate history into the prompt when resuming a CLI session", async () => {

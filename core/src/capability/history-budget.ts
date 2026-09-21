@@ -9,9 +9,11 @@
 //   1. THE BUDGET COMES FROM THE WINDOW, not from a constant. The window is
 //      `plan.context` — the runtime's effective ceiling minus the output
 //      reservation minus what the system prompt and the tool schemas cost.
-//   2. NOTHING IS TRUNCATED MID-CONTENT. Content either fits verbatim, or it is
-//      covered by a ranged summary, or it is reported as overflow for the
-//      compact path to cover. There is no third, quieter outcome.
+//   2. NOTHING IS TRUNCATED MID-CONTENT. A turn either goes in whole, is left
+//      in the archive outside the working set, or is overflow for compact.
+//      local-rebuild's working set is compact summaries plus a recent chat
+//      tail — omitting older chat does not fire compact; conversation_search
+//      is how that archive is read. There is no silent mid-message clip.
 //   3. A NUMBER THAT COULD NOT BE MEASURED SAYS SO. When the local tokenizer is
 //      missing or returns 0 the count falls back to the UTF-8 byte length — an
 //      explicitly labelled conservative upper bound with a diagnostic — never
@@ -159,26 +161,54 @@ export function windowFractionBudget(
   return Math.max(0, Math.floor((window - (context.outputReserve ?? 0)) * fraction));
 }
 
+/** Verbatim chat kept on a local-rebuild, in addition to pinned compact
+ *  summaries. Older chat stays in the archive for conversation_search; it is
+ *  not replayed. Official agent context is a working set, not the whole table. */
+export const LOCAL_REBUILD_CHAT_TAIL_TOKENS = 32_000;
+
 /** Assemble the turn's context from the newest content backwards. */
 export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOutcome {
   const measurer = makeTokenMeasurer(req.measure);
   const diagnostics: string[] = [`history strategy: ${req.strategy} (${req.strategyReason})`];
 
-  const counts = req.turns.map((t) => measurer.count(t.text));
-  const totalTokens = counts.reduce((sum, n) => sum + n, 0);
+  const n = req.turns.length;
+  const counts: number[] = new Array(n);
+  const counted: boolean[] = new Array(n).fill(false);
+  const countAt = (i: number): number => {
+    if (counted[i]) return counts[i]!;
+    counts[i] = measurer.count(req.turns[i]!.text);
+    counted[i] = true;
+    return counts[i]!;
+  };
 
-  const window = req.context.effectiveWindow;
+  const liveWindow = req.context.effectiveWindow;
+  const declaredWindow =
+    req.strategy === "local-rebuild" ? req.context.requestedRuntimeWindow : null;
+  const window = liveWindow ?? declaredWindow;
   const systemTokens = req.systemPrompt ? measurer.count(req.systemPrompt) : 0;
   const toolTokens = req.toolsText ? measurer.count(req.toolsText) : 0;
   const turnTokens = req.turnPrompt ? measurer.count(req.turnPrompt) : 0;
 
   let tokenBudget: number | null = null;
   if (window === null) {
-    diagnostics.push(
-      "no context window was established for this route, so no history budget could be derived: " +
-        "nothing was dropped on a guess",
-    );
+    if (req.strategy === "local-rebuild") {
+      diagnostics.push(
+        "no context window was established for this route, so no model-window budget could be derived; " +
+          "local-rebuild still sends only compact summaries plus a recent chat tail",
+      );
+    } else {
+      diagnostics.push(
+        "no context window was established for this route, so no history budget could be derived: " +
+          "nothing was dropped on a guess",
+      );
+    }
   } else {
+    if (liveWindow === null && declaredWindow !== null) {
+      diagnostics.push(
+        `no live effective window; local-rebuild is capped by the declared runtime window of ${declaredWindow} ` +
+          "so the request is not sent unbounded",
+      );
+    }
     const reserve = req.context.outputReserve;
     if (reserve === null) {
       diagnostics.push("the output reservation is unknown for this route, so none was subtracted");
@@ -216,17 +246,18 @@ export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOu
   for (let i = 0; i < req.turns.length; i++) {
     if (!req.turns[i]!.pinned) continue;
     includedIndexes.add(i);
-    used += counts[i]!;
+    used += countAt(i);
   }
 
-  let firstExcluded = req.turns.length;
+  let firstExcluded = n;
   if (tokenBudget !== null) {
     const budget = Math.max(0, tokenBudget);
-    for (let i = req.turns.length - 1; i >= 0; i--) {
+    for (let i = n - 1; i >= 0; i--) {
       if (includedIndexes.has(i)) continue;
-      if (used + counts[i]! <= budget) {
+      const cost = countAt(i);
+      if (used + cost <= budget) {
         includedIndexes.add(i);
-        used += counts[i]!;
+        used += cost;
         continue;
       }
       // The cut is CONTIGUOUS: everything older than the first turn that did
@@ -237,15 +268,53 @@ export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOu
       firstExcluded = i + 1;
       break;
     }
-  } else if (tokenBudget === null) {
-    // No window: include everything and say so. Dropping content against an
-    // unknown ceiling would be a guess dressed as a limit.
-    for (let i = 0; i < req.turns.length; i++) includedIndexes.add(i);
-    used = totalTokens;
+  } else {
+    // No window: include everything at this step. local-rebuild still clips
+    // to a chat tail below; runtime-session does not send this transcript.
+    for (let i = 0; i < n; i++) {
+      if (includedIndexes.has(i)) continue;
+      includedIndexes.add(i);
+      used += countAt(i);
+    }
+  }
+
+  const includedAfterWindow = new Set(includedIndexes);
+
+  let tailOmitted = 0;
+  if (req.strategy === "local-rebuild") {
+    const tail =
+      tokenBudget !== null && tokenBudget > 0
+        ? Math.min(LOCAL_REBUILD_CHAT_TAIL_TOKENS, tokenBudget)
+        : LOCAL_REBUILD_CHAT_TAIL_TOKENS;
+    const clipped = clipLocalRebuildChatTail(req.turns, includedIndexes, countAt, tail);
+    used = clipped.used;
+    tailOmitted = clipped.omitted;
+    if (tailOmitted > 0) {
+      diagnostics.push(
+        `local-rebuild prompt is compact summaries plus a recent chat tail (≤${tail} tokens); ` +
+          `${tailOmitted} older chat turn(s) stay in the archive for conversation_search and were not sent`,
+      );
+    }
+  }
+
+  let estimatedOverflow = 0;
+  let totalTokens = 0;
+  for (let i = 0; i < n; i++) {
+    if (counted[i]) {
+      totalTokens += counts[i]!;
+    } else {
+      totalTokens += utf8TokenUpperBound(req.turns[i]!.text);
+      estimatedOverflow += 1;
+    }
+  }
+  if (estimatedOverflow > 0) {
+    diagnostics.push(
+      `${estimatedOverflow} older turn(s) were not tokenizer-counted; measuredTokens uses the UTF-8 byte upper bound for those`,
+    );
   }
 
   const included = req.turns.filter((_, i) => includedIndexes.has(i));
-  const excluded = req.turns.slice(0, firstExcluded).filter((_, i) => !includedIndexes.has(i));
+  const excluded = req.turns.filter((_, i) => !includedAfterWindow.has(i) && i < firstExcluded);
 
   const summaries: RunPlanHistorySummaryRef[] = [];
   let summarized = 0;
@@ -298,7 +367,7 @@ export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOu
   const overBudget = tokenBudget !== null && actualIncludedTokens > tokenBudget;
   if (tokenBudget !== null && overBudget) {
     const pinnedTokens = req.turns.reduce(
-      (sum, t, i) => (t.pinned && includedIndexes.has(i) ? sum + counts[i]! : sum),
+      (sum, t, i) => (t.pinned && includedIndexes.has(i) ? sum + countAt(i) : sum),
       0,
     );
     diagnostics.push(
@@ -329,7 +398,7 @@ export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOu
       counting: measurer.counting(),
       counts: {
         included: included.length,
-        dropped: excluded.length,
+        dropped: excluded.length + tailOmitted,
         summarized,
       },
       includedRanges,
@@ -338,4 +407,31 @@ export function resolveHistoryBudget(req: HistoryBudgetRequest): HistoryBudgetOu
       diagnostics,
     },
   };
+}
+
+function clipLocalRebuildChatTail(
+  turns: HistoryTurn[],
+  includedIndexes: Set<number>,
+  countAt: (i: number) => number,
+  tailTokens: number,
+): { used: number; omitted: number } {
+  const unpinnedNewestFirst: number[] = [];
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (!includedIndexes.has(i) || turns[i]!.pinned) continue;
+    unpinnedNewestFirst.push(i);
+  }
+  let tailUsed = 0;
+  const keep = new Set<number>();
+  for (const i of unpinnedNewestFirst) {
+    const cost = countAt(i);
+    if (keep.size === 0 || tailUsed + cost <= tailTokens) {
+      keep.add(i);
+      tailUsed += cost;
+      continue;
+    }
+    includedIndexes.delete(i);
+  }
+  let used = 0;
+  for (const i of includedIndexes) used += countAt(i);
+  return { used, omitted: unpinnedNewestFirst.length - keep.size };
 }

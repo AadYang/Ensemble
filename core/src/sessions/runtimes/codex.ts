@@ -25,6 +25,7 @@ import type { SdkMessage } from "@agentorch/shared";
 import { isReasoningToken, REASONING_SYNTAX_RULE } from "@agentorch/shared";
 import type { LivenessProbeKind } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeErrorEvent, RuntimeEvent, RuntimeOptions } from "./types.js";
+import { chatTextForLocalRebuild } from "../local-rebuild-prompt.js";
 
 /** The answer a Codex health check gives, from what this process can see.
  *
@@ -215,7 +216,7 @@ const DEFAULT_CODEX_SANDBOX: SandboxMode = "danger-full-access";
  *  because POSIX signals propagate to the foreground process group (codex
  *  is spawned as session leader in a process group). */
 export function killCodexChildTree(child: ChildProcess): void {
-  if (child.killed || child.exitCode !== null) return;
+  if (child.exitCode !== null) return;
   if (process.platform === "win32" && typeof child.pid === "number") {
     try {
       execSync(`taskkill /F /T /PID ${child.pid}`, {
@@ -1249,36 +1250,22 @@ function buildPromptWithHistory(opts: RuntimeOptions): string {
   const turns: string[] = [];
   if (opts.systemPrompt) turns.push(`System instructions:\n${opts.systemPrompt}`);
   for (const m of opts.history) {
-    if (m.type === "user") {
-      const text = extractUserText(m);
-      if (text) turns.push(`User:\n${text}`);
-    } else if (m.type === "assistant") {
-      const text = extractAssistantText(m);
-      if (text) turns.push(`Assistant:\n${text}`);
-    }
+    const row = chatTextForLocalRebuild(m);
+    if (!row) continue;
+    turns.push(`${row.role === "user" ? "User" : "Assistant"}:\n${row.text}`);
   }
   if (turns.length === 0) return buildCurrentTurnPrompt(opts.prompt);
   turns.push(buildCurrentTurnPrompt(opts.prompt));
   return [
-    "This is an Ensemble pane transcript reconstructed from local history because no safe native Codex thread id was available.",
+    "Working context reconstructed by Ensemble because no native Codex thread is being resumed.",
+    "This is compact summaries plus recent chat text only.",
+    "Thinking, tool calls, and tool results are not replayed; they remain in the archive.",
+    "Use conversation_search if you need an older detail.",
     "The transcript is background only. The final <current-user-request> block is the active task for this turn.",
     "Do not continue older tasks or peer handoffs from the transcript unless the current request explicitly asks for them.",
     "",
     turns.join("\n\n---\n\n"),
   ].join("\n");
-}
-
-function extractUserText(msg: { message?: unknown }): string {
-  const m = msg.message as { content?: unknown } | undefined;
-  return typeof m?.content === "string" ? m.content : "";
-}
-
-function extractAssistantText(msg: { message?: unknown }): string {
-  const blocks = (msg as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content ?? [];
-  return blocks
-    .filter((b) => b.type === "text" && typeof b.text === "string")
-    .map((b) => b.text!)
-    .join("");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
