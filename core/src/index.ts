@@ -57,10 +57,10 @@ import {
   savePricingOverride,
   type ModelPricing,
 } from "./pricing.js";
-import { execFileSync } from "node:child_process";
 import { mountMcpBridge, setBridgePort } from "./mcp-bridge.js";
 import { startTelemetry } from "./telemetry.js";
-import { getCliSettingsHealth, getClaudeCliPath, getCodexCliPath, setManualCliPath } from "./cli-config.js";
+import { getCliSettingsHealth, getClaudeCliPath, setManualCliPath } from "./cli-config.js";
+import { discoverCodexModels } from "./codex-model-catalog.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { runCodexStdioMcp } from "./codex-stdio-mcp.js";
 import { currentPlatformKey } from "./platform-key.js";
@@ -510,36 +510,10 @@ function currentProviderRuntime(meta: Record<string, unknown>): ProviderRuntimeM
 }
 
 // W20: discover codex models by parsing `codex debug models` JSON catalog
-// — the same catalog the codex TUI uses. Filters to api-supported + visible
-// rows, sorted by codex's own priority. Returns null if codex CLI missing
-// or output unparseable so callers can fall back gracefully (empty list +
-// UI banner already nudges the user to install / `codex login`).
-async function discoverCodexModels(): Promise<string[] | null> {
-  try {
-    const codexPath = await getCodexCliPath();
-    if (!codexPath) return null;
-    const out = execFileSync(codexPath, ["debug", "models"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000,
-    });
-    const parsed = JSON.parse(out) as {
-      models?: Array<{
-        slug?: string;
-        visibility?: string;
-        supported_in_api?: boolean;
-        priority?: number;
-      }>;
-    };
-    if (!Array.isArray(parsed.models)) return null;
-    return parsed.models
-      .filter((m) => m.visibility === "list" && m.supported_in_api === true && typeof m.slug === "string")
-      .sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999))
-      .map((m) => m.slug as string);
-  } catch {
-    return null;
-  }
-}
+// — the same catalog the codex TUI uses. Implementation lives in
+// `codex-model-catalog.ts` so a Windows npm shim / 5s timeout cannot
+// masquerade as "not installed / not logged in".
+
 
 // W24: discover Claude models by asking the local Claude Code CLI (via the
 // claude-agent-sdk) for its supported model list. Unlike the old hardcoded
@@ -799,7 +773,8 @@ async function refreshCodexHealth(): Promise<void> {
   // Re-discover the codex catalog once per startup so providers always
   // reflect the user's current ChatGPT tier. Also self-heals rows that an
   // earlier release accidentally filled with Anthropic defaults.
-  const discoveredModels = cliFound && authPresent ? await discoverCodexModels() : null;
+  const discovered = cliFound && authPresent ? await discoverCodexModels() : { ok: false as const, error: "" };
+  const discoveredModels = discovered.ok ? discovered.models : null;
 
   for (const p of rows) {
     const meta = (p.metadata && typeof p.metadata === "object" ? p.metadata : {}) as Record<string, unknown>;
@@ -962,7 +937,7 @@ fastify.post("/providers", async (req, reply) => {
       : autoManaged
         ? [data.name]
         : data.kind === "openai-codex"
-          ? (await discoverCodexModels() ?? [])
+          ? ((d) => (d.ok ? d.models : []))(await discoverCodexModels())
           : data.kind === "anthropic-local" || (data.kind === "anthropic" && !data.baseUrl)
             ? DEFAULT_ANTHROPIC_MODELS
             : [];
@@ -1125,19 +1100,21 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
     return { error: "not found" };
   }
   // W20: codex has no HTTP /v1/models — its catalog comes from the local
-  // `codex debug models` JSON. Route this BEFORE the !baseUrl fallback
-  // (codex always has null baseUrl) so the user doesn't get Anthropic
-  // defaults stuffed into a codex provider.
+  // `codex debug models` JSON (the CLI refreshes the remote catalog unless
+  // `--bundled`). Route this BEFORE the !baseUrl fallback (codex always has
+  // null baseUrl) so the user doesn't get Anthropic defaults stuffed into a
+  // codex provider. `fresh: true` waits for that live fetch; a cache hit is
+  // not a refresh.
   if (provider.kind === "openai-codex") {
-    const codexModels = await discoverCodexModels();
-    if (!codexModels) {
+    const discovered = await discoverCodexModels({ fresh: true });
+    if (!discovered.ok) {
       reply.code(502);
       return {
         error: "codex_models_unavailable",
-        message:
-          "could not discover codex models — verify `codex` CLI is installed and you've run `codex login`.",
+        message: `could not discover codex models — ${discovered.error}`,
       };
     }
+    const codexModels = discovered.models;
     const meta = (provider.metadata && typeof provider.metadata === "object" ? provider.metadata : {}) as Record<string, unknown>;
     const platformKey = currentPlatformKey();
     const runtimes = { ...providerRuntimes(meta) };
@@ -1150,7 +1127,7 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
     });
     return {
       ...sanitizeProvider(updated),
-      discovered: { count: codexModels.length, source: "codex debug models" },
+      discovered: { count: codexModels.length, source: discovered.source },
     };
   }
   // anthropic-local (or anthropic without baseUrl, the legacy default) — ask

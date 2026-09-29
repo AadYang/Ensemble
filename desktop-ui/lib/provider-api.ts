@@ -149,7 +149,10 @@ export interface RefreshResult extends ProviderDTO {
 }
 
 export async function refreshProviderModels(id: string): Promise<RefreshResult> {
-  const res = await apiFetch(`/api/providers/${id}/refresh-models`, { method: "POST" });
+  const res = await apiFetch(`/api/providers/${id}/refresh-models`, {
+    method: "POST",
+    signal: AbortSignal.timeout(35_000),
+  });
   if (!res.ok) {
     // Server returns 502 + {error, message, tried[]} when no URL yielded models.
     // Each tried entry has bodyHead — preserve it so the user can paste back

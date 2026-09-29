@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CLI_INSTALL_INFO, compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable } from "../cli-config.js";
+import { CLI_INSTALL_INFO, compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable, toSpawnableCliPath } from "../cli-config.js";
 
 describe("compareSemver", () => {
   it("returns 0 for identical versions", () => {
@@ -88,5 +88,22 @@ describe("resolveClaudeExecutable", () => {
     writeFileSync(native, "native");
 
     expect(resolveClaudeExecutable(shim)).toBe(native);
+  });
+});
+
+describe("toSpawnableCliPath", () => {
+  it("does not return an extensionless Windows npm shim", () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-codex-shim-"));
+    const npmRoot = join(root, "npm");
+    mkdirSync(npmRoot, { recursive: true });
+    const shim = join(npmRoot, "codex");
+    const cmd = join(npmRoot, "codex.cmd");
+    writeFileSync(shim, "#!/usr/bin/env node\n");
+    writeFileSync(cmd, "@echo off\n");
+    if (process.platform === "win32") {
+      expect(toSpawnableCliPath("codex", shim)).toBe(cmd);
+    } else {
+      expect(toSpawnableCliPath("codex", shim)).toBe(shim);
+    }
   });
 });

@@ -256,29 +256,35 @@ function detectCli(kind: CliKind, manualPath: string | null): CliHealth {
   };
 
   if (manualPath) {
-    if (existsSync(manualPath) && statSync(manualPath).isFile()) {
-      const resolved = resolveCliExecutable(kind, manualPath) ?? manualPath;
+    const resolved = toSpawnableCliPath(kind, manualPath);
+    if (resolved) {
       return decorateVersion({ ...base, found: true, path: resolved, source: resolved === manualPath ? "manual" : "vendor" });
     }
     return { ...base, found: false, path: null, source: "missing", error: `manual path not found: ${manualPath}` };
   }
 
   const envPath = kind === "codex" ? process.env.CODEX_PATH : process.env.CLAUDE_PATH;
-  if (envPath && existsSync(envPath) && statSync(envPath).isFile()) {
-    const resolved = resolveCliExecutable(kind, envPath) ?? envPath;
-    return decorateVersion({ ...base, found: true, path: resolved, source: resolved === envPath ? "env" : "vendor" });
+  if (envPath) {
+    const resolved = toSpawnableCliPath(kind, envPath);
+    if (resolved) {
+      return decorateVersion({ ...base, found: true, path: resolved, source: resolved === envPath ? "env" : "vendor" });
+    }
   }
 
   const fromPath = findOnPath(kind);
   if (fromPath) {
-    const resolved = resolveCliExecutable(kind, fromPath) ?? fromPath;
-    return decorateVersion({ ...base, found: true, path: resolved, source: resolved === fromPath ? "path" : "vendor" });
+    const resolved = toSpawnableCliPath(kind, fromPath);
+    if (resolved) {
+      return decorateVersion({ ...base, found: true, path: resolved, source: resolved === fromPath ? "path" : "vendor" });
+    }
   }
 
   const common = findCommonLocation(kind);
   if (common) {
-    const resolved = resolveCliExecutable(kind, common) ?? common;
-    return decorateVersion({ ...base, found: true, path: resolved, source: resolved === common ? "common-location" : "vendor" });
+    const resolved = toSpawnableCliPath(kind, common);
+    if (resolved) {
+      return decorateVersion({ ...base, found: true, path: resolved, source: resolved === common ? "common-location" : "vendor" });
+    }
   }
 
   return { ...base, found: false, path: null, source: "missing" };
@@ -513,6 +519,26 @@ export function resolveCodexExecutable(candidate: string): string | null {
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
+  }
+  return null;
+}
+
+function isSpawnableCliPath(path: string): boolean {
+  if (!existsSync(path) || !statSync(path).isFile()) return false;
+  if (process.platform !== "win32") return true;
+  return /\.(exe|cmd|bat)$/i.test(path);
+}
+
+/** Node cannot spawn the extensionless npm POSIX shim on Windows (`ENOENT`).
+ *  Walk to the vendor binary, then `.cmd` / `.exe` next to the shim. */
+export function toSpawnableCliPath(kind: CliKind, candidate: string | null | undefined): string | null {
+  if (!candidate) return null;
+  const resolved = resolveCliExecutable(kind, candidate) ?? candidate;
+  if (isSpawnableCliPath(resolved)) return resolved;
+  if (process.platform !== "win32") return existsSync(resolved) ? resolved : null;
+  for (const ext of [".exe", ".cmd", ".bat"] as const) {
+    const sibling = `${resolved}${ext}`;
+    if (existsSync(sibling) && statSync(sibling).isFile()) return sibling;
   }
   return null;
 }
