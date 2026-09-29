@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-09-22 · Codex 思考过程不可见
+
+**触发**：墨水屏经理 `gpt-5.6-sol` high 首字极慢、思考区空白。thread 里 117 条 reasoning 全是空 `summary[]` + `encrypted_content`，没有 `item.text`。
+
+**根因**：适配器只认 `item.text` 且等 `item.completed`。密文思考被丢掉；正文也不按 token 流。面板在整段 `agent_message` 完成前没有任何思考行。
+
+**改动**：`item.started` 无明文时发 `thinking_tokens` 心跳（「思考中 · N tokens」）；`summary[]` / `text` 才进思考区；`encrypted_content` 永不落聊天。isolated config + `-c` 固定 `model_reasoning_summary=auto`、`model_supports_reasoning_summaries=true`、`hide_agent_reasoning=false`。安装包 0.0.51。
+
+**留下的规则**：Codex 的加密 CoT 不是聊天文本。没摘要也要先占住思考行，不能让 high reasoning 看起来像卡死。
+
+---
+
+## 2026-09-23 · 刷新 Codex 模型列表误报未安装
+
+**触发**：供应商页刷新 Codex 模型，红字 `could not discover codex models — verify \`codex\` CLI is installed and you've run \`codex login\`.`。同一台机器对话仍能跑 gpt-5.6-sol。
+
+**根因**：发现走同步 `codex debug models`，5s 超时、Windows 无扩展名 npm shim 会 `ENOENT`，所有失败都吞掉后假装成没装 / 没 login。CLI 已经把同一份 catalog 写在 `~/.codex/models_cache.json`。
+
+**改动**：刷新按钮走 `discoverCodexModels({ fresh: true })`：异步 spawn 真实 `.exe/.cmd`，等 CLI 默认的远程 catalog 刷新（最多 30s），**不用** `models_cache.json` 冒充成功。健康检查仍可用缓存兜底。客户端 refresh 等到 35s。安装包 0.0.51。
+
+**留下的规则**：刷新模型列表必须拿到 CLI 现拉的 catalog。过期 `models_cache.json` 只能给健康检查兜底，不能冒充刷新成功。
+
+---
+
+## 2026-09-22 · 聊天里的文档 / HTML / URL 点不开
+
+**触发**：墨水屏经理发出 `[文档.html](/D:/WorkSpace/…html)` 和 GitHub URL，点击无反应。
+
+**根因**：markdown `<a>` 在 webview 里会导航。`/D:/…` 变成 sidecar 路径；https 被 nav-guard 拦掉。`shell:allow-open` 只放行升级域名，本来就不能开任意链接。
+
+**改动**：解析 Codex/VS Code 文件链、`file://`、Windows 路径和 http(s)，`preventDefault` 后走 `open_in_os`，用系统默认程序打开（浏览器 / 关联应用）。升级域名白名单不动。安装包 0.0.50。
+
+**留下的规则**：聊天链接是给 OS 的，不是给 webview 的。有全量路径不代表 `<a href>` 能打开。
+
+---
+
 ## 2026-09-21 · local-rebuild 工作集：摘要 + 最近对话，不灌全量
 
 **触发**：Claude local-rebuild 用 `promptTextFromMessage` 把 thinking / tool_use / tool_result 和整张 Message 表塞进一条 prompt。Jumpo 实测 budget 按「用户字符串 + 助手正文」只算 ~22 万字符，真正发出去接近 1950 万。全量只该给 UI 和 `conversation_search`。
