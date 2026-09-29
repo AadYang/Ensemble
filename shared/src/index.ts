@@ -13,6 +13,7 @@ export * from "./layout-ops";
 export * from "./update-manifest";
 export * from "./telemetry";
 export * from "./chat-input";
+export * from "./chat-link";
 export * from "./subagent-tool";
 export * from "./thinking-display";
 export * from "./agent-directory-eq";

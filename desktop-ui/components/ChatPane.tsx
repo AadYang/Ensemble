@@ -36,6 +36,8 @@ import { GitBranchChip } from "./GitBranchChip";
 import { ContextBar } from "./ContextBar";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { chatMarkdownComponents } from "./ChatMarkdown";
+import { openInOs } from "@/lib/open-in-os";
 
 // /model and /provider open a picker when invoked with no args (CLI-parity).
 // Typed args bypass the picker (kept for muscle memory / scripting).
@@ -1285,7 +1287,13 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
     if (path && isHtmlFilePath(path) && !toolCardContent(t.toolName ?? "", t.toolInput)) {
       return (
         <div className="markdown-plan markdown-chat text-[var(--text)] break-all leading-relaxed">
-          {tr("chat.plan.html", { path })}
+          <button
+            type="button"
+            className="text-left text-[var(--accent)] underline underline-offset-2"
+            onClick={() => void openInOs(path)}
+          >
+            {tr("chat.plan.html", { path })}
+          </button>
         </div>
       );
     }
@@ -1311,7 +1319,9 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
         {open ? (
           <div className="whitespace-pre-wrap">{painted.body}</div>
         ) : (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{painted.body}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+            {painted.body}
+          </ReactMarkdown>
         )}
         {!open && (
           <div className="tracking-wider mt-0.5 text-[10px] text-[var(--text-dim)]">{tr("chat.thinkingEnd")}</div>
@@ -1336,7 +1346,9 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
     return (
       <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
         <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.answer")}</div>
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{display}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+          {display}
+        </ReactMarkdown>
       </div>
     );
   }

@@ -1,8 +1,9 @@
 "use client";
 
-import { isSubagentToolName } from "@agentorch/shared";
+import { isSubagentToolName, parseChatLink } from "@agentorch/shared";
 import { displayToolName } from "@/lib/tool-display";
 import { toolCardContent, toolCardOperationLines } from "@/lib/tool-card-facts";
+import { openInOs } from "@/lib/open-in-os";
 
 export type ToolCardStatus = "pending" | "approved" | "denied" | "ran";
 
@@ -72,11 +73,22 @@ export function ToolCard({
       {facts?.description && (
         <div className="text-[var(--text-dim)]">→ {facts.description}</div>
       )}
-      {opLines.map((line, i) => (
-        <div key={i} className="text-[var(--text)] break-all leading-snug">
-          {line}
-        </div>
-      ))}
+      {opLines.map((line, i) =>
+        parseChatLink(line) ? (
+          <button
+            key={i}
+            type="button"
+            className="text-left text-[var(--accent)] underline underline-offset-2 break-all leading-snug"
+            onClick={() => void openInOs(line)}
+          >
+            {line}
+          </button>
+        ) : (
+          <div key={i} className="text-[var(--text)] break-all leading-snug">
+            {line}
+          </div>
+        ),
+      )}
       {content && (
         <div className="text-[var(--text)] whitespace-pre-wrap break-words leading-snug">
           {content}

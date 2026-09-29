@@ -33,6 +33,92 @@ fn get_sidecar_port(app: tauri::AppHandle, state: tauri::State<'_, SidecarPort>)
     Some(port)
 }
 
+/// Open a URL or local file with the OS default handler. Chat markdown links
+/// must not navigate the webview (nav-guard blocks that, and `/D:/…` would
+/// otherwise become a sidecar path). Keep `shell:allow-open` scoped to the
+/// upgrade domain — this command is the user-initiated chat/file opener.
+#[tauri::command]
+fn open_in_os(target: String) -> Result<(), String> {
+    let target = normalize_open_target(&target)?;
+    spawn_os_open(&target)
+}
+
+fn normalize_open_target(raw: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("empty target".into());
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("tauri:")
+        || lower.starts_with("blob:")
+        || lower.starts_with("about:")
+    {
+        return Err("unsupported scheme".into());
+    }
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:") {
+        return Ok(t.to_string());
+    }
+    let mut path = t.to_string();
+    if let Some(rest) = path.strip_prefix("file://") {
+        path = rest.to_string();
+    }
+    if path.len() >= 3 {
+        let bytes = path.as_bytes();
+        if bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+            path = path[1..].to_string();
+        }
+    }
+    Ok(path)
+}
+
+fn spawn_os_open(target: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let quoted = format!("'{}'", target.replace('\'', "''"));
+        let script = format!("Start-Process -FilePath {quoted}");
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Namespace prefix for the device-id derivation. Versioned so future schema
 /// changes (e.g., switching hash function or input shape) can rotate ids
 /// deterministically without colliding with the v1 derivation.
@@ -96,10 +182,9 @@ fn derive_device_id(cache_path: &std::path::Path) -> String {
 /// Plugin that gates webview navigation. Without this, a stray `<a href>` to
 /// an API endpoint replaces the entire window with the raw JSON response
 /// (white background, no close button, no way back) — the user-reported
-/// "fullscreen 500 page" bug. Same applies to external http(s) URLs: the
-/// shell.open allowlist already routes legitimate external links to the
-/// system browser, so any in-webview navigation to a non-loopback host is
-/// almost certainly a misclick we want to block.
+/// "fullscreen 500 page" bug. External http(s) and local `/D:/…` file links
+/// are opened by `open_in_os` (preventDefault on the `<a>`). Anything that
+/// still tries to navigate the webview off loopback is blocked.
 fn ensemble_nav_guard<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
     PluginBuilder::new("ensemble-nav-guard")
         .on_navigation(|_webview, url| {
@@ -163,7 +248,7 @@ pub fn run() {
         .plugin(ensemble_nav_guard())
         .manage(SidecarHandle(Mutex::new(None)))
         .manage(SidecarPort(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![get_sidecar_port])
+        .invoke_handler(tauri::generate_handler![get_sidecar_port, open_in_os])
         .setup(|app| {
             // macOS: force Regular activation policy so the Dock icon shows
             // and the app activates on launch. Tauri 2 sometimes infers
