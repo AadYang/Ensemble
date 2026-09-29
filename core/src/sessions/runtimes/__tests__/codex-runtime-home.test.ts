@@ -44,6 +44,12 @@ describe("Codex runtime isolated CODEX_HOME", () => {
       "approval_policy=\"never\"",
       "-c",
       "sandbox_mode=\"workspace-write\"",
+      "-c",
+      "hide_agent_reasoning=false",
+      "-c",
+      "model_reasoning_summary=\"auto\"",
+      "-c",
+      "model_supports_reasoning_summaries=true",
       "--disable",
       "apps",
       "--cd",
@@ -77,6 +83,12 @@ describe("Codex runtime isolated CODEX_HOME", () => {
       "approval_policy=\"never\"",
       "-c",
       "sandbox_mode=\"danger-full-access\"",
+      "-c",
+      "hide_agent_reasoning=false",
+      "-c",
+      "model_reasoning_summary=\"auto\"",
+      "-c",
+      "model_supports_reasoning_summaries=true",
       "--disable",
       "apps",
       "018f0000-0000-7000-8000-000000000000",
@@ -288,6 +300,33 @@ describe("Codex runtime isolated CODEX_HOME", () => {
       "xhigh",
     );
     expect(toml).toContain("model_reasoning_effort = \"xhigh\"");
+  });
+
+  it("asks Codex for readable reasoning summaries, not encrypted blobs", () => {
+    const toml = renderMcpConfigTomlForCodexRuntime(
+      { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+      [],
+      null,
+      "high",
+      ["model_reasoning_summary = \"none\"", "hide_agent_reasoning = true", ""].join("\n"),
+    );
+    expect(toml).toContain("hide_agent_reasoning = false");
+    expect(toml).toContain('model_reasoning_summary = "auto"');
+    expect(toml).toContain("model_supports_reasoning_summaries = true");
+    expect(toml).not.toContain("model_reasoning_summary = \"none\"");
+    expect(toml).not.toContain("hide_agent_reasoning = true");
+    expect(buildCodexExecArgs({
+      cwd: "D:\\WorkSpace\\Repo",
+      promptFromStdin: true,
+      resume: "018f0000-0000-7000-8000-000000000000",
+    })).toEqual(expect.arrayContaining([
+      "-c",
+      "hide_agent_reasoning=false",
+      "-c",
+      "model_reasoning_summary=\"auto\"",
+      "-c",
+      "model_supports_reasoning_summaries=true",
+    ]));
   });
 
   // `inherit` must be an OMITTED key, not an empty or defaulted one: Codex reads

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { translateItem } from "../codex.js";
+import { translateEvent, translateItem } from "../codex.js";
 
 type ContentBlock = { type?: string; name?: string; input?: unknown };
 
@@ -89,5 +89,89 @@ describe("translateItem reasoning", () => {
       event: { delta: { type: "thinking_delta", thinking: "consider the tests" } },
     });
     expect(singleContent(out)).toEqual([{ type: "thinking", thinking: "consider the tests" }]);
+  });
+
+  it("opens a thinking heartbeat when Codex only has encrypted_content", () => {
+    const out = translateItem(
+      { id: "r2", type: "reasoning", summary: [], encrypted_content: "x".repeat(400) },
+      SESSION,
+      MODEL,
+      false,
+    );
+    expect(out.thinkingTokens).toBe(100);
+    expect(out.streamEvent).toBeUndefined();
+    expect(out.assistantMessage).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain("encrypted");
+  });
+
+  it("does not persist encrypted_content when a completed reasoning item has no summary", () => {
+    const out = translateItem(
+      { id: "r3", type: "reasoning", summary: [], encrypted_content: "cipher" },
+      SESSION,
+      MODEL,
+      true,
+    );
+    expect(out).toEqual({});
+  });
+
+  it("uses summary[] as the visible thinking text", () => {
+    const out = translateItem(
+      {
+        id: "r4",
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "check the protocol" }],
+        encrypted_content: "cipher",
+      },
+      SESSION,
+      MODEL,
+      true,
+    );
+    expect(out.streamEvent).toMatchObject({
+      event: { delta: { type: "thinking_delta", thinking: "check the protocol" } },
+    });
+    expect(singleContent(out)).toEqual([{ type: "thinking", thinking: "check the protocol" }]);
+    expect(JSON.stringify(out)).not.toContain("cipher");
+  });
+
+  it("emits only the new summary suffix across item.updated events", () => {
+    const cursor = new Map<string, string>();
+    const first = translateItem(
+      { id: "r5", type: "reasoning", summary: ["look at"] },
+      SESSION,
+      MODEL,
+      false,
+      cursor,
+    );
+    const second = translateItem(
+      { id: "r5", type: "reasoning", summary: ["look at the tests"] },
+      SESSION,
+      MODEL,
+      false,
+      cursor,
+    );
+    expect(first.streamEvent).toMatchObject({
+      event: { delta: { type: "thinking_delta", thinking: "look at" } },
+    });
+    expect(second.streamEvent).toMatchObject({
+      event: { delta: { type: "thinking_delta", thinking: " the tests" } },
+    });
+  });
+});
+
+describe("translateEvent token_count", () => {
+  it("maps live reasoning_output_tokens onto the thinking heartbeat", () => {
+    const out = translateEvent(
+      {
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: { reasoning_output_tokens: 420, input_tokens: 800000 } },
+        },
+      },
+      SESSION,
+      MODEL,
+    );
+    expect(out.thinkingTokens).toBe(420);
+    expect(out.streamEvent).toBeUndefined();
   });
 });

@@ -296,7 +296,21 @@ function trustedProjectKeys(cwd?: string): string[] {
 const ENSEMBLE_OWNED_ROOT_CONFIG_KEYS = new Set([
   "approval_policy",
   "sandbox_mode",
+  "hide_agent_reasoning",
+  "model_reasoning_summary",
+  "model_supports_reasoning_summaries",
 ]);
+
+function reasoningSurfaceArgv(): string[] {
+  return [
+    "-c",
+    "hide_agent_reasoning=false",
+    "-c",
+    'model_reasoning_summary="auto"',
+    "-c",
+    "model_supports_reasoning_summaries=true",
+  ];
+}
 
 function shouldInheritCodexTable(tablePath: string): boolean {
   return tablePath === "model_providers" ||
@@ -381,7 +395,7 @@ export function renderMcpConfigTomlForCodexRuntime(
   inheritedUserConfigToml = "",
   contextWindow?: number | null,
 ): string {
-  const overriddenRootKeys = new Set<string>();
+  const overriddenRootKeys = new Set<string>(ENSEMBLE_OWNED_ROOT_CONFIG_KEYS);
   if (reasoningEffort) overriddenRootKeys.add("model_reasoning_effort");
   if (contextWindow) overriddenRootKeys.add("model_context_window");
   const safeInheritedUserConfigToml = stripRootConfigKeysFromToml(
@@ -425,6 +439,14 @@ export function renderMcpConfigTomlForCodexRuntime(
   if (contextWindow) {
     lines.push(`model_context_window = ${contextWindow}`);
   }
+  // gpt-5.x stores CoT as encrypted_content with an empty summary[]. Ensemble
+  // never decrypts that blob; we ask Codex for a readable summary so the pane
+  // can show thinking instead of a silent wait.
+  lines.push(
+    "hide_agent_reasoning = false",
+    'model_reasoning_summary = "auto"',
+    "model_supports_reasoning_summaries = true",
+  );
   lines.push(
     "",
     "[features]",
@@ -547,6 +569,7 @@ export function buildCodexExecArgs(opts: {
     ...sandboxOverride,
     ...reasoningOverride,
     ...contextWindowOverride,
+    ...reasoningSurfaceArgv(),
     "--disable",
     "apps",
     // The turn's project root, from the plan. `--cd` and the spawn cwd are the
@@ -568,6 +591,7 @@ export function buildCodexExecArgs(opts: {
       ...sandboxOverride,
       ...reasoningOverride,
       ...contextWindowOverride,
+      ...reasoningSurfaceArgv(),
       "--disable",
       "apps",
       opts.resume,
@@ -972,6 +996,7 @@ export class CodexCliRuntime implements AgentRuntime {
       };
 
       const lines = createInterface({ input: child.stdout });
+      const reasoningCursor = new Map<string, string>();
       for await (const line of lines) {
         if (opts.abortController.signal.aborted) break;
         const trimmed = String(line).trim();
@@ -995,7 +1020,18 @@ export class CodexCliRuntime implements AgentRuntime {
         }
         if (isRecord(ev) && (ev.type === "turn.started" || ev.type === "turn.failed")) turnStarted = true;
         if (isRecord(ev) && ev.type === "turn.completed") turnCompleted = true;
-        const out = translateEvent(ev, codexSessionId, opts.model);
+        const out = translateEvent(ev, codexSessionId, opts.model, reasoningCursor);
+        if (out.thinkingTokens) {
+          yield {
+            type: "sdk_message",
+            payload: {
+              type: "system",
+              subtype: "thinking_tokens",
+              session_id: codexSessionId,
+              estimated_tokens: out.thinkingTokens,
+            } as SdkMessage,
+          };
+        }
         if (out.streamEvent) {
           // Emit as stream_event for streaming UX (frontend already
           // handles content_block_delta + text_delta from W17 work).
@@ -1278,6 +1314,77 @@ interface TranslateOut {
   assistantMessage?: Record<string, unknown>;
   usage?: CodexUsageSnapshot | null;
   errorMessage?: string;
+  thinkingTokens?: number;
+}
+
+function reasoningSummaryText(summary: unknown): string {
+  if (typeof summary === "string") return summary.trim();
+  if (!Array.isArray(summary)) return "";
+  const parts: string[] = [];
+  for (const entry of summary) {
+    if (typeof entry === "string") {
+      const text = entry.trim();
+      if (text) parts.push(text);
+      continue;
+    }
+    if (!isRecord(entry)) continue;
+    const text = entry.text ?? entry.summary;
+    if (typeof text === "string" && text.trim()) parts.push(text.trim());
+  }
+  return parts.join("\n");
+}
+
+/** Readable CoT only. `encrypted_content` is ciphertext and must never become
+ *  chat text — occupancy may use its length, the pane must not. */
+export function reasoningVisibleText(item: unknown): string {
+  if (!isRecord(item)) return "";
+  if (typeof item.text === "string" && item.text.trim()) return item.text;
+  return reasoningSummaryText(item.summary);
+}
+
+function encryptedReasoningTokenEstimate(item: Record<string, unknown>): number {
+  const enc = item.encrypted_content;
+  if (typeof enc === "string" && enc.length > 0) return Math.max(1, Math.ceil(enc.length / 4));
+  return 1;
+}
+
+function thinkingTokensFromCodexEvent(ev: Record<string, unknown>): number | null {
+  const info = isRecord(ev.info) ? ev.info : ev;
+  const last = isRecord(info.last_token_usage) ? info.last_token_usage : info;
+  const n = last.reasoning_output_tokens;
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return null;
+  return Math.trunc(n);
+}
+
+function thinkingDeltaEvent(synthSessionId: string, thinking: string): Record<string, unknown> {
+  return {
+    type: "stream_event",
+    session_id: synthSessionId,
+    event: {
+      type: "content_block_delta",
+      delta: { type: "thinking_delta", thinking },
+    },
+  };
+}
+
+function thinkingAssistantMessage(synthSessionId: string, thinking: string): Record<string, unknown> {
+  return {
+    type: "assistant",
+    session_id: synthSessionId,
+    message: { content: [{ type: "thinking", thinking }] },
+  };
+}
+
+function reasoningDeltaSuffix(
+  itemId: string,
+  visible: string,
+  cursor: Map<string, string> | undefined,
+): string {
+  if (!cursor || !itemId) return visible;
+  const prev = cursor.get(itemId) ?? "";
+  cursor.set(itemId, visible);
+  if (!visible) return "";
+  return visible.startsWith(prev) ? visible.slice(prev.length) : visible;
 }
 
 export function buildCodexRuntimeErrorEvent(
@@ -1397,8 +1504,12 @@ export function translateEvent(
   ev: unknown,
   synthSessionId: string,
   modelName: string,
+  reasoningCursor?: Map<string, string>,
 ): TranslateOut {
   if (!isRecord(ev)) return {};
+  if (ev.type === "event_msg" && isRecord(ev.payload)) {
+    return translateEvent(ev.payload, synthSessionId, modelName, reasoningCursor);
+  }
   switch (ev.type) {
     case "thread.started":
       // We already emitted system/init; thread_id is informational. No-op.
@@ -1414,7 +1525,17 @@ export function translateEvent(
     case "item.started":
     case "item.updated":
     case "item.completed":
-      return translateItem(ev.item, synthSessionId, modelName, ev.type === "item.completed");
+      return translateItem(
+        ev.item,
+        synthSessionId,
+        modelName,
+        ev.type === "item.completed",
+        reasoningCursor,
+      );
+    case "token_count": {
+      const thinkingTokens = thinkingTokensFromCodexEvent(ev);
+      return thinkingTokens ? { thinkingTokens } : {};
+    }
     case "agent_message":
     case "assistant_message":
       return translateAgentMessageEvent(ev, synthSessionId);
@@ -1429,6 +1550,7 @@ export function translateItem(
   synthSessionId: string,
   modelName: string,
   isCompleted: boolean,
+  reasoningCursor?: Map<string, string>,
 ): TranslateOut {
   if (!isRecord(item)) return {};
   if (item.type === "agent_message") {
@@ -1576,23 +1698,19 @@ export function translateItem(
     };
   }
   if (item.type === "reasoning") {
-    const text = typeof item.text === "string" ? item.text : "";
-    if (!text || !isCompleted) return {};
-    return {
-      streamEvent: {
-        type: "stream_event",
-        session_id: synthSessionId,
-        event: {
-          type: "content_block_delta",
-          delta: { type: "thinking_delta", thinking: text },
-        },
-      },
-      assistantMessage: {
-        type: "assistant",
-        session_id: synthSessionId,
-        message: { content: [{ type: "thinking", thinking: text }] },
-      },
-    };
+    const visible = reasoningVisibleText(item);
+    const itemId = typeof item.id === "string" ? item.id : "";
+    const delta = reasoningDeltaSuffix(itemId, visible, reasoningCursor);
+    const out: TranslateOut = {};
+    if (delta) {
+      out.streamEvent = thinkingDeltaEvent(synthSessionId, delta);
+    } else if (!isCompleted && !visible) {
+      out.thinkingTokens = encryptedReasoningTokenEstimate(item);
+    }
+    if (isCompleted && visible) {
+      out.assistantMessage = thinkingAssistantMessage(synthSessionId, visible);
+    }
+    return out;
   }
   if (item.type === "error" && isCompleted) {
     // Per @openai/codex-sdk, an `error` *item* (ErrorItem) is explicitly a
