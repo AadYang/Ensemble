@@ -14,13 +14,13 @@ describe("parseCodexModelCatalog", () => {
           { slug: "gpt-6-astra", visibility: "list", supported_in_api: true, priority: 1 },
           { slug: "internal", visibility: "list", supported_in_api: false, priority: 3 },
         ],
-      })),
+      }))?.map((m) => m.id),
     ).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
   });
 
   it("skips leading log noise before the JSON object", () => {
     expect(
-      parseCodexModelCatalog(`warning: slow catalog\n{"models":[{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true}]}`),
+      parseCodexModelCatalog(`warning: slow catalog\n{"models":[{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true}]}`)?.map((m) => m.id),
     ).toEqual(["gpt-5.6-sol"]);
   });
 
@@ -34,8 +34,30 @@ describe("parseCodexModelCatalog", () => {
     expect(
       parseCodexModelCatalog(JSON.stringify({
         data: [{ slug: "gpt-5.5" }, { id: "hidden-row", visibility: "hide" }],
-      })),
+      }))?.map((m) => m.id),
     ).toEqual(["gpt-5.5"]);
+  });
+
+  it("keeps CLI display_name, description and reasoning ladder", () => {
+    expect(
+      parseCodexModelCatalog(JSON.stringify({
+        models: [{
+          slug: "gpt-6-astra",
+          visibility: "list",
+          supported_in_api: true,
+          display_name: "GPT-6-Astra",
+          description: "Frontier",
+          supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          default_reasoning_level: "high",
+        }],
+      })),
+    ).toEqual([{
+      id: "gpt-6-astra",
+      displayName: "GPT-6-Astra",
+      description: "Frontier",
+      reasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningLevel: "high",
+    }]);
   });
 });
 
@@ -48,7 +70,7 @@ describe("readCodexModelCache", () => {
         models: [{ slug: "gpt-6-astra", visibility: "list", supported_in_api: true, priority: 1 }],
       }),
     );
-    expect(readCodexModelCache(home)).toEqual(["gpt-6-astra"]);
+    expect(readCodexModelCache(home)?.map((m) => m.id)).toEqual(["gpt-6-astra"]);
   });
 
   it("returns null when the cache file is missing", () => {

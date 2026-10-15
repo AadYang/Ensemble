@@ -1,5 +1,5 @@
 import { apiError, apiFetch } from "@/lib/api";
-import type { PlatformKey, TransportPreference } from "@agentorch/shared";
+import type { PlatformKey, ProviderModelInfo, TransportPreference } from "@agentorch/shared";
 
 export type ProviderKind =
   | "anthropic-local"
@@ -30,6 +30,9 @@ export interface ProviderDTO {
    *  settings form must not decide this from `kind` itself. */
   sandboxOverrideSupported: boolean;
   models: string[];
+  /** CLI/HTTP catalog rows from the last refresh. Empty when the provider
+   *  only has bare ids (manual list, or a /models body with no extra fields). */
+  modelCatalog?: ProviderModelInfo[];
   isDefault: boolean;
   disabled: boolean;
   deprecated: string | null;

@@ -360,6 +360,33 @@ describe("resolveModelCapabilities", () => {
   // The other half of the same rule: no evidence is not "no support". The plan
   // must not claim a model lacks a level it simply has no data for, because a
   // user-declared token is then allowed through as unverified.
+  it("uses the provider catalog's effort ladder for a CLI alias like opus", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "opus",
+      runtime: "claude",
+      discoveredModel: {
+        id: "opus",
+        displayName: "Opus",
+        resolvedId: "claude-opus-4-8",
+        supportsEffort: true,
+        reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
+      },
+    });
+    expect(facts.reasoningLevels.value).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(facts.reasoningLevels.origin).toBe("provider-discovered");
+  });
+
+  it("follows opus → resolvedId into the built-in ladder when the CLI omitted levels", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "opus",
+      runtime: "claude",
+      discoveredModel: { id: "opus", resolvedId: "claude-opus-4-8" },
+    });
+    expect(facts.reasoningLevels.value).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(facts.reasoningLevels.origin).toBe("catalog-confirmed");
+    expect(facts.reasoningLevels.source).toContain("opus");
+  });
+
   it("leaves the ladder unknown for a model with no evidence, without claiming it is unsupported", () => {
     const { facts, diagnostics } = m.resolveModelCapabilities({
       model: "not-a-real-model-12345",

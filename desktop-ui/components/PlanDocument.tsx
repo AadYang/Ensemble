@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { planAsChatText } from "@/lib/plan-document";
 import { useT } from "@/i18n/useT";
-import { chatMarkdownComponents } from "./ChatMarkdown";
+import { chatMarkdownComponents, chatUrlTransform } from "./ChatMarkdown";
 
 export function PlanDocument({ plan }: { plan: string; title?: string }) {
   const t = useT();
@@ -14,7 +14,7 @@ export function PlanDocument({ plan }: { plan: string; title?: string }) {
   }
   return (
     <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={chatUrlTransform} components={chatMarkdownComponents}>
         {text}
       </ReactMarkdown>
     </div>

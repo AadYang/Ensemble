@@ -5,21 +5,14 @@ import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { getWS } from "@/lib/ws";
 import { useT } from "@/i18n/useT";
-import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 import { MenuSelect } from "./MenuSelect";
+import { providerModelIds, providerModelSelectItems } from "@/lib/provider-models";
 
 // Same FALLBACK_MODELS treatment NewTeamDialog uses — anthropic-local rows
 // have empty `models[]` in the DB; without this fallback the model dropdown
 // shows nothing.
-function isDefaultAnthropic(p: ProviderDTO | undefined): boolean {
-  if (!p) return false;
-  return p.kind === "anthropic-local" || (p.kind === "anthropic" && !p.baseUrl);
-}
-
 function availableModelsFor(p: ProviderDTO | undefined): string[] {
-  if (!p) return [];
-  if (p.models.length > 0) return p.models;
-  return isDefaultAnthropic(p) ? DEFAULT_ANTHROPIC_MODELS : [];
+  return providerModelIds(p);
 }
 
 export function AddTeamMemberDialog({
@@ -158,7 +151,7 @@ export function AddTeamMemberDialog({
               value={model}
               onChange={setModel}
               placeholder={t("team.new.noModels")}
-              items={availableModels.map((m) => ({ value: m, label: m }))}
+              items={providerModelSelectItems(selectedProvider)}
             />
           </div>
           <label className="flex flex-col gap-1">

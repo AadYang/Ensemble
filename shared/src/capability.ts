@@ -1,3 +1,5 @@
+import type { ProviderModelInfo } from "./provider-model.js";
+
 // The capability/run-plan contract, shared between the core and every consumer
 // of the resolved snapshot (`/status`, the UI, the SDK adapter). See AGENTS.md
 // §2.3: a type that crosses the core↔UI boundary lives here, so the two sides
@@ -760,6 +762,12 @@ export interface ResolutionRequest {
   runtimeVersion?: string | null;
   model: string;
   vendor?: string | null;
+  /** Live catalog row for THIS model, from the last provider refresh (Claude
+   *  `supportedModels()`, Codex `debug models`, or HTTP `/models`). The
+   *  planner treats it as provider-discovered evidence: aliases like `opus`
+   *  get the CLI's description and effort ladder instead of looking like an
+   *  unknown model. Omitted = this route has no catalog row. */
+  discoveredModel?: ProviderModelInfo | null;
   /** The transport fact for THIS route, established by whoever could observe the
    *  endpoint (a native CLI launch, the provider kind, or a cached/live probe).
    *  Omitted = not established, which stays `unknown` rather than defaulting to

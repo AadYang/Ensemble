@@ -6,23 +6,16 @@ import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { createTeam } from "@/lib/team-api";
 import { getWS } from "@/lib/ws";
 import { useT } from "@/i18n/useT";
-import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 import { MenuSelect } from "./MenuSelect";
+import { providerModelIds, providerModelSelectItems } from "@/lib/provider-models";
 
 // Same fallback that AgentSettings uses. anthropic-local provider rows live
 // in the DB with empty `models[]` because the actual model id list comes from
 // the local claude CLI's own catalog, which we don't enumerate at provider
 // creation. AgentSettings hardcodes these three so users can pick something
 // sensible without an explicit refresh; NewTeamDialog should do the same.
-function isDefaultAnthropic(p: ProviderDTO | undefined): boolean {
-  if (!p) return false;
-  return p.kind === "anthropic-local" || (p.kind === "anthropic" && !p.baseUrl);
-}
-
 function availableModelsFor(p: ProviderDTO | undefined): string[] {
-  if (!p) return [];
-  if (p.models.length > 0) return p.models;
-  return isDefaultAnthropic(p) ? DEFAULT_ANTHROPIC_MODELS : [];
+  return providerModelIds(p);
 }
 
 interface MemberDraft {
@@ -274,7 +267,7 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
                       value={m.model}
                       onChange={(model) => updateMember(idx, { model })}
                       placeholder={t("team.new.noModels")}
-                      items={availableModels.map((mm) => ({ value: mm, label: mm }))}
+                      items={providerModelSelectItems(p)}
                     />
                   </div>
                   <input

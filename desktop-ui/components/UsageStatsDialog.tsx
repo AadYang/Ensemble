@@ -103,7 +103,7 @@ export function UsageStatsDialog({ onClose, onNavigateAgent, onOpenPricing, refr
       output: d.outputTokens,
       cacheRead: d.cacheReadTokens,
       cacheWrite: d.cacheCreationTokens,
-      total: d.inputTokens + d.outputTokens + d.cacheReadTokens + d.cacheCreationTokens,
+      total: d.inputTokens + d.outputTokens,
     }));
   }, [data]);
 

@@ -24,6 +24,8 @@ import {
 import { fetchCloudAgentStatus } from "@/lib/cloud-api";
 import { listSkills, toggleAgentSkill } from "@/lib/skill-api";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
+import { providerModelSelectItems } from "@/lib/provider-models";
+import type { MenuSelectItem } from "./MenuSelect";
 import { useStore, type ChatTurn } from "@/store/agents";
 import { dropLiveStream, flushLiveStream } from "@/store/stream-batch";
 import { useT, type TranslateFn } from "@/i18n/useT";
@@ -36,13 +38,13 @@ import { GitBranchChip } from "./GitBranchChip";
 import { ContextBar } from "./ContextBar";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { chatMarkdownComponents } from "./ChatMarkdown";
+import { chatMarkdownComponents, chatUrlTransform } from "./ChatMarkdown";
 import { openInOs } from "@/lib/open-in-os";
 
 // /model and /provider open a picker when invoked with no args (CLI-parity).
 // Typed args bypass the picker (kept for muscle memory / scripting).
 type PickerState =
-  | { kind: "model"; items: string[]; cursor: number }
+  | { kind: "model"; items: MenuSelectItem[]; cursor: number }
   | { kind: "provider"; items: ProviderDTO[]; cursor: number };
 
 // Module-level stable empty array. Zustand selectors compare by reference;
@@ -646,14 +648,15 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
       case "model": {
         const cur = providers.find((p) => p.id === summary.providerId);
         const available = cur?.models ?? [];
+        const modelItems = providerModelSelectItems(cur);
         if (!arg) {
           // CLI-parity: open picker. Caller closes the input field's blur loop.
-          if (available.length === 0) {
+          if (modelItems.length === 0) {
             appendNotice(agentId, t("slash.model.noModels"));
             return;
           }
-          const cursor = Math.max(0, available.indexOf(summary.model));
-          setPicker({ kind: "model", items: available, cursor });
+          const cursor = Math.max(0, modelItems.findIndex((item) => item.value === summary.model));
+          setPicker({ kind: "model", items: modelItems, cursor });
           return;
         }
         if (available.length > 0 && !available.includes(arg)) {
@@ -928,10 +931,10 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
     if (!picker) return;
     try {
       if (picker.kind === "model") {
-        const name = picker.items[picker.cursor];
-        if (!name) return;
-        await patchAgent(agentId, { model: name });
-        appendNotice(agentId, t("slash.model.applied", { name }));
+        const chosen = picker.items[picker.cursor];
+        if (!chosen) return;
+        await patchAgent(agentId, { model: chosen.value });
+        appendNotice(agentId, t("slash.model.applied", { name: chosen.value }));
       } else {
         const target = picker.items[picker.cursor];
         if (!target) return;
@@ -1182,11 +1185,14 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
             <span className="text-[var(--text-faint)]">{t("slash.picker.hint")}</span>
           </div>
           {picker.items.map((item, idx) => {
-            const label = picker.kind === "model" ? (item as string) : `${(item as ProviderDTO).name} · ${(item as ProviderDTO).kind}`;
+            const modelItem = picker.kind === "model" ? (item as MenuSelectItem) : null;
+            const label = modelItem
+              ? modelItem.label
+              : `${(item as ProviderDTO).name} · ${(item as ProviderDTO).kind}`;
             const isCur = idx === picker.cursor;
             return (
               <div
-                key={picker.kind === "model" ? (item as string) : (item as ProviderDTO).id}
+                key={modelItem ? modelItem.value : (item as ProviderDTO).id}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   setPicker({ ...picker, cursor: idx });
@@ -1194,7 +1200,12 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
                 }}
                 className={`px-2 py-1 cursor-pointer ${isCur ? "bg-[var(--accent)] text-black" : "hover:bg-[var(--bg-pane)]"}`}
               >
-                {label}
+                <div>{label}</div>
+                {modelItem?.description && (
+                  <div className={`text-[10px] leading-tight ${isCur ? "text-black/70" : "text-[var(--text-faint)]"}`}>
+                    {modelItem.description}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1319,7 +1330,7 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
         {open ? (
           <div className="whitespace-pre-wrap">{painted.body}</div>
         ) : (
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={chatUrlTransform} components={chatMarkdownComponents}>
             {painted.body}
           </ReactMarkdown>
         )}
@@ -1346,7 +1357,7 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
     return (
       <div className="markdown-plan markdown-chat text-[var(--text)] break-words leading-relaxed">
         <div className="tracking-wider mb-0.5 text-[10px] text-[var(--accent)]">{tr("chat.answer")}</div>
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={chatUrlTransform} components={chatMarkdownComponents}>
           {display}
         </ReactMarkdown>
       </div>

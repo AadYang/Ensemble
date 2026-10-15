@@ -39,6 +39,30 @@ describe("stream event WS batcher", () => {
     vi.useRealTimers();
   });
 
+  it("folds Claude dotted content_block.delta thinking the same way", () => {
+    vi.useFakeTimers();
+    const sent: ServerMsg[] = [];
+    const batcher = createStreamEventWsBatcher({
+      send: (_id, payload) => sent.push(payload),
+      flushMs: 32,
+    });
+    const dotted = (text: string) => ({
+      type: "stream_event",
+      event: { type: "content_block.delta", delta: { type: "thinking_delta", thinking: text } },
+    });
+    batcher.push("s1", dotted("a"));
+    batcher.push("s1", dotted("b"));
+    vi.advanceTimersByTime(32);
+    expect(sent).toHaveLength(1);
+    const msg = sent[0]!;
+    expect(msg.type).toBe("message");
+    if (msg.type !== "message") return;
+    expect(
+      (msg.msg as { event: { delta: { thinking: string } } }).event.delta.thinking,
+    ).toBe("ab");
+    vi.useRealTimers();
+  });
+
   it("flushes thinking before a text delta so order is preserved", () => {
     vi.useFakeTimers();
     const sent: ServerMsg[] = [];

@@ -555,6 +555,12 @@ describe("live occupancy helpers", () => {
         },
       }),
     ).toBe("{\"q\":");
+    expect(
+      occupancyDeltaFromStreamEvent({
+        type: "stream_event",
+        event: { type: "content_block.delta", delta: { type: "thinking_delta", thinking: "hmm" } },
+      }),
+    ).toBe("hmm");
     expect(occupancyDeltaFromStreamEvent({ type: "assistant" })).toBeNull();
   });
 });

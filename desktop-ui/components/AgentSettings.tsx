@@ -20,6 +20,8 @@ import {
   REASONING_HINTS,
   REASONING_SYNTAX_RULE,
 } from "@agentorch/shared";
+import { MenuSelect } from "./MenuSelect";
+import { providerModelInfo, providerModelSelectItems } from "@/lib/provider-models";
 import {
   AgentRequestError,
   closeAgent,
@@ -243,7 +245,9 @@ export function AgentSettings({
   // field here is decided from the provider kind or the model id.
   const storePlan = useStore((s) => s.planByAgent[agentId]);
   const [fetchedPlan, setFetchedPlan] = useState<RunPlanStatusView | null>(null);
-  const planView = storePlan ?? fetchedPlan;
+  // Prefer a fresh `/status` prediction so a just-refreshed CLI catalog can
+  // populate the effort ladder without waiting for the next turn.
+  const planView = fetchedPlan ?? storePlan;
   const t = useT();
 
   // Draggable position. null until first mount → uses centered fallback inline.
@@ -271,11 +275,10 @@ export function AgentSettings({
       });
   }, []);
 
-  // Read the plan when the store holds none. `/status` reports what it resolved
-  // (and says the source is `fresh-resolution`, not a turn's own snapshot), so
-  // the rows below are never blank just because nothing has run yet.
+  // Always re-read `/status`. A last-turn snapshot can predate a provider
+  // refresh, and would otherwise hide the CLI effort ladder for aliases like
+  // `opus` until the next message.
   useEffect(() => {
-    if (storePlan) return;
     let cancelled = false;
     void getAgentStatusReport(agentId)
       .then((report) => {
@@ -292,7 +295,7 @@ export function AgentSettings({
     return () => {
       cancelled = true;
     };
-  }, [agentId, storePlan]);
+  }, [agentId]);
 
   // The DRAFT's own plan, refreshed as the form changes.
   //
@@ -440,12 +443,15 @@ export function AgentSettings({
   const isDefaultAnthropic =
     selectedProvider?.kind === "anthropic-local" ||
     (selectedProvider?.kind === "anthropic" && !selectedProvider.baseUrl);
-  const availableModels: string[] =
-    selectedProvider?.models.length
-      ? selectedProvider.models
-      : isDefaultAnthropic
-        ? DEFAULT_ANTHROPIC_MODELS
-        : [];
+  const modelItems = providerModelSelectItems(selectedProvider);
+  const availableModels = modelItems.map((item) => item.value);
+  const selectedModelInfo = providerModelInfo(selectedProvider, model);
+  const catalogReasoningLevels =
+    selectedModelInfo.reasoningLevels && selectedModelInfo.reasoningLevels.length > 0
+      ? selectedModelInfo.reasoningLevels
+      : selectedModelInfo.supportsEffort === false
+        ? []
+        : null;
   // Whether a per-agent sandbox override means anything here is the SERVER's
   // answer (`sandboxOverrideSupported`, from the runtime it would launch), not
   // this component's reading of a provider kind.
@@ -485,7 +491,7 @@ export function AgentSettings({
   const projectPlanReason = projectRow?.disabledReason ?? null;
   const reasoningRejection = reasoningRow?.rejection ?? null;
   const projectRejection = projectRow?.rejection ?? null;
-  const reasoningLadder = reasoningRow?.options ?? null;
+  const reasoningLadder = reasoningRow?.options ?? catalogReasoningLevels;
   const transportHeader = draftCapability.header ?? capability.header;
   const transportName = transportHeader?.transport ?? null;
   const showTransportBadge = transportName !== null && transportName !== "native-cli";
@@ -716,18 +722,21 @@ export function AgentSettings({
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.label.model")}</span>
-          <select
+          <MenuSelect
             value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="bg-[var(--bg-pane)] border border-[var(--border)] px-1.5 py-1 outline-none focus:border-[var(--accent)]"
-          >
-            {availableModels.map((m) => (
-              <option key={m} value={m}>{m}</option>
-            ))}
-            {!availableModels.includes(model) && (
-              <option key="__current__" value={model}>{model}</option>
-            )}
-          </select>
+            onChange={setModel}
+            items={[
+              ...modelItems,
+              ...(!availableModels.includes(model)
+                ? [{ value: model, label: selectedModelInfo.displayName ? `${selectedModelInfo.displayName} (${model})` : model, description: selectedModelInfo.description }]
+                : []),
+            ]}
+          />
+          {selectedModelInfo.description && (
+            <span className="text-[10px] text-[var(--text-dim)] leading-tight">
+              {selectedModelInfo.description}
+            </span>
+          )}
           {/* The value stays where the user put it and the field SAYS the new
               provider does not list it, instead of the old behaviour, which
               replaced it silently and wrote the replacement on Apply. */}

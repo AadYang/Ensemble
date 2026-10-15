@@ -3,6 +3,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import {
+  parseProviderModelInfo,
+  providerModelIds,
+  type ProviderModelInfo,
+} from "@agentorch/shared";
 import { getCodexCliPath, toSpawnableCliPath } from "./cli-config.js";
 
 const execFileAsync = promisify(execFile);
@@ -11,7 +16,7 @@ const FRESH_DISCOVER_TIMEOUT_MS = 30_000;
 const DISCOVER_MAX_BUFFER = 16 * 1024 * 1024;
 
 export type CodexModelDiscovery =
-  | { ok: true; models: string[]; source: string }
+  | { ok: true; models: string[]; catalog: ProviderModelInfo[]; source: string }
   | { ok: false; error: string };
 
 export interface DiscoverCodexModelsOpts {
@@ -52,7 +57,7 @@ function preferredForApi(model: Record<string, unknown>): boolean {
 
 /** Same catalog `codex debug models` prints. Leading log noise is skipped.
  *  Empty / all-hidden catalogs return null so a refresh cannot wipe models. */
-export function parseCodexModelCatalog(raw: string): string[] | null {
+export function parseCodexModelCatalog(raw: string): ProviderModelInfo[] | null {
   const parsed = extractJsonObject(raw);
   if (!parsed) return null;
   const rows = Array.isArray(parsed.models)
@@ -67,10 +72,11 @@ export function parseCodexModelCatalog(raw: string): string[] | null {
   if (chosen.length === 0) return null;
   return [...chosen]
     .sort((a, b) => (typeof a.priority === "number" ? a.priority : 999) - (typeof b.priority === "number" ? b.priority : 999))
-    .map((row) => slugOf(row)!);
+    .map((row) => parseProviderModelInfo(row))
+    .filter((row): row is ProviderModelInfo => row !== null);
 }
 
-export function readCodexModelCache(codexHome = join(homedir(), ".codex")): string[] | null {
+export function readCodexModelCache(codexHome = join(homedir(), ".codex")): ProviderModelInfo[] | null {
   const path = join(codexHome, "models_cache.json");
   if (!existsSync(path)) return null;
   try {
@@ -112,9 +118,9 @@ export async function discoverCodexModels(
         windowsHide: true,
         env: { ...process.env, CODEX_HOME: userCodexHome() },
       });
-      const models = parseCodexModelCatalog(String(stdout ?? ""));
-      if (models && models.length > 0) {
-        return { ok: true, models, source: "codex debug models" };
+      const catalog = parseCodexModelCatalog(String(stdout ?? ""));
+      if (catalog && catalog.length > 0) {
+        return { ok: true, models: providerModelIds(catalog), catalog, source: "codex debug models" };
       }
       if (fresh) {
         return { ok: false, error: "`codex debug models` returned no usable catalog." };
@@ -122,7 +128,14 @@ export async function discoverCodexModels(
     } catch (err) {
       if (fresh) return { ok: false, error: discoverErrorMessage(err) };
       const fromCache = readCodexModelCache(userCodexHome());
-      if (fromCache) return { ok: true, models: fromCache, source: "~/.codex/models_cache.json" };
+      if (fromCache) {
+        return {
+          ok: true,
+          models: providerModelIds(fromCache),
+          catalog: fromCache,
+          source: "~/.codex/models_cache.json",
+        };
+      }
       return { ok: false, error: discoverErrorMessage(err) };
     }
   }
@@ -137,7 +150,14 @@ export async function discoverCodexModels(
   }
 
   const fromCache = readCodexModelCache(userCodexHome());
-  if (fromCache) return { ok: true, models: fromCache, source: "~/.codex/models_cache.json" };
+  if (fromCache) {
+    return {
+      ok: true,
+      models: providerModelIds(fromCache),
+      catalog: fromCache,
+      source: "~/.codex/models_cache.json",
+    };
+  }
   if (!codexPath) {
     return { ok: false, error: "codex CLI not found — install it and run `codex login`." };
   }

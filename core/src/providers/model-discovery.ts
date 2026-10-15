@@ -1,7 +1,10 @@
+import { parseProviderModelInfo, type ProviderModelInfo } from "@agentorch/shared";
+
 export type ProbeFlavor = "anthropic" | "openai";
 
 export interface ModelsProbeResult {
   models: string[];
+  catalog: ProviderModelInfo[];
   sourceUrl: string;
 }
 
@@ -58,6 +61,7 @@ export function deepSeekOfficialModelsFallback(
 
   return {
     models: DEEPSEEK_OFFICIAL_MODELS,
+    catalog: DEEPSEEK_OFFICIAL_MODELS.map((id) => ({ id })),
     sourceUrl: "DeepSeek official model catalog",
   };
 }
@@ -103,8 +107,8 @@ export const probeModels = async (
         tried.push({ url, status: 200, bodyHead: `non-JSON: ${rawText.slice(0, 200)}` });
         continue;
       }
-      const models = extractModelIds(parsed);
-      if (models.length > 0) return { models, sourceUrl: url };
+      const catalog = extractModelCatalog(parsed);
+      if (catalog.length > 0) return { models: catalog.map((m) => m.id), catalog, sourceUrl: url };
       tried.push({
         url,
         status: 200,
@@ -126,7 +130,17 @@ export const probeModels = async (
  *   - alt key: { models: [{id|name}, ...] } (some providers)
  *   - flat string array: ["m1", "m2"] or { data: ["m1", "m2"] }
  */
-export function extractModelIds(body: unknown): string[] {
+function idFromHttpRow(row: unknown): string | undefined {
+  if (typeof row === "string") return row.length > 0 ? row : undefined;
+  if (row && typeof row === "object") {
+    const r = row as Record<string, unknown>;
+    const candidates = [r.id, r.name, r.model, r.model_id, r.model_name];
+    for (const c of candidates) if (typeof c === "string" && c.length > 0) return c;
+  }
+  return undefined;
+}
+
+export function extractModelCatalog(body: unknown): ProviderModelInfo[] {
   const pickArray = (obj: unknown): unknown[] | null => {
     if (Array.isArray(obj)) return obj;
     if (obj && typeof obj === "object") {
@@ -139,16 +153,21 @@ export function extractModelIds(body: unknown): string[] {
   };
   const arr = pickArray(body);
   if (!arr) return [];
-  return arr
-    .map((m): string | undefined => {
-      if (typeof m === "string") return m;
-      if (m && typeof m === "object") {
-        const r = m as Record<string, unknown>;
-        const candidates = [r.id, r.name, r.model, r.model_id, r.model_name];
-        for (const c of candidates) if (typeof c === "string" && c.length > 0) return c;
-      }
-      return undefined;
-    })
-    .filter((s): s is string => typeof s === "string" && s.length > 0)
-    .sort();
+  const seen = new Set<string>();
+  const catalog: ProviderModelInfo[] = [];
+  for (const row of arr) {
+    const id = idFromHttpRow(row);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const parsed =
+      row && typeof row === "object"
+        ? parseProviderModelInfo({ ...(row as Record<string, unknown>), id })
+        : parseProviderModelInfo(id);
+    catalog.push(parsed ?? { id });
+  }
+  return catalog.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export function extractModelIds(body: unknown): string[] {
+  return extractModelCatalog(body).map((m) => m.id);
 }

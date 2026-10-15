@@ -9,7 +9,7 @@ function streamDeltaKind(msg: unknown): string | null {
   if (!msg || typeof msg !== "object") return null;
   if ((msg as { type?: unknown }).type !== "stream_event") return null;
   const event = (msg as { event?: { type?: unknown; delta?: { type?: unknown } } }).event;
-  if (event?.type !== "content_block_delta") return null;
+  if (event?.type !== "content_block_delta" && event?.type !== "content_block.delta") return null;
   const kind = event.delta?.type;
   return typeof kind === "string" ? kind : null;
 }

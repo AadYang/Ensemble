@@ -19,6 +19,7 @@
 // at the same time; a single group-level `source` could only describe that by
 // being wrong about two of the three.
 
+import { isReasoningToken, type ProviderModelInfo } from "@agentorch/shared";
 import {
   catalogEntry,
   compactionThreshold,
@@ -138,42 +139,29 @@ export function runtimeScopeFor(req: ResolutionRequest): string {
  *  An unusable user override is reported as a rejected rung rather than falling
  *  through to the built-in ladder: a user who typed a broken ladder needs to see
  *  that their configuration did not take effect, not a silently different one. */
-function reasoningCapability(
+function discoveredReasoning(
   model: string,
-  vendor: string,
-  providerId: string | null,
-): { levels: ResolvedCapability<string[]>; defaultLevel: ResolvedCapability<string> } {
-  const entry = reasoningLevelsEntry(model, vendor, { providerId });
-
-  if (entry === null) {
-    const considered: ConsideredRung[] = [
-      {
-        origin: "catalog-confirmed",
-        outcome: "absent",
-        reason: "no catalog entry for this model states a reasoning ladder",
-      },
-      {
-        origin: "provider-discovered",
-        outcome: "absent",
-        reason: "no provider endpoint reports a model's reasoning levels",
-      },
-      {
-        origin: "runtime-observed",
-        outcome: "absent",
-        reason: "this turn produced no runtime observation of the ladder",
-      },
-    ];
-    const source =
-      "no evidence in the registry states which reasoning levels this model supports; " +
-      "a syntactically valid level is accepted as user-declared and sent unverified";
+  discovered: ProviderModelInfo | null | undefined,
+): { levels: string[]; defaultLevel: string | null; source: string } | { empty: true; source: string } | null {
+  if (!discovered || discovered.id !== model) return null;
+  const levels = (discovered.reasoningLevels ?? []).filter((l) => isReasoningToken(l));
+  if (levels.length > 0) {
+    const dflt = discovered.defaultReasoningLevel ?? null;
     return {
-      levels: unknownCapability<string[]>(source, considered),
-      // A default is only meaningful against a known ladder, so it stays unknown
-      // for the same reason — never "no default", which would be a claim.
-      defaultLevel: unknownCapability<string>(source, considered),
+      levels,
+      defaultLevel: dflt !== null && levels.includes(dflt) ? dflt : null,
+      source: `provider catalog for "${model}"`,
     };
   }
+  if (discovered.supportsEffort === false) {
+    return { empty: true, source: `provider catalog for "${model}" reports no effort levels` };
+  }
+  return null;
+}
 
+function reasoningFromRegistry(
+  entry: NonNullable<ReturnType<typeof reasoningLevelsEntry>>,
+): { levels: ResolvedCapability<string[]>; defaultLevel: ResolvedCapability<string> } | null {
   if (!entry.ok) {
     const considered: ConsideredRung[] = [
       { origin: "user-declared", outcome: "rejected", reason: entry.reason },
@@ -222,6 +210,94 @@ function reasoningCapability(
             considered,
           ),
   };
+}
+
+function reasoningCapability(
+  model: string,
+  vendor: string,
+  providerId: string | null,
+  discovered: ProviderModelInfo | null | undefined,
+): { levels: ResolvedCapability<string[]>; defaultLevel: ResolvedCapability<string> } {
+  const fromProvider = discoveredReasoning(model, discovered);
+  if (fromProvider && "empty" in fromProvider) {
+    const considered: ConsideredRung[] = [
+      { origin: "provider-discovered", outcome: "used", reason: fromProvider.source },
+    ];
+    return {
+      levels: resolved([] as string[], "provider-discovered", "observed", fromProvider.source, considered),
+      defaultLevel: unknownCapability<string>("the provider catalog lists no default effort level", considered),
+    };
+  }
+  if (fromProvider) {
+    const considered: ConsideredRung[] = [
+      { origin: "provider-discovered", outcome: "used", reason: fromProvider.source },
+    ];
+    return {
+      levels: resolved(fromProvider.levels, "provider-discovered", "observed", fromProvider.source, considered),
+      defaultLevel:
+        fromProvider.defaultLevel === null
+          ? unknownCapability<string>("the provider catalog lists no default effort level", considered)
+          : resolved(
+              fromProvider.defaultLevel,
+              "provider-discovered",
+              "observed",
+              `${fromProvider.defaultLevel} — ${fromProvider.source}`,
+              considered,
+            ),
+    };
+  }
+
+  const resolvedId = discovered?.id === model ? discovered.resolvedId : undefined;
+  if (resolvedId && resolvedId !== model) {
+    const viaAlias = reasoningLevelsEntry(resolvedId, vendorScopeForModel(resolvedId), { providerId });
+    if (viaAlias !== null) {
+      const mapped = reasoningFromRegistry(viaAlias);
+      if (mapped) {
+        const reason = `"${model}" resolves to "${resolvedId}" in the provider catalog`;
+        mapped.levels.considered = [
+          { origin: "provider-discovered", outcome: "used", reason },
+          ...mapped.levels.considered,
+        ];
+        mapped.levels.source = `${mapped.levels.source} (${reason})`;
+        return mapped;
+      }
+    }
+  }
+
+  const entry = reasoningLevelsEntry(model, vendor, { providerId });
+
+  if (entry === null) {
+    const considered: ConsideredRung[] = [
+      {
+        origin: "catalog-confirmed",
+        outcome: "absent",
+        reason: "no catalog entry for this model states a reasoning ladder",
+      },
+      {
+        origin: "provider-discovered",
+        outcome: "absent",
+        reason: discovered
+          ? "the provider catalog listed this model without a reasoning ladder"
+          : "no provider endpoint reports a model's reasoning levels",
+      },
+      {
+        origin: "runtime-observed",
+        outcome: "absent",
+        reason: "this turn produced no runtime observation of the ladder",
+      },
+    ];
+    const source =
+      "no evidence in the registry states which reasoning levels this model supports; " +
+      "a syntactically valid level is accepted as user-declared and sent unverified";
+    return {
+      levels: unknownCapability<string[]>(source, considered),
+      // A default is only meaningful against a known ladder, so it stays unknown
+      // for the same reason — never "no default", which would be a claim.
+      defaultLevel: unknownCapability<string>(source, considered),
+    };
+  }
+
+  return reasoningFromRegistry(entry)!;
 }
 
 function toolCapabilities(transport: ResolvedCapability<RunPlanTransport>): ToolCapabilities {
@@ -472,7 +548,7 @@ export function resolveModelCapabilities(req: ResolutionRequest): ResolvedCapabi
   });
 
   // ── reasoning ───────────────────────────────────────────────────────────
-  const reasoning = reasoningCapability(req.model, vendor, providerId);
+  const reasoning = reasoningCapability(req.model, vendor, providerId, req.discoveredModel);
   const reasoningLevels = reasoning.levels;
   const defaultReasoningLevel = reasoning.defaultLevel;
   diagnostics.push({

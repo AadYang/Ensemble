@@ -16,13 +16,22 @@ import type {
   SettingsImpactReport,
   SettingsImpactRequest,
 } from "@agentorch/shared";
-import { peerContactAllowed, reasoningReport, runPlanStatusView, samePeerCircle } from "@agentorch/shared";
+import { findProviderModel, peerContactAllowed, readProviderModelCatalog, reasoningReport, runPlanStatusView, samePeerCircle } from "@agentorch/shared";
 import type { ReasoningReport } from "@agentorch/shared";
 import { LivenessController } from "../liveness-controller.js";
 import type { LivenessRunHooks } from "../liveness-controller.js";
 import type { LivenessSnapshot } from "../capability/liveness.js";
 import { newLivenessSignals, resolveLivenessPolicy } from "../capability/liveness.js";
 import { extractUsageEvents, buildMetaUsageEvent } from "../usage-extract.js";
+import { createEventLoopYielder } from "../event-loop-yield.js";
+import {
+  billableResultForUsageAccounting,
+  CLAUDE_USAGE_SNAPSHOT_KEY,
+  isClaudeUsageRuntime,
+  readClaudeUsageSnapshot,
+  resultWithBillableClaudeUsage,
+  type ClaudeUsageSnapshot,
+} from "../claude-usage.js";
 import {
   contextUsageFromUsedTokens,
   liveOccupancy,
@@ -241,7 +250,12 @@ import {
 const CODEX_DEFAULT_SANDBOX: SandboxMode = "danger-full-access";
 const CODEX_RESUME_SIGNATURE_KEY = "codexResumeSignature";
 const CODEX_RESUME_SIGNATURE_VERSION = 1;
-const RESUME_METADATA_KEYS = ["lastSessionId", "codexUsageSnapshot", CODEX_RESUME_SIGNATURE_KEY] as const;
+const RESUME_METADATA_KEYS = [
+  "lastSessionId",
+  "codexUsageSnapshot",
+  CLAUDE_USAGE_SNAPSHOT_KEY,
+  CODEX_RESUME_SIGNATURE_KEY,
+] as const;
 /** Set on a detached subagent once its terminal state has been reported to the
  *  parent — makes the notification idempotent across runs and restarts. */
 const SUBAGENT_SETTLED_KEY = "subagentTerminalNotified";
@@ -276,11 +290,6 @@ const flushVisibleState = (): Promise<void> =>
   new Promise((resolve) => {
     setImmediate(resolve);
   });
-/** `await` of a resolved async return only drains microtasks. Fastify WS/HTTP
- *  sit in the poll phase — without setImmediate, create_agent waits behind
- *  every thinking delta. */
-const EVENT_LOOP_YIELD_EVERY_N = 8;
-const EVENT_LOOP_YIELD_MIN_MS = 16;
 
 function readPositiveMs(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
@@ -320,7 +329,7 @@ function textDeltaFromStreamEvent(msg: unknown): string | null {
   if (!msg || typeof msg !== "object" || (msg as { type?: unknown }).type !== "stream_event") return null;
   const event = (msg as { event?: { type?: unknown; delta?: { type?: unknown; text?: unknown } } }).event;
   const isTextDelta =
-    event?.type === "content_block_delta" &&
+    (event?.type === "content_block_delta" || event?.type === "content_block.delta") &&
     event.delta?.type === "text_delta" &&
     typeof event.delta.text === "string" &&
     event.delta.text.length > 0;
@@ -1670,6 +1679,7 @@ export class SessionManager {
       // source travels with the value so `/status` can say where it came from
       // instead of presenting an env default as a decision.
       livenessSuspectedAfterMs: this.livenessSuspectAfter(input.agentId),
+      discoveredModel: findProviderModel(readProviderModelCatalog(input.provider?.metadata), input.model),
       providerId: input.provider?.id ?? null,
       runtime,
       runtimeVersion: await this.runtimeVersionFor(kind),
@@ -2953,6 +2963,8 @@ export class SessionManager {
     }
 
     if (resultMsg) {
+      const providerKind = resolvedProvider?.kind ?? "anthropic-local";
+      const billed = billableResultForUsageAccounting(resultMsg, cur.metadata, providerKind);
       const events = extractUsageEvents(
         {
           agentId: id,
@@ -2960,9 +2972,9 @@ export class SessionManager {
           parentId: cur.parentId,
           providerId: resolvedProvider?.id ?? null,
           providerName: resolvedProvider?.name ?? "anthropic-default",
-          providerKind: resolvedProvider?.kind ?? "anthropic-local",
+          providerKind,
         },
-        resultMsg,
+        billed.message,
         "meta",
       );
       for (const ev of events) {
@@ -2970,6 +2982,16 @@ export class SessionManager {
           await prisma.usageEvent.create({ data: ev });
         } catch (err) {
           console.warn(`[usage:compact] failed to persist UsageEvent: ${(err as Error).message}`);
+        }
+      }
+      if (billed.snapshot) {
+        try {
+          await prisma.agent.update({
+            where: { id },
+            data: { metadata: mergeMetadata(cur.metadata, { [CLAUDE_USAGE_SNAPSHOT_KEY]: billed.snapshot }) },
+          });
+        } catch (err) {
+          console.warn(`[usage:compact] failed to persist claudeUsageSnapshot: ${(err as Error).message}`);
         }
       }
     }
@@ -3635,6 +3657,8 @@ export class SessionManager {
     // Best-effort: failures here don't affect the caller (they get their
     // accumulated text either way).
     if (resultMsg) {
+      const providerKind = resolvedProvider?.kind ?? "anthropic-local";
+      const billed = billableResultForUsageAccounting(resultMsg, agent.metadata, providerKind);
       const events = extractUsageEvents(
         {
           agentId,
@@ -3642,9 +3666,9 @@ export class SessionManager {
           parentId: agent.parentId,
           providerId: resolvedProvider?.id ?? null,
           providerName: resolvedProvider?.name ?? "anthropic-default",
-          providerKind: resolvedProvider?.kind ?? "anthropic-local",
+          providerKind,
         },
-        resultMsg,
+        billed.message,
         "meta",
       );
       for (const ev of events) {
@@ -3652,6 +3676,17 @@ export class SessionManager {
           await prisma.usageEvent.create({ data: ev });
         } catch (err) {
           console.warn(`[usage:quickQuery] failed to persist UsageEvent: ${(err as Error).message}`);
+        }
+      }
+      const resumeId = readMetaString(agent.metadata, "lastSessionId");
+      if (billed.snapshot?.sessionId && billed.snapshot.sessionId === resumeId) {
+        try {
+          await prisma.agent.update({
+            where: { id: agentId },
+            data: { metadata: mergeMetadata(agent.metadata, { [CLAUDE_USAGE_SNAPSHOT_KEY]: billed.snapshot }) },
+          });
+        } catch (err) {
+          console.warn(`[usage:quickQuery] failed to persist claudeUsageSnapshot: ${(err as Error).message}`);
         }
       }
     }
@@ -4907,6 +4942,7 @@ export class SessionManager {
     const lastSessionId = readMetaString(agent.metadata, "lastSessionId");
     let capturedSessionId: string | null = lastSessionId;
     let latestCodexUsageSnapshot: CodexUsageSnapshot | null = null;
+    let latestClaudeUsageSnapshot: ClaudeUsageSnapshot | null = null;
     // Resolve provider env. anthropic-local (no baseUrl/apiKey) inherits process.env.
     // W16: openai-compat is now handled by OpenAIAgentRuntime (Slice 2+); during
     // Slice 1 we still route everything through the Claude SDK path. The
@@ -5422,6 +5458,8 @@ export class SessionManager {
           // (deleting it) and then write its summary at a seq the runtime's own
           // events are about to want.
           await this.compactNow(agent, turnPlan, undefined, priorCutSeq - 1);
+          const compacted = await prisma.agent.findUnique({ where: { id: sessionId } });
+          if (compacted) agent.metadata = compacted.metadata;
           const reread = await prisma.message.findMany({
             where: { agentId: sessionId },
             orderBy: { seq: "asc" },
@@ -5709,18 +5747,7 @@ export class SessionManager {
       // label foreground commands as "background task started".
       let liveBackgroundTaskIds = new Set<string>();
       const detachedBackgroundTaskIds = new Set<string>();
-      let lastEventLoopYieldAt = 0;
-      let eventsSinceYield = 0;
-      const yieldEventLoop = async (): Promise<void> => {
-        eventsSinceYield++;
-        const now = Date.now();
-        if (eventsSinceYield < EVENT_LOOP_YIELD_EVERY_N && now - lastEventLoopYieldAt < EVENT_LOOP_YIELD_MIN_MS) {
-          return;
-        }
-        eventsSinceYield = 0;
-        lastEventLoopYieldAt = now;
-        await flushVisibleState();
-      };
+      const yieldEventLoop = createEventLoopYielder();
       for await (const event of stream) {
         if (abort.signal.aborted || !this.isRunOwner(sessionId, runId)) break;
         // Every runtime event is proof of life on the model AND on the wire —
@@ -5860,6 +5887,16 @@ export class SessionManager {
           latestCodexUsageSnapshot = normalizeCodexUsageSnapshot(
             (msg as { _codexUsageSnapshot?: unknown })._codexUsageSnapshot,
           );
+          const providerKind = resolvedProvider?.kind ?? "anthropic-local";
+          let usageMsg: unknown = msg;
+          if (isClaudeUsageRuntime(providerKind)) {
+            const billed = resultWithBillableClaudeUsage(
+              msg,
+              latestClaudeUsageSnapshot ?? readClaudeUsageSnapshot(agent.metadata),
+            );
+            usageMsg = billed.message;
+            if (billed.snapshot) latestClaudeUsageSnapshot = billed.snapshot;
+          }
           const events = extractUsageEvents(
             {
               agentId: sessionId,
@@ -5867,9 +5904,9 @@ export class SessionManager {
               parentId: agent.parentId,
               providerId: resolvedProvider?.id ?? null,
               providerName: resolvedProvider?.name ?? "anthropic-default",
-              providerKind: resolvedProvider?.kind ?? "anthropic-local",
+              providerKind,
             },
-            msg,
+            usageMsg,
             "result",
           );
           for (const ev of events) {
@@ -5887,7 +5924,6 @@ export class SessionManager {
           // the result payload's `contextUsage` (OpenAI / Codex). Live occupancy
           // wins when the provider number is smaller (Codex currently reports
           // outputTokens: 0). Fall back to a local count of the replayed history.
-          const providerKind = resolvedProvider?.kind ?? "anthropic-local";
           const windowInput = await this.contextWindowInput(
             agent.model,
             providerKind,
@@ -6021,6 +6057,9 @@ export class SessionManager {
         }
         if (latestCodexUsageSnapshot) {
           metaPatch.codexUsageSnapshot = latestCodexUsageSnapshot;
+        }
+        if (latestClaudeUsageSnapshot) {
+          metaPatch[CLAUDE_USAGE_SNAPSHOT_KEY] = latestClaudeUsageSnapshot;
         }
         if (codexResumeSignature && storedCodexResumeSignature !== codexResumeSignature) {
           metaPatch[CODEX_RESUME_SIGNATURE_KEY] = codexResumeSignature;

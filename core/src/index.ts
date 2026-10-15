@@ -64,7 +64,14 @@ import { discoverCodexModels } from "./codex-model-catalog.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { runCodexStdioMcp } from "./codex-stdio-mcp.js";
 import { currentPlatformKey } from "./platform-key.js";
-import type { PlatformKey } from "@agentorch/shared";
+import {
+  catalogHasDescriptions,
+  parseProviderModelCatalog,
+  providerModelIds,
+  type PlatformKey,
+  type ProviderModelInfo,
+} from "@agentorch/shared";
+import { claudeSupportedModelsToCatalog } from "./providers/claude-model-catalog.js";
 import {
   deepSeekOfficialModelsFallback,
   probeModels,
@@ -522,7 +529,7 @@ function currentProviderRuntime(meta: Record<string, unknown>): ProviderRuntimeM
 // released models. The SDK returns aliases (ModelInfo.value) which is exactly
 // what the CLI accepts when switching models. Falls back to null on any
 // failure so callers can keep the static list as a last resort.
-async function discoverClaudeModels(): Promise<string[] | null> {
+async function discoverClaudeModels(): Promise<ProviderModelInfo[] | null> {
   const abort = new AbortController();
   // Model refresh is a quick CLI-spawn; don't let a stuck login prompt / slow
   // start hang the HTTP handler. Aborting also unblocks the SDK's init wait.
@@ -546,10 +553,7 @@ async function discoverClaudeModels(): Promise<string[] | null> {
   });
   try {
     const infos = await stream.supportedModels();
-    const values = (infos ?? [])
-      .map((m) => m.value)
-      .filter((v): v is string => typeof v === "string" && v.length > 0);
-    return values.length > 0 ? values : null;
+    return claudeSupportedModelsToCatalog(infos);
   } catch {
     return null;
   } finally {
@@ -562,6 +566,18 @@ async function discoverClaudeModels(): Promise<string[] | null> {
       // init already failed / aborted — nothing to clean up.
     }
   }
+}
+
+function metadataWithCatalog(
+  meta: Record<string, unknown>,
+  catalog: ProviderModelInfo[] | null | undefined,
+): Record<string, unknown> {
+  if (!catalog || catalog.length === 0) {
+    const next = { ...meta };
+    delete next.modelCatalog;
+    return next;
+  }
+  return { ...meta, modelCatalog: catalog };
 }
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
@@ -630,6 +646,7 @@ const sanitizeProvider = (p: {
     upstreamProvider: p.upstreamProvider,
     upstreamModel: p.upstreamModel,
     models: runtime?.models && runtime.models.length > 0 ? runtime.models : p.models,
+    modelCatalog: parseProviderModelCatalog(meta.modelCatalog) ?? [],
     isDefault: p.isDefault,
     disabled: p.disabled,
     deprecated: typeof meta.deprecated === "string" ? (meta.deprecated as string) : null,
@@ -731,7 +748,10 @@ async function refreshClaudeLocalHealth(): Promise<void> {
   for (const p of rows) {
     const meta = (p.metadata && typeof p.metadata === "object" ? p.metadata : {}) as Record<string, unknown>;
     const runtimes = { ...providerRuntimes(meta) };
-    const models = Array.from(new Set([...DEFAULT_ANTHROPIC_MODELS, ...p.models]));
+    const catalog = parseProviderModelCatalog(meta.modelCatalog);
+    const models = catalog
+      ? providerModelIds(catalog)
+      : Array.from(new Set([...DEFAULT_ANTHROPIC_MODELS, ...p.models]));
     runtimes[platformKey] = {
       platformKey,
       cliPath: health.claude.path,
@@ -773,8 +793,9 @@ async function refreshCodexHealth(): Promise<void> {
   // Re-discover the codex catalog once per startup so providers always
   // reflect the user's current ChatGPT tier. Also self-heals rows that an
   // earlier release accidentally filled with Anthropic defaults.
-  const discovered = cliFound && authPresent ? await discoverCodexModels() : { ok: false as const, error: "" };
-  const discoveredModels = discovered.ok ? discovered.models : null;
+    const discovered = cliFound && authPresent ? await discoverCodexModels() : { ok: false as const, error: "" };
+    const discoveredModels = discovered.ok ? discovered.models : null;
+    const discoveredCatalog = discovered.ok ? discovered.catalog : null;
 
   for (const p of rows) {
     const meta = (p.metadata && typeof p.metadata === "object" ? p.metadata : {}) as Record<string, unknown>;
@@ -823,6 +844,9 @@ async function refreshCodexHealth(): Promise<void> {
       delete next.codexCliMissing;
       if (!authPresent) next.authMissing = true;
       else delete next.authMissing;
+    }
+    if (discoveredCatalog && discoveredCatalog.length > 0) {
+      next.modelCatalog = discoveredCatalog;
     }
     const data: { metadata: Record<string, unknown>; models?: string[] } = { metadata: next };
     if (discoveredModels && discoveredModels.length > 0) {
@@ -931,13 +955,19 @@ fastify.post("/providers", async (req, reply) => {
   // Explicit models[] in request wins (preset-applied or hand-typed) over the
   // implicit defaults below. Lets users seed a usable model list at create
   // time without a follow-up PATCH.
+  const discoveredCodex =
+    data.kind === "openai-codex" && !(data.models && data.models.length > 0)
+      ? await discoverCodexModels()
+      : null;
   const initialModels =
     data.models && data.models.length > 0
       ? data.models
       : autoManaged
         ? [data.name]
-        : data.kind === "openai-codex"
-          ? ((d) => (d.ok ? d.models : []))(await discoverCodexModels())
+        : discoveredCodex
+          ? discoveredCodex.ok
+            ? discoveredCodex.models
+            : []
           : data.kind === "anthropic-local" || (data.kind === "anthropic" && !data.baseUrl)
             ? DEFAULT_ANTHROPIC_MODELS
             : [];
@@ -953,6 +983,7 @@ fastify.post("/providers", async (req, reply) => {
     // offline. The choice is a preference; the turn resolves what the endpoint
     // actually speaks (and records it as a fact).
     ...(transportChoice?.ok && transportChoice.metadata ? transportChoice.metadata : {}),
+    ...(discoveredCodex?.ok ? { modelCatalog: discoveredCodex.catalog } : {}),
   };
   const codexNoBaseUrlNoApiKey =
     data.kind === "openai-codex"
@@ -1123,7 +1154,7 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
     }
     const updated = await prisma.provider.update({
       where: { id: provider.id },
-      data: { models: codexModels, metadata: { ...meta, runtimes } },
+      data: { models: codexModels, metadata: metadataWithCatalog({ ...meta, runtimes }, discovered.catalog) },
     });
     return {
       ...sanitizeProvider(updated),
@@ -1136,10 +1167,21 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   // only when the CLI is missing / offline / not logged in.
   if (provider.kind === "anthropic-local" || (provider.kind === "anthropic" && !provider.baseUrl && !provider.apiKey)) {
     const discovered = await discoverClaudeModels();
-    const models = discovered ?? DEFAULT_ANTHROPIC_MODELS;
+    const models = discovered ? providerModelIds(discovered) : DEFAULT_ANTHROPIC_MODELS;
+    const meta = (provider.metadata && typeof provider.metadata === "object" ? provider.metadata : {}) as Record<string, unknown>;
+    const platformKey = currentPlatformKey();
+    const runtimes = { ...providerRuntimes(meta) };
+    if (runtimes[platformKey]) {
+      runtimes[platformKey] = { ...runtimes[platformKey]!, models, lastHealthAt: new Date().toISOString() };
+    }
     const updated = await prisma.provider.update({
       where: { id: provider.id },
-      data: { models },
+      data: {
+        models,
+        metadata: discovered
+          ? metadataWithCatalog({ ...meta, runtimes }, discovered)
+          : { ...meta, runtimes },
+      },
     });
     return {
       ...sanitizeProvider(updated),
@@ -1174,9 +1216,11 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   if (canProbe) {
     const result = await probeModels(probeBaseUrl, provider.apiKey, flavor);
     if ("models" in result) {
+      const meta = (provider.metadata && typeof provider.metadata === "object" ? provider.metadata : {}) as Record<string, unknown>;
+      const catalog = catalogHasDescriptions(result.catalog) ? result.catalog : null;
       const updated = await prisma.provider.update({
         where: { id: provider.id },
-        data: { models: result.models },
+        data: { models: result.models, metadata: metadataWithCatalog(meta, catalog) },
       });
       return {
         ...sanitizeProvider(updated),
@@ -1189,9 +1233,10 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/refresh-models", async 
   // Static catalog is the fallback of last resort — only after a live probe
   // failed, or couldn't even be attempted because OpenAI needs a key.
   if (deepSeekFallback) {
+    const meta = (provider.metadata && typeof provider.metadata === "object" ? provider.metadata : {}) as Record<string, unknown>;
     const updated = await prisma.provider.update({
       where: { id: provider.id },
-      data: { models: deepSeekFallback.models },
+      data: { models: deepSeekFallback.models, metadata: metadataWithCatalog(meta, null) },
     });
     // Every candidate URL 404ing means the upstream (e.g. DeepSeek's
     // /anthropic endpoint) simply has no /models route — that's the normal,

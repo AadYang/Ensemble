@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-10-15 · 思考流被 yield 卡成每秒三四个词
+
+**触发**：test 团队 android开发（deepseek-flash / Claude CLI）窗口里思考约 3–4 词/秒。CLI `thinking_duration_ms` 同一块是约 600 字/秒；24k 字思考墙钟约 19 分钟，正好是 20 字/秒。
+
+**根因**：1 字 `thinking_delta` 上 `lastEventLoopYieldAt` 打在 `setImmediate` **之前**。poll 一旦超过 16ms（别的 agent / sqlite / WS），下一个字也会判定「已经过了 16ms」再 yield。每个字等一轮事件循环，正好卡在每秒二十来个字。
+
+**改动**：yield 结束后再打时间戳；合批认 `content_block.delta`。
+
+**留下的规则**：让事件循环的时间戳打在 await **之后**。await 前打点，慢 poll 会把「每 N 个字让一次」变成「每个字让一次」。
+
+---
+
+## 2026-10-15 · Claude usage 按回合差分；统计图总量不含 cache
+
+**触发**：10 月 12 日 token 统计到 104 亿。墨水屏 APP 工程师 48 回合 cacheRead 96 亿；最后一条 result 的 cacheRead 3.51 亿，远超 100 万 context window。
+
+**根因**：Claude CLI `result.modelUsage` 在 anthropic-compat resume（DeepSeek）上是 session 累计值。Ensemble 每条 result 原样写成 UsageEvent。官方 Claude 是按查询报、有升有降。Codex 已经对 `_codexUsageSnapshot` 做差分。统计图「累计」把 cacheRead/cacheWrite 叠进 input+output。
+
+**改动**：同 `session_id` 且四项计数都不下降时按上一快照差分，否则当本回合。Message 仍存原始 modelUsage；`metadata.claudeUsageSnapshot` 随 resume 清掉。图上总量 = input + output。历史 UsageEvent 不回写。
+
+**留下的规则**：Claude 的 modelUsage 不能当「本回合账单」。累计还是按查询，用 session + 单调性区分。图上的总量不要把 cache 加进去。
+
+---
+
+## 2026-09-29 · 聊天链接复制成 sidecar 地址
+
+**触发**：墨水屏经理的文档链接点不开，复制是 `http://127.0.0.1:61300/`。
+
+**根因**：markdown 写 `D:/…html` 时，react-markdown 的 defaultUrlTransform 把 `D:` 当未知协议，href 被清空。`<a>` 落到当前页 origin，点击 `openInOs` 也没东西可开。
+
+**改动**：`chatUrlTransform` 保住盘符 / `file://` / `/D:/`，写成 `file:///D:/…`；`parseChatLink` 还能从 `http://127.0.0.1:port/D:/…` 还原路径。安装包 0.0.52。
+
+**留下的规则**：聊天 href 不能走 markdown 默认的协议白名单。`D:` 是盘符，不是 scheme。
+
+---
+
 ## 2026-09-22 · Codex 思考过程不可见
 
 **触发**：墨水屏经理 `gpt-5.6-sol` high 首字极慢、思考区空白。thread 里 117 条 reasoning 全是空 `summary[]` + `encrypted_content`，没有 `item.text`。

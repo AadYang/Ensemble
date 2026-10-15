@@ -4,8 +4,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { listProviders, type ProviderDTO } from "@/lib/provider-api";
 import { useT } from "@/i18n/useT";
-import { DEFAULT_ANTHROPIC_MODELS } from "@/lib/default-models";
 import { MenuSelect } from "./MenuSelect";
+import { providerModelInfo, providerModelSelectItems } from "@/lib/provider-models";
 
 export function NewAgentDialog({
   defaultName,
@@ -56,14 +56,9 @@ export function NewAgentDialog({
     () => providers.find((p) => p.id === providerId) ?? null,
     [providers, providerId],
   );
-  const isDefaultAnth =
-    selectedProvider?.kind === "anthropic-local" ||
-    (selectedProvider?.kind === "anthropic" && !selectedProvider.baseUrl);
-  const availableModels: string[] = selectedProvider?.models.length
-    ? selectedProvider.models
-    : isDefaultAnth
-      ? DEFAULT_ANTHROPIC_MODELS
-      : [];
+  const modelItems = providerModelSelectItems(selectedProvider);
+  const availableModels = modelItems.map((item) => item.value);
+  const selectedModelDescription = providerModelInfo(selectedProvider ?? undefined, model).description;
 
   // Reset model to first option whenever provider changes.
   useEffect(() => {
@@ -165,8 +160,13 @@ export function NewAgentDialog({
               onChange={setModel}
               disabled={availableModels.length === 0}
               placeholder={t("agent.new.modelEmpty")}
-              items={availableModels.map((m) => ({ value: m, label: m }))}
+              items={modelItems}
             />
+            {selectedModelDescription && (
+              <span className="text-[10px] text-[var(--text-dim)] leading-tight">
+                {selectedModelDescription}
+              </span>
+            )}
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">

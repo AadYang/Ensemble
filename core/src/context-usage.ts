@@ -218,7 +218,7 @@ export function occupancyDeltaFromStreamEvent(msg: unknown): string | null {
       };
     }
   ).event;
-  if (event?.type !== "content_block_delta") return null;
+  if (event?.type !== "content_block_delta" && event?.type !== "content_block.delta") return null;
   const delta = event.delta;
   if (!delta || typeof delta !== "object") return null;
   if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {

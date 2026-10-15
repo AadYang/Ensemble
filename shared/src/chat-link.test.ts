@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseChatLink } from "./chat-link.js";
+import { chatUrlTransform, parseChatLink } from "./chat-link.js";
 
 describe("parseChatLink", () => {
   it("opens https URLs in the system browser", () => {
@@ -29,6 +29,10 @@ describe("parseChatLink", () => {
       kind: "path",
       path: "D:\\WorkSpace\\bondings-app\\readme.md",
     });
+    expect(parseChatLink("D:/WorkSpace/bondings-app/readme.md")).toEqual({
+      kind: "path",
+      path: "D:/WorkSpace/bondings-app/readme.md",
+    });
     expect(parseChatLink("file:///D:/WorkSpace/a.html")).toEqual({
       kind: "path",
       path: "D:/WorkSpace/a.html",
@@ -39,10 +43,30 @@ describe("parseChatLink", () => {
     });
   });
 
+  it("unwraps file paths that the webview resolved against the sidecar origin", () => {
+    expect(parseChatLink("http://127.0.0.1:61300/D:/WorkSpace/bondings-app/plan.html")).toEqual({
+      kind: "path",
+      path: "D:/WorkSpace/bondings-app/plan.html",
+    });
+    expect(parseChatLink("http://127.0.0.1:61300/")).toBeNull();
+  });
+
   it("rejects javascript and other non-openable schemes", () => {
     expect(parseChatLink("javascript:alert(1)")).toBeNull();
     expect(parseChatLink("data:text/html,hi")).toBeNull();
     expect(parseChatLink("/agents/foo")).toBeNull();
     expect(parseChatLink("")).toBeNull();
+  });
+});
+
+describe("chatUrlTransform", () => {
+  it("does not strip Windows drive and file hrefs the way defaultUrlTransform does", () => {
+    expect(chatUrlTransform("D:/WorkSpace/a.html")).toBe("file:///D:/WorkSpace/a.html");
+    expect(chatUrlTransform("/D:/WorkSpace/a.html")).toBe("file:///D:/WorkSpace/a.html");
+    expect(chatUrlTransform("file:///D:/WorkSpace/a.html")).toBe("file:///D:/WorkSpace/a.html");
+    expect(chatUrlTransform("https://github.com/jumpoAi/bondings-app/issues/47")).toBe(
+      "https://github.com/jumpoAi/bondings-app/issues/47",
+    );
+    expect(chatUrlTransform("javascript:alert(1)")).toBe("");
   });
 });

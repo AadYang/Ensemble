@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 export interface MenuSelectItem {
   value: string;
   label: string;
+  description?: string;
   group?: string;
 }
 
@@ -93,7 +94,7 @@ export function MenuSelect({
           ref={menuRef}
           role="listbox"
           style={{ top: anchor.top, left: anchor.left, width: Math.max(anchor.width, 160) }}
-          className="fixed z-[10050] max-h-48 overflow-y-auto border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl shadow-black/50 text-xs"
+          className="fixed z-[10050] max-h-64 overflow-y-auto border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl shadow-black/50 text-xs"
         >
           {items.length === 0 && (
             <div className="px-1.5 py-1 text-[var(--text-faint)]">{placeholder}</div>
@@ -121,7 +122,12 @@ export function MenuSelect({
                     (item.value === value ? "text-[var(--accent)]" : "text-[var(--text)]")
                   }
                 >
-                  {item.label}
+                  <div className="truncate">{item.label}</div>
+                  {item.description && (
+                    <div className="text-[10px] leading-tight text-[var(--text-faint)] whitespace-normal">
+                      {item.description}
+                    </div>
+                  )}
                 </button>
               ))}
             </div>

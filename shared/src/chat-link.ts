@@ -12,12 +12,20 @@ const BLOCKED_SCHEME = /^(javascript|data|vbscript|tauri|blob|about):/i;
 const HTTP_SCHEME = /^(https?:|mailto:)/i;
 const FILE_SCHEME = /^file:/i;
 const DRIVE = /^\/?([A-Za-z]):/;
+const LOOPBACK_HOST = /^(127\.0\.0\.1|localhost|tauri\.localhost)$/i;
 
 export function parseChatLink(raw: string): ChatLink | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   if (BLOCKED_SCHEME.test(trimmed)) return null;
-  if (HTTP_SCHEME.test(trimmed)) return { kind: "url", href: trimmed };
+
+  const loopbackPath = loopbackFilePath(trimmed);
+  if (loopbackPath) return parseChatLink(loopbackPath);
+
+  if (HTTP_SCHEME.test(trimmed)) {
+    if (isBareLoopbackOrigin(trimmed)) return null;
+    return { kind: "url", href: trimmed };
+  }
 
   let path = decodeHref(trimmed);
   if (FILE_SCHEME.test(path)) {
@@ -38,6 +46,19 @@ export function parseChatLink(raw: string): ChatLink | null {
   return null;
 }
 
+/** react-markdown's defaultUrlTransform treats `D:/…` as scheme `D:` and
+ *  `file:` as unsafe, so the `<a href>` becomes empty and copy/click resolve
+ *  to the sidecar origin (`http://127.0.0.1:port/`). Keep OS-openable hrefs. */
+export function chatUrlTransform(value: string): string {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed || BLOCKED_SCHEME.test(trimmed)) return "";
+  const link = parseChatLink(trimmed);
+  if (link?.kind === "url") return link.href;
+  if (link?.kind === "path") return pathToFileUrl(link.path);
+  if (trimmed.startsWith("#") || trimmed.startsWith("/")) return trimmed;
+  return trimmed;
+}
+
 const UNIX_ROOT = /^\/(Users|home|opt|tmp|var|Volumes|private|mnt|Library)\b/;
 const FILE_EXT = /\.[A-Za-z0-9]{1,8}$/;
 
@@ -51,6 +72,41 @@ function decodeHref(href: string): string {
   } catch {
     return href;
   }
+}
+
+function isBareLoopbackOrigin(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (!LOOPBACK_HOST.test(url.hostname)) return false;
+  const path = url.pathname || "/";
+  return path === "/" && !url.search && (!url.hash || url.hash === "#");
+}
+
+function loopbackFilePath(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (!LOOPBACK_HOST.test(url.hostname)) return null;
+  const path = decodeHref(url.pathname || "");
+  if (path.startsWith("/") && DRIVE.test(path)) return path;
+  if (path.startsWith("/") && isUnixFilePath(path)) return path;
+  return null;
+}
+
+function pathToFileUrl(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  if (/^[A-Za-z]:/.test(normalized)) return `file:///${normalized}`;
+  if (normalized.startsWith("/")) return `file://${normalized}`;
+  return path;
 }
 
 /** `file.ts:12` / `file.ts:12:4`, but never the `D:` drive colon. */

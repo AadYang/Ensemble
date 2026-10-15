@@ -1,6 +1,7 @@
 export * from "./protocol";
 export * from "./peer-contact";
 export * from "./reasoning";
+export * from "./provider-model";
 export type * from "./capability";
 export * from "./run-plan-view";
 export * from "./status-report";

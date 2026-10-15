@@ -3,6 +3,7 @@ import {
   DEEPSEEK_OFFICIAL_MODELS,
   candidateModelsUrls,
   deepSeekOfficialModelsFallback,
+  extractModelCatalog,
   extractModelIds,
   probeModels,
 } from "./model-discovery.js";
@@ -26,6 +27,12 @@ describe("provider model discovery", () => {
     expect(extractModelIds({ data: [{ id: "b" }, { name: "a" }] })).toEqual(["a", "b"]);
     expect(extractModelIds({ models: ["m2", "m1"] })).toEqual(["m1", "m2"]);
     expect(extractModelIds({ results: [{ model_id: "x" }] })).toEqual(["x"]);
+  });
+
+  it("keeps display_name from an HTTP /models body", () => {
+    expect(extractModelCatalog({ data: [{ id: "gpt-x", display_name: "GPT X", description: "desc" }] })).toEqual([
+      { id: "gpt-x", displayName: "GPT X", description: "desc" },
+    ]);
   });
 
   it("recognizes DeepSeek official Anthropic baseUrl as fixed-catalog fallback", () => {
