@@ -1,4 +1,4 @@
-import { isReasoningToken } from "./reasoning.js";
+import { isReasoningToken } from "./reasoning";
 
 /** One row from a provider's live model catalog (Claude CLI, Codex
  *  `debug models`, or an HTTP `/models` body). `id` is what Ensemble stores
