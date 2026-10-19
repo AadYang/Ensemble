@@ -529,6 +529,8 @@ describe("gate 6 (wiring): the runtime's history matches the plan's decision", (
       string,
       unknown
     >;
+    // Native compact is attempted, but this mock never emits compact_boundary, so
+    // Ensemble drops the too-long session and retries from local history.
     expect(meta.lastSessionId).toBeUndefined();
     cleanup();
   });

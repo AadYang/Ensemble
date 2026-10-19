@@ -12,12 +12,28 @@ process.env.AGENTORCH_DB_PATH = ":memory:";
 
 const captured: RuntimeOptions[] = [];
 let nativeCompactMode: "success" | "silent" = "success";
+let failNextUserPrompt = false;
 
 vi.mock("../runtimes/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../runtimes/index.js")>()),
   chooseRuntime: () => ({
     async *query(opts: RuntimeOptions): AsyncGenerator<{ type: "sdk_message"; payload: unknown }> {
       captured.push(opts);
+      if (failNextUserPrompt && opts.prompt !== "/compact") {
+        failNextUserPrompt = false;
+        yield {
+          type: "sdk_message" as const,
+          payload: {
+            type: "result" as const,
+            subtype: "success",
+            is_error: true,
+            result: "Prompt is too long",
+            session_id: opts.resume ?? "too-long-session",
+            modelUsage: {},
+          },
+        };
+        return;
+      }
       if (opts.resume && opts.prompt === "/compact") {
         if (nativeCompactMode === "success") {
           opts.captureCompactSummary?.("CLI summary of the native session", { trigger: "manual" });
@@ -72,6 +88,7 @@ vi.mock("../../cli-config.js", () => ({
 
 let prisma: typeof import("../../db.js").prisma;
 let SessionManager: typeof import("../SessionManager.js").SessionManager;
+let hashStableSystemPrompt: typeof import("../SessionManager.js").hashStableSystemPrompt;
 
 class StubHub {
   sendToSession(_sessionId: string, _msg: Record<string, unknown>): void {}
@@ -80,12 +97,13 @@ class StubHub {
 
 beforeAll(async () => {
   ({ prisma } = await import("../../db.js"));
-  ({ SessionManager } = await import("../SessionManager.js"));
+  ({ SessionManager, hashStableSystemPrompt } = await import("../SessionManager.js"));
 });
 
 beforeEach(() => {
   captured.length = 0;
   nativeCompactMode = "success";
+  failNextUserPrompt = false;
 });
 
 async function seedTurns(agentId: string): Promise<void> {
@@ -193,5 +211,40 @@ describe("compact delegates to the native CLI when a session exists", () => {
     const sessions = new SessionManager(new StubHub() as never);
     await sessions.compactAgent(agent.id);
     expect(captured.every((opts) => opts.prompt !== "/compact")).toBe(true);
+  });
+
+  it("retries a Prompt-is-too-long turn after native /compact and keeps the session", async () => {
+    failNextUserPrompt = true;
+    const root = mkdtempSync(join(tmpdir(), "compact-overflow-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-overflow",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    const promptHash = hashStableSystemPrompt({
+      permissionMode: "default",
+      teamContext: "",
+      baseSystemPrompt: agent.systemPrompt ?? "",
+    });
+    await prisma.agent.update({
+      where: { id: agent.id },
+      data: { metadata: { lastSessionId: "native-session-id", systemPromptHash: promptHash } },
+    });
+    await seedTurns(agent.id);
+    const sessions = new SessionManager(new StubHub() as never);
+    await sessions.sendMessage(agent.id, "keep going");
+
+    expect(captured.some((opts) => opts.prompt === "/compact")).toBe(true);
+    expect(captured.some((opts) => opts.prompt === "keep going" && opts.resume === "native-session-id")).toBe(true);
+
+    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
+    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<
+      string,
+      unknown
+    >;
+    expect(meta.lastSessionId).toBe("native-session-id");
   });
 });

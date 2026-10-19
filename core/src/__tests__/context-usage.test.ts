@@ -10,6 +10,7 @@ import {
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
+  shouldCompactForHeadroom,
   promptTokensFromLastCall,
   promptTokensFromResultContextUsage,
   reportedContextWindowFromResult,
@@ -646,5 +647,30 @@ describe("promptTextFromMessage", () => {
     expect(promptTextFromMessage(userRow([]))).toBe("");
     expect(promptTextFromMessage({ type: "system", payload: { type: "system" } })).toBe("");
     expect(promptTextFromMessage(null)).toBe("");
+  });
+});
+
+describe("shouldCompactForHeadroom", () => {
+  it("fires on a 200k Claude window when remaining room is only the output reserve", () => {
+    expect(
+      shouldCompactForHeadroom({ usedTokens: 168_000, window: 200_000, outputReserve: 32_000 }),
+    ).toBe(true);
+    expect(
+      shouldCompactForHeadroom({ usedTokens: 167_999, window: 200_000, outputReserve: 32_000 }),
+    ).toBe(false);
+  });
+
+  it("uses 10% of a large Codex window when that is bigger than the output reserve", () => {
+    expect(
+      shouldCompactForHeadroom({ usedTokens: 745_560, window: 828_400, outputReserve: 32_000 }),
+    ).toBe(true);
+    expect(
+      shouldCompactForHeadroom({ usedTokens: 700_000, window: 828_400, outputReserve: 32_000 }),
+    ).toBe(false);
+  });
+
+  it("does not invent a trigger from missing occupancy or a missing window", () => {
+    expect(shouldCompactForHeadroom({ usedTokens: 0, window: 200_000, outputReserve: 32_000 })).toBe(false);
+    expect(shouldCompactForHeadroom({ usedTokens: 199_000, window: 0, outputReserve: 32_000 })).toBe(false);
   });
 });

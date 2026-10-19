@@ -388,6 +388,23 @@ export function contextUsageFromUsedTokens(
   };
 }
 
+/** Compact when the next request cannot fit the output reserve plus a 10% buffer.
+ *
+ *  Claude auto-compacts around 85% of its window and Codex at 95%; both still
+ *  miss when a turn jumps the remaining headroom. This is that last-resort
+ *  check — occupancy vs the effective window — not a character-count heuristic.
+ *  Unknown used/window must not invent a trigger. */
+export function shouldCompactForHeadroom(args: {
+  usedTokens: number;
+  window: number;
+  outputReserve: number | null;
+}): boolean {
+  if (!(args.usedTokens > 0) || !(args.window > 0)) return false;
+  const tenth = Math.ceil(args.window * 0.1);
+  const reserve = args.outputReserve != null && args.outputReserve > 0 ? args.outputReserve : tenth;
+  return args.usedTokens >= args.window - Math.max(reserve, tenth);
+}
+
 /** Build a ContextUsage from locally-tokenized transcript text. */
 export function contextUsageFromTranscript(
   model: string,
