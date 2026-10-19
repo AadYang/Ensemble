@@ -1,6 +1,6 @@
 [package]
 name = "ensemble"
-version = "0.0.52"
+version = "1.0.0"
 description = "Ensemble — many minds, one workspace"
 authors = ["Ensemble"]
 license = ""
