@@ -98,6 +98,7 @@
     <a href="#codex">Codex CLI</a>
     <a href="#mcp">MCP 和 Skills</a>
     <a href="#usage">用量统计</a>
+    <a href="#loop">Loop</a>
     <a href="#commands">Slash 命令</a>
     <a href="#troubleshoot">常见问题</a>
   </aside>
@@ -213,6 +214,13 @@ message: 请检查这个实现是否有回归风险。</code></pre>
       <p>用量记录是本地审计数据。Codex 通过 ChatGPT 订阅运行时，统计会记录 token，但不会把订阅型 turn 按 API 单价重复计费。</p>
     </section>
 
+    <section id="loop">
+      <h2>Loop</h2>
+      <p>Loop 是 Ensemble 自己的外环停机闸门：你只填<b>目标</b>。Agent 自己连着干，做完由它在 <code>TASKS.md</code> 写下 <code>## DONE</code>。你不用写测试、脚本或结束标记。命令校验是可选项，用来拦住假完成。</p>
+      <p>在聊天框输入 <code>/loop</code> 打开对话框。目标是多行文本。可选配方：TDD、Ralph（每轮外环清空会话，<code>TASKS.md</code> 才是记忆）、PR 门禁。右侧看板读写项目根的 <code>TASKS.md</code>。</p>
+      <p>Team Loop 是一块看板、多个隔离 runner、可选一个 reviewer（<code>peer_send review</code>，LGTM 才 done）。可选 git worktree；停环<b>不删除</b> worktree。Ensemble <b>不会</b>加载 Claude <code>settingSources</code> / 用户 MEMORY.md。</p>
+    </section>
+
     <section id="commands">
       <h2>Slash 命令</h2>
       <table>
@@ -226,6 +234,10 @@ message: 请检查这个实现是否有回归风险。</code></pre>
           <tr><td><code>/cost</code></td><td>查看 token 和成本统计。</td></tr>
           <tr><td><code>/mcp</code></td><td>查看 MCP 状态。</td></tr>
           <tr><td><code>/skills</code></td><td>查看 skills 状态。</td></tr>
+          <tr><td><code>/loop [stop|pause|resume]</code></td><td>无参数打开 Loop 对话框；带参数控制进行中的环。</td></tr>
+          <tr><td><code>/verify</code></td><td>立刻跑一遍 Loop 校验。</td></tr>
+          <tr><td><code>/done-when</code></td><td>改 Loop 完成条件。</td></tr>
+          <tr><td><code>/max-iter</code></td><td>限制 Loop 外环轮数。</td></tr>
         </tbody>
       </table>
     </section>

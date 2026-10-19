@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getWS } from "@/lib/ws";
 import { listAgents } from "@/lib/agent-api";
+import { listLoops } from "@/lib/loop-api";
 import { listTeams } from "@/lib/team-api";
 import { getDialog } from "@/lib/dialog";
 import type {
@@ -89,6 +90,7 @@ export default function Page() {
   const clearLiveness = useStore((s) => s.clearLiveness);
   const setRunPlan = useStore((s) => s.setRunPlan);
   const clearRunPlan = useStore((s) => s.clearRunPlan);
+  const setLoop = useStore((s) => s.setLoop);
   const ingestSdkMessage = useStore((s) => s.ingestSdkMessage);
   const appendError = useStore((s) => s.appendError);
   const agents = useAgentDirectory();
@@ -236,9 +238,10 @@ export default function Page() {
     let cancelled = false;
     (async () => {
       try {
-        const [list, teams] = await Promise.all([listAgents(), listTeams()]);
+        const [list, teams, loops] = await Promise.all([listAgents(), listTeams(), listLoops()]);
         if (cancelled) return;
         useStore.getState().setTeams(teams);
+        for (const loop of loops) useStore.getState().setLoop(loop.agentId, loop);
         for (const a of list) {
           upsertAgent(a);
           if (ws.isOpen()) ws.send({ type: "subscribe", sessionId: a.id });
@@ -405,6 +408,9 @@ export default function Page() {
           // inferred from the provider kind or the model id.
           setRunPlan(msg.sessionId, msg.plan);
           break;
+        case "loop_update":
+          setLoop(msg.sessionId, msg.loop);
+          break;
         case "message":
           ingestLiveSdkMessage(msg.sessionId, msg.seq, msg.msg);
           break;
@@ -446,6 +452,7 @@ export default function Page() {
     clearLiveness,
     setRunPlan,
     clearRunPlan,
+    setLoop,
     addPermissionRequest,
     addUserQuestion,
     appendError,
@@ -749,14 +756,14 @@ export default function Page() {
       <CliInstallReminder />
       <header
         data-tauri-drag-region
-        className="shrink-0 flex items-center justify-between pl-4 pr-0 py-2 border-b border-[var(--border)] bg-[var(--bg-pane)]/40 select-none"
+        className="shrink-0 flex items-center justify-between pl-4 pr-0 py-2 border-b border-[var(--border)] bg-[var(--bg-pane)]/40 select-none min-w-0"
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0 overflow-hidden">
           <span className="text-[var(--accent)]">▎</span>
           <span className="font-bold tracking-[0.18em]">{t("header.brand")}</span>
           <span className="text-[var(--text-faint)] text-[10px] tracking-wider ml-1">{t("header.version")}</span>
         </div>
-        <div className="flex items-center gap-4 text-xs">
+        <div className="flex items-center gap-4 text-xs shrink-0">
           <span className="flex items-center gap-1">
             <span className="text-[var(--accent)]">◉</span>
             <span className="text-[var(--text)]">{activeCount}</span>

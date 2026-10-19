@@ -7,6 +7,7 @@ import {
   formatCapabilityFieldLines,
   measureChatInputHeight,
   thinkingDomText,
+  formatLoopStatusLines,
   type RunPlanStatusView,
   type SdkMessage,
 } from "@agentorch/shared";
@@ -36,6 +37,9 @@ import { isHtmlFilePath, toolCardContent, toolPathFromInput } from "@/lib/tool-c
 import { PeerSendPopover } from "./PeerSendPopover";
 import { GitBranchChip } from "./GitBranchChip";
 import { ContextBar } from "./ContextBar";
+import { LoopDialog } from "./LoopDialog";
+import { LoopBoard } from "./LoopBoard";
+import { loopAction, patchLoop } from "@/lib/loop-api";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { chatMarkdownComponents, chatUrlTransform } from "./ChatMarkdown";
@@ -69,6 +73,14 @@ const SLASH_COMMAND_HINTS: readonly string[] = Object.freeze([
   "/compact",
   "/cost",
   "/status",
+  "/loop",
+  "/loop ",
+  "/loop stop",
+  "/loop pause",
+  "/loop resume",
+  "/verify",
+  "/done-when ",
+  "/max-iter ",
   "/mcp",
   "/skills",
   "/skill enable ",
@@ -314,7 +326,9 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
   // The server's last word on this agent's run. Absent = nothing has been said
   // for it since the connection opened, which renders as nothing at all.
   const liveness = useStore((s) => s.livenessByAgent[agentId]);
+  const loop = useStore((s) => s.loopsByAgent[agentId]);
   const ingestOlderTurns = useStore((s) => s.ingestOlderTurns);
+  const [loopDialogOpen, setLoopDialogOpen] = useState(false);
   const [historyExtra, setHistoryExtra] = useState(0);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyExhausted, setHistoryExhausted] = useState(false);
@@ -819,6 +833,7 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
             // the settings page and the context bar render, so the text report
             // and the UI cannot answer differently.
             ...formatRunPlanLines(s.planView),
+            ...(s.loop ? formatLoopStatusLines(s.loop) : ["loop=(none)"]),
             // A compacted history whose originals are invisible reads as data
             // the user lost. Read-only this phase: the generations are listed and
             // nothing here restores them.
@@ -871,6 +886,58 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
         try {
           await toggleAgentSkill(agentId, name, sub as "enable" | "disable" | "auto");
           appendNotice(agentId, t("slash.skill.applied", { name, action: sub }));
+        } catch (err) {
+          appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
+        }
+        return;
+      }
+      case "loop": {
+        const sub = arg.split(/\s+/)[0]?.toLowerCase() ?? "";
+        if (!sub) {
+          setLoopDialogOpen(true);
+          return;
+        }
+        if (sub === "stop" || sub === "pause" || sub === "resume") {
+          try {
+            await loopAction(agentId, sub);
+          } catch (err) {
+            appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
+          }
+          return;
+        }
+        appendNotice(agentId, t("slash.loop.usage"));
+        return;
+      }
+      case "verify": {
+        try {
+          await loopAction(agentId, "verify");
+        } catch (err) {
+          appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
+        }
+        return;
+      }
+      case "done-when": {
+        const parts = arg.split(/\s+/).filter(Boolean);
+        const kind = parts[0] as "exit-0" | "file-contains" | "peer-lgtm" | undefined;
+        if (kind !== "exit-0" && kind !== "file-contains" && kind !== "peer-lgtm") {
+          appendNotice(agentId, t("slash.doneWhen.usage"));
+          return;
+        }
+        try {
+          await patchLoop(agentId, { doneWhen: { kind, spec: parts.slice(1).join(" ") } });
+        } catch (err) {
+          appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
+        }
+        return;
+      }
+      case "max-iter": {
+        const n = Number(arg);
+        if (!Number.isFinite(n) || n < 1) {
+          appendNotice(agentId, t("slash.maxIter.usage"));
+          return;
+        }
+        try {
+          await patchLoop(agentId, { maxIterations: Math.floor(n) });
         } catch (err) {
           appendNotice(agentId, t("slash.error", { err: (err as Error).message }));
         }
@@ -1069,17 +1136,20 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
     }
   };
 
+  const loopActive = loop && loop.status !== "idle" && loop.status !== "done" && loop.status !== "failed";
+
   return (
-    <div className="flex flex-col flex-1 min-h-0">
-      <div className="px-3 py-1.5 border-b border-[var(--border)] flex items-center gap-2 text-xs">
+    <div className="@container flex flex-1 min-h-0 min-w-0">
+    <div className="flex flex-col flex-1 min-h-0 min-w-0">
+      <div className="px-3 py-1.5 border-b border-[var(--border)] flex flex-wrap items-center gap-x-2 gap-y-1 text-xs min-w-0">
         <span className={`status-dot ${summary.status}`} />
-        <span className="font-bold">{summary.name}</span>
+        <span className="font-bold truncate max-w-[10rem]">{summary.name}</span>
         {/* The model the LAST TURN actually used, when we have a plan. `summary
             .model` is the configured value and can differ from what ran, and a
             header that shows the configuration as if it were the fact is a
             small lie the plan lets us avoid. Falls back to the configured value
             only when there is no plan at all — never to a guess. */}
-        <span className="text-[var(--text-dim)]">{plan?.identity.modelId ?? summary.model}</span>
+        <span className="text-[var(--text-dim)] truncate max-w-[12rem]">{plan?.identity.modelId ?? summary.model}</span>
         {/* The project this agent actually works in. Shown only when the plan
             established one: absent means "we do not know", which is NOT the same
             as "unbound", and rendering `(unbound)` for it would invent a state
@@ -1115,6 +1185,60 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
             state (nothing has run yet, or the server has not reported since
             we subscribed). */}
         <ContextBar context={contextUsage} capability={capability} />
+        {loopActive && loop ? (
+          <span className="flex items-center gap-1 shrink-0">
+            <span
+              className={
+                loop.lastVerifyOk === false
+                  ? "text-[var(--warn)]"
+                  : loop.status === "paused" || loop.status === "awaiting_review"
+                    ? "text-[var(--warn)]"
+                    : "text-[var(--accent)]"
+              }
+              title={loop.lastVerifySummary || loop.config.goal}
+            >
+              {t("loop.chip.label")} {loop.iter}/{loop.maxIterations}
+              {loop.lastVerifyOk === false
+                ? ` · ${t("loop.chip.verifyFail")}`
+                : loop.lastVerifyOk === true
+                  ? ` · ${t("loop.chip.verifyOk")}`
+                  : ""}
+            </span>
+            {loop.status === "paused" ? (
+              <button
+                type="button"
+                className="px-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)]"
+                onClick={() => void loopAction(agentId, "resume").catch((err) => appendNotice(agentId, t("slash.error", { err: (err as Error).message })))}
+              >
+                {t("loop.chip.resume")}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="px-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)]"
+                onClick={() => void loopAction(agentId, "pause").catch((err) => appendNotice(agentId, t("slash.error", { err: (err as Error).message })))}
+              >
+                {t("loop.chip.pause")}
+              </button>
+            )}
+            <button
+              type="button"
+              className="px-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--err)]"
+              onClick={() => void loopAction(agentId, "stop").catch((err) => appendNotice(agentId, t("slash.error", { err: (err as Error).message })))}
+            >
+              {t("loop.chip.stop")}
+            </button>
+          </span>
+        ) : (
+          <button
+            type="button"
+            className="px-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)]"
+            title={t("loop.chip.start")}
+            onClick={() => setLoopDialogOpen(true)}
+          >
+            {t("loop.chip.label")}
+          </button>
+        )}
         {subagentStarts > 0 && (
           <span
             className="text-[var(--accent)]"
@@ -1136,7 +1260,7 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
             {t("chat.badge.plan")}
           </span>
         )}
-        <span className="flex-1" />
+        <span className="flex items-center gap-2 shrink-0 ml-auto">
         {totalAgents > 1 && (
           <button
             title={t("peer.btn.title")}
@@ -1154,6 +1278,7 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
             {t("chat.cancel")}
           </button>
         )}
+        </span>
       </div>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 min-h-0">
@@ -1288,6 +1413,15 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
           onClose={() => setPeerOpen(false)}
         />
       )}
+      {loopDialogOpen && (
+        <LoopDialog
+          agentId={agentId}
+          teamId={summary.teamId}
+          onClose={() => setLoopDialogOpen(false)}
+        />
+      )}
+    </div>
+    {loopActive && loop && <LoopBoard agentId={agentId} loop={loop} />}
     </div>
   );
 });

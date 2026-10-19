@@ -81,6 +81,9 @@ message: 请检查这个实现是否有回归风险。</code></pre>
   <h2>用量统计</h2>
   <p>输入 <code>/cost</code> 可打开 Usage Stats，按 agent、model、provider、日期查看 token / cost breakdown，并导出 CSV。Codex 订阅型 turn 会记录 token，但不会按 API 单价重复计费。</p>
 
+  <h2>Loop</h2>
+  <p>用 <code>/loop</code> 给 agent 开循环：你只填目标，agent 做完后自己在 <code>TASKS.md</code> 写下 <code>## DONE</code>。命令校验是可选项。Team 上可以一块看板、多个隔离 runner、可选 reviewer；可选 git worktree（停环不删）。这是 Ensemble 编排器的 Stop-gate，不会加载 Claude <code>settingSources</code>。</p>
+
   <h2>常见问题</h2>
   <p>如果目标 agent 收到消息但运行失败，说明 <code>peer_send</code> 已送达，失败点通常在目标 provider 的 key、baseUrl 或 model。</p>
   <p>流式输出会自动跟随到底部；如果你手动滚动离开底部，Ensemble 会尊重当前位置。</p>

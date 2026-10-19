@@ -571,7 +571,11 @@ const en: Dict = {
   /clear               drop this agent's history and start fresh
   /compact             ask the native CLI to compact this session when one exists; otherwise summarize locally
   /cost                open usage / token-cost dialog
-  /status              print provider / model / mode / sandbox / counts
+  /status              print provider / model / mode / sandbox / counts / loop
+  /loop [stop|pause|resume]  no arg → Loop dialog (goal required)
+  /verify              run the Loop verifier now
+  /done-when <kind> [spec]  change Loop completion condition
+  /max-iter <n>        cap outer Loop iterations
   /mcp                 list enabled MCP servers
   /skills              list available skills (with forced/disabled/auto status)
   /skill <enable|disable|auto> <name>   set per-agent skill override
@@ -604,6 +608,67 @@ const en: Dict = {
   "slash.picker.provider": "select provider — ↑/↓ + Enter, Esc to cancel",
   "slash.picker.hint": "or click",
   "slash.picker.placeholder": "(picker active — press Enter or Esc)",
+  "slash.loop.usage": "usage: /loop [stop|pause|resume]  — no arg opens the Loop dialog",
+  "slash.doneWhen.usage": "usage: /done-when <exit-0|file-contains|peer-lgtm> [spec]",
+  "slash.maxIter.usage": "usage: /max-iter <n>",
+  "slash.loop.none": "no active loop on this agent — /loop to start one",
+
+  "loop.dialog.title": "start a loop",
+  "loop.dialog.start": "start",
+  "loop.dialog.cancel": "cancel",
+  "loop.field.goal": "goal",
+  "loop.field.goal.placeholder": "what should be true when this loop is done?",
+  "loop.field.goal.hint": "The agent keeps working and writes ## DONE in TASKS.md when finished. You do not write a script or an end marker.",
+  "loop.field.advanced": "advanced — optional command check",
+  "loop.field.verifier": "optional verifier",
+  "loop.field.verifierHint": "Leave empty unless this repo already has a test/lint command. Ensemble runs it after each turn to catch a false ## DONE.",
+  "loop.field.verifierSpec": "command (optional)",
+  "loop.field.verifierSpec.placeholder": "leave empty, or e.g. npm test",
+  "loop.field.doneWhen": "done when",
+  "loop.field.doneSpec": "done-when spec",
+  "loop.field.session": "session",
+  "loop.field.snapshot": "snapshot",
+  "loop.field.iterations": "max iterations",
+  "loop.field.permission": "permission bump",
+  "loop.field.recipe": "recipe",
+  "loop.field.team": "run as team loop on {name}",
+  "loop.field.worktree": "isolate runners in git worktrees",
+  "loop.field.reviewer": "reviewer",
+  "loop.field.reviewer.none": "(none)",
+  "loop.prefill.from": "from",
+  "loop.verifier.command": "command (exit 0)",
+  "loop.verifier.job": "job",
+  "loop.verifier.file": "file marker",
+  "loop.verifier.peer": "peer review",
+  "loop.done.exit0": "verifier exits 0",
+  "loop.done.file": "file contains marker",
+  "loop.done.lgtm": "reviewer LGTM",
+  "loop.session.fresh": "fresh-disk (reset runtime each outer iter)",
+  "loop.session.resume": "resume (keep session)",
+  "loop.snapshot.none": "none",
+  "loop.snapshot.git": "git commit each outer iter",
+  "loop.perm.acceptEdits": "acceptEdits while looping",
+  "loop.perm.bypass": "bypassPermissions (night Ralph)",
+  "loop.perm.keep": "keep current",
+  "loop.perm.bypassConfirm": "bypassPermissions skips every approval. Click start again to confirm.",
+  "loop.recipe.none": "(none)",
+  "loop.recipe.tdd": "TDD — one failing test per turn",
+  "loop.recipe.ralph": "Ralph — TASKS.md is memory",
+  "loop.recipe.pr": "PR gate — lint/types/tests then review",
+  "loop.chip.label": "LOOP",
+  "loop.chip.start": "start loop",
+  "loop.chip.pause": "pause",
+  "loop.chip.resume": "resume",
+  "loop.chip.stop": "stop",
+  "loop.chip.verifyOk": "VERIFY OK",
+  "loop.chip.verifyFail": "VERIFY FAIL",
+  "loop.board.title": "loop board",
+  "loop.board.tasks": "TASKS.md",
+  "loop.board.empty": "no tasks yet — the agent will write TASKS.md",
+  "loop.board.doneMarker": "TASKS.md · ## DONE",
+  "loop.board.iters": "iterations",
+  "loop.tree.reviewing": "reviewing",
+  "loop.tree.runners": "runners",
   "slash.status.notLocal":
     "no local status report for this agent — it is not one this instance runs, so its plan and usage are produced elsewhere",
   "slash.status.cloudSnapshot":
@@ -1194,7 +1259,11 @@ const zh: Dict = {
   /clear               清空当前 agent 的历史，从零开始
   /compact             有 CLI 会话时交给 CLI 压缩；否则本地总结并替换历史
   /cost                打开 token / 费用统计弹窗
-  /status              打印 provider / model / 模式 / sandbox / 计数
+  /status              打印 provider / model / 模式 / sandbox / 计数 / loop
+  /loop [stop|pause|resume]  无参数 → 打开 Loop 对话框（只需目标）
+  /verify              立刻跑一遍 Loop 校验
+  /done-when <kind> [spec]  改 Loop 完成条件
+  /max-iter <n>        限制 Loop 外环轮数
   /mcp                 列出已启用的 MCP servers
   /skills              列出可用 skills（含强制/禁用/自动状态）
   /skill <enable|disable|auto> <name>   设置当前 agent 对某 skill 的覆盖
@@ -1225,6 +1294,67 @@ const zh: Dict = {
   "slash.picker.provider": "选择供应商 — ↑/↓ + Enter，Esc 取消",
   "slash.picker.hint": "或点击",
   "slash.picker.placeholder": "（选择器已激活——按 Enter 或 Esc）",
+  "slash.loop.usage": "用法：/loop [stop|pause|resume]  — 无参数打开 Loop 对话框",
+  "slash.doneWhen.usage": "用法：/done-when <exit-0|file-contains|peer-lgtm> [条件]",
+  "slash.maxIter.usage": "用法：/max-iter <n>",
+  "slash.loop.none": "当前 agent 没有进行中的 Loop — 用 /loop 开一个",
+
+  "loop.dialog.title": "开始 Loop",
+  "loop.dialog.start": "开始",
+  "loop.dialog.cancel": "取消",
+  "loop.field.goal": "目标",
+  "loop.field.goal.placeholder": "这个 Loop 完成时，什么必须为真？",
+  "loop.field.goal.hint": "Agent 会一直做，做完由它在 TASKS.md 写下 ## DONE。你不用写脚本，也不用事先写结束标记。",
+  "loop.field.advanced": "高级 — 可选命令校验",
+  "loop.field.verifier": "可选校验器",
+  "loop.field.verifierHint": "一般留空。只有仓库里已经有测试/检查命令时才填，用来拦住假的 ## DONE。",
+  "loop.field.verifierSpec": "命令（可选）",
+  "loop.field.verifierSpec.placeholder": "留空，或例如 npm test",
+  "loop.field.doneWhen": "完成条件",
+  "loop.field.doneSpec": "完成条件细节",
+  "loop.field.session": "会话策略",
+  "loop.field.snapshot": "快照",
+  "loop.field.iterations": "最大轮数",
+  "loop.field.permission": "权限提升",
+  "loop.field.recipe": "配方",
+  "loop.field.team": "作为团队 Loop 跑在 {name}",
+  "loop.field.worktree": "用 git worktree 隔离 runner",
+  "loop.field.reviewer": "评审 agent",
+  "loop.field.reviewer.none": "（无）",
+  "loop.prefill.from": "来自",
+  "loop.verifier.command": "命令（exit 0）",
+  "loop.verifier.job": "任务 job",
+  "loop.verifier.file": "文件标记",
+  "loop.verifier.peer": "同伴评审",
+  "loop.done.exit0": "校验退出码 0",
+  "loop.done.file": "文件含标记",
+  "loop.done.lgtm": "评审 LGTM",
+  "loop.session.fresh": "fresh-disk（每轮外环重置 runtime）",
+  "loop.session.resume": "resume（保留会话）",
+  "loop.snapshot.none": "无",
+  "loop.snapshot.git": "每轮外环 git commit",
+  "loop.perm.acceptEdits": "循环期间 acceptEdits",
+  "loop.perm.bypass": "bypassPermissions（夜间 Ralph）",
+  "loop.perm.keep": "保持当前",
+  "loop.perm.bypassConfirm": "bypassPermissions 会跳过所有审批。再点一次开始以确认。",
+  "loop.recipe.none": "（无）",
+  "loop.recipe.tdd": "TDD — 每回合修一个失败测试",
+  "loop.recipe.ralph": "Ralph — TASKS.md 才是记忆",
+  "loop.recipe.pr": "PR 门禁 — lint/类型/测试后再评审",
+  "loop.chip.label": "LOOP",
+  "loop.chip.start": "开始 Loop",
+  "loop.chip.pause": "暂停",
+  "loop.chip.resume": "继续",
+  "loop.chip.stop": "停止",
+  "loop.chip.verifyOk": "校验通过",
+  "loop.chip.verifyFail": "校验失败",
+  "loop.board.title": "Loop 看板",
+  "loop.board.tasks": "TASKS.md",
+  "loop.board.empty": "还没有任务 — agent 会写 TASKS.md",
+  "loop.board.doneMarker": "TASKS.md · ## DONE",
+  "loop.board.iters": "迭代",
+  "loop.tree.reviewing": "评审中",
+  "loop.tree.runners": "执行中",
   "slash.status.notLocal":
     "本实例没有该 agent 的状态报告 —— 它不是由本实例运行的，其计划与用量在别处产生",
   "slash.status.cloudSnapshot":

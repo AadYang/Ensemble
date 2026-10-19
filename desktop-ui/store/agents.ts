@@ -27,6 +27,7 @@ import {
   type SdkMessage,
   type SplitDir,
   type TeamSummary,
+  type LoopView,
 } from "@agentorch/shared";
 import type { Locale } from "@/i18n/dict";
 import type { CloudAccount, CloudSession, CloudSnapshot, CloudWorkspace } from "@/lib/cloud-api";
@@ -201,6 +202,12 @@ interface Store {
    *  re-establishes it, and keeping a stale one would show a previous turn's
    *  limits as the current turn's. */
   clearRunPlan: () => void;
+
+  /** Live Loop view keyed by the agent that owns it. `null` clears a finished
+   *  or stopped loop so the chip / board disappear. Hydrated from GET /loops
+   *  and patched by `loop_update`. */
+  loopsByAgent: Record<string, LoopView>;
+  setLoop: (agentId: string, loop: LoopView | null) => void;
   appendUserTurn: (id: string, text: string, peerOrigin?: PeerOrigin) => void;
   appendNotice: (id: string, text: string) => void;
   ingestSdkMessage: (id: string, seq: number, msg: SdkMessage) => void;
@@ -390,6 +397,11 @@ const formatBackgroundTaskSystem = (
     // never softened into a success: a job whose process vanished without an
     // exit code did NOT succeed, and saying otherwise is the failure mode the
     // whole job primitive exists to remove.
+    case "loop": {
+      const text = typeof m.text === "string" && m.text.trim() ? m.text : "loop";
+      if (/FAIL|PAUSED|paused|failed/i.test(text)) return { text, tone: "warn" };
+      return { text };
+    }
     case "job_settled": {
       const jobStatus = typeof m.status === "string" ? m.status : "";
       const text = typeof m.text === "string" && m.text.trim() ? m.text : `job ${m.jobId ?? ""} ${jobStatus}`;
@@ -889,6 +901,19 @@ export const useStore = create<Store>((set) => ({
 
   clearRunPlan: () =>
     set((s) => (Object.keys(s.planByAgent).length === 0 ? s : { planByAgent: {} })),
+
+  loopsByAgent: {},
+
+  setLoop: (agentId, loop) =>
+    set((s) => {
+      if (loop == null) {
+        if (!(agentId in s.loopsByAgent)) return s;
+        const next = { ...s.loopsByAgent };
+        delete next[agentId];
+        return { loopsByAgent: next };
+      }
+      return { loopsByAgent: { ...s.loopsByAgent, [agentId]: loop } };
+    }),
 
   setLiveness: (sessionId, update) =>
     set((s) => ({ livenessByAgent: { ...s.livenessByAgent, [sessionId]: update } })),

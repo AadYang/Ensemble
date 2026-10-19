@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { AgentSummary, TeamSummary } from "@agentorch/shared";
+import type { AgentSummary, LoopView, TeamSummary } from "@agentorch/shared";
 import { useAgentDirectory, useStore, type AgentState } from "@/store/agents";
 import { useT } from "@/i18n/useT";
 import { AgentSettings } from "./AgentSettings";
@@ -38,6 +38,19 @@ interface GroupedView {
   ungrouped: TreeNode[];
 }
 
+function collectLoops(nodes: TreeNode[], loopsByAgent: Record<string, LoopView>): LoopView[] {
+  const out: LoopView[] = [];
+  const walk = (list: TreeNode[]) => {
+    for (const n of list) {
+      const loop = loopsByAgent[n.agent.summary.id];
+      if (loop) out.push(loop);
+      walk(n.children);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
 const groupAgents = (agents: Record<string, AgentState>, teams: Record<string, TeamSummary>): GroupedView => {
   const buckets = new Map<string | "_none", AgentState[]>();
   for (const a of Object.values(agents)) {
@@ -67,6 +80,7 @@ export function AgentTree({
 }) {
   const agents = useAgentDirectory();
   const teams = useStore((s) => s.teams);
+  const loopsByAgent = useStore((s) => s.loopsByAgent);
   const grouped = useMemo(() => groupAgents(agents, teams), [agents, teams]);
   const t = useT();
   const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
@@ -113,6 +127,19 @@ export function AgentTree({
               <span className="text-[var(--text)] group-hover:text-[var(--accent)]">{collapsed ? "▸" : "▾"}</span>
               <span className="text-[var(--accent)] text-[10px] tracking-wider uppercase">team</span>
               <span className="font-bold text-[var(--text)] truncate flex-1">{team.name}</span>
+              {(() => {
+                const loops = collectLoops(nodes, loopsByAgent);
+                const runners = loops.filter((l) => l.status === "running").length;
+                const reviewing = loops.filter((l) => l.status === "awaiting_review").length;
+                if (runners === 0 && reviewing === 0) return null;
+                return (
+                  <span className="text-[var(--accent)] text-[10px]">
+                    {runners > 0 ? `${t("loop.tree.runners")} ${runners}` : ""}
+                    {runners > 0 && reviewing > 0 ? " · " : ""}
+                    {reviewing > 0 ? `${t("loop.tree.reviewing")} ${reviewing}` : ""}
+                  </span>
+                );
+              })()}
               <span className="text-[var(--text-faint)] text-[10px]">{nodes.length}</span>
               <button
                 onClick={(e) => {
@@ -160,6 +187,7 @@ export function AgentTree({
                   activeId={activeId}
                   boundAgentIds={boundAgentIds}
                   onSettings={setSettingsAgentId}
+                  loopsByAgent={loopsByAgent}
                 />
               ))}
           </div>
@@ -179,6 +207,7 @@ export function AgentTree({
           activeId={activeId}
           boundAgentIds={boundAgentIds}
           onSettings={setSettingsAgentId}
+          loopsByAgent={loopsByAgent}
         />
       ))}
       {settingsAgentId && (
@@ -205,6 +234,7 @@ function TreeRow({
   activeId,
   boundAgentIds,
   onSettings,
+  loopsByAgent,
 }: {
   node: TreeNode;
   depth: number;
@@ -212,8 +242,10 @@ function TreeRow({
   activeId: string | null;
   boundAgentIds: ReadonlySet<string>;
   onSettings: (id: string) => void;
+  loopsByAgent: Record<string, LoopView>;
 }) {
   const a = node.agent.summary;
+  const loop = loopsByAgent[a.id];
   const bound = boundAgentIds.has(a.id);
   // A subagent that has been RETIRED (core archives + deactivates it when its
   // task ends): kept in the tree as a record, marked and dimmed rather than
@@ -242,6 +274,11 @@ function TreeRow({
         >
           {a.name}
         </span>
+        {loop && loop.status !== "idle" && loop.status !== "done" && loop.status !== "failed" && (
+          <span className="text-[var(--accent)] text-[10px] shrink-0">
+            {loop.iter}/{loop.maxIterations}
+          </span>
+        )}
         {bound && <span className="text-[var(--accent)] text-[10px]" aria-label="attached">●</span>}
         {node.children.length > 0 && (
           <span className="text-[var(--text-faint)] text-[10px]">{node.children.length}</span>
@@ -266,6 +303,7 @@ function TreeRow({
           activeId={activeId}
           boundAgentIds={boundAgentIds}
           onSettings={onSettings}
+          loopsByAgent={loopsByAgent}
         />
       ))}
     </>
