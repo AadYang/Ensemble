@@ -147,6 +147,23 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
   }, [mounted, pos]);
 
   useEffect(() => {
+    const clamp = () => {
+      setPos((p) => {
+        if (!p) return p;
+        const el = dialogRef.current;
+        const w = el?.offsetWidth ?? 520;
+        const h = el?.offsetHeight ?? 200;
+        return {
+          x: Math.max(8, Math.min(p.x, Math.max(8, window.innerWidth - w - 8))),
+          y: Math.max(8, Math.min(p.y, Math.max(8, window.innerHeight - h - 8))),
+        };
+      });
+    };
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -274,18 +291,18 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
   const dialog = (
     <div
       ref={dialogRef}
-      className="tool-card bg-[var(--bg-elevated)] w-[520px] max-w-full text-xs shadow-2xl shadow-black/50"
+      className="tool-card bg-[var(--bg-elevated)] flex w-[520px] max-w-[calc(100dvw-16px)] max-h-[calc(100dvh-16px)] min-h-0 min-w-0 flex-col overflow-hidden text-xs shadow-2xl shadow-black/50"
       style={{
         position: "fixed",
         zIndex: 9999,
         left: pos?.x ?? "50%",
-        top: pos?.y ?? "30vh",
+        top: pos?.y ?? 8,
         transform: pos ? undefined : "translateX(-50%)",
       }}
     >
       <div
         onMouseDown={onHeaderMouseDown}
-        className="px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 cursor-move select-none"
+        className="shrink-0 px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 cursor-move select-none"
         title={t("settings.dragHint")}
       >
         <span className="text-[var(--text-faint)]">⋮⋮</span>
@@ -299,7 +316,7 @@ export function GlobalSettings({ onClose, onShowUpdate }: GlobalSettingsProps) {
           ✕
         </button>
       </div>
-      <div className="p-3 flex flex-col gap-4">
+      <div className="min-h-0 flex-1 overflow-y-auto p-3 flex flex-col gap-4">
         <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
           {t("globalSettings.language")}
         </span>

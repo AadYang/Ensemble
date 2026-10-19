@@ -178,7 +178,7 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
 
   const dialog = (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-      <div className="tool-card bg-[var(--bg-elevated)] w-full max-w-[760px] max-h-[92vh] flex flex-col text-xs">
+      <div className="tool-card bg-[var(--bg-elevated)] w-full max-w-[760px] max-h-[calc(100dvh-2rem)] min-h-0 min-w-0 overflow-hidden flex flex-col text-xs">
         <div className="px-3 py-2 border-b border-[var(--border)] flex items-center gap-2">
           <span className="text-[var(--text-dim)] tracking-wider">{t("team.new.title")}</span>
           <span className="flex-1" />
@@ -190,7 +190,7 @@ export function NewTeamDialog({ onClose }: { onClose: () => void }) {
           </button>
         </div>
 
-        <div className="p-3 flex-1 overflow-y-auto flex flex-col gap-3">
+        <div className="p-3 flex-1 min-h-0 overflow-y-auto flex flex-col gap-3">
           <label className="flex flex-col gap-1">
             <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
               {t("team.new.label.name")}

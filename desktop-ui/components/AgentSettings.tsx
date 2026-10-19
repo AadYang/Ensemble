@@ -373,6 +373,23 @@ export function AgentSettings({
   }, [mounted, pos]);
 
   useEffect(() => {
+    const clamp = () => {
+      setPos((p) => {
+        if (!p) return p;
+        const el = dialogRef.current;
+        const w = el?.offsetWidth ?? 420;
+        const h = el?.offsetHeight ?? 200;
+        return {
+          x: Math.max(8, Math.min(p.x, Math.max(8, window.innerWidth - w - 8))),
+          y: Math.max(8, Math.min(p.y, Math.max(8, window.innerHeight - h - 8))),
+        };
+      });
+    };
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -655,18 +672,18 @@ export function AgentSettings({
   const dialog = (
     <div
       ref={dialogRef}
-      className="tool-card bg-[var(--bg-elevated)] w-[420px] max-w-full text-xs shadow-2xl shadow-black/50"
+      className="tool-card bg-[var(--bg-elevated)] flex w-[420px] max-w-[calc(100dvw-16px)] max-h-[calc(100dvh-16px)] min-h-0 min-w-0 flex-col overflow-hidden text-xs shadow-2xl shadow-black/50"
       style={{
         position: "fixed",
         zIndex: 9999,
         left: pos?.x ?? "50%",
-        top: pos?.y ?? "15vh",
+        top: pos?.y ?? 8,
         transform: pos ? undefined : "translateX(-50%)",
       }}
     >
       <div
         onMouseDown={onHeaderMouseDown}
-        className="px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 cursor-move select-none"
+        className="shrink-0 px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 cursor-move select-none"
         title={t("settings.dragHint")}
       >
         <span className="text-[var(--text-faint)]">⋮⋮</span>
@@ -684,7 +701,7 @@ export function AgentSettings({
           ✕
         </button>
       </div>
-      <div className="p-3 flex flex-col gap-3">
+      <div className="min-h-0 flex-1 overflow-y-auto p-3 flex flex-col gap-3">
         <label className="flex flex-col gap-1">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.label.name")}</span>
           <input
@@ -994,23 +1011,6 @@ export function AgentSettings({
             )}
           </div>
         )}
-        <div className="flex gap-2">
-          <button
-            onClick={onApply}
-            disabled={!dirty || busy || reasoningEffortInvalid || draftPreview?.rejection != null}
-            title={reasoningEffortInvalid ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE }) : undefined}
-            className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
-          >
-            {t("settings.apply")}
-          </button>
-          <button
-            onClick={onClose}
-            className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)]"
-          >
-            {t("settings.cancel")}
-          </button>
-        </div>
-
         <details className="border-t border-[var(--border)] pt-3">
           <summary className="text-[10px] tracking-wider text-[var(--text-faint)] cursor-pointer select-none">
             {t("settings.plan.title")}
@@ -1030,7 +1030,7 @@ export function AgentSettings({
 
         <div className="border-t border-[var(--border)] pt-3 flex flex-col gap-2">
           <span className="text-[10px] tracking-wider text-[var(--text-faint)]">{t("settings.lifecycle")}</span>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             {summary.closed ? (
               <button
                 onClick={onRestart}
@@ -1059,7 +1059,7 @@ export function AgentSettings({
               {t("settings.delete")}
             </button>
           </div>
-          <div className="flex gap-2 self-start">
+          <div className="flex flex-wrap gap-2 self-start">
             <button
               onClick={onResetRuntime}
               disabled={busy}
@@ -1089,6 +1089,22 @@ export function AgentSettings({
             {summary.hasResumeInfo ? t("settings.resume.has") : t("settings.resume.none")}
           </div>
         </div>
+      </div>
+      <div className="shrink-0 flex gap-2 border-t border-[var(--border)] px-3 py-2">
+        <button
+          onClick={onApply}
+          disabled={!dirty || busy || reasoningEffortInvalid || draftPreview?.rejection != null}
+          title={reasoningEffortInvalid ? t("settings.reasoningEffort.hint.invalid", { rule: REASONING_SYNTAX_RULE }) : undefined}
+          className="flex-1 px-2 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+        >
+          {t("settings.apply")}
+        </button>
+        <button
+          onClick={onClose}
+          className="px-2 py-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)]"
+        >
+          {t("settings.cancel")}
+        </button>
       </div>
       {suggestOpen && (
         <SuggestSubagentDialog
