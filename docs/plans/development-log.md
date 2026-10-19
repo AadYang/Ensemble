@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-10-19 · Loop 默认只填目标，结束标志由 agent 落盘
+
+**触发**：1.0 强制用户填 `npm test` / 结束标记，和「用 agent 做开发」本末倒置；不会写脚本的人开不了环。
+
+**根因**：Loop 工程文档把「无人值守 CI 环」当成了默认交互。Claude CLI 内环（工具来回直到模型停）本来就不要求用户写 verifier；Ensemble 普通对话已经有这一层。外环要的是「模型停了再踢一脚」，烧钱帽用最大轮数 + 无 diff 暂停即可。
+
+**改动**：`parseLoopConfig` 只要求 goal；默认 `doneWhen=file-contains ## DONE`、`session=resume`。首轮和续跑灌 `loopStartPrompt` / `loopContinuePrompt`。可选命令校验仍可拦住假 `## DONE`。对话框高级区才露出命令。不打开 `settingSources`。
+
+**留下的规则**：Loop 默认是目标驱动的外环续跑。命令校验是高级选项，不是开环资格。结束标记是 agent 的产出，不是用户事先交的作业。
+
+---
+
+## 2026-10-16 · Claude OAuth 刷新失败：SDK `env` 整份替换子进程环境
+
+**触发**：1.0.0 安装包里 anthropic-local 报 `Failed to authenticate: OAuth session expired and could not be refreshed`。
+
+**根因**：和 Codex 已经修过的坑同类。Claude Agent SDK 的 `env` 不是增量 merge，是子进程的完整环境。Ensemble 只把 settings.json 里的鉴权键 / 窗口声明传进去时，子进程没有 `USERPROFILE` / `HOME` / `APPDATA` / `PATH`，Claude CLI 找不到（也写不回）`~/.claude` 凭证，refresh 直接失败。`settingSources: []` 仍然正确；错的是补鉴权 env 的方式。`CLAUDE_CODE_OAUTH_TOKEN` 也不该从 settings.json 再灌进去——过期 access token 会盖住 credentials 文件里的 refresh。
+
+**改动**：Claude runtime 和 Codex 一样先铺 `process.env` 再叠 overlay；OAuth token 不再从 settings.env 拷贝。错误文案提示在系统终端跑 `claude login`。
+
+**留下的规则**：凡是 SDK/CLI `env` 选项，先当「完整子进程环境」处理。缺 HOME 的鉴权失败看起来会像「token 过期」。
+
+---
+
+## 2026-10-15 · Loop 1.0 Stop-gate 在 core，不打开 settingSources
+
+**触发**：对照 loop-engineering 文档做 Ensemble 一等公民 Loop（P0 内环 + P1 外环 + P2 团队回路），发版 1.0.0。
+
+**根因**：Claude Code 的 Stop hook / `settingSources` 会把用户 `MEMORY.md` 灌进每个 agent（身份污染）。Ensemble 的闸门必须是编排器自己的，挂在三条 runtime 共用的 `SessionManager.sendMessage` 回合结束处（`onTurnSettled`），复用 `autoRecoverAfterRun` 续跑，而不是在 `claude.ts` / `openai.ts` / `codex.ts` 各写一套，更不是打开 SDK `settingSources`。
+
+**改动**：`LoopManager` + `AgentLoop` 表 + `loop_update`；verifier 走 `JobManager`；无 verifier 拒绝启动；连续失败 3 次且无 diff → pause；fresh-disk 调 `resetRuntimeSession`；git snapshot 用 argv `commit`（无 `--force`，无 `reset --hard`）；Team loop + worktree（停环不删）+ peer-review LGTM；goal 用 textarea；文案走 `loop.*` 中英 i18n。
+
+**留下的规则**：Loop 的 Stop-gate 只属于 core。项目 `.claude/settings.json` / `verify.sh` / `AGENTS.md` 只做只读预填，永不交给 SDK。
+
+---
+
 ## 2026-10-15 · 思考流被 yield 卡成每秒三四个词
 
 **触发**：test 团队 android开发（deepseek-flash / Claude CLI）窗口里思考约 3–4 词/秒。CLI `thinking_duration_ms` 同一块是约 600 字/秒；24k 字思考墙钟约 19 分钟，正好是 20 字/秒。

@@ -364,8 +364,11 @@ type ServerMsg =
   | { type: "message"; sessionId: string; msg: SDKMessage }
   | { type: "permission_request"; sessionId: string; reqId: string; toolName: string; input: any }
   | { type: "subagent_spawned"; parentId: string; childId: string; description: string }
-  | { type: "status"; sessionId: string; status: string };
+  | { type: "status"; sessionId: string; status: string }
+  | { type: "loop_update"; sessionId: string; loop: LoopView | null };
 ```
+
+Loop HTTP (not ClientMsg): `POST /agents/:id/loop` start (400 without goal; verifier optional); `POST /agents/:id/loop/{stop,pause,resume,verify}`; `PATCH /agents/:id/loop`; `GET /agents/:id/loop`; `POST /teams/:id/loop`. Stop-gate lives in `SessionManager.sendMessage` `onTurnSettled` — not Claude `settingSources`. Agent writes `## DONE` in `TASKS.md`.
 
 ---
 

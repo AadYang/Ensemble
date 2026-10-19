@@ -22,6 +22,7 @@ User-facing surfaces (DO NOT try to script these — point the user to them):
   - settings dialog (per agent): name, model, provider, permissionMode, sandbox, projectRoot
   - usage stats dialog: token + cost analytics
   - chat pane: slash commands + ↑/↓ history walking
+  - Loop dialog (/loop): goal required; agent writes ## DONE; Ensemble owns the Stop-gate, not Claude hooks
   - permission popups: appear in-app when write tools are called
 
 Delegation — you can spawn your OWN subagents / background tasks (see subagents topic):
@@ -169,6 +170,11 @@ canUseTool → permission popup.
 To set permissionMode:
   - UI: Settings dialog → permission mode dropdown
   - HTTP: PATCH /api/agents/:id { "permissionMode": "..." }
+
+Loop start may bump default → acceptEdits for the duration of the loop (verifier
+commands are allowlisted on that Loop). Stopping the loop restores the previous
+mode. bypassPermissions is never the default; the dialog asks for a second click.
+Codex uses sandboxMode (workspace-write) as the gate, not canUseTool.
 `,
 
   sandbox: `sandboxMode is the Codex runtime's safety gate. Ensemble disables
@@ -276,7 +282,11 @@ Typical pattern:
   /model [name]         switch model (picker if no arg)
   /provider [name]      switch provider (picker if no arg)
   /cost                 open the usage/cost dialog
-  /status               print provider/model/permissionMode/sandbox/counts
+  /status               print provider/model/permissionMode/sandbox/counts/loop
+  /loop [stop|pause|resume]  no arg → Loop dialog (goal required)
+  /verify               run the Loop verifier now
+  /done-when <kind> [spec]  change Loop completion condition
+  /max-iter <n>         cap outer Loop iterations
   /mcp                  list enabled MCP servers
   /close                close current agent (preserves resume info)
   /restart              restart current agent
@@ -488,6 +498,60 @@ To inspect the DB:
   - Find the path above
   - Use any SQLite client (DB Browser for SQLite, sqlite3 CLI, etc.)
   - DO NOT modify while Ensemble is running — close the app first or risk WAL corruption
+`,
+
+  loop: `A Loop is Ensemble's first-class stop-gate around one agent (or a team of
+runners). It is NOT Claude Code Stop hooks and it does NOT open settingSources
+(that would load the user's MEMORY.md into every agent).
+
+Required: a goal. The agent writes ## DONE in TASKS.md when finished.
+Optional: a command verifier (catches a false ## DONE). HTTP 400 only without a goal.
+
+Config (shared LoopConfig):
+  goal              what must be true when the loop is done
+  verifier          optional command | job | file-marker | peer-review
+  verifier.spec     only if verifier is set
+  doneWhen          default file-contains ## DONE; exit-0 | peer-lgtm are advanced
+  maxIterations     outer-loop cap (default 20). Does NOT change global maxTurns.
+  session           resume (default) | fresh-disk. fresh-disk calls resetRuntimeSession
+                    each outer iter and re-injects the goal + TASKS.md reminder.
+  snapshot          git-commit | none. Commits via argv (no shell, no --force).
+                    Empty commit = skip. No git reset --hard in 1.0.
+  permissionBump    acceptEdits | bypassPermissions | null; restored on stop.
+
+Lifecycle (core LoopManager, hooked from SessionManager.sendMessage finally):
+  1. The turn runs on the agent's existing runtime (Claude / OpenAI / Codex).
+  2. On a successful result that was not aborted, SessionManager asks LoopManager.
+  3. Optional command verifier runs as a JobManager job if configured.
+  4. Command fail → VERIFY FAIL notice + auto-continue with the tail.
+     Missing ## DONE → re-inject the goal (outer iter). Three consecutive
+     no-progress turns (fail or no diff) → paused.
+  5. ## DONE present (and optional command green) → LOOP DONE.
+  6. peer-review: command/job must be green, then peer_send(mode=review) to the
+     reviewer; status=awaiting_review until LGTM (or reject back to the runner).
+
+Team Loop: one TASKS.md board, N isolated runners (they do not peer_send
+continue to each other), optional one reviewer, optional git worktree add to a
+sibling directory. Stopping the loop does NOT delete the worktree.
+
+UI: /loop opens the dialog (goal is a textarea; command check is advanced). Header chip shows 3/20 plus
+VERIFY OK/FAIL and pause/stop. Right drawer is a view of project-root TASKS.md.
+Recipes loop-tdd / loop-ralph / loop-pr-gate live in DATA_DIR/skills and are
+force-on when selected. Project hints (package.json scripts, AGENTS.md, a
+.claude/hooks/verify.sh path) are READ-ONLY prefill — never loaded as SDK
+settingSources.
+
+HTTP:
+  POST /agents/:id/loop            start (400 without goal)
+  POST /agents/:id/loop/{stop,pause,resume,verify}
+  PATCH /agents/:id/loop           doneWhen / maxIterations
+  PUT  /agents/:id/loop/tasks      rewrite TASKS.md
+  GET  /agents/:id/loop
+  GET  /loops
+  POST /teams/:id/loop
+  WS:  { type: "loop_update", sessionId, loop }
+
+Point the user at /loop. Do not try to emulate this with Bash while-true.
 `,
 };
 

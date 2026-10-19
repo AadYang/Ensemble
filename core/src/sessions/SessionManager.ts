@@ -40,6 +40,7 @@ import {
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
   reportedContextWindowFromResult,
+  shouldCompactForHeadroom,
   estimateStreamTokens,
   shouldEncodeLiveStreamOccupancy,
   shouldPublishLiveContext,
@@ -96,6 +97,7 @@ import {
 } from "../peer-mcp.js";
 import { makeHelpMcpServer, HELP_MCP_SERVER_NAME, ENSEMBLE_HELP_TOOL_NAME } from "../help-mcp.js";
 import { JobManager } from "../jobs.js";
+import type { LoopManager } from "../loop.js";
 import {
   makeJobsMcpServer,
   JOBS_MCP_SERVER_NAME,
@@ -489,7 +491,7 @@ type SendMessageOptions = {
    *  machinery — a terminal notification must never be deferred or dropped.
    *  Consecutive notices are coalesced into one turn. */
   subagentOrigin?: { childId: string; childName: string };
-  autoRecoveryAttempt?: "codex-event-stream-lagged" | "codex-thread-writer-conflict";
+  autoRecoveryAttempt?: "codex-event-stream-lagged" | "codex-thread-writer-conflict" | "context-overflow";
   suppressUserMessage?: boolean;
   freshnessContinuationForRunId?: string;
   freshnessContinuationCount?: number;
@@ -547,7 +549,8 @@ function normalizeQueuedTurnOpts(raw: unknown): SendMessageOptions | undefined {
   const autoRecoveryAttempt = (raw as { autoRecoveryAttempt?: unknown }).autoRecoveryAttempt;
   if (
     autoRecoveryAttempt === "codex-event-stream-lagged" ||
-    autoRecoveryAttempt === "codex-thread-writer-conflict"
+    autoRecoveryAttempt === "codex-thread-writer-conflict" ||
+    autoRecoveryAttempt === "context-overflow"
   ) {
     out.autoRecoveryAttempt = autoRecoveryAttempt;
   }
@@ -1227,9 +1230,20 @@ function supportsServerConversationFor(plan: ResolvedRunPlan): boolean {
   );
 }
 
+function isContextOverflowText(text: string): boolean {
+  return (
+    /prompt is too long/i.test(text) ||
+    /context_length_exceeded/i.test(text) ||
+    /maximum context length/i.test(text) ||
+    /context window.*(exceed|full|overflow)/i.test(text) ||
+    /request_too_large/i.test(text) ||
+    /too many tokens/i.test(text)
+  );
+}
+
 function isPromptTooLongResult(msg: { type?: string; is_error?: unknown; result?: unknown }): boolean {
   if (msg.type !== "result" || msg.is_error !== true) return false;
-  return typeof msg.result === "string" && /prompt is too long/i.test(msg.result);
+  return typeof msg.result === "string" && isContextOverflowText(msg.result);
 }
 
 /** Why the turn is using the strategy it is. Printed by /status verbatim, so a
@@ -1466,6 +1480,25 @@ export class SessionManager {
       this.notifyJobSettled(job);
     },
   });
+
+  private loops: LoopManager | null = null;
+
+  attachLoops(loops: LoopManager): void {
+    this.loops = loops;
+  }
+
+  async persistLoopNotice(sessionId: string, text: string): Promise<void> {
+    const payload = { type: "system" as const, subtype: "loop", text };
+    const row = await prisma.message.create({
+      data: { agentId: sessionId, seq: this.nextMessageSeq(sessionId), type: "system", payload },
+    });
+    this.hub.sendToSession(sessionId, {
+      type: "message",
+      sessionId,
+      seq: row.seq,
+      msg: payload as never,
+    });
+  }
 
   /** Phase 4: THE liveness authority. One per process; every run registers here
    *  and `/status` reads its snapshot. Nothing else in this file forms an
@@ -2820,6 +2853,38 @@ export class SessionManager {
     return this.compactAgentHistory(cur, plan, shouldContinue, upperBoundSeq);
   }
 
+  /** Ask the CLI to compact an existing native session. Local layered summary
+   *  is intentionally not a fallback here: that would rewrite Ensemble's
+   *  transcript while the next resume still holds the uncompacted CLI session. */
+  private async tryNativeCompact(
+    cur: DbAgent,
+    plan: ResolvedRunPlan,
+    upperBoundSeq?: number,
+  ): Promise<boolean> {
+    const resumeId = readMetaString(cur.metadata, "lastSessionId");
+    if (!runtimeOwnsNativeCompact(plan.identity.runtime) || !resumeId) return false;
+    const prior = (
+      await prisma.message.findMany({
+        where: { agentId: cur.id },
+        orderBy: { seq: "asc" },
+      })
+    ).filter((row) => upperBoundSeq === undefined || row.seq <= upperBoundSeq);
+    if (prior.length === 0) return false;
+    try {
+      const native = await this.compactViaNativeSession(cur, plan, resumeId, undefined, upperBoundSeq);
+      if (!native) return false;
+      const compacted = await prisma.agent.findUnique({ where: { id: cur.id } });
+      if (compacted) cur.metadata = compacted.metadata;
+      return true;
+    } catch (err) {
+      console.error(
+        `[compact] native compact did not complete for agent=${cur.id.slice(0, 8)}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
   private async compactViaNativeSession(
     cur: DbAgent,
     plan: ResolvedRunPlan,
@@ -3500,6 +3565,7 @@ export class SessionManager {
         sourceHash: g.sourceHash,
         archivedAt: g.archivedAt,
       })),
+      loop: this.loops?.view(id) ?? null,
     };
   }
 
@@ -4864,7 +4930,11 @@ export class SessionManager {
     let usedServerConversationId: string | null = null;
     let resumeInvalidReasonForRun: string | null = null;
     let promptTooLong = false;
+    let overflowPlan: ResolvedRunPlan | null = null;
+    let overflowCutSeq: number | undefined;
+    let contextOverflowKeepResume = false;
     let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
+    let loopEligible = false;
     let autoRecoveryPromise: Promise<{ finalText: string } | null> | null = null;
     // Declared outside the try so the detached-subagent notification in the
     // `finally` block can read the child's final output.
@@ -5163,6 +5233,8 @@ export class SessionManager {
       // the rows the budget measured and the rows a compact may archive are the
       // same rows by construction.
       const priorCutSeq = userPersisted?.seq ?? seq;
+      overflowPlan = turnPlan;
+      overflowCutSeq = priorCutSeq;
       const priorRows = (
         await prisma.message.findMany({
           where: { agentId: sessionId },
@@ -5482,6 +5554,30 @@ export class SessionManager {
           effectiveHistory.history.diagnostics.push(
             `the pre-dispatch compact failed (${err instanceof Error ? err.message : String(err)}); ` +
               "the turn is running with the overflow reported rather than silently dropped",
+          );
+        }
+      }
+      if (historyStrategy === "runtime-session") {
+        const usage = this.contextUsageByAgent.get(sessionId);
+        const window = turnPlan.context.effectiveWindow ?? usage?.contextWindow ?? null;
+        const used = usage?.usedTokens ?? null;
+        if (
+          used != null &&
+          window != null &&
+          shouldCompactForHeadroom({
+            usedTokens: used,
+            window,
+            outputReserve: turnPlan.context.outputReserve,
+          })
+        ) {
+          console.log(
+            `[history] agent=${sessionId.slice(0, 8)} occupancy ${used}/${window} leaves too little headroom — compacting native session before dispatch`,
+          );
+          const compacted = await this.tryNativeCompact(agent, turnPlan, priorCutSeq - 1);
+          effectiveHistory.history.diagnostics.push(
+            compacted
+              ? "this turn asked the native CLI to compact before dispatch because remaining context headroom was below the output reserve"
+              : "this turn wanted a native compact before dispatch (headroom below the output reserve) but the CLI did not compact; the turn proceeds",
           );
         }
       }
@@ -6039,6 +6135,27 @@ export class SessionManager {
       const persistData: { status: "DONE" | "IDLE"; metadata?: object } = {
         status: drainedCleanly ? "DONE" : "IDLE",
       };
+      if (promptTooLong && opts?.autoRecoveryAttempt !== "context-overflow") {
+        contextOverflowKeepResume = overflowPlan
+          ? await this.tryNativeCompact(
+              agent,
+              overflowPlan,
+              overflowCutSeq !== undefined ? overflowCutSeq - 1 : undefined,
+            )
+          : false;
+        persistData.status = "IDLE";
+        autoRecoverAfterRun = {
+          userInput,
+          opts: {
+            ...(opts?.peerOrigin ? { peerOrigin: opts.peerOrigin } : {}),
+            autoRecoveryAttempt: "context-overflow",
+            suppressUserMessage: true,
+          },
+        };
+        console.log(
+          `[sendMessage] context overflow agent=${sessionId.slice(0, 8)} nativeCompact=${contextOverflowKeepResume} — retrying this turn`,
+        );
+      }
       subagentTerminalStatus = drainedCleanly ? "DONE" : "IDLE";
       if (!drainedCleanly) {
         this.liveness.end(runId, "RUNTIME_STREAM_CLOSED", "interrupted");
@@ -6070,10 +6187,11 @@ export class SessionManager {
           Object.keys(metaPatch).length > 0 ||
           serverResponseIdFromResult !== null
         ) {
-          const baseMetadata =
-            resumeInvalidReasonForRun !== null || promptTooLong
-              ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
-              : agent.metadata;
+          const dropResume =
+            resumeInvalidReasonForRun !== null || (promptTooLong && !contextOverflowKeepResume);
+          const baseMetadata = dropResume
+            ? removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS])
+            : agent.metadata;
           let nextMetadata = mergeMetadata(baseMetadata, metaPatch);
           // Only a route that earned the continuation may store the id it
           // issued. On a route that did not, an id in hand would be an
@@ -6099,6 +6217,7 @@ export class SessionManager {
       } else {
         console.log(`[sendMessage] run=${runId.slice(0, 8)} finished post-cancel; skipping DB update`);
       }
+      loopEligible = sawResultForDrain && !abort.signal.aborted;
       return { finalText };
     } catch (err) {
       // Phase 4: the run ends here, and WHICH ending it gets is decided by what
@@ -6200,6 +6319,38 @@ export class SessionManager {
           );
         }
       }
+      const shouldAutoRecoverContextOverflow =
+        !aborted &&
+        isContextOverflowText(rawMsg) &&
+        opts?.autoRecoveryAttempt !== "context-overflow";
+      if (shouldAutoRecoverContextOverflow) {
+        contextOverflowKeepResume = overflowPlan
+          ? await this.tryNativeCompact(
+              agent,
+              overflowPlan,
+              overflowCutSeq !== undefined ? overflowCutSeq - 1 : undefined,
+            )
+          : false;
+        persistData.status = "IDLE";
+        autoRecoverAfterRun = {
+          userInput,
+          opts: {
+            ...(opts?.peerOrigin ? { peerOrigin: opts.peerOrigin } : {}),
+            autoRecoveryAttempt: "context-overflow",
+            suppressUserMessage: true,
+          },
+        };
+        if (!contextOverflowKeepResume) {
+          persistData.metadata = removeMetadataKeys(
+            (persistData.metadata as Record<string, unknown> | undefined) ??
+              (agent.metadata as Record<string, unknown>),
+            [...RESUME_METADATA_KEYS],
+          );
+        }
+        console.log(
+          `[sendMessage] context overflow exception agent=${sessionId.slice(0, 8)} nativeCompact=${contextOverflowKeepResume} — retrying this turn`,
+        );
+      }
       const shouldAutoRecoverCodexEventStream =
         !aborted &&
         recoverableCodexEventStreamFailure &&
@@ -6212,7 +6363,7 @@ export class SessionManager {
         !aborted &&
         recoverableThreadWriterConflict &&
         opts?.autoRecoveryAttempt !== "codex-thread-writer-conflict";
-      if (shouldAutoRecoverCodexEventStream) {
+      if (!shouldAutoRecoverContextOverflow && shouldAutoRecoverCodexEventStream) {
         persistData.status = "IDLE";
         autoRecoverAfterRun = {
           userInput: "continue",
@@ -6235,7 +6386,11 @@ export class SessionManager {
       }
       // Auto-recovery keeps the run alive on a fresh thread/session, so it is
       // NOT a terminal state — the retry run settles the child instead.
-      if (!shouldAutoRecoverCodexEventStream && !shouldAutoRecoverThreadWriterConflict) {
+      if (
+        !shouldAutoRecoverCodexEventStream &&
+        !shouldAutoRecoverThreadWriterConflict &&
+        !shouldAutoRecoverContextOverflow
+      ) {
         // A cancelled child is reported as INTERRUPTED, not failed: the parent
         // must not treat a deliberate stop as a broken task.
         subagentTerminalStatus = aborted ? "IDLE" : persistData.status;
@@ -6263,8 +6418,16 @@ export class SessionManager {
               ? rawMsg + "\n\nThe local Codex event stream fell behind and dropped events. Ensemble saved the interrupted turn, cleared cached Codex resume state, and is automatically continuing from local history."
             : shouldAutoRecoverThreadWriterConflict
               ? rawMsg + "\n\nThe cached Codex thread was still locked by a previous process (thread-store writer conflict). Ensemble killed the stale process, cleared the cached thread id, and is automatically continuing on a fresh thread from local history."
+            : shouldAutoRecoverContextOverflow
+              ? rawMsg +
+                (contextOverflowKeepResume
+                  ? "\n\nThe context window was full. Ensemble asked the native CLI to compact and is retrying this turn."
+                  : "\n\nThe context window was full. Ensemble cleared the cached session and is retrying this turn from a shorter local history.")
             : recoverableResumeFailure
               ? rawMsg + "\n\nCleared cached session state for this agent. Please send your message again; Ensemble will start a fresh runtime session while preserving the local chat history."
+            : /OAuth session expired and could not be refreshed/i.test(rawMsg)
+              ? rawMsg +
+                "\n\nClaude Code could not refresh the local OAuth login. Run `claude login` in a system terminal (not inside Ensemble), then send the message again."
             : rawMsg;
           this.hub.sendToSession(sessionId, {
             type: "error",
@@ -6273,6 +6436,8 @@ export class SessionManager {
               ? "CODEX_EVENT_STREAM_RECOVERING"
               : shouldAutoRecoverThreadWriterConflict
                 ? "CODEX_THREAD_WRITER_CONFLICT_RECOVERING"
+                : shouldAutoRecoverContextOverflow
+                  ? "CONTEXT_OVERFLOW_RECOVERING"
                 : persistenceFailure
                   ? "MESSAGE_PERSISTENCE_FAILED"
                   : staleResume ? "SESSION_LOST" : "QUERY_FAILED",
@@ -6283,7 +6448,10 @@ export class SessionManager {
           type: "status",
           sessionId,
           status:
-            aborted || shouldAutoRecoverCodexEventStream || shouldAutoRecoverThreadWriterConflict
+            aborted ||
+            shouldAutoRecoverCodexEventStream ||
+            shouldAutoRecoverThreadWriterConflict ||
+            shouldAutoRecoverContextOverflow
               ? "idle"
               : "error",
         });
@@ -6311,6 +6479,14 @@ export class SessionManager {
         if (qb) {
           for (const [, q] of qb) q.resolve("[run ended before answer]");
           this.pendingQuestions.delete(sessionId);
+        }
+        if (!autoRecoverAfterRun && loopEligible && this.loops) {
+          try {
+            const cont = await this.loops.onTurnSettled(sessionId, { lastText: finalText });
+            if (cont) autoRecoverAfterRun = { userInput: cont.userInput, opts: {} };
+          } catch (err) {
+            console.error(`[loop] onTurnSettled failed for ${sessionId}:`, err);
+          }
         }
         if (autoRecoverAfterRun) {
           const recoveryDrainToken = this.beginDrain(sessionId);

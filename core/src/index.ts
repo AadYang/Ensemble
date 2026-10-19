@@ -38,6 +38,7 @@ import {
 import type { GitCheckoutError, GitErrorCode } from "@agentorch/shared";
 import { runtimeScopeForKind } from "./sessions/runtimes/index.js";
 import { prisma, closeDb, sqliteDb } from "./db.js";
+import { LoopConfigError, LoopManager } from "./loop.js";
 import { createHash } from "node:crypto";
 import {
   SUBAGENT_CATALOG,
@@ -117,6 +118,15 @@ fastify.register(websocket);
 
 const hub = new WSHub();
 const sessions = new SessionManager(hub);
+const loops = new LoopManager(sessions.jobs, hub, {
+  sendMessage: (id, text) => sessions.sendMessage(id, text),
+  resetRuntimeSession: (id) => sessions.resetRuntimeSession(id),
+  persistLoopNotice: (id, text) => sessions.persistLoopNotice(id, text),
+  patchAgent: (id, patch) => sessions.patchAgent(id, patch),
+  sendPeerMessage: (from, target, body, mode) => sessions.sendPeerMessage(from, target, body, mode),
+  toggleAgentSkill: (id, name, action) => sessions.toggleAgentSkill(id, name, action),
+});
+sessions.attachLoops(loops);
 mountMcpBridge(fastify, {
   getFallbackHandlers: (agentId) => ({
     peerSend: ({
@@ -1726,6 +1736,157 @@ fastify.get<{ Params: { id: string } }>("/agents/:id/status", async (req, reply)
     return { error: "not found" };
   }
   return s;
+});
+
+const LoopStartSchema = z.object({
+  goal: z.string().min(1),
+  verifier: z.object({
+    kind: z.enum(["command", "job", "file-marker", "peer-review"]),
+    spec: z.string().min(1),
+  }),
+  doneWhen: z
+    .object({
+      kind: z.enum(["exit-0", "file-contains", "peer-lgtm"]),
+      spec: z.string(),
+    })
+    .optional(),
+  maxIterations: z.number().int().positive().optional(),
+  maxTurnsPerIter: z.number().int().positive().nullable().optional(),
+  session: z.enum(["resume", "fresh-disk"]).optional(),
+  snapshot: z.enum(["git-commit", "none"]).optional(),
+  permissionBump: z.enum(["acceptEdits", "bypassPermissions"]).nullable().optional(),
+  allowedVerifierCmds: z.array(z.string()).optional(),
+  teamId: z.string().uuid().optional(),
+  reviewerAgentId: z.string().uuid().optional(),
+  worktree: z.boolean().optional(),
+  recipe: z.enum(["tdd", "ralph", "pr-gate"]).optional(),
+});
+
+const loopError = (err: unknown, reply: FastifyReply) => {
+  if (err instanceof LoopConfigError) {
+    reply.code(400);
+    return { error: err.code, message: err.message };
+  }
+  reply.code(500);
+  return { error: (err as Error).message };
+};
+
+fastify.get("/loops", async () => loops.listActive());
+
+fastify.get<{ Params: { id: string } }>("/agents/:id/loop", async (req, reply) => {
+  const view = loops.view(req.params.id);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.get<{ Params: { id: string } }>("/agents/:id/loop/suggest", async (req) => {
+  return loops.suggest(req.params.id);
+});
+
+fastify.post<{ Params: { id: string } }>("/agents/:id/loop", async (req, reply) => {
+  const parsed = LoopStartSchema.safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  try {
+    return await loops.start(req.params.id, parsed.data);
+  } catch (err) {
+    return loopError(err, reply);
+  }
+});
+
+fastify.post<{ Params: { id: string } }>("/agents/:id/loop/stop", async (req, reply) => {
+  const view = await loops.stop(req.params.id);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.post<{ Params: { id: string } }>("/agents/:id/loop/pause", async (req, reply) => {
+  const view = await loops.pause(req.params.id);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.post<{ Params: { id: string } }>("/agents/:id/loop/resume", async (req, reply) => {
+  const view = await loops.resume(req.params.id);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.post<{ Params: { id: string } }>("/agents/:id/loop/verify", async (req, reply) => {
+  const view = await loops.verifyNow(req.params.id);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.patch<{ Params: { id: string } }>("/agents/:id/loop", async (req, reply) => {
+  const parsed = z
+    .object({
+      doneWhen: LoopStartSchema.shape.doneWhen,
+      maxIterations: z.number().int().positive().optional(),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  const view = await loops.patch(req.params.id, parsed.data);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.put<{ Params: { id: string } }>("/agents/:id/loop/tasks", async (req, reply) => {
+  const parsed = z
+    .object({
+      tasks: z.array(z.object({ text: z.string(), done: z.boolean() })),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  const view = await loops.writeBoard(req.params.id, parsed.data.tasks);
+  if (!view) {
+    reply.code(404);
+    return { error: "not found" };
+  }
+  return view;
+});
+
+fastify.post<{ Params: { id: string } }>("/teams/:id/loop", async (req, reply) => {
+  const parsed = LoopStartSchema.extend({
+    reviewerAgentId: z.string().uuid().optional(),
+    worktree: z.boolean().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  try {
+    const { reviewerAgentId, worktree, ...rest } = parsed.data;
+    return await loops.startTeam(req.params.id, rest, { reviewerAgentId, worktree });
+  } catch (err) {
+    return loopError(err, reply);
+  }
 });
 
 // ── Git ─────────────────────────────────────────────────────────────────────

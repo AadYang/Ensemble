@@ -33,6 +33,13 @@ describe("formatEnsembleHelp", () => {
   it("HELP_TOPIC_NAMES matches the keys of HELP_TOPICS", () => {
     expect(HELP_TOPIC_NAMES).toEqual(Object.keys(HELP_TOPICS));
   });
+
+  it("includes the loop topic and refuses settingSources", () => {
+    expect(HELP_TOPIC_NAMES).toContain("loop");
+    const out = formatEnsembleHelp("loop");
+    expect(out).toContain("verifier");
+    expect(out).toContain("settingSources");
+  });
 });
 
 describe("buildEnsemblePrimer", () => {
@@ -52,7 +59,7 @@ describe("buildEnsemblePrimer", () => {
 
   it("mentions slash commands users have access to", () => {
     const p = buildEnsemblePrimer();
-    for (const cmd of ["/clear", "/compact", "/model", "/provider", "/cost", "/status", "/mcp"]) {
+    for (const cmd of ["/clear", "/compact", "/model", "/provider", "/cost", "/status", "/mcp", "/loop"]) {
       expect(p).toContain(cmd);
     }
   });

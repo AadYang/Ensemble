@@ -27,6 +27,7 @@ import type { ReasoningEffort } from "./reasoning";
 // builds the projection and the UI that receives it cannot drift apart.
 import type { LivenessUpdate } from "./capability";
 import type { RunPlanStatusView } from "./run-plan-view";
+import type { LoopView } from "./loop";
 
 export interface TeamSummary {
   id: string;
@@ -223,6 +224,7 @@ export type ServerMsg =
    *  instead of resolving anything of their own. `plan.source` is always
    *  "last-turn" here: this is a turn's own plan, not a status read's guess. */
   | { type: "run_plan"; sessionId: string; plan: RunPlanStatusView }
+  | { type: "loop_update"; sessionId: string; loop: LoopView | null }
   | { type: "message"; sessionId: string; seq: number; msg: SdkMessage }
   | { type: "permission_request"; sessionId: string; reqId: string; toolName: string; input: unknown }
   | {

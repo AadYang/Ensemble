@@ -496,3 +496,51 @@ export async function checkoutGitBranch(
 
   return { ok: true, created, tracked, status: await readGitState(cwd, { timeoutMs }) };
 }
+
+export function gitWorkTreeDirty(status: GitStatus): boolean {
+  const d = status.dirty;
+  if (!d) return false;
+  return d.staged > 0 || d.unstaged > 0 || d.untracked > 0;
+}
+
+/** Commit whatever is in the work tree as a loop snapshot. Empty commits are a
+ *  skip (sha stays the current HEAD), never an error — a green verifier with
+ *  no file changes is a legal iteration. */
+export async function commitLoopSnapshot(
+  cwd: string,
+  message: string,
+  opts: GitRunOptions = {},
+): Promise<{ ok: true; sha: string | null } | { ok: false; error: string }> {
+  const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
+  const repo = await resolveRepo(cwd, timeoutMs);
+  if (!repo.ok) return { ok: false, error: repo.error };
+  const add = await runGit(cwd, ["add", "-A"], timeoutMs);
+  if (!add.ok) return { ok: false, error: add.message ?? (add.stderr.trim() || "git add failed") };
+  const commit = await runGit(cwd, ["commit", "-m", message], timeoutMs);
+  if (!commit.ok) {
+    const err = (commit.stderr + commit.stdout).toLowerCase();
+    if (err.includes("nothing to commit") || err.includes("no changes added")) {
+      const head = await runGit(cwd, ["rev-parse", "HEAD"], timeoutMs);
+      return { ok: true, sha: head.ok ? head.stdout.trim() : null };
+    }
+    return { ok: false, error: commit.stderr.trim() || commit.message || "git commit failed" };
+  }
+  const head = await runGit(cwd, ["rev-parse", "HEAD"], timeoutMs);
+  return { ok: true, sha: head.ok ? head.stdout.trim() : null };
+}
+
+export async function addLoopWorktree(
+  cwd: string,
+  worktreePath: string,
+  branch: string,
+  opts: GitRunOptions = {},
+): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
+  const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
+  const valid = validateBranchName(branch);
+  if (!valid.ok) return { ok: false, error: valid.reason };
+  const repo = await resolveRepo(cwd, timeoutMs);
+  if (!repo.ok) return { ok: false, error: repo.error };
+  const run = await runGit(cwd, ["worktree", "add", "-b", branch, worktreePath], timeoutMs);
+  if (!run.ok) return { ok: false, error: run.stderr.trim() || run.message || "git worktree add failed" };
+  return { ok: true, path: worktreePath };
+}

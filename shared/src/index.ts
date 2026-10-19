@@ -21,4 +21,5 @@ export * from "./agent-directory-eq";
 export * from "./stream-display-batch";
 export * from "./workspace-selection";
 export * from "./git";
+export * from "./loop";
 export * from "./cloud-remote-bridge";

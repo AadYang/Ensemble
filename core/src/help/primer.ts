@@ -27,7 +27,13 @@ to the UI):
 
 Slash commands available in chat (the / is literal):
   /help /clear /compact /model [name] /provider [name] /cost /status /mcp
+  /loop [stop|pause|resume]  /verify  /done-when  /max-iter
   /close /restart /exit /quit
+A Loop is Ensemble's outer stop-gate. The user fills a goal; you keep working and
+write ## DONE in TASKS.md when the whole goal is met. An optional command check
+is advanced — do not ask the user to write tests or scripts to start a loop.
+Ensemble owns the loop — do not wrap yourself in a bash while-true, and do not
+ask to load Claude settingSources / MEMORY.md.
 ↑/↓ in the input box walks through your prior inputs for this agent (CLI-style).
 
 Cross-agent communication tools you have:

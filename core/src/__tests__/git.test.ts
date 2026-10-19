@@ -439,3 +439,19 @@ describe("unbound responses", () => {
     expect(branches.error).toBe("no root here");
   });
 });
+
+describe("commitLoopSnapshot", () => {
+  it("commits a dirty tree and skips an empty one", async () => {
+    const dir = newRepo("loop-snap");
+    writeFileSync(join(dir, "README.md"), "one\n");
+    raw(dir, ["add", "README.md"]);
+    raw(dir, ["commit", "-m", "seed"]);
+    writeFileSync(join(dir, "loop.txt"), "iter 1\n");
+    const first = await git.commitLoopSnapshot(dir, "loop: iter 1");
+    expect(first.ok).toBe(true);
+    if (first.ok) expect(first.sha).toMatch(/^[0-9a-f]{40}$/);
+    const skip = await git.commitLoopSnapshot(dir, "loop: empty");
+    expect(skip.ok).toBe(true);
+    if (first.ok && skip.ok) expect(skip.sha).toBe(first.sha);
+  });
+});

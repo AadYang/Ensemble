@@ -356,6 +356,21 @@ CREATE TABLE IF NOT EXISTS Job (
 );
 CREATE INDEX IF NOT EXISTS job_agent_idx ON Job(agentId);
 CREATE INDEX IF NOT EXISTS job_status_idx ON Job(status);
+
+-- One Loop per agent. config/state are JSON. CASCADE with the agent: a Loop
+-- is operational state, not an audit log (UsageEvent is the audit log).
+CREATE TABLE IF NOT EXISTS AgentLoop (
+  id TEXT PRIMARY KEY,
+  agentId TEXT NOT NULL UNIQUE REFERENCES Agent(id) ON DELETE CASCADE,
+  teamId TEXT,
+  status TEXT NOT NULL CHECK (status IN ('idle','running','paused','awaiting_review','done','failed')),
+  config TEXT NOT NULL,
+  state TEXT NOT NULL,
+  createdAt INTEGER NOT NULL DEFAULT (unixepoch()),
+  updatedAt INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS agentloop_team_idx ON AgentLoop(teamId);
+CREATE INDEX IF NOT EXISTS agentloop_status_idx ON AgentLoop(status);
 `;
 
 sqliteDb.exec(SCHEMA);
@@ -682,6 +697,19 @@ export interface Job {
   transcriptNotifiedAt: Date | null;
 }
 
+export type AgentLoopStatus = "idle" | "running" | "paused" | "awaiting_review" | "done" | "failed";
+
+export interface AgentLoop {
+  id: string;
+  agentId: string;
+  teamId: string | null;
+  status: AgentLoopStatus;
+  config: unknown;
+  state: unknown;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Row mappers (raw SQLite row → typed row)
 // ─────────────────────────────────────────────────────────────
@@ -788,6 +816,17 @@ const mapWorkspace = (r: Record<string, unknown>): Workspace => ({
 const mapAppSetting = (r: Record<string, unknown>): AppSetting => ({
   key: r.key as string,
   value: parseJson(r.value as string),
+  updatedAt: dateOf(r.updatedAt as number),
+});
+
+const mapAgentLoop = (r: Record<string, unknown>): AgentLoop => ({
+  id: r.id as string,
+  agentId: r.agentId as string,
+  teamId: (r.teamId as string | null) ?? null,
+  status: r.status as AgentLoopStatus,
+  config: parseJson(r.config as string) ?? {},
+  state: parseJson(r.state as string) ?? {},
+  createdAt: dateOf(r.createdAt as number),
   updatedAt: dateOf(r.updatedAt as number),
 });
 
@@ -1016,7 +1055,7 @@ function makeRepo<TRow>(
     update(args: { where: WhereClause; data: Record<string, unknown> }): TRow {
       const data = enc(args.data);
       // Auto-bump updatedAt for tables that have it.
-      if (table === "Agent" || table === "Provider") {
+      if (table === "Agent" || table === "Provider" || table === "AgentLoop") {
         if (!("updatedAt" in data)) data.updatedAt = Math.floor(Date.now() / 1000);
       }
       const sets = Object.keys(data).map((c) => `${c} = ?`).join(", ");
@@ -1071,6 +1110,10 @@ const workspaceRepo = makeRepo("Workspace", mapWorkspace, {
 const usageEventRepo = makeRepo("UsageEvent", mapUsageEvent);
 const teamRepo = makeRepo("Team", mapTeam);
 const jobRepo = makeRepo("Job", mapJob);
+const agentLoopRepo = makeRepo("AgentLoop", mapAgentLoop, {
+  config: jsonEncoder,
+  state: jsonEncoder,
+});
 const appSettingRepo = {
   findUnique(args: { where: { key?: unknown } }): AppSetting | null {
     const row = sqliteDb
@@ -1115,6 +1158,7 @@ export const db = {
   appSetting: appSettingRepo,
   team: teamRepo,
   job: jobRepo,
+  agentLoop: agentLoopRepo,
 };
 
 /** Drop-in for the prior Prisma export so existing imports keep working. */

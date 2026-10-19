@@ -46,6 +46,7 @@ import type {
   TransportPreference,
 } from "./capability.js";
 import type { ReasoningReport, RunPlanStatusView } from "./run-plan-view.js";
+import type { LoopView } from "./loop";
 
 /** One automatic transport switch, as the runtime that made it reported it.
  *  Structural twin of the core's `TransportFallbackInfo` — see the header. */
@@ -265,4 +266,6 @@ export interface AgentStatusReport {
      *  feeds this straight to `new Date()` prints 1970. */
     archivedAt: number;
   }>;
+  /** Current Loop for this agent, or null when none is running/paused/done. */
+  loop: LoopView | null;
 }
