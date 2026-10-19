@@ -153,8 +153,20 @@ const CLAUDE_LOCAL_AUTH_ENV_KEYS = new Set([
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_CUSTOM_HEADERS",
   "CLAUDE_API_KEY",
-  "CLAUDE_CODE_OAUTH_TOKEN",
 ]);
+
+function seedClaudeChildEnv(overlay: Record<string, string>): Record<string, string> {
+  // Same contract as Codex: a non-empty SDK `env` is the COMPLETE child env,
+  // not a merge. Handing only the auth/window overlay drops USERPROFILE/HOME/
+  // APPDATA/PATH, so Claude Code cannot find or rewrite ~/.claude credentials
+  // and OAuth refresh dies with "session expired and could not be refreshed".
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") env[k] = v;
+  }
+  Object.assign(env, overlay);
+  return env;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -297,7 +309,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       };
       return;
     }
-    const env = mergeContextWindowEnv(opts, mergeClaudeLocalAuthEnv(opts));
+    const env = seedClaudeChildEnv(mergeContextWindowEnv(opts, mergeClaudeLocalAuthEnv(opts)));
     // The child-process observer, when there is a run to report to. `probe` is
     // handed to the controller by the caller, not used here.
     const observer = makeClaudeSpawner(opts.liveness ?? null, opts.abortController.signal);
@@ -320,7 +332,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         cwd,
         ...(opts.resume ? { resume: opts.resume } : {}),
         mcpServers: opts.mcpServers,
-        ...(Object.keys(env).length > 0 ? { env } : {}),
+        env,
         // The SDK's public option is `systemPrompt`, not `customSystemPrompt` —
         // any unknown key gets silently dropped into ...rest, and the SDK then
         // falls back to the built-in `claude_code` preset which auto-loads

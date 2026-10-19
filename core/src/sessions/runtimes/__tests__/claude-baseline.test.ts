@@ -417,6 +417,7 @@ describe("ClaudeAgentRuntime baseline", () => {
         ANTHROPIC_BASE_URL: "https://claude.example.test",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "polluting-model",
         CLAUDE_CODE_USE_VERTEX: "1",
+        CLAUDE_CODE_OAUTH_TOKEN: "expired-oauth-snapshot",
         EMPTY: "",
       },
       hooks: { Stop: [{ command: "should-not-load" }] },
@@ -439,6 +440,9 @@ describe("ClaudeAgentRuntime baseline", () => {
     });
     expect(options.env).not.toHaveProperty("ANTHROPIC_DEFAULT_OPUS_MODEL");
     expect(options.env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
+    expect(options.env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    const childEnv = options.env as Record<string, string>;
+    expect(childEnv.PATH ?? childEnv.Path).toBeTruthy();
     expect(options).not.toHaveProperty("hooks");
     expect(options.mcpServers).toEqual({});
   });
