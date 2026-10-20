@@ -4,6 +4,18 @@
 
 ---
 
+## 2026-10-20 · Ensemble 订 /line SSE，不再 3s 轮询
+
+**触发**：用户指出 Ensemble 已经是桌面客户端，接入邮局 MCP 后再起一个 core 轮询是多此一举。
+
+**根因**：接入 MCP ≠ 邮局还连着。三条 runtime 都是一轮 turn 连上、turn 结束 `closeAll`。桌面 sidecar 进程活着，MCP 工具会话并不活着。3s `setInterval` 是用进程寿命去补会话寿命，形状不对。
+
+**改动**：0.1.13 `GET /line` 在 `Accept: text/event-stream` 时推 SSE；`notify` 同时叫醒 line watcher。Ensemble sidecar 订这一条长连接，有未读再 `sendMessage`。回合结束的一次 poke 还留着，用来冲掉 turn 进行中积下的信。Claude Code 仍靠 Stop hook。
+
+**留下的规则**：要维护的长连接是 sidecar 对邮局的 `/line` SSE，不是 MCP tools/call。不要用轮询假装长连接。
+
+---
+
 ## 2026-10-20 · 长连接靠客户端钩子，不靠邮局叫醒
 
 **触发**：用户问能不能带一个 skill，让 agent 起 core 保持长连接、有消息就塞进对话。

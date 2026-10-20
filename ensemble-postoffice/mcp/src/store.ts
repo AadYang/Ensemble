@@ -115,6 +115,7 @@ export class Store {
   readonly filesDir: string;
   readonly inviteCode: string;
   private readonly waiters = new Map<string, Set<(items: InboxItem[]) => void>>();
+  private readonly lineWatchers = new Map<string, Set<() => void>>();
   private readonly callWaiters = new Map<string, Set<CallWaiter>>();
   private readonly answerWaiters = new Map<string, Set<() => void>>();
   private readonly callState = new Map<string, CallView & { peerId: string }>();
@@ -718,6 +719,34 @@ export class Store {
     return view;
   }
 
+  lineSnapshot(mailboxId: string): {
+    commCode: string;
+    name: string;
+    call: CallView | null;
+    listening: boolean;
+    unread: InboxItem[];
+  } | null {
+    const box = this.mailbox(mailboxId);
+    if (!box) return null;
+    return {
+      commCode: box.commCode,
+      name: box.name,
+      call: this.callView(box.id),
+      listening: this.atPhone(box.id),
+      unread: this.unread(box.id),
+    };
+  }
+
+  watchLine(mailboxId: string, fn: () => void): () => void {
+    const bucket = this.lineWatchers.get(mailboxId) ?? new Set<() => void>();
+    this.lineWatchers.set(mailboxId, bucket);
+    bucket.add(fn);
+    return () => {
+      bucket.delete(fn);
+      if (bucket.size === 0) this.lineWatchers.delete(mailboxId);
+    };
+  }
+
   atPhone(mailboxId: string): boolean {
     return this.isListening(mailboxId);
   }
@@ -951,10 +980,13 @@ export class Store {
   }
 
   private notify(toId: string): void {
-    const bucket = this.waiters.get(toId);
-    if (!bucket || bucket.size === 0) return;
     const items = this.unread(toId);
-    if (items.length === 0) return;
-    for (const fn of [...bucket]) fn(items);
+    const bucket = this.waiters.get(toId);
+    if (bucket && bucket.size > 0 && items.length > 0) {
+      for (const fn of [...bucket]) fn(items);
+    }
+    const line = this.lineWatchers.get(toId);
+    if (!line || line.size === 0) return;
+    for (const fn of [...line]) fn();
   }
 }

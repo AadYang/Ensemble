@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { postofficeCredsFromMcp, stayOnLinePrompt, userAskedHangup } from "../postoffice-line.js";
+import {
+  asPostofficeLine,
+  postofficeCredsFromMcp,
+  stayOnLinePrompt,
+  takeSseJsonFrames,
+  userAskedHangup,
+} from "../postoffice-line.js";
 
 describe("postoffice-line", () => {
   it("reads bind + base url from an http MCP row", () => {
@@ -39,5 +45,15 @@ describe("postoffice-line", () => {
   it("detects hangup phrases", () => {
     expect(userAskedHangup("挂断吧")).toBe(true);
     expect(userAskedHangup("keep going")).toBe(false);
+  });
+
+  it("splits SSE data frames and keeps a partial tail", () => {
+    const { frames, rest } = takeSseJsonFrames(
+      ': keepalive\n\ndata: {"commCode":"A","unread":[]}\n\ndata: {"commCode":"B","unre',
+    );
+    expect(frames).toEqual([{ commCode: "A", unread: [] }]);
+    expect(rest).toBe('data: {"commCode":"B","unre');
+    expect(asPostofficeLine({ commCode: "A", unread: [] })).toMatchObject({ commCode: "A" });
+    expect(asPostofficeLine({ unread: "nope" })).toBeNull();
   });
 });

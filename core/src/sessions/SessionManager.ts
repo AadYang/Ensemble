@@ -103,6 +103,8 @@ import {
   fetchPostofficeLine,
   postofficeCredsFromMcp,
   stayOnLinePrompt,
+  watchPostofficeLine,
+  type PostofficeCreds,
 } from "../postoffice-line.js";
 import { parseMcpFailureLine } from "../mcp-notice.js";
 import { JobManager } from "../jobs.js";
@@ -1477,7 +1479,7 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
 
 export class SessionManager {
   private running = new Map<string, RunningSession>();
-  private postofficePollers = new Map<string, ReturnType<typeof setInterval>>();
+  private postofficeWatches = new Map<string, AbortController>();
 
   /** Per-kind runtime/CLI version cache — see runtimeVersionFor. */
   private runtimeVersionCache = new Map<string, string | null>();
@@ -2661,7 +2663,7 @@ export class SessionManager {
   async closeAgent(id: string): Promise<AgentSummary | null> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
-    this.stopPostofficePoller(id);
+    this.stopPostofficeWatch(id);
     // Abort running stream if any. resolvePermission will deny outstanding via cancel().
     this.clearQueuedTurns(id);
     await this.cancel(id);
@@ -2726,7 +2728,7 @@ export class SessionManager {
   async deleteAgent(id: string): Promise<boolean> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
-    this.stopPostofficePoller(id);
+    this.stopPostofficeWatch(id);
     this.clearQueuedTurns(id);
     await this.cancel(id);
     // Cascading FKs on Message / Permission / McpServer / PaneState will clean rows.
@@ -2737,10 +2739,10 @@ export class SessionManager {
     return true;
   }
 
-  private stopPostofficePoller(id: string): void {
-    const handle = this.postofficePollers.get(id);
-    if (handle) clearInterval(handle);
-    this.postofficePollers.delete(id);
+  private stopPostofficeWatch(id: string): void {
+    const ac = this.postofficeWatches.get(id);
+    ac?.abort();
+    this.postofficeWatches.delete(id);
   }
 
   private async postofficeUnreadPoke(sessionId: string): Promise<string | null> {
@@ -2754,29 +2756,55 @@ export class SessionManager {
     return prompt;
   }
 
-  private async ensurePostofficePoller(sessionId: string): Promise<void> {
-    if (this.postofficePollers.has(sessionId)) return;
+  private async ensurePostofficeWatch(sessionId: string): Promise<void> {
+    if (this.postofficeWatches.has(sessionId)) return;
     const mcp = await loadEnabledMcpServers(sessionId);
     const creds = postofficeCredsFromMcp(mcp);
     if (!creds) return;
-    const tick = async () => {
-      if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
+    const ac = new AbortController();
+    this.postofficeWatches.set(sessionId, ac);
+    void this.runPostofficeWatch(sessionId, creds, ac);
+  }
+
+  private async runPostofficeWatch(
+    sessionId: string,
+    creds: PostofficeCreds,
+    ac: AbortController,
+  ): Promise<void> {
+    while (!ac.signal.aborted) {
       try {
-        const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
-        if (!agent || readMetaBool(agent.metadata, "closed")) {
-          this.stopPostofficePoller(sessionId);
-          return;
-        }
-        const prompt = await this.postofficeUnreadPoke(sessionId);
-        if (prompt) void this.sendMessage(sessionId, prompt);
+        await watchPostofficeLine(
+          creds,
+          async (line) => {
+            if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
+            const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
+            if (!agent || readMetaBool(agent.metadata, "closed")) {
+              this.stopPostofficeWatch(sessionId);
+              return;
+            }
+            const prompt = stayOnLinePrompt(line);
+            if (!prompt) return;
+            await ackPostofficeLine(creds, line.unread.map((m) => m.id));
+            void this.sendMessage(sessionId, prompt);
+          },
+          ac.signal,
+        );
       } catch {
-        /* mailbox unreachable */
+        if (ac.signal.aborted) return;
       }
-    };
-    const handle = setInterval(() => {
-      void tick();
-    }, 3000);
-    this.postofficePollers.set(sessionId, handle);
+      if (ac.signal.aborted) return;
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 1000);
+        ac.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(t);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    }
   }
 
   /** /skill enable|disable|auto — persist the per-agent skill toggle list
@@ -5152,6 +5180,7 @@ export class SessionManager {
     // Scope is per agent: global rows plus this agent's own rows. Another
     // agent's private servers must never be mounted here.
     const mcpServers = await loadEnabledMcpServers(sessionId);
+    void this.ensurePostofficeWatch(sessionId);
     const peerMcp = makePeerMcpServer(this, sessionId);
     const askUserMcp = makeAskUserMcpServer(this, sessionId);
     const subagentMcp = makeSubagentMcpServer(this, sessionId);
@@ -6659,7 +6688,7 @@ export class SessionManager {
             console.error(`[postoffice] unread poke failed for ${sessionId}:`, err);
           }
         }
-        void this.ensurePostofficePoller(sessionId);
+        void this.ensurePostofficeWatch(sessionId);
         if (!autoRecoverAfterRun && loopEligible && this.loops && !queuedBeforeLoop) {
           try {
             const cont = await this.loops.onTurnSettled(sessionId, { lastText: finalText });

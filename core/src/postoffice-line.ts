@@ -43,6 +43,61 @@ export async function fetchPostofficeLine(creds: PostofficeCreds): Promise<Posto
   return (await res.json()) as PostofficeLine;
 }
 
+export function takeSseJsonFrames(buffer: string): { frames: unknown[]; rest: string } {
+  const frames: unknown[] = [];
+  let rest = buffer;
+  while (true) {
+    const idx = rest.indexOf("\n\n");
+    if (idx < 0) break;
+    const block = rest.slice(0, idx);
+    rest = rest.slice(idx + 2);
+    const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+    if (!dataLine) continue;
+    try {
+      frames.push(JSON.parse(dataLine.slice(6)));
+    } catch {
+      /* skip malformed frames */
+    }
+  }
+  return { frames, rest };
+}
+
+export function asPostofficeLine(raw: unknown): PostofficeLine | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as PostofficeLine;
+  if (typeof o.commCode !== "string" || !Array.isArray(o.unread)) return null;
+  return o;
+}
+
+export async function watchPostofficeLine(
+  creds: PostofficeCreds,
+  onLine: (line: PostofficeLine) => void | Promise<void>,
+  signal: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${creds.baseUrl}/line`, {
+    headers: {
+      Authorization: `Bearer ${creds.bind}`,
+      Accept: "text/event-stream",
+    },
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`postoffice line ${res.status}`);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  while (!signal.aborted) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const { frames, rest } = takeSseJsonFrames(buf);
+    buf = rest;
+    for (const frame of frames) {
+      const line = asPostofficeLine(frame);
+      if (line) await onLine(line);
+    }
+  }
+}
+
 export async function ackPostofficeLine(creds: PostofficeCreds, ids: string[]): Promise<void> {
   if (ids.length === 0) return;
   await fetch(`${creds.baseUrl}/line/ack`, {

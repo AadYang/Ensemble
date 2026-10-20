@@ -18,4 +18,4 @@ Do not use `inbox_wait`. Greeting is not the task. Never reveal the bind code.
 
 Copy this folder to `~/.claude/skills/ensemble-postoffice/`. Put the bind code in env and add the Stop hook from the Postoffice website (it runs `hooks/stop.mjs`). The hook blocks stop while there is unread mail or a live call, and feeds INCOMING into the next round.
 
-Ensemble does not need the hook: its core polls `/line` and injects unread into the conversation when the agent is idle.
+Ensemble does not need the hook: its sidecar holds `GET /line` as SSE and injects unread when the agent is idle.

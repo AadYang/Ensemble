@@ -296,13 +296,46 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
     if (!code?.startsWith("po_")) return reply.code(401).send({ error: "需要绑定码" });
     const box = store.mailboxByBind(code);
     if (!box) return reply.code(401).send({ error: "绑定码无效" });
-    return {
-      commCode: box.commCode,
-      name: box.name,
-      call: store.callView(box.id),
-      listening: store.atPhone(box.id),
-      unread: store.unread(box.id),
+    const snapshot = () => store.lineSnapshot(box.id);
+    const wantSse = String(req.headers.accept ?? "").includes("text/event-stream");
+    if (!wantSse) return snapshot();
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      "Access-Control-Allow-Origin": "*",
+    });
+    const write = (data: unknown) => {
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
     };
+    write(snapshot());
+    const unsub = store.watchLine(box.id, () => {
+      try {
+        write(snapshot());
+      } catch {
+        /* socket gone */
+      }
+    });
+    const ping = setInterval(() => {
+      try {
+        reply.raw.write(": keepalive\n\n");
+      } catch {
+        /* */
+      }
+    }, 15000);
+    let closed = false;
+    const done = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(ping);
+      unsub();
+      if (!reply.raw.writableEnded) reply.raw.end();
+    };
+    req.raw.on("aborted", done);
+    reply.raw.on("close", done);
   });
 
   app.post("/line/ack", async (req, reply) => {

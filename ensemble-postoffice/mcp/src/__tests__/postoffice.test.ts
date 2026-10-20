@@ -532,6 +532,47 @@ describe("postoffice", () => {
     expect(bBody.result?.structuredContent).toMatchObject({ connected: true });
   });
 
+  it("GET /line SSE pushes unread without polling", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const addr = app.server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    const ac = new AbortController();
+    const res = await fetch(`http://127.0.0.1:${port}/line`, {
+      headers: { authorization: `Bearer ${b.bindCode}`, accept: "text/event-stream" },
+      signal: ac.signal,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.headers.get("content-type") ?? "").toContain("text/event-stream");
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    const nextData = async () => {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("sse closed");
+        buf += dec.decode(value, { stream: true });
+        const split = buf.split("\n\n");
+        buf = split.pop() ?? "";
+        for (const block of split) {
+          const line = block.split("\n").find((l) => l.startsWith("data: "));
+          if (line) return JSON.parse(line.slice(6)) as { unread: { body: string }[] };
+        }
+      }
+    };
+    const first = await nextData();
+    expect(first.unread).toEqual([]);
+    await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { to: b.commCode, message: "over-the-wire", wait_sec: 0 },
+    });
+    const pushed = await nextData();
+    expect(pushed.unread.map((m) => m.body)).toContain("over-the-wire");
+    ac.abort();
+  });
+
   it("simultaneous live HTTP send shares the line without inbox_wait", async () => {
     const tok = await register("alice");
     const a = await openBox(tok, "desk");
