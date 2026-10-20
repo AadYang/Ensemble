@@ -133,7 +133,7 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("running");
   });
 
-  it("rolls the turn window while the board keeps advancing, and pauses when it stalls", async () => {
+  it("extends the turn ceiling while the board keeps advancing, and pauses when it stalls", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-turn-cap-"));
     gitInitWithDirtyFile(root);
     const agent = seedAgent("turn-cap", root);
@@ -151,20 +151,21 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("running");
     expect(mgr.view(agent.id)?.innerTurns).toBe(1);
 
-    // Turn 2 ticks an item AND reaches the ceiling: the attempt continues in a
-    // fresh window instead of pausing a productive loop.
+    // Turn 2 ticks an item AND reaches the ceiling: the ceiling is raised and
+    // the counter keeps climbing — it must not jump back to 0.
     writeFileSync(join(root, "TASKS.md"), "- [x] one\n- [ ] two\n");
     await mgr.onTurnSettled(agent.id, { lastText: "done one" });
     expect(mgr.view(agent.id)?.status).toBe("running");
-    expect(mgr.view(agent.id)?.innerTurns).toBe(0);
-    expect(host.calls.some((c) => c.includes("turn window rolled over"))).toBe(true);
+    expect(mgr.view(agent.id)?.innerTurns).toBe(2);
+    expect(mgr.view(agent.id)?.config.maxTurnsPerIter).toBe(4);
+    expect(host.calls.some((c) => c.includes("turn ceiling extended 2 → 4"))).toBe(true);
 
-    // Two more turns without a tick reach the ceiling again — this time the
-    // board did not move, so the loop pauses.
+    // Turns without a tick still advance the counter; reaching the NEW ceiling
+    // with no progress pauses the loop.
     await mgr.onTurnSettled(agent.id, { lastText: "stuck" });
     await mgr.onTurnSettled(agent.id, { lastText: "still stuck" });
     expect(mgr.view(agent.id)?.status).toBe("paused");
-    expect(mgr.view(agent.id)?.iterations.at(-1)?.summary).toMatch(/inner-turn cap 2 reached/);
+    expect(mgr.view(agent.id)?.iterations.at(-1)?.summary).toMatch(/inner-turn cap 4 reached/);
   });
 
   it("resume refills an attempt budget that was already spent", async () => {

@@ -82,10 +82,11 @@ export interface LoopView {
 }
 
 export type LoopDecision =
-  // `resetTurns` opens a fresh turn window for the SAME attempt: the ceiling
-  // was reached, but the board advanced, so stopping would interrupt progress
-  // rather than brake a stall.
-  | { action: "continue"; userInput: string; resetTurns?: boolean }
+  // `extendTurns` raises the ceiling for the SAME attempt: the limit was
+  // reached, but the board advanced, so stopping would interrupt progress
+  // rather than brake a stall. The counter keeps climbing instead of resetting
+  // to 0 — a number that jumps backwards reads as a bug.
+  | { action: "continue"; userInput: string; extendTurns?: boolean }
   | { action: "outer-iter"; userInput: string; resetRuntime: boolean }
   | { action: "pause"; reason: string }
   | { action: "done"; summary: string }
@@ -334,7 +335,7 @@ export function decideLoopAfterVerify(input: {
   const turnCapReached = state.innerTurns >= turnCap;
   const capDecision = (): LoopDecision =>
     progressed
-      ? { action: "continue", userInput: loopContinuePrompt(config), resetTurns: true }
+      ? { action: "continue", userInput: loopContinuePrompt(config), extendTurns: true }
       : { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
   const failPrompt = [
     "VERIFY FAIL. The completion condition is not met. Continue. Do not stop until it passes.",
@@ -409,9 +410,9 @@ export function formatLoopStatusLines(view: LoopView): string[] {
   return [
     // `iter` counts ATTEMPTS and only moves when a full attempt fails; the turn
     // figure is the one that advances while one attempt spans a long board.
-    `loop            ${view.status}  attempt ${view.iter}/${view.maxIterations}  turn ${view.innerTurns}/${
+    `loop            ${view.status}  turn ${view.innerTurns}/${
       view.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER
-    }`,
+    }  attempt ${view.iter}/${view.maxIterations}`,
     `verifier        ${v ? `${v.kind}  ${v.spec}` : "none"}  last=${
       // No verifier means nothing was checked. Reporting `pass` here made
       // "no command verifier" look like a green gate.

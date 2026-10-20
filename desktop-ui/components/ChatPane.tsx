@@ -1204,14 +1204,14 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
                   : "") || loop.lastVerifySummary || loop.config.goal
               }
             >
-              {t("loop.chip.label")} {loop.iter}/{loop.maxIterations}
-              {/* The attempt number only moves when a full attempt fails; the
-                  turn counter is what advances while one attempt spans a long
-                  board, so it must be visible or the chip looks frozen. */}
-              {` · ${t("loop.chip.turns", {
-                n: loop.innerTurns,
-                cap: loop.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER,
-              })}`}
+              {/* The moving number leads: turns inside the current attempt.
+                  The attempt counter only moves when a whole attempt fails, so
+                  leading with it made a working loop look frozen. */}
+              {t("loop.chip.label")} {loop.innerTurns}/
+              {loop.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER}
+              {loop.iter > 1
+                ? ` · ${t("loop.chip.attempt", { n: loop.iter, max: loop.maxIterations })}`
+                : ""}
               {loop.status === "paused" ? ` · ${t("loop.chip.paused")}` : ""}
               {loop.config.verifier
                 ? loop.lastVerifyOk === false

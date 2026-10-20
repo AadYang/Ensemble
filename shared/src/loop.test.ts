@@ -186,7 +186,7 @@ describe("decideLoopAfterVerify", () => {
     expect(d).toEqual({ action: "pause", reason: "inner-turn cap 5 reached" });
   });
 
-  it("rolls the turn window instead of pausing when the board advanced", () => {
+  it("extends the turn ceiling instead of pausing when the board advanced", () => {
     // A 50-turn ceiling stopped an agent that had just ticked 75 of 89 items.
     // Progress, not tick count, decides whether the ceiling brakes.
     const cfg = parseLoopConfig({ goal: "ship it", maxTurnsPerIter: 5 });
@@ -200,7 +200,7 @@ describe("decideLoopAfterVerify", () => {
       progressed: true,
     });
     expect(d.action).toBe("continue");
-    expect(d).toMatchObject({ resetTurns: true });
+    expect(d).toMatchObject({ extendTurns: true });
   });
 
   it("uses the default turn cap when the config does not set one", () => {

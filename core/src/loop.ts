@@ -421,15 +421,22 @@ export class LoopManager {
     };
 
     if (decision.action === "continue") {
-      // The ceiling was reached with the board still advancing: open a fresh
-      // turn window for the SAME attempt rather than pausing productive work.
-      if (decision.resetTurns) state.innerTurns = 0;
+      // The ceiling was reached with the board still advancing: raise it for
+      // the SAME attempt rather than pausing productive work. The counter keeps
+      // climbing — resetting it to 0 looked like lost progress.
+      let extendedFrom: number | null = null;
+      let extendedTo: number | null = null;
+      if (decision.extendTurns) {
+        extendedFrom = config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER;
+        extendedTo = extendedFrom * 2;
+        config = { ...config, maxTurnsPerIter: extendedTo };
+      }
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
-      if (decision.resetTurns) {
+      if (extendedTo !== null) {
         await this.host.persistLoopNotice(
           agentId,
-          `LOOP · turn window rolled over at ${config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER} (board advanced)`,
+          `LOOP · turn ceiling extended ${extendedFrom} → ${extendedTo} (board advanced)`,
         );
       } else if (!verifyOk) {
         // A green verifier on the "not finished yet" path is not a failure; it
