@@ -38,6 +38,7 @@ import {
 import type { GitCheckoutError, GitErrorCode } from "@agentorch/shared";
 import { runtimeScopeForKind } from "./sessions/runtimes/index.js";
 import { prisma, closeDb, sqliteDb } from "./db.js";
+import { createMcpServerRow, McpScopeError, scopedMcpRows } from "./mcp-scope.js";
 import { LoopConfigError, LoopManager } from "./loop.js";
 import { createHash } from "node:crypto";
 import {
@@ -1346,7 +1347,7 @@ fastify.post<{ Params: { id: string } }>("/providers/:id/migrate-from-deprecated
   return sanitizeProvider(created);
 });
 
-// ----- MCP servers (W5.1) — global only per CLAUDE.md 3.1 -----
+// ----- MCP servers (W5.1) — global, or scoped to one agent via `agentId` -----
 
 const McpStdioConfigSchema = z.object({
   command: z.string().min(1),
@@ -1359,10 +1360,14 @@ const McpHttpLikeConfigSchema = z.object({
   headers: z.record(z.string(), z.string()).optional(),
 });
 
+// `agentId` omitted/null = GLOBAL server. A value scopes the server to that
+// agent only; it is validated against Agent below rather than trusted.
+const McpAgentScopeSchema = { agentId: z.string().min(1).nullable().optional() };
+
 const McpServerInputSchema = z.discriminatedUnion("transport", [
-  z.object({ name: z.string().min(1), transport: z.literal("stdio"), config: McpStdioConfigSchema, enabled: z.boolean().optional() }),
-  z.object({ name: z.string().min(1), transport: z.literal("http"), config: McpHttpLikeConfigSchema, enabled: z.boolean().optional() }),
-  z.object({ name: z.string().min(1), transport: z.literal("sse"), config: McpHttpLikeConfigSchema, enabled: z.boolean().optional() }),
+  z.object({ name: z.string().min(1), transport: z.literal("stdio"), config: McpStdioConfigSchema, enabled: z.boolean().optional(), ...McpAgentScopeSchema }),
+  z.object({ name: z.string().min(1), transport: z.literal("http"), config: McpHttpLikeConfigSchema, enabled: z.boolean().optional(), ...McpAgentScopeSchema }),
+  z.object({ name: z.string().min(1), transport: z.literal("sse"), config: McpHttpLikeConfigSchema, enabled: z.boolean().optional(), ...McpAgentScopeSchema }),
 ]);
 
 const McpServerPatchSchema = z.object({
@@ -1370,13 +1375,35 @@ const McpServerPatchSchema = z.object({
   enabled: z.boolean().optional(),
 });
 
-fastify.get("/mcp-servers", async () => {
+fastify.get<{ Querystring: { agentId?: string } }>("/mcp-servers", async (req) => {
+  const agentId = req.query.agentId?.trim() || null;
+  // Without `agentId`: the global list (the sidebar manages globals). With it:
+  // exactly what that agent will get at runtime — globals plus its own rows,
+  // per-agent rows winning on a name collision.
+  if (!agentId) {
+    const rows = await prisma.mcpServer.findMany({
+      where: { agentId: null },
+      orderBy: { name: "asc" },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agentId,
+      name: r.name,
+      transport: r.transport,
+      config: r.config,
+      enabled: r.enabled,
+    }));
+  }
   const rows = await prisma.mcpServer.findMany({
-    where: { agentId: null },
+    where: { OR: [{ agentId: null }, { agentId }] },
     orderBy: { name: "asc" },
   });
-  return rows.map((r) => ({
+  const scoped = scopedMcpRows(rows, agentId);
+  // A disabled global row shadowed by an enabled per-agent one is live, so the
+  // list must not pre-filter on `enabled`; expose it and let the client decide.
+  return scoped.map((r) => ({
     id: r.id,
+    agentId: r.agentId,
     name: r.name,
     transport: r.transport,
     config: r.config,
@@ -1391,17 +1418,19 @@ fastify.post("/mcp-servers", async (req, reply) => {
     return { error: "invalid", detail: parsed.error.issues };
   }
   const data = parsed.data;
-  const created = await prisma.mcpServer.create({
-    data: {
-      name: data.name,
-      transport: data.transport,
-      config: data.config as object,
-      enabled: data.enabled ?? true,
-      agentId: null,
-    },
-  });
+  let created;
+  try {
+    created = await createMcpServerRow(data);
+  } catch (err) {
+    if (err instanceof McpScopeError) {
+      reply.code(400);
+      return { error: err.code, detail: err.message };
+    }
+    throw err;
+  }
   return {
     id: created.id,
+    agentId: created.agentId,
     name: created.name,
     transport: created.transport,
     config: created.config,
@@ -1847,6 +1876,7 @@ fastify.patch<{ Params: { id: string } }>("/agents/:id/loop", async (req, reply)
     .object({
       doneWhen: LoopStartSchema.shape.doneWhen,
       maxIterations: z.number().int().positive().optional(),
+      resetAttempts: z.boolean().optional(),
     })
     .safeParse(req.body);
   if (!parsed.success) {

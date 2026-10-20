@@ -1,13 +1,34 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import type { LoopView } from "@agentorch/shared";
 import { useT } from "@/i18n/useT";
-import { putLoopTasks } from "@/lib/loop-api";
+import { patchLoop, putLoopTasks } from "@/lib/loop-api";
 
 export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }) {
   const t = useT();
   const last = loop.lastVerifyOk;
   const done = loop.tasks.filter((task) => task.done).length;
+  const [capDraft, setCapDraft] = useState(String(loop.maxIterations));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    setCapDraft(String(loop.maxIterations));
+  }, [loop.maxIterations]);
+
+  const run = (body: { maxIterations?: number; resetAttempts?: boolean }) => {
+    setBusy(true);
+    setError("");
+    void patchLoop(agentId, body)
+      .catch((err) => setError((err as Error).message))
+      .finally(() => setBusy(false));
+  };
+  // An exhausted budget (iter >= max) is a dead end: every later attempt
+  // pauses on sight. Both controls re-arm it — `set` raises the cap, `reset`
+  // clears the counter — so the operator is never stuck at 10/10.
+  const spent = loop.iter >= loop.maxIterations;
+  const draft = Number(capDraft);
+  const draftValid = Number.isFinite(draft) && draft >= 1 && draft <= 200 && Math.floor(draft) === draft;
   return (
     <aside className="hidden @[560px]:flex flex-col w-[min(17rem,42%)] shrink-0 min-w-0 min-h-0 border-l border-[var(--border)] bg-[var(--bg)] p-3 text-[11px] overflow-y-auto">
       <div className="text-[var(--accent)] tracking-wider uppercase mb-2">{t("loop.board.title")}</div>
@@ -15,6 +36,40 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
         {loop.config.verifier
           ? `${loop.config.verifier.spec}${last == null ? "" : last ? " · pass" : " · fail"}`
           : `${t("loop.board.noVerifier")} · ${loop.config.doneWhen.spec || t("loop.board.doneMarker")}`}
+      </div>
+      <div className="flex flex-wrap items-center gap-1 mb-2 text-[var(--text-dim)]">
+        <span className="text-[var(--text-faint)] tracking-wider uppercase">{t("loop.board.attempts")}</span>
+        <span className={spent ? "tabular-nums text-[var(--warn)]" : "tabular-nums"}>
+          {loop.iter}/{loop.maxIterations}
+        </span>
+        <input
+          type="number"
+          min={1}
+          max={200}
+          value={capDraft}
+          onChange={(e) => setCapDraft(e.target.value)}
+          aria-label={t("loop.board.maxAttempts")}
+          title={t("loop.board.maxAttempts")}
+          className="w-12 bg-[var(--bg-pane)] border border-[var(--border)] px-1 tabular-nums text-[var(--text)] focus-visible:outline focus-visible:outline-1 focus-visible:outline-[var(--accent)]"
+        />
+        <button
+          type="button"
+          disabled={busy || !draftValid}
+          className="px-1 border border-[var(--border)] hover:text-[var(--accent)] disabled:opacity-40"
+          onClick={() => run({ maxIterations: Math.floor(draft) })}
+        >
+          {t("loop.board.setCap")}
+        </button>
+        <button
+          type="button"
+          disabled={busy || loop.iter === 1}
+          className="px-1 border border-[var(--border)] hover:text-[var(--accent)] disabled:opacity-40"
+          onClick={() => run({ resetAttempts: true })}
+        >
+          {t("loop.board.resetAttempts")}
+        </button>
+        {spent && <span className="text-[var(--warn)] w-full">{t("loop.board.spent")}</span>}
+        {error && <span className="text-[var(--err)] w-full break-words">{error}</span>}
       </div>
       <div className="flex items-center justify-between mb-1">
         <span className="text-[var(--text-faint)] tracking-wider uppercase">{t("loop.board.tasks")}</span>
@@ -44,8 +99,9 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
         </label>
       ))}
       <div className="text-[var(--text-faint)] tracking-wider uppercase mt-3 mb-1">{t("loop.board.iters")}</div>
-      {loop.iterations.map((it) => (
-        <details key={it.n} className="border-b border-dashed border-[var(--border)] py-0.5">
+      {loop.iterations.map((it, idx) => (
+        // `n` restarts after a manual reset, so it is not unique.
+        <details key={`${idx}-${it.n}`} className="border-b border-dashed border-[var(--border)] py-0.5">
           <summary className="flex justify-between gap-2 cursor-pointer text-[var(--text-dim)] hover:text-[var(--text)]">
             <span>#{it.n}</span>
             <span className={it.result === "fail" ? "text-[var(--err)]" : "text-[var(--ok)]"}>

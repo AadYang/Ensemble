@@ -670,6 +670,11 @@ const en: Dict = {
   "loop.board.doneMarker": "TASKS.md · ## DONE",
   "loop.board.noVerifier": "no verifier configured",
   "loop.board.iters": "iterations",
+  "loop.board.attempts": "attempts",
+  "loop.board.maxAttempts": "max attempts (failed re-opens)",
+  "loop.board.setCap": "set",
+  "loop.board.resetAttempts": "clear",
+  "loop.board.spent": "attempt budget spent — raise the cap or clear the counter, otherwise the next failure pauses immediately",
   "loop.tree.reviewing": "reviewing",
   "loop.tree.runners": "runners",
   "slash.status.notLocal":
@@ -1359,6 +1364,11 @@ const zh: Dict = {
   "loop.board.doneMarker": "TASKS.md · ## DONE",
   "loop.board.noVerifier": "未配置校验命令",
   "loop.board.iters": "迭代",
+  "loop.board.attempts": "尝试",
+  "loop.board.maxAttempts": "最大尝试次数（失败重开）",
+  "loop.board.setCap": "设置",
+  "loop.board.resetAttempts": "清零",
+  "loop.board.spent": "尝试次数已用尽 — 调高上限或清零计数，否则下次失败会立刻暂停",
   "loop.tree.reviewing": "评审中",
   "loop.tree.runners": "执行中",
   "slash.status.notLocal":

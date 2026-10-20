@@ -97,6 +97,7 @@ import {
   CONVERSATION_SEARCH_TOOL_NAME,
 } from "../peer-mcp.js";
 import { makeHelpMcpServer, HELP_MCP_SERVER_NAME, ENSEMBLE_HELP_TOOL_NAME } from "../help-mcp.js";
+import { loadEnabledMcpServers, scopedMcpRows } from "../mcp-scope.js";
 import { JobManager } from "../jobs.js";
 import type { LoopManager } from "../loop.js";
 import {
@@ -3405,7 +3406,15 @@ export class SessionManager {
       ? await prisma.provider.findUnique({ where: { id: a.providerId } })
       : null;
     const msgCount = await prisma.message.count({ where: { agentId: id } });
-    const mcpRows = await prisma.mcpServer.findMany({ where: { enabled: true } });
+    // Report the same set the runtime is given: global + this agent's own.
+    // Counting every enabled row made another agent's private server look
+    // mounted here.
+    const mcpRows = scopedMcpRows(
+      await prisma.mcpServer.findMany({
+        where: { enabled: true, OR: [{ agentId: null }, { agentId: id }] },
+      }),
+      id,
+    );
     const providerKind = provider?.kind ?? null;
     const permissionMode = readPermissionMode(a.metadata);
     const sandboxOverride = readSandboxOverride(a.metadata);
@@ -5041,7 +5050,9 @@ export class SessionManager {
     }
     if (userPersisted) seq++;
 
-    const mcpServers = await this.loadEnabledMcpServers();
+    // Scope is per agent: global rows plus this agent's own rows. Another
+    // agent's private servers must never be mounted here.
+    const mcpServers = await loadEnabledMcpServers(sessionId);
     const peerMcp = makePeerMcpServer(this, sessionId);
     const askUserMcp = makeAskUserMcpServer(this, sessionId);
     const subagentMcp = makeSubagentMcpServer(this, sessionId);
@@ -6581,37 +6592,6 @@ export class SessionManager {
       if (!this.running.has(sessionId)) this.flushSettledJobNotices(sessionId);
     }
     return autoRecoveryPromise ? await autoRecoveryPromise : null;
-  }
-
-  private async loadEnabledMcpServers(): Promise<NonNullable<Options["mcpServers"]>> {
-    const rows = await prisma.mcpServer.findMany({
-      where: { agentId: null, enabled: true },
-    });
-    const out: NonNullable<Options["mcpServers"]> = {};
-    for (const r of rows) {
-      const cfg = r.config as Record<string, unknown>;
-      if (r.transport === "stdio") {
-        out[r.name] = {
-          type: "stdio",
-          command: String(cfg.command),
-          args: Array.isArray(cfg.args) ? (cfg.args as string[]) : undefined,
-          env: (cfg.env as Record<string, string> | undefined) ?? undefined,
-        };
-      } else if (r.transport === "http") {
-        out[r.name] = {
-          type: "http",
-          url: String(cfg.url),
-          headers: (cfg.headers as Record<string, string> | undefined) ?? undefined,
-        };
-      } else if (r.transport === "sse") {
-        out[r.name] = {
-          type: "sse",
-          url: String(cfg.url),
-          headers: (cfg.headers as Record<string, string> | undefined) ?? undefined,
-        };
-      }
-    }
-    return out;
   }
 
   /** Re-emit the authoritative current state to a freshly subscribed socket,

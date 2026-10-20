@@ -945,7 +945,9 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
       }
       case "mcp": {
         try {
-          const res = await fetch("/api/mcp-servers");
+          // Scope the list to this agent: globals plus its own rows, which is
+          // exactly what the runtime mounts.
+          const res = await fetch(`/api/mcp-servers?agentId=${encodeURIComponent(agentId)}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const rows = (await res.json()) as Array<{
             id: string;

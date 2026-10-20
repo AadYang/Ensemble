@@ -234,18 +234,66 @@ export class LoopManager {
     // again on its very next turn.
     state.innerTurns = 0;
     state.consecutiveFails = 0;
+    // The attempt cap is a safety valve, not a verdict: a human clicking
+    // "resume" outranks it. Resuming an already-exhausted budget would leave
+    // the chip at 10/10 and pause again on the next failed attempt, so refill
+    // the counter and record that a human did it.
+    const spent = state.iter >= config.maxIterations;
+    if (spent) {
+      state.iterations = [
+        ...state.iterations,
+        {
+          n: 1,
+          result: "skip" as const,
+          summary: `manual resume: attempt counter reset (was ${state.iter}/${config.maxIterations})`,
+          snapshot: null,
+        },
+      ].slice(-LOOP_ITERATION_LOG_CAP);
+      state.iter = 1;
+    }
     const next = this.upsert(agentId, { status: "running", config, state });
     this.broadcast(next);
-    await this.host.persistLoopNotice(agentId, "LOOP RESUME");
+    await this.host.persistLoopNotice(
+      agentId,
+      spent ? `LOOP RESUME · attempt 1/${config.maxIterations} (budget was spent)` : "LOOP RESUME",
+    );
     void this.host.sendMessage(agentId, loopStartPrompt(config));
     return this.view(agentId);
   }
 
-  async patch(agentId: string, raw: { doneWhen?: unknown; maxIterations?: number }): Promise<LoopView | null> {
+  async patch(
+    agentId: string,
+    raw: { doneWhen?: unknown; maxIterations?: number; resetAttempts?: boolean },
+  ): Promise<LoopView | null> {
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row) return null;
-    const config = parseLoopConfig({ ...(row.config as object), ...raw, verifier: parseLoopConfig(row.config).verifier, goal: parseLoopConfig(row.config).goal });
-    const next = this.upsert(agentId, { status: row.status, config, state: parseLoopState(row.state) });
+    const base = parseLoopConfig(row.config);
+    const config = parseLoopConfig({
+      ...(row.config as object),
+      ...(raw.doneWhen !== undefined ? { doneWhen: raw.doneWhen } : {}),
+      ...(raw.maxIterations !== undefined ? { maxIterations: raw.maxIterations } : {}),
+      verifier: base.verifier,
+      goal: base.goal,
+    });
+    const state = parseLoopState(row.state);
+    // Explicit "clear the counter" from the UI/slash path. Distinct from
+    // resume: it does not kick a turn, it only re-arms the budget.
+    if (raw.resetAttempts) {
+      const was = state.iter;
+      state.iter = 1;
+      state.innerTurns = 0;
+      state.consecutiveFails = 0;
+      state.iterations = [
+        ...state.iterations,
+        {
+          n: 1,
+          result: "skip" as const,
+          summary: `attempt counter reset by user (was ${was}/${config.maxIterations})`,
+          snapshot: null,
+        },
+      ].slice(-LOOP_ITERATION_LOG_CAP);
+    }
+    const next = this.upsert(agentId, { status: row.status, config, state });
     return this.broadcast(next);
   }
 

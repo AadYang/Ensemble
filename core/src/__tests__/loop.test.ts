@@ -133,6 +133,61 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("running");
   });
 
+  it("resume refills an attempt budget that was already spent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-resume-cap-"));
+    gitInitWithDirtyFile(root);
+    const agent = seedAgent("cap-spent", root);
+    const host = mockHost();
+    const mgr = new LoopManager(mockJobs(1, "still red"), mockHub(), host);
+    await mgr.start(agent.id, {
+      goal: "green",
+      verifier: { kind: "command", spec: "npm test" },
+      doneWhen: { kind: "file-contains", spec: "## DONE" },
+      maxIterations: 1,
+    });
+    writeFileSync(join(root, "TASKS.md"), "- [x] all\n\n## DONE\n");
+    expect(await mgr.onTurnSettled(agent.id, { lastText: "done" })).toBeNull();
+    expect(mgr.view(agent.id)?.status).toBe("paused");
+    expect(mgr.view(agent.id)?.iter).toBe(1);
+
+    // A human "resume" must not land back on the same spent budget: that is
+    // the 10/10 chip that never moves and pauses again on the next failure.
+    await mgr.resume(agent.id);
+    const resumed = mgr.view(agent.id);
+    expect(resumed?.status).toBe("running");
+    expect(resumed?.iter).toBe(1);
+    expect(resumed?.iterations.some((it) => /manual resume/.test(it.summary))).toBe(true);
+    // The mock host truncates notices to 40 chars, so match the prefix.
+    expect(host.calls.some((c) => c.includes("LOOP RESUME · attempt 1/1 (budget"))).toBe(true);
+  });
+
+  it("patch can clear a spent attempt counter without kicking a turn", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-reset-cap-"));
+    gitInitWithDirtyFile(root);
+    const agent = seedAgent("cap-reset", root);
+    const host = mockHost();
+    const mgr = new LoopManager(mockJobs(1, "still red"), mockHub(), host);
+    await mgr.start(agent.id, {
+      goal: "green",
+      verifier: { kind: "command", spec: "npm test" },
+      doneWhen: { kind: "file-contains", spec: "## DONE" },
+      maxIterations: 1,
+    });
+    writeFileSync(join(root, "TASKS.md"), "- [x] all\n\n## DONE\n");
+    await mgr.onTurnSettled(agent.id, { lastText: "done" });
+    expect(mgr.view(agent.id)?.status).toBe("paused");
+    const sendsBefore = host.calls.filter((c) => c.startsWith("send:")).length;
+
+    const view = await mgr.patch(agent.id, { resetAttempts: true, maxIterations: 3 });
+    expect(view?.iter).toBe(1);
+    expect(view?.maxIterations).toBe(3);
+    // Clearing the counter re-arms the budget; restarting is still the
+    // operator's separate decision.
+    expect(view?.status).toBe("paused");
+    expect(host.calls.filter((c) => c.startsWith("send:")).length).toBe(sendsBefore);
+    expect(view?.iterations.some((it) => /reset by user/.test(it.summary))).toBe(true);
+  });
+
   it("starts with only a goal and kicks until the agent writes ## DONE", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-agent-"));
     const agent = seedAgent("goal-only", root);

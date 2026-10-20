@@ -62,11 +62,15 @@ Inter-agent communication (you have these tools):
 
 2. Direct HTTP API (only if the user explicitly wants headless control):
    POST   /api/mcp-servers   { name, transport, config, agentId?, enabled? }
-   GET    /api/mcp-servers
+   GET    /api/mcp-servers                → global rows only
+   GET    /api/mcp-servers?agentId=<id>   → what that agent actually gets
    PATCH  /api/mcp-servers/:id  { enabled?, name?, config? }
    DELETE /api/mcp-servers/:id
    Note: omit agentId for a GLOBAL server (available to every agent).
-   Set agentId for a per-agent server.
+   Set agentId for a per-agent server; an unknown agentId is rejected with
+   AGENT_NOT_FOUND rather than written as a dead row.
+   Runtime rule: an agent is given GLOBAL rows plus its OWN rows, never
+   another agent's. On a name collision the per-agent row wins.
 
 3. SQLite path (last resort — UI does this for you):
    table: McpServer(id, agentId, name, transport, config (JSON text), enabled)
