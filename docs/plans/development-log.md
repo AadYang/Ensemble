@@ -4,6 +4,102 @@
 
 ---
 
+## 2026-10-20 · 长连接靠客户端钩子，不靠邮局叫醒
+
+**触发**：用户问能不能带一个 skill，让 agent 起 core 保持长连接、有消息就塞进对话。
+
+**根因**：SKILL.md 只是说明书，拦不住收工。邮局服务器也不能把文字推进空闲主机。能塞进对话的只有：Claude Code Stop hook 拦住 stop，或 Ensemble 自己在回合结束/空闲时读 `/line` 再开一轮。
+
+**改动**：0.1.12 `GET /line` + `POST /line/ack`（绑定码鉴权）；`ensemble-postoffice/skill` + Stop hook 脚本；Ensemble `SessionManager` 空闲轮询未读并 `sendMessage` 注入。
+
+**留下的规则**：skill 负责用法。真正的长连接是主机侧闸门（Stop hook / onTurnSettled 轮询），不是 MCP 工具自己变成守护进程。
+
+---
+
+## 2026-10-20 · 结束 turn 就变聋
+
+**触发**：agent 看到已接通+对方回复后对用户说「成功」并停了。
+
+**根因**：MCP 只能把对方文字放进某次工具结果。工具一返回、模型不再调工具，主机 idle，服务器叫不醒。信会进信箱，进不了上下文。对方说「辩论结束/在等任务」会被当成完成条件。
+
+**改动**：0.1.11 所有占线结果先写 STILL ON THE CALL；下一轮任何工具自动捎上未读；网站提示「有未读，去客户端说继续」。
+
+**留下的规则**：邮局不能叫醒空闲 agent。能做的是让停下来更难看、让下一轮开口时把漏掉的信一次性喂回去。
+
+---
+
+## 2026-10-20 · 拨和接做成 MCP 工具
+
+**触发**：用户认为让 agent 自己摸索怎么通话太业余，要开箱即用。
+
+**根因**：`send` / `connect` / `inbox_wait` 职责重叠，primer 再长也挡不住模型乱拼协议。
+
+**改动**：0.1.10 工具面收成 `dial`（发起方）/ `answer`（接听方）/ `send`（接通后才说话）。未接通的 send 返回 NO LINE。`inbox_wait` 不再出现在 tools/list。
+
+**留下的规则**：电话 MCP 的用法必须写在工具名和 description 里，不能靠模型读说明书。
+
+---
+
+## 2026-10-20 · 两边同时呼叫却永远 RINGING
+
+**触发**：两边都在呼叫，网站一直「正在呼叫」，谁也接不通。
+
+**根因**：MCP handler 把 `IncomingMessage` 的 `close` 当成客户端挂断。POST body 读完就会 `close`，几百毫秒内 `connect`/`send` 被 abort。`inject` 测不出这条路径。
+
+**改动**：0.1.9 只在请求 `aborted` 或响应未写完就 socket close 时才取消占线；A→B 与 B→A 同时登记时立刻双方接通。
+
+**留下的规则**：长轮询不要听 request `close`。body 读完 ≠ 对端挂了。会合测试必须走真实 HTTP，不能只靠 Fastify inject。
+
+---
+
+## 2026-10-20 · 占线的是 send，不是 inbox_wait
+
+**触发**：用户以为已经改成长连接，却看见 agent 仍在 `inbox_wait` 取信。
+
+**根因**：MCP 要把对方消息喂进模型，必须落在某次工具结果里。长轮询之前做成了独立工具，模型就会「发完再去取」，看起来不像电话。
+
+**改动**：0.1.8 `send` 默认自己接通并 HOLD 到对方回复；`send`/`connect` 期间算「在听筒上」。primer 禁止再调 `inbox_wait`。
+
+**留下的规则**：对模型而言长连接 = 正在进行的那次 `send`。主机不会在没有 tool_result 时把推送注入上下文。
+
+---
+
+## 2026-10-20 · 首次连接改成电话会合
+
+**触发**：一边 send 完发现对面没接就停、问用户「不在线」；对面上线后这边已经挂了，两边永远错开。
+
+**根因**：邮箱语义是留言，agent 把「这一轮没回信」当成对方不在。没有「双方都在听筒上」的会合点。
+
+**改动**：0.1.7 `connect`：HOLD 到对方也 `connect` 或已在 `inbox_wait`。超时只能再 connect，instructions 禁止报离线。接通后才 send / inbox_wait。网站显示正在呼叫 / 已接通。
+
+**留下的规则**：闲置 agent 叫不醒。能做的是：已经开始的 turn 必须一直响铃，直到对面拿起听筒。
+
+---
+
+## 2026-10-20 · 通讯码登记一次，不要每轮再问
+
+**触发**：两边协作每次都要把通讯码贴进对话，MCP 自己不知道固定收件人。
+
+**根因**：信箱只有 bind 码（我是谁），没有联系人（寄给谁）。initialize 只写本箱通讯码。
+
+**改动**：0.1.6 联系人名单。同账号其它信箱自动出现；`contact_add` / 网站添加；发过信的对方也会留下。唯一联系人即默认，`send` 可省略 `to`。名单写进 initialize instructions。
+
+**留下的规则**：跨会话稳定的对端地址属于服务器上的信箱状态，不要让人当聊天输入重复提供。
+
+---
+
+## 2026-10-20 · 远程信箱双方消息要能被看见
+
+**触发**：邮局已经能互通，但人在 Ensemble / Claude Code CLI / Codex CLI 里只能看到工具名，看不到发出和收到的正文。
+
+**根因**：MCP 工具结果是 JSON；Ensemble ToolCard 只渲染 tool_use 的 input，且把 `message` 当内部字段丢掉；`user` 里的 `tool_result` 被整段忽略。CLI 宿主不会给邮局单独做 UI，只能靠工具回显正文。
+
+**改动**：Postoffice 0.1.5 的 send / inbox_wait / query / transcript 以 `display` 转写开头（发出 + 收到 + 线程），网站轮询 `/api/mailboxes/:id/messages`。Ensemble 把 `send`/`send_file` 当 `peer_send` 展示正文，并把邮局 tool_result 的 display 挂回对应 ToolCard。
+
+**留下的规则**：跨客户端可见的对话必须出现在 MCP `content[0].text` 里，不能只放结构化字段。CLI 没有第二块 UI。
+
+---
+
 ## 2026-10-19 · Loop 默认只填目标，结束标志由 agent 落盘
 
 **触发**：1.0 强制用户填 `npm test` / 结束标记，和「用 agent 做开发」本末倒置；不会写脚本的人开不了环。

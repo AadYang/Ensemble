@@ -100,23 +100,27 @@ ensemble-postoffice/
 
 | 工具 | 入参 | 行为 |
 |---|---|---|
-| `whoami` | 无 | 本箱通讯码、名称、未读数 |
+| `whoami` | 无 | 本箱通讯码、名称、未读数、联系人、默认收件人 |
 | `register` | `bind_code` | 把当前 MCP session 绑到信箱（无 Bearer 时用） |
-| `send` | `to`（通讯码）, `message`, `mode?`（`message`\|`task`，默认 message） | 投递文字。收件箱必须存在 |
-| `inbox` | 无 | 列出未读（含附件元数据），**不**标已读 |
-| `inbox_wait` | `timeout_sec?`（默认 55，最大 90） | 若已有未读立刻返回；否则挂起直到新信或超时。**返回后把这些未读标已读** |
-| `query` | `comm_code`, `limit?`（默认 20，最大 50） | 你与该通讯码之间最近 N 条往来（已读+未读），相当于远程版 peer_query 的「能看见的部分」 |
+| `contacts` | 无 | 联系人名单：同账号其它信箱 + 已保存 + 有过往来的 |
+| `contact_add` | `comm_code`, `alias?`, `default?` | 记住一个通讯码，之后 send 可省略 `to` 或用别名 |
+| `contact_remove` | `comm_code` | 去掉已保存联系人（同账号信箱仍在名单里） |
+| `connect` | `to?`, `timeout_sec?` | 电话式会合：一直等到对方也 `connect` 或已在 `inbox_wait`。超时不是失败，必须再 connect。禁止报「对面不在线」后停 |
+| `send` | `to?`, `message`, `mode?`（`message`\|`task`，默认 message） | 占线：必要时先接通，送达后再 HOLD 等对方回复（默认 600s）。不要再调 `inbox_wait` |
+| `inbox` | 无 | 列出未读（含附件元数据），**不**标已读。结果带 `display` |
+| `inbox_wait` | `timeout_sec?`（默认 600，最大 900） | 若已有未读立刻返回；否则挂起直到新信或超时。**返回后把这些未读标已读**。结果带收到正文 + 线程 |
+| `query` | `comm_code`, `limit?`（默认 20，最大 50） | 你与该通讯码之间最近 N 条往来（已读+未读） |
+| `transcript` | `limit?`（默认 30） | 本箱最近往来（发出+收到），给人看的完整线程 |
 | `send_file` | `to`, `filename`, `data_base64`, `mime?`, `message?` | 附件投递。解码后 ≤ 12MB |
 | `file_get` | `file_id` | 返回 `{filename, mime, data_base64}`。仅收件人或发件人可取。约 7 天过期 |
 
 自动多轮约定（写入 instructions）：
 
-1. 用户在两边各点一次开始，并交代通讯码与任务。
-2. 你做完一轮工作后 `send`（或 `send_file`）给对方。
-3. 立刻 `inbox_wait`，不要结束 turn、不要干等用户。
-4. 等到信就处理，再 `send`，再 `inbox_wait`。
-5. 超时（空 inbox）就再 `inbox_wait`，除非用户/任务说停。
-6. 不要假设服务器会在你空闲时再叫醒你。
+1. 两边同时点开始。Agent **只 `send`**：工具自己响铃接通、送达、再 HOLD 等对方下一条（默认 10 分钟）。不要 `inbox_wait`。
+2. 响铃或空回复不是离线。立刻再 `send`。禁止对用户说「对面不在线」然后结束。
+3. 对方回复在同一次 `send` 的工具结果里（`INCOMING`）。继续做真实任务，再 `send`。
+4. 只有用户叫停或任务明确完成才结束。
+5. 不要假设服务器会在你空闲时再叫醒你。通讯码从名单读。
 
 `inbox_wait` 必须走 MCP 工具调用，这样卡的是**当前 turn 的工具结果**，不是 Ensemble 进程里对 idle session 的假轮询。
 
@@ -138,6 +142,11 @@ ensemble-postoffice/
 | POST | `/api/logout` | 作废 token |
 | GET | `/api/mailboxes` | 列表（绑定码打码） |
 | POST | `/api/mailboxes` | `{ name }` → 含一次明文 `bindCode` |
+| GET | `/api/mailboxes/:id/messages` | 该箱发出+收到的线程（网站实时日志用） |
+| GET | `/api/mailboxes/:id/contacts` | 联系人名单 |
+| POST | `/api/mailboxes/:id/contacts` | `{ commCode, alias?, default? }` |
+| POST | `/api/mailboxes/:id/contacts/:comm/default` | 设为默认收件人 |
+| DELETE | `/api/mailboxes/:id/contacts/:comm` | 去掉已保存联系人 |
 | POST | `/api/mailboxes/:id/reset-bind` | 新绑定码明文一次 |
 | DELETE | `/api/mailboxes/:id` | 删箱（级联未读与无权访问的附件） |
 
@@ -155,6 +164,7 @@ Session(token, userId, createdAt, expiresAt)
 Mailbox(id, userId, name, commCode UNIQUE, bindHash, createdAt, lastSeenAt, boundSessionId)
 Message(id, fromId, toId, mode, body, createdAt, readAt)
 FileBlob(id, messageId, filename, mime, byteSize, expiresAt)
+Contact(mailboxId, peerId, alias, isDefault, createdAt)  -- PRIMARY KEY (mailboxId, peerId)
 ```
 
 密码：`scrypt`（node:crypto）。绑定码：32 字节随机 hex，库里只存 sha256。通讯码：8 位 Crockford（去 0O1I）。
