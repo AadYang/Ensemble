@@ -66,7 +66,20 @@ describe("postoffice", () => {
   function toolText(res: Awaited<ReturnType<typeof rpc>>): string {
     const body = res.json() as { result?: { content?: { text: string }[]; isError?: boolean }; error?: { message: string } };
     if (body.error) throw new Error(body.error.message);
-    return body.result?.content?.[0]?.text ?? "";
+    return (body.result?.content ?? []).map((c) => c.text).join("\n");
+  }
+
+  function toolJson(res: Awaited<ReturnType<typeof rpc>>): Record<string, unknown> {
+    const body = res.json() as {
+      result?: { structuredContent?: Record<string, unknown>; content?: { text: string }[] };
+      error?: { message: string };
+    };
+    if (body.error) throw new Error(body.error.message);
+    if (body.result?.structuredContent) return body.result.structuredContent;
+    const text = toolText(res);
+    const marker = text.lastIndexOf("---json---");
+    if (marker >= 0) return JSON.parse(text.slice(marker + "---json---".length)) as Record<string, unknown>;
+    return JSON.parse(text) as Record<string, unknown>;
   }
 
   it("rejects a wrong invite code", async () => {
@@ -103,13 +116,17 @@ describe("postoffice", () => {
       arguments: { to: b.commCode, message: "hello from A", wait_sec: 0 },
     });
     expect(sent.statusCode).toBe(200);
-    expect(toolText(sent)).toContain("delivered");
+    expect(toolText(sent)).toContain("YOU SENT");
+    expect(toolText(sent)).toContain("hello from A");
+    expect(toolJson(sent)).toMatchObject({ delivered: true });
 
     const waited = await waiting;
     expect(waited.statusCode).toBe(200);
     const text = toolText(waited);
+    expect(text).toContain("INCOMING");
     expect(text).toContain("hello from A");
     expect(text).toContain(a.commCode);
+    expect(text).toContain("--- thread ---");
   });
 
   it("round-trips a file attachment", async () => {
@@ -130,13 +147,12 @@ describe("postoffice", () => {
         wait_sec: 0,
       },
     });
-    const sentText = toolText(sent);
-    const sentJson = JSON.parse(sentText) as { files?: { id: string }[]; error?: string };
-    expect(sentJson, sentText).toMatchObject({ delivered: true });
+    const sentJson = toolJson(sent) as { files?: { id: string }[]; error?: string };
+    expect(sentJson, toolText(sent)).toMatchObject({ delivered: true });
     expect(sentJson.files?.[0]?.id).toBeTruthy();
 
     const inbox = await rpc(b.bindCode, "sess-b", "tools/call", { name: "inbox", arguments: {} });
-    const inboxJson = JSON.parse(toolText(inbox)) as { messages: { files: { id: string }[] }[] };
+    const inboxJson = toolJson(inbox) as { messages: { files: { id: string }[] }[] };
     const fileId = inboxJson.messages[0]?.files[0]?.id;
     expect(fileId).toBeTruthy();
 
@@ -144,7 +160,7 @@ describe("postoffice", () => {
       name: "file_get",
       arguments: { file_id: fileId },
     });
-    const file = JSON.parse(toolText(got)) as { data_base64: string; filename: string };
+    const file = toolJson(got) as { data_base64: string; filename: string };
     expect(file.filename).toBe("note.txt");
     expect(Buffer.from(file.data_base64, "base64").toString()).toBe("pdf-bytes");
   });
@@ -172,6 +188,18 @@ describe("postoffice", () => {
     const a = await openBox(aTok, "A");
     const b = await openBox(bTok, "B");
 
+    const ringing = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "dial",
+      arguments: { to: b.commCode, timeout_sec: 8 },
+    }, 1);
+    await new Promise((r) => setTimeout(r, 80));
+    const picked = await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "answer",
+      arguments: { timeout_sec: 8 },
+    }, 2);
+    expect(toolJson(await ringing)).toMatchObject({ connected: true });
+    expect(toolJson(picked)).toMatchObject({ connected: true });
+
     const waiting = rpc(a.bindCode, "sess-a", "tools/call", {
       name: "send",
       arguments: { to: b.commCode, message: "ping", wait_sec: 8 },
@@ -186,9 +214,59 @@ describe("postoffice", () => {
 
     const waited = await waiting;
     expect(toolText(waited)).toContain("pong");
+    expect(toolText(waited)).toContain("STILL ON THE CALL");
   });
 
-  it("puts the comm code into initialize instructions", async () => {
+  it("bind code can peek and ack the live line without a user session", async () => {
+    const aTok = await register("alice");
+    const bTok = await register("bob");
+    const a = await openBox(aTok, "A");
+    const b = await openBox(bTok, "B");
+    await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { to: b.commCode, message: "queued-for-hook", wait_sec: 0 },
+    });
+    const peeked = await app.inject({
+      method: "GET",
+      url: "/line",
+      headers: { authorization: `Bearer ${b.bindCode}` },
+    });
+    expect(peeked.statusCode).toBe(200);
+    const body = peeked.json() as { unread: { body: string; id: string }[] };
+    expect(body.unread.map((m) => m.body)).toContain("queued-for-hook");
+    const acked = await app.inject({
+      method: "POST",
+      url: "/line/ack",
+      headers: { authorization: `Bearer ${b.bindCode}`, "content-type": "application/json" },
+      payload: { ids: body.unread.map((m) => m.id) },
+    });
+    expect(acked.statusCode).toBe(200);
+    const again = await app.inject({
+      method: "GET",
+      url: "/line",
+      headers: { authorization: `Bearer ${b.bindCode}` },
+    });
+    expect((again.json() as { unread: unknown[] }).unread).toEqual([]);
+  });
+
+  it("whoami flushes queued mail after the agent stopped holding", async () => {
+    const aTok = await register("alice");
+    const bTok = await register("bob");
+    const a = await openBox(aTok, "A");
+    const b = await openBox(bTok, "B");
+    await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { to: b.commCode, message: "after-you-hung-up", wait_sec: 0 },
+    });
+    const me = await rpc(b.bindCode, "sess-b", "tools/call", { name: "whoami", arguments: {} });
+    expect(toolText(me)).toContain("after-you-hung-up");
+    expect(toolText(me)).toContain("queued");
+    expect(toolJson(me).missed).toEqual(
+      expect.arrayContaining([expect.objectContaining({ body: "after-you-hung-up" })]),
+    );
+  });
+
+  it("puts the comm code and phone protocol into initialize instructions", async () => {
     const token = await register("alice");
     const box = await openBox(token, "A");
     const res = await rpc(box.bindCode, "sess-init", "initialize", {
@@ -198,5 +276,285 @@ describe("postoffice", () => {
     });
     const body = res.json() as { result: { instructions: string } };
     expect(body.result.instructions).toContain(box.commCode);
+    expect(body.result.instructions).toMatch(/\bdial\b/);
+    expect(body.result.instructions).toMatch(/\banswer\b/);
+    expect(body.result.instructions).toContain("inbox_wait");
+
+    const listed = await rpc(box.bindCode, "sess-init", "tools/list", {});
+    const tools = (listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
+    expect(tools).toEqual(expect.arrayContaining(["dial", "answer", "send"]));
+    expect(tools).not.toContain("inbox_wait");
+    expect(tools).not.toContain("connect");
+  });
+
+  it("shows both sent and received messages on transcript and website API", async () => {
+    const aTok = await register("alice");
+    const bTok = await register("bob");
+    const a = await openBox(aTok, "A");
+    const b = await openBox(bTok, "B");
+
+    await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { to: b.commCode, message: "from-a", wait_sec: 0 },
+    });
+    await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "send",
+      arguments: { to: a.commCode, message: "from-b", wait_sec: 0 },
+    });
+
+    const tr = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "transcript",
+      arguments: { limit: 20 },
+    });
+    const text = toolText(tr);
+    expect(text).toContain("from-a");
+    expect(text).toContain("from-b");
+    expect(text).toContain("you →");
+
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/mailboxes/${a.id}/messages`,
+      headers: { authorization: `Bearer ${aTok}` },
+    });
+    expect(listed.statusCode).toBe(200);
+    const body = listed.json() as { messages: { body: string }[] };
+    expect(body.messages.map((m) => m.body).sort()).toEqual(["from-a", "from-b"]);
+
+    const forbidden = await app.inject({
+      method: "GET",
+      url: `/api/mailboxes/${a.id}/messages`,
+      headers: { authorization: `Bearer ${bTok}` },
+    });
+    expect(forbidden.statusCode).toBe(404);
+  });
+
+  it("same-account sibling is the default send target without pasting a comm code", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    const init = await rpc(a.bindCode, "sess-sib", "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "t", version: "0" },
+    });
+    const instructions = (init.json() as { result: { instructions: string } }).result.instructions;
+    expect(instructions).toContain(b.commCode);
+    expect(instructions).toContain("phone");
+    expect(instructions).toMatch(/default/i);
+
+    const sent = await rpc(a.bindCode, "sess-sib", "tools/call", {
+      name: "send",
+      arguments: { message: "auto-to-sibling", wait_sec: 0 },
+    });
+    expect(toolJson(sent)).toMatchObject({ delivered: true });
+    expect(toolText(sent)).toContain("auto-to-sibling");
+
+    const inbox = await rpc(b.bindCode, "sess-phone", "tools/call", { name: "inbox", arguments: {} });
+    expect(toolText(inbox)).toContain("auto-to-sibling");
+  });
+
+  it("contact_add remembers a peer so later send can omit to", async () => {
+    const aTok = await register("alice");
+    const bTok = await register("bob");
+    const a = await openBox(aTok, "A");
+    const b = await openBox(bTok, "B");
+
+    const added = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "contact_add",
+      arguments: { comm_code: b.commCode, alias: "firmware", default: true },
+    });
+    expect(toolText(added)).toContain("firmware");
+    expect(toolText(added)).toContain(b.commCode);
+
+    const sent = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { message: "by-default", wait_sec: 0 },
+    });
+    expect(toolJson(sent)).toMatchObject({ delivered: true });
+
+    const named = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { to: "firmware", message: "by-alias", wait_sec: 0 },
+    });
+    expect(toolText(named)).toContain("by-alias");
+
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/mailboxes/${a.id}/contacts`,
+      headers: { authorization: `Bearer ${aTok}` },
+    });
+    expect(listed.statusCode).toBe(200);
+    const contacts = (listed.json() as { contacts: { commCode: string; alias: string; isDefault: boolean }[] }).contacts;
+    expect(contacts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ commCode: b.commCode, alias: "firmware", isDefault: true })]),
+    );
+  });
+
+  it("dial plus answer connects, then send works", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+
+    const ringing = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "dial",
+      arguments: { timeout_sec: 8 },
+    }, 8);
+    await new Promise((r) => setTimeout(r, 80));
+    const pickup = await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "answer",
+      arguments: { timeout_sec: 8 },
+    }, 9);
+    const answered = await ringing;
+    expect(toolText(answered)).toContain("CONNECTED");
+    expect(toolJson(answered)).toMatchObject({ connected: true });
+    expect(toolText(pickup)).toContain("CONNECTED");
+    expect(toolJson(pickup)).toMatchObject({ connected: true });
+  });
+
+  it("send without a line tells the agent to dial or answer", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    await openBox(tok, "phone");
+    const sent = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { message: "too-soon", wait_sec: 8 },
+    });
+    expect(toolJson(sent)).toMatchObject({ delivered: false, connected: false });
+    expect(toolText(sent)).toContain("NO LINE");
+    expect(toolText(sent)).toContain("dial");
+    expect(toolText(sent)).toContain("answer");
+  });
+
+  it("connect succeeds when the peer is already inbox_waiting", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+
+    const listening = rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "inbox_wait",
+      arguments: { timeout_sec: 8 },
+    }, 2);
+    await new Promise((r) => setTimeout(r, 80));
+    const call = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "dial",
+      arguments: { timeout_sec: 8 },
+    }, 3);
+    expect(toolJson(call)).toMatchObject({ connected: true });
+
+    await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { message: "line-up", wait_sec: 0 },
+    }, 4);
+    const waited = await listening;
+    expect(toolText(waited)).toContain("line-up");
+  });
+
+  it("send holds the line for the reply without inbox_wait", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+
+    const ringing = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "dial",
+      arguments: { timeout_sec: 8 },
+    }, 10);
+    await new Promise((r) => setTimeout(r, 40));
+    await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "answer",
+      arguments: { timeout_sec: 8 },
+    }, 11);
+    expect(toolJson(await ringing)).toMatchObject({ connected: true });
+
+    const aHold = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { message: "from-desk", wait_sec: 8 },
+    }, 12);
+    await new Promise((r) => setTimeout(r, 80));
+    const bHold = rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "send",
+      arguments: { message: "from-phone", wait_sec: 8 },
+    }, 13);
+    const aRes = await aHold;
+    const bRes = await bHold;
+    expect(toolText(aRes)).toContain("from-desk");
+    expect(toolText(aRes)).toContain("from-phone");
+    expect(toolJson(aRes)).toMatchObject({ delivered: true, connected: true });
+    expect(toolText(bRes)).toContain("from-phone");
+    expect(toolText(bRes)).toContain("from-desk");
+  });
+
+  async function liveCall(port: number, bind: string, session: string, name: string, args: Record<string, unknown>, accept: string) {
+    const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bind}`,
+        "mcp-session-id": session,
+        "content-type": "application/json",
+        accept,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const ctype = res.headers.get("content-type") ?? "";
+    const raw = await res.text();
+    if (ctype.includes("text/event-stream")) {
+      const dataLine = raw.split("\n").find((l) => l.startsWith("data: "));
+      if (!dataLine) throw new Error(`no sse data: ${raw.slice(0, 200)}`);
+      return JSON.parse(dataLine.slice(6)) as { result?: { structuredContent?: Record<string, unknown>; content?: { text: string }[] } };
+    }
+    return JSON.parse(raw) as { result?: { structuredContent?: Record<string, unknown>; content?: { text: string }[] } };
+  }
+
+  it("simultaneous dial and answer via inject completes without stagger", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    const [answered, pickup] = await Promise.all([
+      rpc(a.bindCode, "sess-a", "tools/call", { name: "dial", arguments: { timeout_sec: 8 } }, 20),
+      rpc(b.bindCode, "sess-b", "tools/call", { name: "answer", arguments: { timeout_sec: 8 } }, 21),
+    ]);
+    expect(toolJson(answered)).toMatchObject({ connected: true });
+    expect(toolJson(pickup)).toMatchObject({ connected: true });
+  });
+
+  it("simultaneous live HTTP dial and answer complete without stagger", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const addr = app.server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    const accept = "application/json, text/event-stream";
+    const [aBody, bBody] = await Promise.all([
+      liveCall(port, a.bindCode, "live-a", "dial", { timeout_sec: 8 }, accept),
+      liveCall(port, b.bindCode, "live-b", "answer", { timeout_sec: 8 }, accept),
+    ]);
+    expect(aBody.result?.structuredContent).toMatchObject({ connected: true });
+    expect(bBody.result?.structuredContent).toMatchObject({ connected: true });
+  });
+
+  it("simultaneous live HTTP send shares the line without inbox_wait", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const addr = app.server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    const accept = "application/json, text/event-stream";
+    const [dialed, picked] = await Promise.all([
+      liveCall(port, a.bindCode, "live-a", "dial", { timeout_sec: 8 }, accept),
+      liveCall(port, b.bindCode, "live-b", "answer", { timeout_sec: 8 }, accept),
+    ]);
+    expect(dialed.result?.structuredContent).toMatchObject({ connected: true });
+    expect(picked.result?.structuredContent).toMatchObject({ connected: true });
+    const [aBody, bBody] = await Promise.all([
+      liveCall(port, a.bindCode, "live-a", "send", { message: "from-desk", wait_sec: 8 }, accept),
+      liveCall(port, b.bindCode, "live-b", "send", { message: "from-phone", wait_sec: 8 }, accept),
+    ]);
+    expect(aBody.result?.structuredContent).toMatchObject({ delivered: true, connected: true });
+    expect(bBody.result?.structuredContent).toMatchObject({ delivered: true, connected: true });
+    const aText = (aBody.result?.content ?? []).map((c) => c.text).join("\n");
+    const bText = (bBody.result?.content ?? []).map((c) => c.text).join("\n");
+    expect(aText).toContain("from-phone");
+    expect(bText).toContain("from-desk");
   });
 });

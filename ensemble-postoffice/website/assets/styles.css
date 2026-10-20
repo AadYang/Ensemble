@@ -33,7 +33,29 @@ code, pre { font-family: var(--mono); color: var(--accent); word-break: break-al
 pre { background: #0a0e14; padding: 10px; overflow: auto; font-size: 12px; }
 .meta { color: var(--dim); font-size: 12px; }
 .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-dialog { background: var(--panel); color: var(--text); border: 1px solid var(--accent); border-radius: 10px; max-width: 640px; }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--accent); border-radius: 10px; max-width: 640px; width: calc(100% - 32px); max-height: 90vh; display: flex; flex-direction: column; padding: 16px 18px; }
 dialog::backdrop { background: rgba(0,0,0,.55); }
+.secret-body { overflow: auto; min-height: 0; }
+.secret-block { margin-top: 12px; }
+.secret-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+.secret-head span { color: var(--dim); font-size: 13px; }
+.secret-block pre { max-height: 160px; margin: 0; }
+.secret-foot { margin-top: 12px; flex-shrink: 0; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #5e6f7e; }
 .dot.on { background: #3dd68c; }
+.call { margin-left: 8px; }
+.call.ringing, .call.waiting { color: #f5c16c; }
+.call.incoming { color: #7eb8ff; }
+.call.connected { color: #3dd68c; }
+.hung { color: #f5c16c; font-size: 12px; margin: 6px 0 0; }
+.hung:empty { display: none; }
+.log { max-height: 280px; overflow: auto; white-space: pre-wrap; font-size: 12px; color: var(--text); background: #0a0e14; padding: 10px; margin-top: 10px; border-radius: 6px; min-height: 72px; font-family: var(--mono); }
+.log .mine { color: var(--accent); }
+.log .theirs { color: var(--text); }
+.log .empty { color: var(--dim); }
+.contacts { list-style: none; padding: 0; margin: 12px 0 0; }
+.contacts li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-family: var(--mono); font-size: 12px; margin-top: 6px; color: var(--text); }
+.contacts .src { color: var(--dim); }
+.contacts .on { color: var(--accent); }
+.contact-form { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.contact-form input { margin: 0; flex: 1; min-width: 120px; }

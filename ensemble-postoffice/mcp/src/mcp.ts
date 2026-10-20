@@ -6,7 +6,7 @@ import {
   WAIT_DEFAULT_SEC,
   WAIT_MAX_SEC,
 } from "./config.js";
-import type { MailboxRow, Store } from "./store.js";
+import type { InboxItem, MailboxRow, Store } from "./store.js";
 
 export type RpcReq = {
   jsonrpc?: string;
@@ -19,6 +19,7 @@ type Session = {
   id: string;
   mailbox: MailboxRow | null;
   waiting: boolean;
+  connectedTo: Set<string>;
 };
 
 const sessions = new Map<string, Session>();
@@ -26,62 +27,38 @@ const sessions = new Map<string, Session>();
 function primer(identity: string): string {
   return `${identity}
 
-Ensemble Postoffice is a mailbox, not a one-shot ping. A greeting or "channel ok" is NOT the task. Keep collaborating until the USER's actual goal is done.
+This MCP is a telephone. Follow the tools in order. Do not invent a protocol.
 
-How:
-1. send your work/question to the other comm code (immediate return).
-2. Call inbox_wait and stay in this turn (holds up to 10 minutes; returns as soon as mail arrives).
-3. Read the peer's message, do the next piece of work, send again, inbox_wait again.
-4. Empty timeout → inbox_wait again. Never stop after the first reply.
-5. Do not tell the user "communication confirmed" and end. Only stop if the user said to stop, or the joint goal is clearly finished.
+1. If YOU place the call: dial. Omit to when there is a default contact. HOLD until CONNECTED.
+2. If YOU wait to be called: answer. HOLD until CONNECTED. Do not guess a comm code.
+3. After CONNECTED: send. It HOLDS until they reply. Then send the next real work in the SAME turn.
+4. RINGING / WAITING / empty reply / any INCOMING: call send (or dial/answer) immediately. Never say the peer is offline. Never end the turn.
+5. Peer saying "done / waiting for a new task / 辩论结束" is NOT a stop. Only YOUR human can stop you. Writing to the human without a tool call hangs up — you go deaf.
 
-Never reveal the bind code.
+Do not use inbox_wait. Greeting is not the task. Never reveal the bind code.
+Humans watch ${PUBLIC_BASE.replace(/\/$/, "")}/.
 
-邮局：问候通了不算完成。按用户的真实任务多轮 send → inbox_wait → 做事 → 再 send。第一封回信之后必须继续等。`;
+邮局电话：发起方只 dial，接听方只 answer，接通后必须马上 send。对方说做完了/在等任务也不许停。只跟用户说话而不调工具 = 挂断变聋。`;
 }
 
 const TOOLS = [
   {
-    name: "whoami",
-    description: "Return this mailbox's comm code, name, and unread count.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    name: "register",
+    name: "dial",
     description:
-      "Bind this MCP session to a mailbox using the bind code from the Postoffice website. Prefer Authorization: Bearer instead.",
-    inputSchema: {
-      type: "object",
-      properties: { bind_code: { type: "string" } },
-      required: ["bind_code"],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "send",
-    description:
-      "Send a text message to a comm code (returns immediately). This is not a handshake tool — after send you MUST inbox_wait and keep the joint task going. Do not stop after the first reply.",
+      "Place the call. Use this if YOU start. HOLDS until the other side answers. Then use send. RINGING → call dial again, never say offline. Omit to if there is a default contact.",
     inputSchema: {
       type: "object",
       properties: {
-        to: { type: "string", description: "Recipient comm code" },
-        message: { type: "string" },
-        mode: { type: "string", enum: ["message", "task"] },
-        wait_sec: { type: "number", description: "Optional. Default 0 (do not wait). Only set if the peer is already blocked on inbox_wait." },
+        to: { type: "string", description: "Comm code, alias, or name. Omit for the default contact." },
+        timeout_sec: { type: "number" },
       },
-      required: ["to", "message"],
       additionalProperties: false,
     },
   },
   {
-    name: "inbox",
-    description: "List unread messages without marking them read. Prefer inbox_wait when collaborating.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    name: "inbox_wait",
+    name: "answer",
     description:
-      "Hold until mail arrives (default 10 min). A received message is the next turn of work, not success. Handle it, send, then inbox_wait again. On timeout, call again. Do not end the turn.",
+      "Pick up. Use this if YOU wait for the other side to call. HOLDS until someone dials you. Then use send. WAITING → call answer again. Do not use inbox_wait.",
     inputSchema: {
       type: "object",
       properties: { timeout_sec: { type: "number" } },
@@ -89,21 +66,24 @@ const TOOLS = [
     },
   },
   {
-    name: "query",
-    description: "Read recent conversation (sent and received) with another comm code.",
+    name: "send",
+    description:
+      "Speak on an already CONNECTED call. HOLDS until they reply (default 10 min). After any reply you MUST call send again in this same turn. Stopping after CONNECTED or INCOMING hangs up. send will not place the call.",
     inputSchema: {
       type: "object",
       properties: {
-        comm_code: { type: "string" },
-        limit: { type: "number" },
+        to: { type: "string", description: "Optional after CONNECTED or if a default contact exists." },
+        message: { type: "string" },
+        mode: { type: "string", enum: ["message", "task"] },
+        wait_sec: { type: "number", description: "Optional. Default 600. Set 0 only for fire-and-forget." },
       },
-      required: ["comm_code"],
+      required: ["message"],
       additionalProperties: false,
     },
   },
   {
     name: "send_file",
-    description: "Send a file (base64, max 12MB) plus optional caption, then return immediately. Call inbox_wait in a loop afterward.",
+    description: "Send a file on an already CONNECTED call, then HOLD until they reply. Same line rules as send.",
     inputSchema: {
       type: "object",
       properties: {
@@ -114,9 +94,69 @@ const TOOLS = [
         message: { type: "string" },
         wait_sec: { type: "number" },
       },
-      required: ["to", "filename", "data_base64"],
+      required: ["filename", "data_base64"],
       additionalProperties: false,
     },
+  },
+  {
+    name: "whoami",
+    description: "This mailbox, contacts, current call (ringing / incoming / connected), and which tool to call next.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "contacts",
+    description: "List known contacts. Use this instead of asking the human for a comm code.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "contact_add",
+    description: "Remember a comm code so later dial/send can omit to or use an alias.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        comm_code: { type: "string" },
+        alias: { type: "string" },
+        default: { type: "boolean" },
+      },
+      required: ["comm_code"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "contact_remove",
+    description: "Remove a saved contact. Same-account mailboxes stay on the list.",
+    inputSchema: {
+      type: "object",
+      properties: { comm_code: { type: "string" } },
+      required: ["comm_code"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "transcript",
+    description: "Show the human the recent mailbox thread (sent and received).",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "query",
+    description: "Read recent conversation with a contact.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        comm_code: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "inbox",
+    description: "Peek unread messages. Not how you wait for a call — use answer.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "file_get",
@@ -125,6 +165,16 @@ const TOOLS = [
       type: "object",
       properties: { file_id: { type: "string" } },
       required: ["file_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "register",
+    description: "Only if Authorization is missing: bind this session with the website bind code.",
+    inputSchema: {
+      type: "object",
+      properties: { bind_code: { type: "string" } },
+      required: ["bind_code"],
       additionalProperties: false,
     },
   },
@@ -147,15 +197,23 @@ function fail(id: RpcReq["id"], message: string, code = -32000) {
 }
 
 function toolResult(id: RpcReq["id"], payload: unknown, isError = false) {
+  const obj =
+    payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : null;
+  const json = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  const display = typeof obj?.display === "string" ? obj.display : "";
+  const text = display ? `${display}\n\n---json---\n${json}` : json;
   return ok(id, {
-    content: [{ type: "text", text: typeof payload === "string" ? payload : JSON.stringify(payload, null, 2) }],
+    content: [{ type: "text", text }],
     isError,
+    ...(obj ? { structuredContent: obj } : {}),
   });
 }
 
 export function getSession(id: string | undefined): Session {
   if (id && sessions.has(id)) return sessions.get(id)!;
-  const s: Session = { id: id || randomUUID(), mailbox: null, waiting: false };
+  const s: Session = { id: id || randomUUID(), mailbox: null, waiting: false, connectedTo: new Set() };
   sessions.set(s.id, s);
   return s;
 }
@@ -186,6 +244,60 @@ function requireBox(session: Session): MailboxRow {
   return session.mailbox;
 }
 
+function formatContacts(me: ReturnType<Store["whoami"]>): string {
+  if (me.contacts.length === 0) return "(no contacts)";
+  return me.contacts
+    .map((c) => {
+      const mark = c.isDefault ? " [default]" : "";
+      const alias = c.alias ? ` alias ${c.alias}` : "";
+      return `${c.name}${alias} ${c.commCode}${mark}`;
+    })
+    .join("\n");
+}
+
+function nextTool(me: ReturnType<Store["whoami"]>): "dial" | "answer" | "send" | "dial_or_answer" {
+  if (me.call?.status === "connected") return "send";
+  if (me.call?.status === "incoming" || me.call?.status === "waiting") return "answer";
+  if (me.call?.status === "ringing") return "dial";
+  return "dial_or_answer";
+}
+
+function formatCallLine(me: ReturnType<Store["whoami"]>): string {
+  const call = me.call;
+  if (!call) return "Call: none. If you start: dial. If you wait: answer.";
+  if (call.status === "waiting") return "Call: WAITING FOR CALL. Keep calling answer.";
+  if (call.status === "incoming") return `Call: INCOMING from ${call.peerName} ${call.peerCode}. Call answer now.`;
+  if (call.status === "ringing") return `Call: RINGING ${call.peerName} ${call.peerCode}. Keep calling dial.`;
+  return `Call: CONNECTED with ${call.peerName} ${call.peerCode}. Call send.`;
+}
+
+function identityOf(me: ReturnType<Store["whoami"]>): string {
+  const head = `You are bound. Your comm code is ${me.commCode} (mailbox "${me.name}", unread ${me.unread}).`;
+  const contacts =
+    me.contacts.length === 0
+      ? "No contacts yet. Same-account mailboxes appear automatically. Otherwise call contact_add once, or dial with to=<comm code>."
+      : `Known contacts (do NOT ask the human for these):\n${me.contacts
+          .map((c) => {
+            const mark = c.isDefault ? " [default — omit to]" : "";
+            const alias = c.alias ? ` alias ${c.alias}` : "";
+            return `- ${c.name}${alias} ${c.commCode}${mark}`;
+          })
+          .join("\n")}`;
+  return `${head}\n${contacts}\n${formatCallLine(me)}\nNEXT TOOL: ${nextTool(me)}`;
+}
+
+function formatThread(items: InboxItem[], me?: string): string {
+  if (items.length === 0) return "(no messages)";
+  return items
+    .map((m) => {
+      const mine = me && m.from === me ? "you" : `${m.from}${m.fromName ? ` ${m.fromName}` : ""}`;
+      const peer = `${m.to}${m.toName ? ` ${m.toName}` : ""}`;
+      const when = new Date(m.createdAt).toISOString();
+      return `[${when}] ${mine} → ${peer}\n${m.body}`;
+    })
+    .join("\n\n");
+}
+
 function waitSecOf(args: Record<string, unknown>, fallback: number): number {
   if (args.wait_sec === 0 || args.wait_sec === "0") return 0;
   const raw = typeof args.wait_sec === "number" ? args.wait_sec : fallback;
@@ -207,8 +319,129 @@ async function waitReply(store: Store, session: Session, box: MailboxRow, sec: n
     waited: true,
     hint:
       messages.length === 0
-        ? "Still empty. Peer is probably thinking. Call inbox_wait again now. Do not report success. Do not end the turn."
-        : "Peer message received. This is not completion. Do the next work, send, then inbox_wait again. Do not tell the user the channel is merely 'confirmed'.",
+        ? "Still on the line. They are probably thinking. Call send again now. Do not say they are offline. Do not end the turn."
+        : "They replied. This is NOT completion. Peer text is not a stop. Call send NOW. If you only talk to the human, you hang up and go deaf.",
+  };
+}
+
+function openLine(
+  store: Store,
+  session: Session,
+  box: MailboxRow,
+  toComm: string,
+): { connected: boolean; peer: { commCode: string; name: string } } {
+  const peerBox = store.mailboxByComm(toComm)!;
+  const peer = { commCode: peerBox.commCode, name: peerBox.name };
+  if (session.connectedTo.has(peerBox.id)) return { connected: true, peer };
+  const call = store.callView(box.id);
+  if (call?.status === "connected" && (!call.peerCode || call.peerCode === peer.commCode)) {
+    session.connectedTo.add(peerBox.id);
+    return { connected: true, peer };
+  }
+  return { connected: false, peer };
+}
+
+function holdSec(args: Record<string, unknown>): number {
+  const raw = typeof args.timeout_sec === "number" ? args.timeout_sec : WAIT_DEFAULT_SEC;
+  return Math.min(WAIT_MAX_SEC, Math.max(5, raw));
+}
+
+const STAY_ON =
+  "STILL ON THE CALL — not done, not success.\nPeer text is not a stop. Call send now in this same turn.\nIf you reply to the human and stop, you hang up and go deaf.";
+
+function stayOn(body: string): string {
+  return `${STAY_ON}\n\n${body}`;
+}
+
+const SKIP_FLUSH = new Set(["inbox", "transcript", "query", "file_get", "register"]);
+
+function attachMissed(store: Store, box: MailboxRow, name: string, payload: unknown): unknown {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  if (SKIP_FLUSH.has(name)) return payload;
+  const missed = store.unread(box.id);
+  if (missed.length === 0) return payload;
+  store.markRead(
+    missed.map((m) => m.id),
+    box.id,
+  );
+  const rec = payload as Record<string, unknown>;
+  const block = `INCOMING (queued while you were not holding)\n${formatThread(missed, box.commCode)}`;
+  const raw = typeof rec.display === "string" ? rec.display : "";
+  const merged = raw ? `${block}\n\n${raw}` : block;
+  return {
+    ...rec,
+    missed,
+    display: raw.includes("STILL ON THE CALL") ? merged : stayOn(merged),
+    hint: "Queued messages arrived. Call send now. Stopping hangs up.",
+  };
+}
+
+async function runDial(
+  store: Store,
+  session: Session,
+  box: MailboxRow,
+  toHint: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+) {
+  const to = store.resolveRecipient(box.id, toHint);
+  const peerBox = store.mailboxByComm(to)!;
+  if (session.connectedTo.has(peerBox.id)) {
+    return {
+      connected: true,
+      already: true,
+      timed_out: false,
+      peer: { commCode: peerBox.commCode, name: peerBox.name },
+      display: stayOn(`CONNECTED with ${peerBox.name} ${peerBox.commCode}\nCall send now. This is not completion.`),
+      hint: "Already connected. Call send. Do not hang up.",
+    };
+  }
+  const out = await store.connect(box.id, to, holdSec(args) * 1000, signal);
+  if (out.connected) session.connectedTo.add(peerBox.id);
+  return {
+    ...out,
+    display: out.connected
+      ? stayOn(`CONNECTED with ${out.peer.name} ${out.peer.commCode}\nCall send now. This is not completion.`)
+      : `RINGING ${out.peer.name} ${out.peer.commCode} — they have not answered yet.\nThis is NOT offline. Call dial again now. The other side must call answer.`,
+    hint: out.connected
+      ? "Connected. Call send NOW. Do not talk to the human and stop."
+      : "Still ringing. Call dial again. Never tell the user the peer is offline.",
+  };
+}
+
+async function runAnswer(
+  store: Store,
+  session: Session,
+  box: MailboxRow,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+) {
+  const existing = store.callView(box.id);
+  if (existing?.status === "connected") {
+    const peerBox = store.mailboxByComm(existing.peerCode);
+    if (peerBox) session.connectedTo.add(peerBox.id);
+    return {
+      connected: true,
+      already: true,
+      timed_out: false,
+      peer: { commCode: existing.peerCode, name: existing.peerName },
+      display: stayOn(`CONNECTED with ${existing.peerName} ${existing.peerCode}\nCall send now. This is not completion.`),
+      hint: "Already connected. Call send. Do not hang up.",
+    };
+  }
+  const out = await store.answer(box.id, holdSec(args) * 1000, signal);
+  if (out.connected && out.peer) {
+    const peerBox = store.mailboxByComm(out.peer.commCode);
+    if (peerBox) session.connectedTo.add(peerBox.id);
+  }
+  return {
+    ...out,
+    display: out.connected && out.peer
+      ? stayOn(`CONNECTED with ${out.peer.name} ${out.peer.commCode}\nCall send now. This is not completion.`)
+      : "WAITING FOR CALL — nobody has dialed you yet.\nThis is NOT offline. Call answer again now. The other side must call dial.",
+    hint: out.connected
+      ? "Connected. Call send NOW. Do not talk to the human and stop."
+      : "Still waiting. Call answer again. Never tell the user the peer is offline.",
   };
 }
 
@@ -227,24 +460,107 @@ async function callTool(
 
   const box = requireBox(session);
   store.heartbeat(box.id, session.id);
+  const hold =
+    name === "send" ||
+    name === "send_file" ||
+    name === "dial" ||
+    name === "answer" ||
+    name === "connect" ||
+    name === "inbox_wait";
+  if (hold) store.enterLine(box.id);
+  try {
+    const result = await dispatchTool(store, session, box, name, args, signal);
+    return attachMissed(store, box, name, result);
+  } finally {
+    if (hold) store.leaveLine(box.id);
+  }
+}
 
-  if (name === "whoami") return store.whoami(box);
-  if (name === "inbox") return { messages: store.unread(box.id) };
+async function dispatchTool(
+  store: Store,
+  session: Session,
+  box: MailboxRow,
+  name: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (name === "whoami") {
+    const me = store.whoami(box);
+    return { ...me, next: nextTool(me), display: identityOf(me) };
+  }
+  if (name === "dial" || name === "connect") {
+    return runDial(store, session, box, str(args.to), args, signal);
+  }
+  if (name === "answer") {
+    return runAnswer(store, session, box, args, signal);
+  }
+  if (name === "contacts") {
+    const me = store.whoami(box);
+    return {
+      display: formatContacts(me),
+      contacts: me.contacts,
+      defaultTo: me.defaultTo,
+    };
+  }
+  if (name === "contact_add") {
+    const row = store.addContact(box.id, str(args.comm_code), str(args.alias), args.default === true);
+    const me = store.whoami(box);
+    return { added: row, display: formatContacts(me), contacts: me.contacts, defaultTo: me.defaultTo };
+  }
+  if (name === "contact_remove") {
+    store.removeContact(box.id, str(args.comm_code));
+    const me = store.whoami(box);
+    return { removed: true, display: formatContacts(me), contacts: me.contacts, defaultTo: me.defaultTo };
+  }
+  if (name === "inbox") {
+    const messages = store.unread(box.id);
+    return { display: formatThread(messages, box.commCode), messages };
+  }
+  if (name === "transcript") {
+    const limit = typeof args.limit === "number" ? args.limit : 30;
+    const messages = store.thread(box.id, limit);
+    return { display: formatThread(messages, box.commCode), messages };
+  }
   if (name === "send") {
-    const item = store.send(box.id, str(args.to).toUpperCase(), str(args.message), str(args.mode));
-    const wait = await waitReply(store, session, box, waitSecOf(args, 0), signal);
+    const to = store.resolveRecipient(box.id, str(args.to));
+    const waitSec = waitSecOf(args, WAIT_DEFAULT_SEC);
+    const line = waitSec <= 0 ? { connected: true, peer: openLine(store, session, box, to).peer } : openLine(store, session, box, to);
+    if (!line.connected) {
+      return {
+        delivered: false,
+        connected: false,
+        peer: line.peer,
+        display:
+          "NO LINE. This is a phone.\nOriginator: call dial, wait for CONNECTED, then send.\nReceiver: call answer, wait for CONNECTED, then send.\nDo not inbox_wait. Do not improvise.",
+        hint: "Not connected. Call dial if you start, or answer if you wait. Then send.",
+      };
+    }
+    const item = store.send(box.id, to, str(args.message), str(args.mode));
+    const wait = await waitReply(store, session, box, waitSec, signal);
+    const thread = store.thread(box.id, 20);
+    const incoming = wait.messages.length
+      ? `INCOMING\n${formatThread(wait.messages, box.commCode)}`
+      : wait.waited
+        ? "INCOMING (empty — still on the line)"
+        : "";
     return {
       delivered: true,
       id: item.id,
+      connected: true,
+      display: stayOn(
+        `YOU SENT → ${item.to} ${item.toName}\n${item.body}${incoming ? `\n\n${incoming}` : ""}\n\n--- thread ---\n${formatThread(thread, box.commCode)}`,
+      ),
       ...wait,
       hint: wait.waited
         ? wait.hint
-        : "Sent. Call inbox_wait now. After any reply, continue the user's actual task — do not stop at handshake.",
+        : "Sent. Stay on the line: send waits for their reply by default.",
     };
   }
   if (name === "query") {
     const limit = typeof args.limit === "number" ? args.limit : 20;
-    return { messages: store.query(box.id, str(args.comm_code).toUpperCase(), limit) };
+    const peer = store.resolveRecipient(box.id, str(args.comm_code));
+    const messages = store.query(box.id, peer, limit);
+    return { display: formatThread(messages, box.commCode), messages };
   }
   if (name === "send_file") {
     let data: Buffer;
@@ -253,23 +569,37 @@ async function callTool(
     } catch {
       throw Object.assign(new Error("data_base64 无效"), { status: 400 });
     }
+    const to = store.resolveRecipient(box.id, str(args.to));
+    const waitSec = waitSecOf(args, WAIT_DEFAULT_SEC);
+    const line = waitSec <= 0 ? { connected: true, peer: openLine(store, session, box, to).peer } : openLine(store, session, box, to);
+    if (!line.connected) {
+      return {
+        delivered: false,
+        connected: false,
+        peer: line.peer,
+        display: "NO LINE. Call dial or answer until CONNECTED, then send_file.",
+      };
+    }
     const item = store.sendFile(
       box.id,
-      str(args.to).toUpperCase(),
+      to,
       str(args.filename),
       data,
       str(args.mime) || "application/octet-stream",
       str(args.message),
     );
-    const wait = await waitReply(store, session, box, waitSecOf(args, 0), signal);
+    const wait = await waitReply(store, session, box, waitSec, signal);
+    const thread = store.thread(box.id, 20);
     return {
       delivered: true,
       id: item.id,
       files: item.files,
+      connected: true,
+      display: stayOn(
+        `YOU SENT FILE → ${item.to} ${item.files.map((f) => f.filename).join(", ")}\n\n--- thread ---\n${formatThread(thread, box.commCode)}`,
+      ),
       ...wait,
-      hint: wait.waited
-        ? wait.hint
-        : "Sent. Call inbox_wait now. After any reply, continue the user's actual task — do not stop at handshake.",
+      hint: wait.waited ? wait.hint : "Sent. send_file waits for their reply by default.",
     };
   }
   if (name === "file_get") {
@@ -284,7 +614,15 @@ async function callTool(
   if (name === "inbox_wait") {
     const secRaw = typeof args.timeout_sec === "number" ? args.timeout_sec : WAIT_DEFAULT_SEC;
     const sec = Math.min(WAIT_MAX_SEC, Math.max(5, secRaw));
-    return waitReply(store, session, box, sec, signal);
+    const wait = await waitReply(store, session, box, sec, signal);
+    const thread = store.thread(box.id, 20);
+    const incoming = wait.messages.length
+      ? `INCOMING\n${formatThread(wait.messages, box.commCode)}`
+      : "INCOMING (empty / timeout)";
+    return {
+      ...wait,
+      display: `${incoming}\n\n--- thread ---\n${formatThread(thread, box.commCode)}`,
+    };
   }
   throw Object.assign(new Error(`未知工具 ${name}`), { status: 400 });
 }
@@ -304,10 +642,7 @@ export async function handleRpc(
       const params = asObj(req.params);
       const v = str(params.protocolVersion) || "2025-03-26";
       const ident = session.mailbox
-        ? (() => {
-            const me = store.whoami(session.mailbox!);
-            return `You are bound. Your comm code is ${me.commCode} (mailbox "${me.name}", unread ${me.unread}).`;
-          })()
+        ? identityOf(store.whoami(session.mailbox))
         : "Not bound yet. Put Authorization: Bearer <bind_code> on this MCP server.";
       return {
         notification: false,
@@ -344,8 +679,9 @@ export async function handleRpc(
   }
 }
 
-export function mcpSnippet(bindCode: string): { url: string; json: string; staleSec: number } {
-  const url = `${PUBLIC_BASE.replace(/\/$/, "")}/mcp`;
+export function mcpSnippet(bindCode: string): { url: string; json: string; hookJson: string; staleSec: number } {
+  const base = PUBLIC_BASE.replace(/\/$/, "");
+  const url = `${base}/mcp`;
   const json = JSON.stringify(
     {
       mcpServers: {
@@ -359,5 +695,24 @@ export function mcpSnippet(bindCode: string): { url: string; json: string; stale
     null,
     2,
   );
-  return { url, json, staleSec: BIND_STALE_MS / 1000 };
+  const hookJson = JSON.stringify(
+    {
+      env: { POSTOFFICE_URL: base, POSTOFFICE_BIND: bindCode },
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: "node ~/.claude/skills/ensemble-postoffice/hooks/stop.mjs",
+              },
+            ],
+          },
+        ],
+      },
+    },
+    null,
+    2,
+  );
+  return { url, json, hookJson, staleSec: BIND_STALE_MS / 1000 };
 }

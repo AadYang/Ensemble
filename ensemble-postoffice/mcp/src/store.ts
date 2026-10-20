@@ -53,10 +53,35 @@ export type InboxItem = {
   id: string;
   from: string;
   fromName: string;
+  to: string;
+  toName: string;
   mode: string;
   body: string;
   createdAt: number;
   files: { id: string; filename: string; mime: string; bytes: number }[];
+};
+
+export type ContactView = {
+  commCode: string;
+  name: string;
+  alias: string;
+  isDefault: boolean;
+  source: "saved" | "account" | "thread";
+};
+
+export type CallStatus = "ringing" | "incoming" | "waiting" | "connected";
+
+export type CallView = {
+  status: CallStatus;
+  peerName: string;
+  peerCode: string;
+  at: number;
+};
+
+type CallWaiter = {
+  fromId: string;
+  toId: string;
+  resolve: (ok: boolean) => void;
 };
 
 function hashBind(code: string): string {
@@ -90,6 +115,10 @@ export class Store {
   readonly filesDir: string;
   readonly inviteCode: string;
   private readonly waiters = new Map<string, Set<(items: InboxItem[]) => void>>();
+  private readonly callWaiters = new Map<string, Set<CallWaiter>>();
+  private readonly answerWaiters = new Map<string, Set<() => void>>();
+  private readonly callState = new Map<string, CallView & { peerId: string }>();
+  private readonly onLine = new Set<string>();
 
   constructor(dbPath: string, filesDir: string, inviteCode: string) {
     this.filesDir = filesDir;
@@ -140,6 +169,14 @@ export class Store {
         mime TEXT NOT NULL,
         byteSize INTEGER NOT NULL,
         expiresAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS Contact (
+        mailboxId TEXT NOT NULL REFERENCES Mailbox(id) ON DELETE CASCADE,
+        peerId TEXT NOT NULL REFERENCES Mailbox(id) ON DELETE CASCADE,
+        alias TEXT NOT NULL DEFAULT '',
+        isDefault INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL,
+        PRIMARY KEY (mailboxId, peerId)
       );
     `);
   }
@@ -211,6 +248,9 @@ export class Store {
     createdAt: number;
     bound: boolean;
     lastSeenAt: number | null;
+    unread: number;
+    listening: boolean;
+    call: CallView | null;
   }> {
     const now = Date.now();
     const rows = this.db
@@ -220,14 +260,24 @@ export class Store {
       .all(userId) as Array<
       Pick<MailboxRow, "id" | "name" | "commCode" | "createdAt" | "lastSeenAt" | "boundSessionId">
     >;
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      commCode: r.commCode,
-      createdAt: r.createdAt,
-      lastSeenAt: r.lastSeenAt,
-      bound: !!(r.boundSessionId && r.lastSeenAt && now - r.lastSeenAt < BIND_STALE_MS),
-    }));
+    return rows.map((r) => {
+      const unread = (
+        this.db.prepare("SELECT COUNT(*) AS c FROM Message WHERE toId = ? AND readAt IS NULL").get(r.id) as {
+          c: number;
+        }
+      ).c;
+      return {
+        id: r.id,
+        name: r.name,
+        commCode: r.commCode,
+        createdAt: r.createdAt,
+        lastSeenAt: r.lastSeenAt,
+        bound: !!(r.boundSessionId && r.lastSeenAt && now - r.lastSeenAt < BIND_STALE_MS),
+        unread,
+        listening: this.isListening(r.id),
+        call: this.callView(r.id),
+      };
+    });
   }
 
   createMailbox(userId: string, name: string): { id: string; name: string; commCode: string; bindCode: string } {
@@ -303,6 +353,7 @@ export class Store {
 
   send(fromId: string, toComm: string, body: string, mode: string): InboxItem {
     const { id, toId } = this.insertMessage(fromId, toComm, body, mode);
+    this.rememberPeer(fromId, toId);
     this.notify(toId);
     return this.hydrate([this.message(id)!])[0]!;
   }
@@ -340,6 +391,7 @@ export class Store {
         data.length,
         Date.now() + FILE_TTL_MS,
       );
+    this.rememberPeer(fromId, toId);
     this.notify(toId);
     return this.hydrate([this.message(messageId)!])[0]!;
   }
@@ -391,13 +443,416 @@ export class Store {
     return this.hydrate(rows.reverse());
   }
 
-  whoami(box: MailboxRow): { commCode: string; name: string; unread: number } {
+  thread(mailboxId: string, limit = 50): InboxItem[] {
+    const n = Math.min(100, Math.max(1, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM Message WHERE fromId = ? OR toId = ? ORDER BY createdAt DESC LIMIT ?`,
+      )
+      .all(mailboxId, mailboxId, n) as MessageRow[];
+    return this.hydrate(rows.reverse());
+  }
+
+  contacts(mailboxId: string): ContactView[] {
+    const box = this.mailbox(mailboxId);
+    if (!box) throw Object.assign(new Error("信箱不存在"), { status: 404 });
+    const byId = new Map<string, ContactView & { peerId: string }>();
+
+    const siblings = this.db
+      .prepare("SELECT id, name, commCode FROM Mailbox WHERE userId = ? AND id != ?")
+      .all(box.userId, box.id) as Array<{ id: string; name: string; commCode: string }>;
+    for (const s of siblings) {
+      byId.set(s.id, {
+        peerId: s.id,
+        commCode: s.commCode,
+        name: s.name,
+        alias: "",
+        isDefault: false,
+        source: "account",
+      });
+    }
+
+    const peers = this.db
+      .prepare(
+        `SELECT m.id, m.name, m.commCode FROM Mailbox m
+         WHERE m.id IN (
+           SELECT toId FROM Message WHERE fromId = ?
+           UNION
+           SELECT fromId FROM Message WHERE toId = ?
+         ) AND m.id != ?`,
+      )
+      .all(mailboxId, mailboxId, mailboxId) as Array<{ id: string; name: string; commCode: string }>;
+    for (const p of peers) {
+      if (!byId.has(p.id)) {
+        byId.set(p.id, {
+          peerId: p.id,
+          commCode: p.commCode,
+          name: p.name,
+          alias: "",
+          isDefault: false,
+          source: "thread",
+        });
+      }
+    }
+
+    const saved = this.db
+      .prepare(
+        `SELECT c.peerId, c.alias, c.isDefault, m.name, m.commCode
+         FROM Contact c JOIN Mailbox m ON m.id = c.peerId WHERE c.mailboxId = ?`,
+      )
+      .all(mailboxId) as Array<{
+      peerId: string;
+      alias: string;
+      isDefault: number;
+      name: string;
+      commCode: string;
+    }>;
+    for (const s of saved) {
+      byId.set(s.peerId, {
+        peerId: s.peerId,
+        commCode: s.commCode,
+        name: s.name,
+        alias: s.alias,
+        isDefault: s.isDefault === 1,
+        source: "saved",
+      });
+    }
+
+    const list = [...byId.values()];
+    if (!list.some((c) => c.isDefault) && list.length === 1) list[0]!.isDefault = true;
+    return list
+      .sort((a, b) => a.name.localeCompare(b.name) || a.commCode.localeCompare(b.commCode))
+      .map(({ peerId: _peerId, ...row }) => row);
+  }
+
+  resolveRecipient(mailboxId: string, hint: string): string {
+    const q = hint.trim();
+    const list = this.contacts(mailboxId);
+    if (!q) {
+      const d = list.find((c) => c.isDefault);
+      if (d) return d.commCode;
+      if (list.length === 0) {
+        throw Object.assign(new Error("没有联系人。在网站添加通讯码，或 dial/send 时传入 to"), { status: 400 });
+      }
+      const names = list.map((c) => `${c.name} ${c.commCode}`).join("；");
+      throw Object.assign(new Error(`有多个联系人，请指定 to（通讯码 / 别名 / 名称）：${names}`), { status: 400 });
+    }
+    const upper = q.toUpperCase();
+    const byCode = list.find((c) => c.commCode === upper);
+    if (byCode) return byCode.commCode;
+    const direct = this.mailboxByComm(upper);
+    if (direct && direct.id !== mailboxId) return direct.commCode;
+
+    const lower = q.toLowerCase();
+    const byAlias = list.filter((c) => c.alias && c.alias.toLowerCase() === lower);
+    if (byAlias.length === 1) return byAlias[0]!.commCode;
+    if (byAlias.length > 1) throw Object.assign(new Error(`别名 ${q} 对应多个联系人，请用通讯码`), { status: 400 });
+    const byName = list.filter((c) => c.name.toLowerCase() === lower);
+    if (byName.length === 1) return byName[0]!.commCode;
+    if (byName.length > 1) throw Object.assign(new Error(`名称 ${q} 对应多个联系人，请用通讯码`), { status: 400 });
+    throw Object.assign(new Error(`找不到联系人 ${q}`), { status: 404 });
+  }
+
+  addContact(mailboxId: string, commCode: string, alias = "", makeDefault = false): ContactView {
+    const peer = this.mailboxByComm(commCode);
+    if (!peer) throw Object.assign(new Error(`找不到通讯码 ${commCode.trim().toUpperCase()}`), { status: 404 });
+    if (peer.id === mailboxId) throw Object.assign(new Error("不能添加自己"), { status: 400 });
+    const label = alias.trim().slice(0, 40);
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO Contact (mailboxId, peerId, alias, isDefault, createdAt) VALUES (?, ?, ?, 0, ?)
+         ON CONFLICT(mailboxId, peerId) DO UPDATE SET alias = excluded.alias`,
+      )
+      .run(mailboxId, peer.id, label, now);
+    if (makeDefault || !this.contacts(mailboxId).some((c) => c.isDefault)) this.setDefault(mailboxId, peer.commCode);
+    return this.contacts(mailboxId).find((c) => c.commCode === peer.commCode)!;
+  }
+
+  removeContact(mailboxId: string, commCode: string): void {
+    const peer = this.mailboxByComm(commCode);
+    if (!peer) throw Object.assign(new Error("联系人不存在"), { status: 404 });
+    const info = this.db.prepare("DELETE FROM Contact WHERE mailboxId = ? AND peerId = ?").run(mailboxId, peer.id);
+    if (info.changes === 0) throw Object.assign(new Error("联系人不存在"), { status: 404 });
+  }
+
+  setDefault(mailboxId: string, commCode: string): ContactView {
+    const peer = this.mailboxByComm(commCode);
+    if (!peer || peer.id === mailboxId) throw Object.assign(new Error("联系人不存在"), { status: 404 });
+    this.db.prepare("UPDATE Contact SET isDefault = 0 WHERE mailboxId = ?").run(mailboxId);
+    this.db
+      .prepare(
+        `INSERT INTO Contact (mailboxId, peerId, alias, isDefault, createdAt) VALUES (?, ?, '', 1, ?)
+         ON CONFLICT(mailboxId, peerId) DO UPDATE SET isDefault = 1`,
+      )
+      .run(mailboxId, peer.id, Date.now());
+    return this.contacts(mailboxId).find((c) => c.commCode === peer.commCode)!;
+  }
+
+  private markCall(
+    mailboxId: string,
+    peerId: string,
+    peer: { commCode: string; name: string },
+    status: CallStatus,
+  ): void {
+    this.callState.set(mailboxId, {
+      peerId,
+      status,
+      peerName: peer.name,
+      peerCode: peer.commCode,
+      at: Date.now(),
+    });
+  }
+
+  enterLine(mailboxId: string): void {
+    this.onLine.add(mailboxId);
+    this.nudgeCallersOf(mailboxId);
+  }
+
+  leaveLine(mailboxId: string): void {
+    this.onLine.delete(mailboxId);
+  }
+
+  private isListening(mailboxId: string): boolean {
+    return (
+      (this.waiters.get(mailboxId)?.size ?? 0) > 0 ||
+      this.onLine.has(mailboxId) ||
+      (this.answerWaiters.get(mailboxId)?.size ?? 0) > 0
+    );
+  }
+
+  findCallerOf(mailboxId: string): MailboxRow | null {
+    const seen = this.callState.get(mailboxId);
+    if (seen?.status === "incoming" && seen.peerId) {
+      const row = this.mailbox(seen.peerId);
+      if (row) return row;
+    }
+    for (const [fromId, set] of this.callWaiters) {
+      for (const w of set) {
+        if (w.toId === mailboxId) {
+          const row = this.mailbox(fromId);
+          if (row) return row;
+        }
+      }
+    }
+    for (const [id, state] of this.callState) {
+      if (id !== mailboxId && state.peerId === mailboxId && state.status === "ringing") {
+        const row = this.mailbox(id);
+        if (row) return row;
+      }
+    }
+    return null;
+  }
+
+  private wakeAnswerers(mailboxId: string): void {
+    const set = this.answerWaiters.get(mailboxId);
+    if (!set) return;
+    for (const fn of [...set]) fn();
+  }
+
+  private peerWaitingFor(fromId: string, toId: string): boolean {
+    const theirs = this.callWaiters.get(toId);
+    if (!theirs) return false;
+    for (const w of theirs) if (w.toId === fromId) return true;
+    return false;
+  }
+
+  private peerAtPhone(fromId: string, toId: string): boolean {
+    return this.isListening(toId) || this.peerWaitingFor(fromId, toId);
+  }
+
+  private wakeCallers(a: string, b: string): void {
+    const wake = (fromId: string, toId: string) => {
+      const set = this.callWaiters.get(fromId);
+      if (!set) return;
+      for (const w of [...set]) if (w.toId === toId) w.resolve(true);
+    };
+    wake(a, b);
+    wake(b, a);
+  }
+
+  private nudgeCallersOf(mailboxId: string): void {
+    for (const set of this.callWaiters.values()) {
+      for (const w of [...set]) if (w.toId === mailboxId) w.resolve(true);
+    }
+  }
+
+  private rememberPeer(fromId: string, toId: string): void {
+    const hadDefault = this.contacts(fromId).some((c) => c.isDefault);
+    this.db
+      .prepare(
+        `INSERT INTO Contact (mailboxId, peerId, alias, isDefault, createdAt) VALUES (?, ?, '', ?, ?)
+         ON CONFLICT(mailboxId, peerId) DO NOTHING`,
+      )
+      .run(fromId, toId, hadDefault ? 0 : 1, Date.now());
+  }
+
+  whoami(box: MailboxRow): {
+    commCode: string;
+    name: string;
+    unread: number;
+    contacts: ContactView[];
+    defaultTo: string | null;
+    call: CallView | null;
+  } {
     const unread = (
       this.db.prepare("SELECT COUNT(*) AS c FROM Message WHERE toId = ? AND readAt IS NULL").get(box.id) as {
         c: number;
       }
     ).c;
-    return { commCode: box.commCode, name: box.name, unread };
+    const contacts = this.contacts(box.id);
+    return {
+      commCode: box.commCode,
+      name: box.name,
+      unread,
+      contacts,
+      defaultTo: contacts.find((c) => c.isDefault)?.commCode ?? null,
+      call: this.callView(box.id),
+    };
+  }
+
+  callView(mailboxId: string): CallView | null {
+    const row = this.callState.get(mailboxId);
+    if (!row) return null;
+    const { peerId: _peerId, ...view } = row;
+    return view;
+  }
+
+  atPhone(mailboxId: string): boolean {
+    return this.isListening(mailboxId);
+  }
+
+  connect(
+    fromId: string,
+    toComm: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ connected: boolean; timed_out: boolean; peer: { commCode: string; name: string } }> {
+    const to = this.mailboxByComm(toComm);
+    if (!to) throw Object.assign(new Error(`找不到通讯码 ${toComm}`), { status: 404 });
+    if (to.id === fromId) throw Object.assign(new Error("不能呼叫自己"), { status: 400 });
+    const from = this.mailbox(fromId);
+    if (!from) throw Object.assign(new Error("信箱不存在"), { status: 404 });
+    const peer = { commCode: to.commCode, name: to.name };
+    const self = { commCode: from.commCode, name: from.name };
+
+    const pickup = () => {
+      this.markCall(fromId, to.id, peer, "connected");
+      this.markCall(to.id, fromId, self, "connected");
+    };
+
+    if (this.peerAtPhone(fromId, to.id)) {
+      this.wakeCallers(fromId, to.id);
+      pickup();
+      return Promise.resolve({ connected: true, timed_out: false, peer });
+    }
+
+    if (timeoutMs <= 0 || signal?.aborted) {
+      return Promise.resolve({ connected: false, timed_out: true, peer });
+    }
+
+    this.markCall(fromId, to.id, peer, "ringing");
+    const peerCall = this.callState.get(to.id);
+    if (!peerCall || peerCall.status === "waiting" || peerCall.status === "incoming") {
+      this.markCall(to.id, fromId, self, "incoming");
+    }
+    return new Promise((resolve) => {
+      const bucket = this.callWaiters.get(fromId) ?? new Set<CallWaiter>();
+      this.callWaiters.set(fromId, bucket);
+      let settled = false;
+      const waiter: CallWaiter = {
+        fromId,
+        toId: to.id,
+        resolve: (ok) => finish(ok),
+      };
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        bucket.delete(waiter);
+        if (ok) pickup();
+        else if (this.callState.get(fromId)?.status === "ringing") {
+          this.callState.delete(fromId);
+          const theirs = this.callState.get(to.id);
+          if (theirs?.status === "incoming" && theirs.peerId === fromId) this.callState.delete(to.id);
+        }
+        resolve({ connected: ok, timed_out: !ok, peer });
+      };
+      const onAbort = () => finish(false);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      bucket.add(waiter);
+      this.wakeAnswerers(to.id);
+      if (this.callState.get(fromId)?.status === "connected") {
+        finish(true);
+        return;
+      }
+      if (this.peerWaitingFor(fromId, to.id) || this.peerAtPhone(fromId, to.id)) {
+        this.wakeCallers(fromId, to.id);
+        if (!settled) finish(true);
+      }
+    });
+  }
+
+  answer(
+    mailboxId: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ connected: boolean; timed_out: boolean; peer: { commCode: string; name: string } | null }> {
+    const existing = this.callState.get(mailboxId);
+    if (existing?.status === "connected") {
+      const peer = this.mailbox(existing.peerId);
+      if (peer) {
+        return Promise.resolve({
+          connected: true,
+          timed_out: false,
+          peer: { commCode: peer.commCode, name: peer.name },
+        });
+      }
+    }
+    const callerNow = this.findCallerOf(mailboxId);
+    if (callerNow) return this.connect(mailboxId, callerNow.commCode, Math.max(timeoutMs, 1), signal);
+    if (timeoutMs <= 0 || signal?.aborted) {
+      return Promise.resolve({ connected: false, timed_out: true, peer: null });
+    }
+
+    this.callState.set(mailboxId, {
+      peerId: "",
+      status: "waiting",
+      peerName: "",
+      peerCode: "",
+      at: Date.now(),
+    });
+    return new Promise((resolve) => {
+      const bucket = this.answerWaiters.get(mailboxId) ?? new Set<() => void>();
+      this.answerWaiters.set(mailboxId, bucket);
+      let settled = false;
+      const finishMiss = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        bucket.delete(onRing);
+        if (this.callState.get(mailboxId)?.status === "waiting") this.callState.delete(mailboxId);
+        resolve({ connected: false, timed_out: true, peer: null });
+      };
+      const onRing = () => {
+        if (settled) return;
+        const caller = this.findCallerOf(mailboxId);
+        if (!caller) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        bucket.delete(onRing);
+        void this.connect(mailboxId, caller.commCode, Math.max(timeoutMs, 1), signal).then(resolve);
+      };
+      const onAbort = () => finishMiss();
+      const timer = setTimeout(finishMiss, timeoutMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      bucket.add(onRing);
+      onRing();
+    });
   }
 
   waitInbox(mailboxId: string, timeoutMs: number, signal?: AbortSignal): Promise<InboxItem[]> {
@@ -417,6 +872,7 @@ export class Store {
       const timer = setTimeout(() => finish([]), timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
       bucket.add(finish);
+      this.nudgeCallersOf(mailboxId);
     });
   }
 
@@ -480,6 +936,8 @@ export class Store {
       id: r.id,
       from: comms.get(r.fromId) ?? r.fromId,
       fromName: names.get(r.fromId) ?? "",
+      to: comms.get(r.toId) ?? r.toId,
+      toName: names.get(r.toId) ?? "",
       mode: r.mode,
       body: r.body,
       createdAt: r.createdAt,

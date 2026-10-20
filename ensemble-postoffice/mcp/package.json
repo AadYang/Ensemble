@@ -1,6 +1,6 @@
 {
   "name": "ensemble-postoffice",
-  "version": "0.1.0",
+  "version": "0.1.12",
   "private": true,
   "type": "module",
   "description": "Client-agnostic remote mailbox MCP for Ensemble, Claude Code, Codex, and others",

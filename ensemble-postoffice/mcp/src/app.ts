@@ -136,6 +136,69 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
     }
   });
 
+  app.get("/api/mailboxes/:id/messages", async (req, reply) => {
+    const user = store.userByToken(sessionToken(req));
+    if (!user) return reply.code(401).send({ error: "未登录" });
+    const id = (req.params as { id: string }).id;
+    const box = store.mailbox(id);
+    if (!box || box.userId !== user.id) return reply.code(404).send({ error: "信箱不存在" });
+    const raw = Number((req.query as { limit?: string }).limit);
+    const limit = Number.isFinite(raw) ? raw : 50;
+    return { commCode: box.commCode, messages: store.thread(box.id, limit) };
+  });
+
+  app.get("/api/mailboxes/:id/contacts", async (req, reply) => {
+    const user = store.userByToken(sessionToken(req));
+    if (!user) return reply.code(401).send({ error: "未登录" });
+    const box = store.mailbox((req.params as { id: string }).id);
+    if (!box || box.userId !== user.id) return reply.code(404).send({ error: "信箱不存在" });
+    const me = store.whoami(box);
+    return { contacts: me.contacts, defaultTo: me.defaultTo };
+  });
+
+  app.post("/api/mailboxes/:id/contacts", async (req, reply) => {
+    const user = store.userByToken(sessionToken(req));
+    if (!user) return reply.code(401).send({ error: "未登录" });
+    const box = store.mailbox((req.params as { id: string }).id);
+    if (!box || box.userId !== user.id) return reply.code(404).send({ error: "信箱不存在" });
+    const b = (req.body ?? {}) as { commCode?: string; alias?: string; default?: boolean };
+    try {
+      const row = store.addContact(box.id, b.commCode ?? "", b.alias ?? "", b.default === true);
+      const me = store.whoami(box);
+      return { contact: row, contacts: me.contacts, defaultTo: me.defaultTo };
+    } catch (e) {
+      return sendErr(reply, e);
+    }
+  });
+
+  app.post("/api/mailboxes/:id/contacts/:comm/default", async (req, reply) => {
+    const user = store.userByToken(sessionToken(req));
+    if (!user) return reply.code(401).send({ error: "未登录" });
+    const box = store.mailbox((req.params as { id: string }).id);
+    if (!box || box.userId !== user.id) return reply.code(404).send({ error: "信箱不存在" });
+    try {
+      const row = store.setDefault(box.id, (req.params as { comm: string }).comm);
+      const me = store.whoami(box);
+      return { contact: row, contacts: me.contacts, defaultTo: me.defaultTo };
+    } catch (e) {
+      return sendErr(reply, e);
+    }
+  });
+
+  app.delete("/api/mailboxes/:id/contacts/:comm", async (req, reply) => {
+    const user = store.userByToken(sessionToken(req));
+    if (!user) return reply.code(401).send({ error: "未登录" });
+    const box = store.mailbox((req.params as { id: string }).id);
+    if (!box || box.userId !== user.id) return reply.code(404).send({ error: "信箱不存在" });
+    try {
+      store.removeContact(box.id, (req.params as { comm: string }).comm);
+      const me = store.whoami(box);
+      return { ok: true, contacts: me.contacts, defaultTo: me.defaultTo };
+    } catch (e) {
+      return sendErr(reply, e);
+    }
+  });
+
   const mcpHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     if (req.method === "DELETE") {
       const sid = String(req.headers["mcp-session-id"] ?? "");
@@ -161,7 +224,16 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
     }
 
     const ac = new AbortController();
-    req.raw.on("close", () => ac.abort());
+    const abortWait = () => {
+      if (!ac.signal.aborted) ac.abort();
+    };
+    // IncomingMessage "close" fires when the POST body is consumed, not when the
+    // client hangs up. MCP hosts keep the socket open for a 10-minute hold; treating
+    // body-complete as abort makes both sides RINGING in a few hundred ms.
+    req.raw.on("aborted", abortWait);
+    reply.raw.on("close", () => {
+      if (!reply.raw.writableEnded) abortWait();
+    });
 
     const body = req.body;
     const batch = Array.isArray(body) ? (body as RpcReq[]) : [body as RpcReq];
@@ -170,7 +242,14 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
       first && typeof first === "object" && first.method === "tools/call"
         ? String((first.params as { name?: string } | undefined)?.name ?? "")
         : "";
-    const longWait = batch.length === 1 && firstName === "inbox_wait";
+    const longWait =
+      batch.length === 1 &&
+      (firstName === "inbox_wait" ||
+        firstName === "connect" ||
+        firstName === "dial" ||
+        firstName === "answer" ||
+        firstName === "send" ||
+        firstName === "send_file");
     const wantSse = String(req.headers.accept ?? "").includes("text/event-stream");
 
     if (longWait && wantSse) {
@@ -212,6 +291,31 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
     return reply.send(Array.isArray(body) ? results : results[0]);
   };
 
+  app.get("/line", async (req, reply) => {
+    const code = bearer(req);
+    if (!code?.startsWith("po_")) return reply.code(401).send({ error: "需要绑定码" });
+    const box = store.mailboxByBind(code);
+    if (!box) return reply.code(401).send({ error: "绑定码无效" });
+    return {
+      commCode: box.commCode,
+      name: box.name,
+      call: store.callView(box.id),
+      listening: store.atPhone(box.id),
+      unread: store.unread(box.id),
+    };
+  });
+
+  app.post("/line/ack", async (req, reply) => {
+    const code = bearer(req);
+    if (!code?.startsWith("po_")) return reply.code(401).send({ error: "需要绑定码" });
+    const box = store.mailboxByBind(code);
+    if (!box) return reply.code(401).send({ error: "绑定码无效" });
+    const ids = (req.body as { ids?: string[] } | null)?.ids;
+    const unread = store.unread(box.id);
+    store.markRead(ids && ids.length ? ids : unread.map((m) => m.id), box.id);
+    return { ok: true, acked: ids?.length ?? unread.length };
+  });
+
   app.post("/mcp", mcpHandler);
   app.get("/mcp", mcpHandler);
   app.delete("/mcp", mcpHandler);
@@ -223,7 +327,7 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
   });
 
   app.setNotFoundHandler((req, reply) => {
-    if (req.url.startsWith("/api") || req.url.startsWith("/mcp")) {
+    if (req.url.startsWith("/api") || req.url.startsWith("/mcp") || req.url.startsWith("/line")) {
       return reply.code(404).send({ error: "not found" });
     }
     return reply.sendFile("index.html");

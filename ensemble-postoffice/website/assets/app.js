@@ -102,21 +102,97 @@ document.getElementById("sec-close").onclick = () => secret.close();
 document.getElementById("copy-json").onclick = async () => {
   await navigator.clipboard.writeText(document.getElementById("sec-json").textContent);
 };
+document.getElementById("copy-hook").onclick = async () => {
+  await navigator.clipboard.writeText(document.getElementById("sec-hook").textContent);
+};
 
 function openSecret(box) {
   document.getElementById("sec-comm").textContent = box.commCode;
   document.getElementById("sec-bind").textContent = box.bindCode;
   document.getElementById("sec-json").textContent = box.mcp.json;
+  document.getElementById("sec-hook").textContent = box.mcp.hookJson || "";
   secret.showModal();
+}
+
+function formatMsg(m, me) {
+  const mine = m.from === me;
+  const who = mine
+    ? `you → ${m.to}${m.toName ? ` ${m.toName}` : ""}`
+    : `${m.from}${m.fromName ? ` ${m.fromName}` : ""} → you`;
+  return `<div class="${mine ? "mine" : "theirs"}">[${new Date(m.createdAt).toISOString()}] ${escapeHtml(who.trim())}\n${escapeHtml(m.body)}</div>`;
+}
+
+async function refreshLog(article) {
+  const id = article.dataset.id;
+  const data = await api(`api/mailboxes/${id}/messages?limit=50`);
+  let log = article.querySelector(".log");
+  if (!log) {
+    log = document.createElement("pre");
+    log.className = "log";
+    article.appendChild(log);
+  }
+  log.innerHTML = data.messages.length
+    ? data.messages.map((m) => formatMsg(m, data.commCode)).join("\n\n")
+    : `<span class="empty">还没有消息。接通后双方 send 的发出和收到都会显示在这里。</span>`;
+}
+
+function formatCall(call) {
+  if (!call) return "";
+  if (call.status === "waiting") return "等待来电";
+  if (call.status === "incoming") return `来电 ${call.peerName} ${call.peerCode}`;
+  if (call.status === "ringing") return `正在呼叫 ${call.peerName} ${call.peerCode}`;
+  if (call.status === "connected") return `已接通 ${call.peerName} ${call.peerCode}`;
+  return "";
+}
+
+function hungHint(b) {
+  if (b.unread > 0 && !b.listening) {
+    return `有 ${b.unread} 条未读，agent 已结束 turn。去客户端说「继续」。`;
+  }
+  return "";
+}
+
+async function refreshPresence() {
+  const { mailboxes } = await api("api/mailboxes");
+  for (const b of mailboxes) {
+    const article = boxesEl.querySelector(`article[data-id="${b.id}"]`);
+    if (!article) continue;
+    const dot = article.querySelector(".dot");
+    if (dot) {
+      dot.classList.toggle("on", !!b.bound);
+      const meta = dot.parentElement;
+      if (meta && meta.childNodes[1]) meta.childNodes[1].textContent = b.bound ? "MCP 在线 " : "未占用 ";
+    }
+    const el = article.querySelector(".call");
+    if (el) {
+      el.className = `call ${b.call?.status || ""}`;
+      el.textContent = formatCall(b.call);
+    }
+    const hung = article.querySelector(".hung");
+    if (hung) hung.textContent = hungHint(b);
+  }
+}
+
+let pollTimer = null;
+function startPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    if (appPanel.hidden) return;
+    try { await refreshPresence(); } catch { /* ignore */ }
+    for (const article of boxesEl.querySelectorAll("article.box")) {
+      try { await refreshLog(article); } catch { /* ignore */ }
+    }
+  }, 2000);
 }
 
 async function renderBoxes() {
   const { mailboxes } = await api("api/mailboxes");
   boxesEl.innerHTML = mailboxes.length
     ? mailboxes.map((b) => `
-      <article class="box" data-id="${b.id}">
+      <article class="box" data-id="${b.id}" data-comm="${escapeHtml(b.commCode)}">
         <h3>${escapeHtml(b.name)}</h3>
-        <div class="meta"><span class="dot ${b.bound ? "on" : ""}"></span>${b.bound ? "MCP 在线" : "未占用"}</div>
+        <div class="meta"><span class="dot ${b.bound ? "on" : ""}"></span>${b.bound ? "MCP 在线" : "未占用"} <span class="call ${escapeHtml(b.call?.status || "")}">${formatCall(b.call)}</span></div>
+        <p class="hung">${escapeHtml(hungHint(b))}</p>
         <p>通讯码 <code>${b.commCode}</code></p>
         <p class="meta">绑定码已隐藏。丢失请重置（旧配置会失效）。</p>
         <div class="actions">
@@ -124,14 +200,49 @@ async function renderBoxes() {
           <button type="button" data-act="reset">重置绑定码</button>
           <button type="button" data-act="del">删除</button>
         </div>
+        <ul class="contacts"><li class="src">加载联系人…</li></ul>
+        <form class="contact-form" data-act="add-contact">
+          <input name="comm" placeholder="对方通讯码" required maxlength="12" />
+          <input name="alias" placeholder="别名，可选" maxlength="40" />
+          <button type="submit">添加联系人</button>
+        </form>
+        <pre class="log"><span class="empty">加载消息…</span></pre>
       </article>`).join("")
     : `<p class="hint">还没有信箱。</p>`;
+  for (const article of boxesEl.querySelectorAll("article.box")) {
+    try { await refreshLog(article); } catch { /* ignore */ }
+    try { await refreshContacts(article); } catch { /* ignore */ }
+  }
+}
+
+function sourceLabel(src) {
+  if (src === "account") return "同账号";
+  if (src === "thread") return "往来";
+  return "已保存";
+}
+
+async function refreshContacts(article) {
+  const id = article.dataset.id;
+  const data = await api(`api/mailboxes/${id}/contacts`);
+  const ul = article.querySelector(".contacts");
+  if (!ul) return;
+  ul.innerHTML = data.contacts.length
+    ? data.contacts.map((c) => `
+      <li data-comm="${escapeHtml(c.commCode)}">
+        <span class="src">${sourceLabel(c.source)}</span>
+        <span>${escapeHtml(c.name)}${c.alias ? ` / ${escapeHtml(c.alias)}` : ""}</span>
+        <code>${escapeHtml(c.commCode)}</code>
+        ${c.isDefault ? `<span class="on">默认</span>` : `<button type="button" data-act="default">设为默认</button>`}
+        ${c.source === "saved" ? `<button type="button" data-act="forget">删除</button>` : ""}
+      </li>`).join("")
+    : `<li class="src">还没有联系人。同账号开第二只信箱会自动出现；跨账号在下面填通讯码加一次。</li>`;
 }
 
 boxesEl.onclick = async (e) => {
   const btn = e.target.closest("button");
   const article = e.target.closest("article");
   if (!btn || !article) return;
+  if (btn.type === "submit") return;
   const id = article.dataset.id;
   const act = btn.dataset.act;
   if (act === "copy") {
@@ -147,6 +258,32 @@ boxesEl.onclick = async (e) => {
     await api(`api/mailboxes/${id}`, { method: "DELETE" });
     await renderBoxes();
   }
+  if (act === "default") {
+    const comm = btn.closest("li")?.dataset.comm;
+    if (!comm) return;
+    await api(`api/mailboxes/${id}/contacts/${comm}/default`, { method: "POST" });
+    await refreshContacts(article);
+  }
+  if (act === "forget" && confirm("从已保存联系人里去掉？往来和同账号信箱仍会留在名单里。")) {
+    const comm = btn.closest("li")?.dataset.comm;
+    if (!comm) return;
+    await api(`api/mailboxes/${id}/contacts/${comm}`, { method: "DELETE" });
+    await refreshContacts(article);
+  }
+};
+
+boxesEl.onsubmit = async (e) => {
+  const form = e.target.closest("form");
+  const article = e.target.closest("article");
+  if (!form || !article || form.dataset.act !== "add-contact") return;
+  e.preventDefault();
+  const fd = new FormData(form);
+  await api(`api/mailboxes/${article.dataset.id}/contacts`, {
+    method: "POST",
+    body: JSON.stringify({ commCode: fd.get("comm"), alias: fd.get("alias") || "", default: true }),
+  });
+  form.reset();
+  await refreshContacts(article);
 };
 
 function escapeHtml(s) {
@@ -159,6 +296,7 @@ async function load() {
     const me = await api("api/me");
     showApp(me.username);
     await renderBoxes();
+    startPoll();
   } catch {
     localStorage.removeItem(tokenKey);
     showAuth();
