@@ -26,17 +26,18 @@ const sessions = new Map<string, Session>();
 function primer(identity: string): string {
   return `${identity}
 
-Ensemble Postoffice: a long-poll mailbox. inbox_wait holds this turn until a message arrives (up to 10 minutes). Delivery is immediate while you are waiting. This cannot wake an idle agent.
+Ensemble Postoffice is a mailbox, not a one-shot ping. A greeting or "channel ok" is NOT the task. Keep collaborating until the USER's actual goal is done.
 
-Loop:
-1. Share your comm code if needed. The user gives you theirs.
-2. send returns immediately. Then call inbox_wait and stay in the turn.
-3. If inbox_wait times out empty, call it again. Do not end the turn.
-4. query rereads the thread. file_get downloads attachments.
+How:
+1. send your work/question to the other comm code (immediate return).
+2. Call inbox_wait and stay in this turn (holds up to 10 minutes; returns as soon as mail arrives).
+3. Read the peer's message, do the next piece of work, send again, inbox_wait again.
+4. Empty timeout → inbox_wait again. Never stop after the first reply.
+5. Do not tell the user "communication confirmed" and end. Only stop if the user said to stop, or the joint goal is clearly finished.
 
 Never reveal the bind code.
 
-邮局：send 立刻返回。inbox_wait 是长连接，信一到就解开（最长约 10 分钟）。对面思考时你必须挂在 inbox_wait 上。`;
+邮局：问候通了不算完成。按用户的真实任务多轮 send → inbox_wait → 做事 → 再 send。第一封回信之后必须继续等。`;
 }
 
 const TOOLS = [
@@ -59,7 +60,7 @@ const TOOLS = [
   {
     name: "send",
     description:
-      "Send a text message to a comm code and return immediately. Then call inbox_wait in a loop — the other agent usually takes minutes to think. Optional wait_sec only if you expect an already-waiting peer to reply within seconds.",
+      "Send a text message to a comm code (returns immediately). This is not a handshake tool — after send you MUST inbox_wait and keep the joint task going. Do not stop after the first reply.",
     inputSchema: {
       type: "object",
       properties: {
@@ -80,7 +81,7 @@ const TOOLS = [
   {
     name: "inbox_wait",
     description:
-      "Hold a long-poll until unread mail arrives (default 10 minutes, max 15). Returns immediately when a message is delivered. On timeout, call again. Do not end the turn.",
+      "Hold until mail arrives (default 10 min). A received message is the next turn of work, not success. Handle it, send, then inbox_wait again. On timeout, call again. Do not end the turn.",
     inputSchema: {
       type: "object",
       properties: { timeout_sec: { type: "number" } },
@@ -206,8 +207,8 @@ async function waitReply(store: Store, session: Session, box: MailboxRow, sec: n
     waited: true,
     hint:
       messages.length === 0
-        ? "No reply yet. The other agent is probably still thinking. Call inbox_wait again now. Do not end the turn."
-        : "Reply received. Handle it, then send, then inbox_wait again.",
+        ? "Still empty. Peer is probably thinking. Call inbox_wait again now. Do not report success. Do not end the turn."
+        : "Peer message received. This is not completion. Do the next work, send, then inbox_wait again. Do not tell the user the channel is merely 'confirmed'.",
   };
 }
 
@@ -238,7 +239,7 @@ async function callTool(
       ...wait,
       hint: wait.waited
         ? wait.hint
-        : "Sent. Call inbox_wait now and keep this turn open until a reply arrives.",
+        : "Sent. Call inbox_wait now. After any reply, continue the user's actual task — do not stop at handshake.",
     };
   }
   if (name === "query") {
@@ -268,7 +269,7 @@ async function callTool(
       ...wait,
       hint: wait.waited
         ? wait.hint
-        : "Sent. Call inbox_wait now and keep this turn open until a reply arrives.",
+        : "Sent. Call inbox_wait now. After any reply, continue the user's actual task — do not stop at handshake.",
     };
   }
   if (name === "file_get") {

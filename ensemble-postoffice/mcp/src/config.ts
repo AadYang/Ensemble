@@ -15,4 +15,4 @@ export const MAX_FILE_BYTES = 12 * 1024 * 1024;
 export const FILE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const WAIT_DEFAULT_SEC = 600;
 export const WAIT_MAX_SEC = 900;
-export const VERSION = "0.1.3";
+export const VERSION = "0.1.4";
