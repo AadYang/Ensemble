@@ -82,7 +82,12 @@ export async function loopAction(agentId: string, action: "stop" | "pause" | "re
 
 export async function patchLoop(
   agentId: string,
-  body: { doneWhen?: LoopStartBody["doneWhen"]; maxIterations?: number; resetAttempts?: boolean },
+  body: {
+    doneWhen?: LoopStartBody["doneWhen"];
+    maxIterations?: number;
+    maxTurnsPerIter?: number | null;
+    resetAttempts?: boolean;
+  },
 ): Promise<LoopView> {
   const res = await fetch(`/api/agents/${agentId}/loop`, {
     method: "PATCH",

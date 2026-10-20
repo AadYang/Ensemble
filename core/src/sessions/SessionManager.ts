@@ -98,6 +98,7 @@ import {
 } from "../peer-mcp.js";
 import { makeHelpMcpServer, HELP_MCP_SERVER_NAME, ENSEMBLE_HELP_TOOL_NAME } from "../help-mcp.js";
 import { loadEnabledMcpServers, scopedMcpRows } from "../mcp-scope.js";
+import { parseMcpFailureLine } from "../mcp-notice.js";
 import { JobManager } from "../jobs.js";
 import type { LoopManager } from "../loop.js";
 import {
@@ -1516,7 +1517,11 @@ export class SessionManager {
   }
 
   async persistLoopNotice(sessionId: string, text: string): Promise<void> {
-    const payload = { type: "system" as const, subtype: "loop", text };
+    await this.persistSystemNotice(sessionId, "loop", text);
+  }
+
+  private async persistSystemNotice(sessionId: string, subtype: string, text: string): Promise<void> {
+    const payload = { type: "system" as const, subtype, text };
     const row = await prisma.message.create({
       data: { agentId: sessionId, seq: this.nextMessageSeq(sessionId), type: "system", payload },
     });
@@ -1526,6 +1531,38 @@ export class SessionManager {
       seq: row.seq,
       msg: payload as never,
     });
+  }
+
+  /** MCP servers that failed to connect during the CURRENT turn, keyed
+   *  agentId -> server name -> reason. Recorded from CLI stderr while the turn
+   *  runs, written as one notice after the turn unwinds: an MCP failure used to
+   *  be invisible, so the model reported "the tools were never loaded" and
+   *  invented a cause while the user saw nothing at all. */
+  private readonly mcpFailures = new Map<string, Map<string, string>>();
+
+  /** Claude Code logs e.g.
+   *  `[ERROR] MCP server "x" SdkHttpError: Error POSTing to endpoint: {"code":-32001,"message":"…"}` */
+  private noteMcpFailure(sessionId: string, line: string): void {
+    const failure = parseMcpFailureLine(line);
+    if (!failure) return;
+    const perAgent = this.mcpFailures.get(sessionId) ?? new Map<string, string>();
+    // First failure per server wins: it carries the underlying cause, while the
+    // CLI's follow-up "rejected the Authorization header" line is a guess.
+    if (!perAgent.has(failure.name)) {
+      perAgent.set(failure.name, failure.reason);
+      this.mcpFailures.set(sessionId, perAgent);
+    }
+  }
+
+  private flushMcpFailures(sessionId: string): void {
+    const perAgent = this.mcpFailures.get(sessionId);
+    if (!perAgent || perAgent.size === 0) return;
+    this.mcpFailures.delete(sessionId);
+    for (const [name, reason] of perAgent) {
+      void this.persistSystemNotice(sessionId, "mcp", `MCP "${name}" failed to connect: ${reason}`).catch(
+        (err) => console.error(`[mcp] could not report failure of ${name}:`, err),
+      );
+    }
   }
 
   /** Phase 4: THE liveness authority. One per process; every run registers here
@@ -5751,6 +5788,7 @@ export class SessionManager {
         // session file got pruned/lost between runs.
         onStderr: (line) => {
           console.error(`[claude-cli ${sessionId.slice(0, 8)}] ${line}`);
+          this.noteMcpFailure(sessionId, line);
           if (line.includes("No conversation found with session ID")) {
             staleResume = true;
           }
@@ -6590,6 +6628,9 @@ export class SessionManager {
       // namespace until its iterator fully unwound. Persist them now. If a new
       // run already won the race, flushSettledJobNotices sees it and defers.
       if (!this.running.has(sessionId)) this.flushSettledJobNotices(sessionId);
+      // Same rule for MCP: one notice per failed server per turn, with the
+      // server's own reason instead of a silent empty tool list.
+      if (!this.running.has(sessionId)) this.flushMcpFailures(sessionId);
     }
     return autoRecoveryPromise ? await autoRecoveryPromise : null;
   }

@@ -13,14 +13,29 @@ export interface McpHttpLikeConfig {
 
 export interface McpServerDTO {
   id: string;
+  /** null = global. Anything else = private to that agent. */
+  agentId: string | null;
   name: string;
   transport: McpTransport;
   config: McpStdioConfig | McpHttpLikeConfig;
   enabled: boolean;
 }
 
-export async function listMcpServers(): Promise<McpServerDTO[]> {
-  const res = await fetch("/api/mcp-servers");
+/**
+ * `all` is the management view (every row, with its owner). Without options
+ * the server returns the global list; with `agentId` it returns what that
+ * agent actually gets at runtime (globals + its own, agent winning on a name
+ * collision).
+ */
+export async function listMcpServers(
+  opts: { agentId?: string; all?: boolean } = {},
+): Promise<McpServerDTO[]> {
+  const qs = opts.all
+    ? "?scope=all"
+    : opts.agentId
+      ? `?agentId=${encodeURIComponent(opts.agentId)}`
+      : "";
+  const res = await fetch(`/api/mcp-servers${qs}`);
   if (!res.ok) throw new Error(`listMcpServers: ${res.status}`);
   return (await res.json()) as McpServerDTO[];
 }
@@ -30,6 +45,8 @@ export async function createMcpServer(input: {
   transport: McpTransport;
   config: McpStdioConfig | McpHttpLikeConfig;
   enabled?: boolean;
+  /** Omit or null for a global server; an agent id scopes it to that agent. */
+  agentId?: string | null;
 }): Promise<McpServerDTO> {
   const res = await fetch("/api/mcp-servers", {
     method: "POST",

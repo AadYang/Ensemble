@@ -1375,11 +1375,25 @@ const McpServerPatchSchema = z.object({
   enabled: z.boolean().optional(),
 });
 
-fastify.get<{ Querystring: { agentId?: string } }>("/mcp-servers", async (req) => {
+fastify.get<{ Querystring: { agentId?: string; scope?: string } }>("/mcp-servers", async (req) => {
   const agentId = req.query.agentId?.trim() || null;
-  // Without `agentId`: the global list (the sidebar manages globals). With it:
-  // exactly what that agent will get at runtime — globals plus its own rows,
-  // per-agent rows winning on a name collision.
+  // `scope=all` is the management view: every row with its owner, so a
+  // per-agent server is never invisible in the UI just because it is not
+  // global. The default (no params) stays the global list.
+  if (req.query.scope === "all") {
+    const rows = await prisma.mcpServer.findMany({ orderBy: { name: "asc" } });
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agentId,
+      name: r.name,
+      transport: r.transport,
+      config: r.config,
+      enabled: r.enabled,
+    }));
+  }
+  // Without `agentId`: the global list. With it: exactly what that agent will
+  // get at runtime — globals plus its own rows, per-agent rows winning on a
+  // name collision.
   if (!agentId) {
     const rows = await prisma.mcpServer.findMany({
       where: { agentId: null },
@@ -1876,6 +1890,9 @@ fastify.patch<{ Params: { id: string } }>("/agents/:id/loop", async (req, reply)
     .object({
       doneWhen: LoopStartSchema.shape.doneWhen,
       maxIterations: z.number().int().positive().optional(),
+      // Per-attempt turn ceiling. `null` restores the default (50). This is the
+      // counter that actually moves while one attempt spans a long board.
+      maxTurnsPerIter: z.number().int().positive().max(500).nullable().optional(),
       resetAttempts: z.boolean().optional(),
     })
     .safeParse(req.body);

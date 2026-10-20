@@ -902,7 +902,11 @@ export default function Page() {
               zero. */}
           <div className="shrink-0 min-h-0 max-h-[50%] overflow-y-auto overscroll-contain border-t border-[var(--border)]">
             <ProviderPanel />
-            <McpServerPanel />
+            <McpServerPanel
+              agents={Object.fromEntries(
+                Object.entries(agents).map(([id, a]) => [id, { name: a.summary.name }]),
+              )}
+            />
             <SkillPanel agentId={activeId} />
           </div>
           <div

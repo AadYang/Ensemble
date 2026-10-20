@@ -567,8 +567,15 @@ const sdkMessageToTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
       const st = (msg as { subtype?: string }).subtype;
       if (st === "thinking_tokens") return null;
       const systemText = (msg as { text?: unknown }).text;
-      if (st === "compact_status" && typeof systemText === "string") {
-        return { seq, kind: "system", text: systemText };
+      // Ensemble's own notices carry their wording in `text`. Without this
+      // they degraded to a bare `system · loop` / `system · mcp` row and the
+      // reason (e.g. an MCP connect failure) was never shown.
+      if (st === "compact_status" || st === "loop" || st === "mcp") {
+        return {
+          seq,
+          kind: "system",
+          text: typeof systemText === "string" ? systemText : `system · ${st}`,
+        };
       }
       const bg = backgroundTaskTurn(seq, msg);
       if (bg) return bg;

@@ -8,6 +8,7 @@ import {
   measureChatInputHeight,
   thinkingDomText,
   formatLoopStatusLines,
+  DEFAULT_MAX_TURNS_PER_ITER,
   type RunPlanStatusView,
   type SdkMessage,
 } from "@agentorch/shared";
@@ -1204,6 +1205,13 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
               }
             >
               {t("loop.chip.label")} {loop.iter}/{loop.maxIterations}
+              {/* The attempt number only moves when a full attempt fails; the
+                  turn counter is what advances while one attempt spans a long
+                  board, so it must be visible or the chip looks frozen. */}
+              {` · ${t("loop.chip.turns", {
+                n: loop.innerTurns,
+                cap: loop.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER,
+              })}`}
               {loop.status === "paused" ? ` · ${t("loop.chip.paused")}` : ""}
               {loop.config.verifier
                 ? loop.lastVerifyOk === false

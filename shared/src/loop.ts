@@ -394,7 +394,11 @@ export function decideLoopAfterVerify(input: {
 export function formatLoopStatusLines(view: LoopView): string[] {
   const v = view.config.verifier;
   return [
-    `loop            ${view.status}  ${view.iter}/${view.maxIterations}`,
+    // `iter` counts ATTEMPTS and only moves when a full attempt fails; the turn
+    // figure is the one that advances while one attempt spans a long board.
+    `loop            ${view.status}  attempt ${view.iter}/${view.maxIterations}  turn ${view.innerTurns}/${
+      view.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER
+    }`,
     `verifier        ${v ? `${v.kind}  ${v.spec}` : "none"}  last=${
       // No verifier means nothing was checked. Reporting `pass` here made
       // "no command verifier" look like a green gate.

@@ -23,7 +23,12 @@ const HTTP_TEMPLATE = `{
   "headers": {}
 }`;
 
-export function McpServerPanel() {
+export function McpServerPanel({
+  agents = {},
+}: {
+  /** Agent directory, used only to label which agent owns a scoped server. */
+  agents?: Record<string, { name: string }>;
+} = {}) {
   const [servers, setServers] = useState<McpServerDTO[]>([]);
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -31,15 +36,25 @@ export function McpServerPanel() {
   const [name, setName] = useState("");
   const [configText, setConfigText] = useState(STDIO_TEMPLATE);
   const [error, setError] = useState<string | null>(null);
+  /** "" = global; otherwise the agent this new server is private to. */
+  const [scope, setScope] = useState("");
   const t = useT();
 
   const refresh = async () => {
     try {
-      const list = await listMcpServers();
+      // The management view: every row, including per-agent ones. Listing
+      // globals only made a correctly scoped server look like it had never
+      // been saved (the panel read 0/0 while the row existed).
+      const list = await listMcpServers({ all: true });
       setServers(list);
     } catch (err) {
       console.warn("listMcpServers failed", err);
     }
+  };
+
+  const scopeLabel = (agentId: string | null): string => {
+    if (!agentId) return t("mcp.scope.global");
+    return agents[agentId]?.name ?? t("mcp.scope.unknown");
   };
 
   useEffect(() => {
@@ -70,6 +85,8 @@ export function McpServerPanel() {
         name: name.trim(),
         transport,
         config: parsed as never,
+        // Explicit scope: "" means global, exactly like omitting agentId.
+        agentId: scope || null,
       });
       setName("");
       setConfigText(transport === "stdio" ? STDIO_TEMPLATE : HTTP_TEMPLATE);
@@ -118,8 +135,16 @@ export function McpServerPanel() {
               className="flex items-center gap-1 px-1 py-0.5 border border-[var(--border)] bg-[var(--bg-pane)]"
             >
               <span className={`status-dot ${s.enabled ? "running" : "idle"}`} />
-              <span className="truncate flex-1" title={`${s.transport}`}>
+              <span className="truncate flex-1" title={`${s.name} · ${scopeLabel(s.agentId)} · ${s.transport}`}>
                 {s.name}
+              </span>
+              <span
+                className={`shrink-0 max-w-[6.5rem] truncate text-[10px] ${
+                  s.agentId ? "text-[var(--accent)]" : "text-[var(--text-faint)]"
+                }`}
+                title={scopeLabel(s.agentId)}
+              >
+                {scopeLabel(s.agentId)}
               </span>
               <span className="text-[var(--text-faint)] text-[10px]">{s.transport}</span>
               <button
@@ -146,6 +171,22 @@ export function McpServerPanel() {
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
+              <select
+                className="bg-[var(--bg)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)]"
+                value={scope}
+                onChange={(e) => setScope(e.target.value)}
+                title={t("mcp.scope.label")}
+                aria-label={t("mcp.scope.label")}
+              >
+                <option value="">{t("mcp.scope.global")}</option>
+                {Object.entries(agents)
+                  .sort((a, b) => a[1].name.localeCompare(b[1].name))
+                  .map(([id, a]) => (
+                    <option key={id} value={id}>
+                      {a.name}
+                    </option>
+                  ))}
+              </select>
               <select
                 className="bg-[var(--bg)] border border-[var(--border)] px-1 py-0.5 outline-none focus:border-[var(--accent)]"
                 value={transport}

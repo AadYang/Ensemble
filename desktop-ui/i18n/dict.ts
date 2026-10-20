@@ -191,6 +191,9 @@ const en: Dict = {
   "mcp.toggle.enable": "enable",
   "mcp.toggle.disable": "disable",
   "mcp.delete.title": "delete",
+  "mcp.scope.label": "scope",
+  "mcp.scope.global": "global",
+  "mcp.scope.unknown": "unknown agent",
 
   // skills
   "skill.label": "Skills",
@@ -664,6 +667,7 @@ const en: Dict = {
   "loop.chip.verifyFail": "VERIFY FAIL",
   "loop.chip.verifyNone": "no verifier",
   "loop.chip.paused": "PAUSED",
+  "loop.chip.turns": "turn {n}/{cap}",
   "loop.board.title": "loop board",
   "loop.board.tasks": "TASKS.md",
   "loop.board.empty": "no tasks yet — the agent will write TASKS.md",
@@ -675,6 +679,9 @@ const en: Dict = {
   "loop.board.setCap": "set",
   "loop.board.resetAttempts": "clear",
   "loop.board.spent": "attempt budget spent — raise the cap or clear the counter, otherwise the next failure pauses immediately",
+  "loop.board.turns": "this attempt",
+  "loop.board.maxTurns": "max turns per attempt",
+  "loop.board.turnsHint": "turns run inside the current attempt; reaching the cap pauses the loop",
   "loop.tree.reviewing": "reviewing",
   "loop.tree.runners": "runners",
   "slash.status.notLocal":
@@ -890,6 +897,9 @@ const zh: Dict = {
   "mcp.toggle.enable": "启用",
   "mcp.toggle.disable": "禁用",
   "mcp.delete.title": "删除",
+  "mcp.scope.label": "作用域",
+  "mcp.scope.global": "全局",
+  "mcp.scope.unknown": "未知代理",
 
   // skills
   "skill.label": "Skills",
@@ -1358,6 +1368,7 @@ const zh: Dict = {
   "loop.chip.verifyFail": "校验失败",
   "loop.chip.verifyNone": "未配置校验",
   "loop.chip.paused": "已暂停",
+  "loop.chip.turns": "本轮 {n}/{cap}",
   "loop.board.title": "Loop 看板",
   "loop.board.tasks": "TASKS.md",
   "loop.board.empty": "还没有任务 — agent 会写 TASKS.md",
@@ -1369,6 +1380,9 @@ const zh: Dict = {
   "loop.board.setCap": "设置",
   "loop.board.resetAttempts": "清零",
   "loop.board.spent": "尝试次数已用尽 — 调高上限或清零计数，否则下次失败会立刻暂停",
+  "loop.board.turns": "本次尝试",
+  "loop.board.maxTurns": "单次尝试最大轮数",
+  "loop.board.turnsHint": "当前这次尝试内已跑的轮数；达到上限会暂停",
   "loop.tree.reviewing": "评审中",
   "loop.tree.runners": "执行中",
   "slash.status.notLocal":

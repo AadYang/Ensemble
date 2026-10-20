@@ -263,7 +263,12 @@ export class LoopManager {
 
   async patch(
     agentId: string,
-    raw: { doneWhen?: unknown; maxIterations?: number; resetAttempts?: boolean },
+    raw: {
+      doneWhen?: unknown;
+      maxIterations?: number;
+      maxTurnsPerIter?: number | null;
+      resetAttempts?: boolean;
+    },
   ): Promise<LoopView | null> {
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row) return null;
@@ -272,6 +277,9 @@ export class LoopManager {
       ...(row.config as object),
       ...(raw.doneWhen !== undefined ? { doneWhen: raw.doneWhen } : {}),
       ...(raw.maxIterations !== undefined ? { maxIterations: raw.maxIterations } : {}),
+      ...(raw.maxTurnsPerIter !== undefined
+        ? { maxTurnsPerIter: raw.maxTurnsPerIter ?? undefined }
+        : {}),
       verifier: base.verifier,
       goal: base.goal,
     });
