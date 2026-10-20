@@ -1668,7 +1668,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(isRuntimeResumeRecoverySignal("QUERY_FAILED", true, true, "codex-thread-id")).toBe(false);
   });
 
-  it("cancel() clears Codex native resume metadata for the aborted run", async () => {
+  it("cancel() preserves Codex native resume metadata for compaction and continuation", async () => {
     const provider = await prisma.provider.create({
       data: { name: "cancel-codex-provider", kind: "openai-codex", models: ["gpt-5.5"] },
     });
@@ -1698,7 +1698,6 @@ describe("SessionManager cancel + stale-session recovery", () => {
       startedSeq: 0,
       startedAt: new Date().toISOString(),
       autoAllowedTools: new Set<string>(),
-      clearResumeOnAbort: true,
     });
 
     await sessions.cancel(agent.id);
@@ -1706,9 +1705,9 @@ describe("SessionManager cancel + stale-session recovery", () => {
     const after = await prisma.agent.findUnique({ where: { id: agent.id } });
     const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<string, unknown>;
     expect(after?.status).toBe("IDLE");
-    expect(meta.lastSessionId).toBeUndefined();
-    expect(meta.codexUsageSnapshot).toBeUndefined();
-    expect(meta.codexResumeSignature).toBeUndefined();
+    expect(meta.lastSessionId).toBe("019ea530-56b8-7163-8b3c-5bd5ae5c2c79");
+    expect(meta.codexUsageSnapshot).toBeDefined();
+    expect(meta.codexResumeSignature).toBe("runtime-shape");
   });
 
   it("Codex history reconstruction drops an unfinished trailing user turn", () => {

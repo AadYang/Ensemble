@@ -107,9 +107,11 @@ async function seedConversation(agentId: string, turns: number, charsPerTurn: nu
 }
 
 async function newAgent(name: string, maxRunDurationMs?: number): Promise<string> {
+  const provider = await prisma.provider.create({ data: { name, kind: "openai-local", apiKey: "sk-test", models: ["test-model"] } });
   const agent = await prisma.agent.create({
     data: {
       name,
+      providerId: provider.id,
       model: "test-model",
       metadata: maxRunDurationMs === undefined ? {} : { maxRunDurationMs },
     },

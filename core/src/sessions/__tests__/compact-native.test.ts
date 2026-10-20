@@ -1,6 +1,5 @@
 // /compact asks the native CLI to compact when a session exists. Ensemble
-// archives the live rows and writes the CLI's summary; it does not summarize
-// the transcript itself on that path.
+// preserves the live rows; the CLI only owns its native context.
 
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
@@ -17,6 +16,9 @@ let failNextUserPrompt = false;
 vi.mock("../runtimes/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../runtimes/index.js")>()),
   chooseRuntime: () => ({
+    async *compact(opts: RuntimeOptions) {
+      yield* this.query(opts);
+    },
     async *query(opts: RuntimeOptions): AsyncGenerator<{ type: "sdk_message"; payload: unknown }> {
       captured.push(opts);
       if (failNextUserPrompt && opts.prompt !== "/compact") {
@@ -126,6 +128,38 @@ async function seedTurns(agentId: string): Promise<void> {
 }
 
 describe("compact delegates to the native CLI when a session exists", () => {
+  it.each(["anthropic-local", "openai-codex"])("persists the native id before %s is cancelled", async (kind) => {
+    const provider = await prisma.provider.create({ data: { name: `cancel-${kind}`, kind, models: ["test-model"] } });
+    const agent = await prisma.agent.create({ data: {
+      name: `cancel-${kind}`, providerId: provider.id, model: "test-model",
+      projectRoot: mkdtempSync(join(tmpdir(), "compact-cancel-")),
+    } });
+    const sessions = new SessionManager(new StubHub() as never);
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const nativeId = "01a1576f-be4d-73f2-9dbe-e04a618fd87a";
+    (sessions as any).runtimeResolver = () => ({
+      async *query(opts: RuntimeOptions) {
+        yield { type: "sdk_message", payload: { type: "system", subtype: "init", session_id: nativeId } };
+        // SessionManager has consumed and persisted init before asking for the next event.
+        ready();
+        await new Promise<void>((resolve) => {
+          if (opts.abortController.signal.aborted) resolve();
+          else opts.abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    });
+    const turn = sessions.sendMessage(agent.id, "start");
+    await started;
+    await sessions.cancel(agent.id);
+    await turn;
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.metadata).toMatchObject({
+      lastSessionId: nativeId,
+    });
+    await sessions.resetRuntimeSession(agent.id);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.metadata).not.toHaveProperty("lastSessionId");
+  });
+
   it("resumes the CLI with /compact and keeps lastSessionId", async () => {
     const root = mkdtempSync(join(tmpdir(), "compact-native-"));
     const agent = await prisma.agent.create({
@@ -154,46 +188,44 @@ describe("compact delegates to the native CLI when a session exists", () => {
     expect(meta.lastSessionId).toBe("native-session-id");
 
     const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
-    expect(rows).toHaveLength(1);
-    expect(JSON.stringify(rows[0]?.payload)).toContain("CLI summary");
-    const payload = rows[0]?.payload as { generation?: number; diagnostics?: string[] };
-    const archived = await sessions.readArchivedGeneration(agent.id, payload.generation as number, null);
-    expect(archived?.records).toHaveLength(3);
-    expect(archived?.text).toContain("patched the inset");
-    expect(payload.diagnostics?.some((d) => d.includes("native claude CLI"))).toBe(true);
+    expect(rows.some((row) => JSON.stringify(row.payload).includes("patched the inset"))).toBe(true);
+    expect(rows.some((row) => JSON.stringify(row.payload).includes("native context compacted"))).toBe(true);
+    expect(await sessions.listArchivedGenerations(agent.id)).toEqual([]);
   });
 
-  it("falls back to a local summary when the CLI does not compact", async () => {
+  it("preserves history and rejects when the CLI does not confirm compaction", async () => {
     nativeCompactMode = "silent";
-    const root = mkdtempSync(join(tmpdir(), "compact-fallback-"));
+    const root = mkdtempSync(join(tmpdir(), "compact-no-fallback-"));
     const agent = await prisma.agent.create({
-      data: {
-        name: "cli-silent",
-        projectRoot: root,
-        metadata: { lastSessionId: "native-session-id" },
-      },
+      data: { name: "cli-silent", projectRoot: root, metadata: { lastSessionId: "native-session-id" } },
     });
     await seedTurns(agent.id);
     const sessions = new SessionManager(new StubHub() as never);
-    const out = await sessions.compactAgent(agent.id);
-
-    expect(out?.summary).toContain("local layered summary");
-    expect(captured.some((opts) => opts.prompt === "/compact")).toBe(true);
-    expect(captured.some((opts) => opts.prompt !== "/compact")).toBe(true);
-    const after = await prisma.agent.findUnique({ where: { id: agent.id } });
-    const meta = (after?.metadata && typeof after.metadata === "object" ? after.metadata : {}) as Record<
-      string,
-      unknown
-    >;
-    expect(meta.lastSessionId).toBeUndefined();
+    await expect(sessions.compactAgent(agent.id)).rejects.toThrow("without confirming compaction");
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.prompt).toBe("/compact");
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.metadata).toMatchObject({ lastSessionId: "native-session-id" });
+    expect(await sessions.listArchivedGenerations(agent.id)).toEqual([]);
   });
 
-  it("does not send /compact to an OpenAI in-process agent even if lastSessionId is set", async () => {
+  it.each(["anthropic-local", "anthropic", "openai-codex"])("does not summarize locally for %s without a native session", async (kind) => {
+    const provider = await prisma.provider.create({ data: { name: `missing-${kind}`, kind, models: ["test-model"] } });
+    const agent = await prisma.agent.create({ data: {
+      name: `missing-${kind}`, providerId: provider.id, projectRoot: mkdtempSync(join(tmpdir(), "compact-missing-")),
+    } });
+    await seedTurns(agent.id);
+    const sessions = new SessionManager(new StubHub() as never);
+    await expect(sessions.compactAgent(agent.id)).rejects.toThrow("native session is unavailable");
+    expect(captured).toHaveLength(0);
+    expect(await sessions.listArchivedGenerations(agent.id)).toEqual([]);
+  });
+
+  it.each(["openai-local", "openai-compat"])("keeps application compaction for %s", async (kind) => {
     const root = mkdtempSync(join(tmpdir(), "compact-openai-"));
     const provider = await prisma.provider.create({
       data: {
-        name: "openai-local-test",
-        kind: "openai-local",
+        name: `compact-${kind}`,
+        kind,
         apiKey: "sk-test",
         models: ["gpt-4o"],
       },

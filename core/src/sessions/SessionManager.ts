@@ -424,7 +424,6 @@ interface RunningSession {
    *  Deny is NOT cached — the model gets per-call rejection feedback and may
    *  reasonably retry with different input. */
   autoAllowedTools: Set<string>;
-  clearResumeOnAbort?: boolean;
 }
 
 interface LiveTranscript {
@@ -2839,7 +2838,7 @@ export class SessionManager {
    *  summarize locally. The pane is then replaced with that summary and the
    *  originals move to MessageArchive. */
   async compactAgent(id: string): Promise<{ summary: string } | null> {
-    const cur = await prisma.agent.findUnique({ where: { id } });
+    let cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
     this.clearQueuedTurns(id);
     if (
@@ -2850,6 +2849,9 @@ export class SessionManager {
     ) {
       await this.cancel(id);
     }
+    // Cancellation may settle a newly observed native session id.
+    cur = await prisma.agent.findUnique({ where: { id } });
+    if (!cur) return null;
     const runId = randomUUID();
     const startedSeq = this.nextMessageSeq(id);
     this.running.set(id, {
@@ -2870,10 +2872,8 @@ export class SessionManager {
       if (!this.isRunOwner(id, runId)) {
         return { summary: "(compact cancelled)" };
       }
-      // The chunk budget comes from the plan, so a compact reads the transcript
-      // in the same sized helpings the turn would have had room for. A plan
-      // that cannot resolve is not fatal to a compact: the fallback chunk size
-      // is recorded in the summary's diagnostics.
+      // Resolve the owner before dispatch. Missing native state or a failed
+      // plan must not silently turn a CLI compact into a full-history summary.
       let compactPlan: ResolvedRunPlan | null = null;
       try {
         const provider = cur.providerId ? await prisma.provider.findUnique({ where: { id: cur.providerId } }) : null;
@@ -2943,28 +2943,23 @@ export class SessionManager {
     }
   }
 
-  /** Prefer the CLI's own compact when a native session exists. Ensemble only
-   *  summarizes when there is no compact owner (OpenAI in-process, or no
-   *  lastSessionId). */
+  /** CLI runtimes own their context. Only in-process runtimes summarize locally;
+   *  a missing native session is an explicit error, never an expensive fallback. */
   private async compactNow(
     cur: DbAgent,
     plan: ResolvedRunPlan | null,
     shouldContinue?: () => boolean,
     upperBoundSeq?: number,
   ): Promise<{ summary: string }> {
-    const resumeId = readMetaString(cur.metadata, "lastSessionId");
-    if (plan && runtimeOwnsNativeCompact(plan.identity.runtime) && resumeId) {
-      try {
-        const native = await this.compactViaNativeSession(cur, plan, resumeId, shouldContinue, upperBoundSeq);
-        if (native) return native;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const code = (err as { code?: string }).code;
-        if (code === "NATIVE_COMPACT_FAILED" || code === "RUNTIME_WALL_CLOCK_LIMIT") throw err;
-        console.error(
-          `[compact] native CLI compact did not complete for agent=${cur.id.slice(0, 8)}: ${message} — falling back to local summary`,
-        );
+    if (!plan) throw new Error("Cannot resolve the compaction runtime; history was preserved");
+    if (runtimeOwnsNativeCompact(plan.identity.runtime)) {
+      const resumeId = readMetaString(cur.metadata, "lastSessionId");
+      if (!resumeId) {
+        throw new Error(`${plan.identity.runtime} native session is unavailable; history was preserved. No local summary was started.`);
       }
+      const native = await this.compactViaNativeSession(cur, plan, resumeId, shouldContinue);
+      if (!native) throw new Error("Native compaction did not complete; history was preserved");
+      return native;
     }
     return this.compactAgentHistory(cur, plan, shouldContinue, upperBoundSeq);
   }
@@ -2987,7 +2982,7 @@ export class SessionManager {
     ).filter((row) => upperBoundSeq === undefined || row.seq <= upperBoundSeq);
     if (prior.length === 0) return false;
     try {
-      const native = await this.compactViaNativeSession(cur, plan, resumeId, undefined, upperBoundSeq);
+      const native = await this.compactViaNativeSession(cur, plan, resumeId);
       if (!native) return false;
       const compacted = await prisma.agent.findUnique({ where: { id: cur.id } });
       if (compacted) cur.metadata = compacted.metadata;
@@ -3006,19 +3001,8 @@ export class SessionManager {
     plan: ResolvedRunPlan,
     resumeId: string,
     shouldContinue?: () => boolean,
-    upperBoundSeq?: number,
   ): Promise<{ summary: string } | null> {
     const id = cur.id;
-    const messages = (
-      await prisma.message.findMany({
-        where: { agentId: id },
-        orderBy: { seq: "asc" },
-      })
-    ).filter((row) => upperBoundSeq === undefined || row.seq <= upperBoundSeq);
-    if (messages.length === 0) {
-      return { summary: "(nothing in range — no row was archived and no summary was written)" };
-    }
-
     let resolvedProvider: Awaited<ReturnType<typeof prisma.provider.findUnique>> = null;
     if (cur.providerId) {
       resolvedProvider = await prisma.provider.findUnique({ where: { id: cur.providerId } });
@@ -3041,6 +3025,7 @@ export class SessionManager {
     const abort = run?.abort ?? new AbortController();
     let capturedSummary = "";
     const runtime = this.runtimeResolver(resolvedProvider?.kind ?? "anthropic-local");
+    if (!runtime.compact) throw new Error(`${plan.identity.runtime} does not expose native compaction`);
     const runtimeOpts: RuntimeOptions = {
       sessionId: id,
       prompt: NATIVE_COMPACT_SLASH,
@@ -3055,6 +3040,7 @@ export class SessionManager {
       codexCliPath: await getCodexCliPath(),
       mcpServers: {},
       env: Object.keys(providerEnv).length > 0 ? mergedEnv : {},
+      agentMetadata: cur.metadata,
       provider: resolvedProvider ?? {
         id: "",
         name: "anthropic-default",
@@ -3096,7 +3082,7 @@ export class SessionManager {
     let compactFailed: string | null = null;
     let resultMsg: unknown = null;
     try {
-      for await (const event of runtime.query(runtimeOpts)) {
+      for await (const event of runtime.compact(runtimeOpts)) {
         // Compact is a run too: without this every event it received was
         // invisible to liveness, which then reported "no signal has been fed".
         if (run) this.liveness.noteModelEvent(run.runId);
@@ -3125,7 +3111,12 @@ export class SessionManager {
           const text = assistantTextFromMessage(msg).trim();
           if (text) assistantText = text;
         }
-        if (msg.type === "result") resultMsg = msg;
+        if (msg.type === "result") {
+          resultMsg = msg;
+          if (msg.is_error || (typeof msg.subtype === "string" && msg.subtype !== "success")) {
+            compactFailed = String(msg.result ?? JSON.stringify(msg.errors ?? msg.subtype));
+          }
+        }
       }
     } finally {
       if (timer) clearTimeout(timer);
@@ -3141,7 +3132,10 @@ export class SessionManager {
       throw err;
     }
     const cliDidCompact = compactOk || boundary || capturedSummary.trim().length > 0;
-    if (!cliDidCompact) return null;
+    abort.signal.throwIfAborted();
+    if (!cliDidCompact || (plan.identity.runtime === "claude" && !resultMsg)) {
+      throw new Error("Native runtime ended without confirming compaction; history was preserved");
+    }
     if (shouldContinue && !shouldContinue()) {
       return { summary: capturedSummary || assistantText || commandText || "(compact cancelled)" };
     }
@@ -3184,26 +3178,13 @@ export class SessionManager {
       capturedSummary.trim() ||
       commandText ||
       assistantText ||
-      "Conversation compacted by the native CLI. Originals are in the Ensemble archive.";
-    return this.commitCompactReplacement(cur, messages, summary, {
-      diagnostics: [
-        `native ${plan.identity.runtime} CLI compacted session ${resumeId.slice(0, 8)} (slash ${NATIVE_COMPACT_SLASH})`,
-      ],
-      chunkCount: 1,
-      layers: [
-        {
-          level: 0,
-          index: 0,
-          fromSeq: messages[0]!.seq,
-          toSeq: messages[messages.length - 1]!.seq,
-          count: messages.length,
-          sourceHash: "",
-          summaryVersion: SUMMARY_VERSION,
-          text: summary,
-        },
-      ],
-      keepResume: true,
-    });
+      "Native context compacted. Ensemble conversation history was preserved.";
+    // The CLI compacted its own context, not the union of all Ensemble turns.
+    // Keep the transcript intact: it can include other threads and runtimes.
+    this.clearLiveContext(id);
+    this.setContextUsage(id, null);
+    await this.appendCompactStatusMessage(id, `${plan.identity.runtime} native context compacted. Conversation history preserved.`);
+    return { summary };
   }
 
   private async commitCompactReplacement(
@@ -5380,10 +5361,6 @@ export class SessionManager {
       // db and hand them to the runtime — Claude side ignores `history`
       // (CLI session file is the source of truth there).
       const isCodexKind = resolvedProvider?.kind === "openai-codex";
-      const runningEntry = this.running.get(sessionId);
-      if (runningEntry?.runId === runId) {
-        runningEntry.clearResumeOnAbort = isCodexKind;
-      }
       const isOpenAIKind =
         resolvedProvider?.kind === "openai-compat" ||
         resolvedProvider?.kind === "openai-local" ||
@@ -6040,6 +6017,19 @@ export class SessionManager {
         const incomingSid = (msg as { session_id?: string }).session_id;
         if (incomingSid && incomingSid !== capturedSessionId) {
           capturedSessionId = incomingSid;
+          if (runtimeOwnsNativeCompact(turnPlan.identity.runtime) && !opts?.suppressRuntimeMetadata) {
+            const latest = await prisma.agent.findUnique({ where: { id: sessionId } });
+            if (latest && this.isRunOwner(sessionId, runId)) {
+              await prisma.agent.update({
+                where: { id: sessionId },
+                data: { metadata: mergeMetadata(latest.metadata, {
+                  lastSessionId: incomingSid,
+                  systemPromptHash: promptHash,
+                  ...(codexResumeSignature ? { [CODEX_RESUME_SIGNATURE_KEY]: codexResumeSignature } : {}),
+                }) },
+              });
+            }
+          }
         }
 
         if (isInternalSystemMessage(msg)) {
@@ -7702,16 +7692,9 @@ export class SessionManager {
     }
 
     try {
-      let nextMetadata: object | undefined;
-      if (r?.clearResumeOnAbort) {
-        const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
-        if (agent) {
-          nextMetadata = removeMetadataKeys(agent.metadata, [...RESUME_METADATA_KEYS]);
-        }
-      }
       const updated = await prisma.agent.update({
         where: { id: sessionId },
-        data: { status: opts.dbStatus, ...(nextMetadata ? { metadata: nextMetadata } : {}) },
+        data: { status: opts.dbStatus },
       });
       this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
       if (opts.error) {
@@ -7833,12 +7816,9 @@ export class SessionManager {
     // Authoritative DB reset. We deliberately do NOT touch metadata — only the
     // status flips back to IDLE. lastSessionId / sandboxMode / etc. survive.
     try {
-      const metadata = r?.clearResumeOnAbort
-        ? removeMetadataKeys((await prisma.agent.findUnique({ where: { id: sessionId } }))?.metadata, [...RESUME_METADATA_KEYS])
-        : undefined;
       const updated = await prisma.agent.update({
         where: { id: sessionId },
-        data: { status: "IDLE", ...(metadata ? { metadata } : {}) },
+        data: { status: "IDLE" },
       });
       this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
       this.hub.sendToSession(sessionId, { type: "status", sessionId, status: "idle" });

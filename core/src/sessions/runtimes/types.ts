@@ -339,4 +339,6 @@ export interface AgentRuntime {
   /** Yields RuntimeEvents for one turn of conversation. Caller iterates via
    *  for-await; abort by toggling opts.abortController.signal. */
   query(opts: RuntimeOptions): AsyncIterable<RuntimeEvent>;
+  /** Native context compaction. Never dispatch this as an ordinary user turn. */
+  compact?(opts: RuntimeOptions): AsyncIterable<RuntimeEvent>;
 }

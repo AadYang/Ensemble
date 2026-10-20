@@ -264,6 +264,13 @@ function mergeContextWindowEnv(
 }
 
 export class ClaudeAgentRuntime implements AgentRuntime {
+  async *compact(opts: RuntimeOptions): AsyncIterable<RuntimeEvent> {
+    if (!opts.resume) throw new Error("Claude compact requires a native session id");
+    // The SDK recognizes the literal slash command. Do not wrap it in a
+    // reconstructed conversation or turn it into a model summarization prompt.
+    yield* this.query({ ...opts, prompt: "/compact", history: [] });
+  }
+
   async *query(opts: RuntimeOptions): AsyncIterable<RuntimeEvent> {
     // The level comes from the plan — the same field `/status` reports and the
     // same snapshot the SDK parameters are derived from. It is NOT re-read from
@@ -401,6 +408,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       closedByError = err instanceof Error ? err.message : String(err);
       throw err;
     } finally {
+      if (opts.captureCompactSummary) stream.close();
       // `abnormal` is narrow on purpose: a close the runtime already reported as
       // an error is explained, and an abort is something WE did. What remains is
       // a stream that vanished without a result and without an explanation —

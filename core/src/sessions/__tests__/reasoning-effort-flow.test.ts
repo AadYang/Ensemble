@@ -656,10 +656,13 @@ describe("reasoning effort flow", () => {
     ).toBe(true);
   });
 
-  it("compactAgent clears native resume metadata", async () => {
+  it("application compaction clears obsolete native resume metadata", async () => {
+    const provider = await prisma.provider.create({ data: { name: "compact-in-process", kind: "openai-local", apiKey: "sk-test", models: ["test-model"] } });
     const agent = await prisma.agent.create({
       data: {
         name: "compact-resume-agent",
+        providerId: provider.id,
+        model: "test-model",
         metadata: {
           lastSessionId: "native-session",
           codexUsageSnapshot: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },

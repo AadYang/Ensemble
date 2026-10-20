@@ -531,3 +531,12 @@
 
 **留下的规则**：<这次改动后可固化的判断准则；如果不需要新规则就写「无」>
 ```
+
+
+### 2026-10-20 ? Native compaction across runtimes (implementation, validation pending)
+
+- Claude SDK (`anthropic-local` / `anthropic`): explicit runtime compact entry sends literal `/compact` with resume, requires a native completion signal and terminal result, closes the compact query.
+- Codex: dedicated stdio app-server connection resumes the agent thread in its original CODEX_HOME and calls `thread/compact/start`; RPC acknowledgement is not completion. Windows uses process-tree termination; macOS/Linux use a dedicated process group.
+- OpenAI in-process (`openai-local` / `openai-compat`): retains layered application summaries and transactional archives. Native runtimes never silently fall back to this path.
+- Normal cancellation preserves native session metadata; actual native thread IDs and resume signatures are saved when first observed. Explicit reset/provider changes retain their invalidation semantics. Native compaction preserves Ensemble message rows rather than claiming to summarize unrelated native sessions.
+- Regression cases added/updated for native cancellation, absent sessions, failed compaction, Codex protocol acknowledgement/completion/cancellation, and the in-process summary path. Per user workflow, no tests, typecheck, builds, live compaction or database repair were run. Windows and macOS runtime validation remain pending; no release claim.

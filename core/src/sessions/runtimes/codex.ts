@@ -76,6 +76,7 @@ function codexScopeFor(model: string | null | undefined): WindowScope {
 }
 import { DATA_DIR, PACKAGED, REPO_ROOT } from "../../paths.js";
 import { reloadSkills } from "../../skills/index.js";
+import { compactCodexThread } from "./codex-compact.js";
 
 // Resolve the user's already-installed Codex binary. The npm shim is often a
 // shell script, so we need to locate the native platform executable.
@@ -682,6 +683,29 @@ async function preflightCodexMcp(opts: {
 }
 
 export class CodexCliRuntime implements AgentRuntime {
+  async *compact(opts: RuntimeOptions): AsyncIterable<RuntimeEvent> {
+    const cwd = opts.runPlan.execution.projectRoot.value;
+    if (!cwd || !isLikelyCodexThreadId(opts.resume)) {
+      throw new Error("Codex compact requires a project root and a native thread id");
+    }
+    const binary = opts.codexCliPath ?? await getCodexCliPath() ?? locateCodexBinary();
+    if (!binary) throw new Error("Codex CLI not found");
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (typeof value === "string") env[key] = value;
+    }
+    Object.assign(env, opts.env);
+    const isolatedHome = joinPath(DATA_DIR, "codex-runtime", opts.sessionId);
+    const home = existsSync(isolatedHome) ? isolatedHome : env.CODEX_HOME ?? joinPath(homedir(), ".codex");
+    if (!findCodexSessionFile(home, opts.resume)) {
+      throw new Error("Codex native thread is missing from this agent's CODEX_HOME; history was preserved");
+    }
+    // Do not regenerate config with an empty MCP map: it would select another
+    // home or overwrite the configuration used to create this native thread.
+    env.CODEX_HOME = home;
+    yield* compactCodexThread(opts, binary, env, killCodexChildTree);
+  }
+
   async *query(opts: RuntimeOptions): AsyncIterable<RuntimeEvent> {
     // Per-agent sandbox override > provider default > Codex CLI config/default.
     const sandbox =
@@ -992,7 +1016,7 @@ export class CodexCliRuntime implements AgentRuntime {
         payload: {
           type: "system",
           subtype: "init",
-          session_id: codexSessionId,
+          ...(canResumeNative ? { session_id: codexSessionId } : {}),
           model: opts.model,
         },
       };
@@ -1012,6 +1036,10 @@ export class CodexCliRuntime implements AgentRuntime {
         }
         if (isRecord(ev) && ev.type === "thread.started" && typeof ev.thread_id === "string") {
           codexSessionId = ev.thread_id;
+          yield {
+            type: "sdk_message",
+            payload: { type: "system", subtype: "init", session_id: codexSessionId, model: opts.model },
+          };
           // A fresh thread's rollout is named after the id we just learned, so
           // this is the first moment its mark CAN be written.
           if (turnMarks.length === 0) {
