@@ -98,6 +98,12 @@ import {
 } from "../peer-mcp.js";
 import { makeHelpMcpServer, HELP_MCP_SERVER_NAME, ENSEMBLE_HELP_TOOL_NAME } from "../help-mcp.js";
 import { loadEnabledMcpServers, scopedMcpRows } from "../mcp-scope.js";
+import {
+  ackPostofficeLine,
+  fetchPostofficeLine,
+  postofficeCredsFromMcp,
+  stayOnLinePrompt,
+} from "../postoffice-line.js";
 import { parseMcpFailureLine } from "../mcp-notice.js";
 import { JobManager } from "../jobs.js";
 import type { LoopManager } from "../loop.js";
@@ -1472,6 +1478,7 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
 
 export class SessionManager {
   private running = new Map<string, RunningSession>();
+  private postofficePollers = new Map<string, ReturnType<typeof setInterval>>();
 
   /** Per-kind runtime/CLI version cache — see runtimeVersionFor. */
   private runtimeVersionCache = new Map<string, string | null>();
@@ -2655,6 +2662,7 @@ export class SessionManager {
   async closeAgent(id: string): Promise<AgentSummary | null> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return null;
+    this.stopPostofficePoller(id);
     // Abort running stream if any. resolvePermission will deny outstanding via cancel().
     this.clearQueuedTurns(id);
     await this.cancel(id);
@@ -2719,6 +2727,7 @@ export class SessionManager {
   async deleteAgent(id: string): Promise<boolean> {
     const cur = await prisma.agent.findUnique({ where: { id } });
     if (!cur) return false;
+    this.stopPostofficePoller(id);
     this.clearQueuedTurns(id);
     await this.cancel(id);
     // Cascading FKs on Message / Permission / McpServer / PaneState will clean rows.
@@ -2727,6 +2736,48 @@ export class SessionManager {
     this.transportFallbackByAgent.delete(id);
     this.hub.broadcast({ type: "agent_deleted", sessionId: id });
     return true;
+  }
+
+  private stopPostofficePoller(id: string): void {
+    const handle = this.postofficePollers.get(id);
+    if (handle) clearInterval(handle);
+    this.postofficePollers.delete(id);
+  }
+
+  private async postofficeUnreadPoke(sessionId: string): Promise<string | null> {
+    const mcp = await loadEnabledMcpServers(sessionId);
+    const creds = postofficeCredsFromMcp(mcp);
+    if (!creds) return null;
+    const line = await fetchPostofficeLine(creds);
+    const prompt = stayOnLinePrompt(line);
+    if (!prompt) return null;
+    await ackPostofficeLine(creds, line.unread.map((m) => m.id));
+    return prompt;
+  }
+
+  private async ensurePostofficePoller(sessionId: string): Promise<void> {
+    if (this.postofficePollers.has(sessionId)) return;
+    const mcp = await loadEnabledMcpServers(sessionId);
+    const creds = postofficeCredsFromMcp(mcp);
+    if (!creds) return;
+    const tick = async () => {
+      if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) return;
+      try {
+        const agent = await prisma.agent.findUnique({ where: { id: sessionId } });
+        if (!agent || readMetaBool(agent.metadata, "closed")) {
+          this.stopPostofficePoller(sessionId);
+          return;
+        }
+        const prompt = await this.postofficeUnreadPoke(sessionId);
+        if (prompt) void this.sendMessage(sessionId, prompt);
+      } catch {
+        /* mailbox unreachable */
+      }
+    };
+    const handle = setInterval(() => {
+      void tick();
+    }, 3000);
+    this.postofficePollers.set(sessionId, handle);
   }
 
   /** /skill enable|disable|auto — persist the per-agent skill toggle list
@@ -3046,6 +3097,9 @@ export class SessionManager {
     let resultMsg: unknown = null;
     try {
       for await (const event of runtime.query(runtimeOpts)) {
+        // Compact is a run too: without this every event it received was
+        // invisible to liveness, which then reported "no signal has been fed".
+        if (run) this.liveness.noteModelEvent(run.runId);
         if (event.type === "error") {
           if (event.code === "PROJECT_ROOT_NOT_FOUND") return null;
           throw Object.assign(new Error(event.message), { code: event.code });
@@ -3324,6 +3378,13 @@ export class SessionManager {
     const planDeadlineMs = plan?.liveness.hardDeadlineMs ?? null;
     const deadlineAtMs = planDeadlineMs === null ? null : Date.now() + planDeadlineMs;
     const remainingBudgetMs = (): number | null => (deadlineAtMs === null ? null : deadlineAtMs - Date.now());
+    // The compact owns a run in `running`; its signal is what `/stop` aborts.
+    // Handing it to every summarizer call is what makes cancel actually cancel
+    // this long, layered operation instead of leaving it running behind an idle
+    // UI. The run also gets a model-event signal per layer so /status shows
+    // progress rather than "no signal has been fed".
+    const compactRun = this.running.get(id);
+    const compactSignal = compactRun?.abort.signal;
     const layered = await summarizeLayered({
       turns,
       chunkTokens: budgets.chunkTokens,
@@ -3344,7 +3405,8 @@ export class SessionManager {
           err.code = "RUNTIME_WALL_CLOCK_LIMIT";
           throw err;
         }
-        const text = (await this.quickQuery(id, prompt, remaining)).trim();
+        if (compactRun) this.liveness.noteModelEvent(compactRun.runId);
+        const text = (await this.quickQuery(id, prompt, remaining, compactSignal)).trim();
         return text || "(model returned empty summary)";
       },
     });
@@ -3656,7 +3718,15 @@ export class SessionManager {
    *  one, and that deadline is honoured with a structured reason. The USER's own
    *  ceiling (`maxRunDurationMs`) is the only other deadline that may apply, and
    *  it applies here because it is the user's, not ours. */
-  async quickQuery(agentId: string, prompt: string, abortMs: number | null = null): Promise<string> {
+  async quickQuery(
+    agentId: string,
+    prompt: string,
+    abortMs: number | null = null,
+    /** The owning run's signal. Without it this helper had its own controller
+     *  and `/stop` could not reach the model call: the UI returned to idle while
+     *  the summarizer kept running behind it. */
+    parentSignal?: AbortSignal,
+  ): Promise<string> {
     const agent = await prisma.agent.findUnique({ where: { id: agentId } });
     if (!agent) throw new Error("agent not found");
     let resolvedProvider: Awaited<ReturnType<typeof prisma.provider.findUnique>> = null;
@@ -3681,6 +3751,14 @@ export class SessionManager {
     // Why the abort fired, as data. An abort with no reason is indistinguishable
     // from a crash, and the caller cannot tell the user which one happened.
     let abortReason: string | null = null;
+    const onParentAbort = () => {
+      abortReason = "the run was cancelled while this helper call was in flight";
+      abort.abort();
+    };
+    if (parentSignal) {
+      if (parentSignal.aborted) onParentAbort();
+      else parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    }
 
     const runtime = this.runtimeResolver(resolvedProvider?.kind ?? "anthropic-local");
     // A side-channel query still runs under a plan (the OpenAI runtime refuses
@@ -3779,6 +3857,9 @@ export class SessionManager {
       }
     } finally {
       if (timer) clearTimeout(timer);
+      // `{ once: true }` removes a listener that fired; this covers the normal
+      // completion path so a long-lived signal does not accumulate listeners.
+      parentSignal?.removeEventListener("abort", onParentAbort);
     }
 
     // A deadline that fired is REPORTED, not swallowed into an empty string.
@@ -6580,6 +6661,15 @@ export class SessionManager {
         // it, so the queue is starved for as long as the loop keeps continuing.
         // Deliver the queued work first; the loop decides again after that turn.
         const queuedBeforeLoop = this.hasQueuedTurn(sessionId);
+        if (!autoRecoverAfterRun && !queuedBeforeLoop) {
+          try {
+            const poke = await this.postofficeUnreadPoke(sessionId);
+            if (poke) autoRecoverAfterRun = { userInput: poke, opts: {} };
+          } catch (err) {
+            console.error(`[postoffice] unread poke failed for ${sessionId}:`, err);
+          }
+        }
+        void this.ensurePostofficePoller(sessionId);
         if (!autoRecoverAfterRun && loopEligible && this.loops && !queuedBeforeLoop) {
           try {
             const cont = await this.loops.onTurnSettled(sessionId, { lastText: finalText });
