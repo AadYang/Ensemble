@@ -222,12 +222,26 @@ export function McpServerPanel({
               </div>
             </div>
           ) : (
-            <button
-              onClick={() => setAdding(true)}
-              className="px-2 py-0.5 mt-1 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)]"
-            >
-              {t("mcp.add")}
-            </button>
+            <div className="flex gap-1 mt-1">
+              <button
+                onClick={() => setAdding(true)}
+                className="flex-1 px-2 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)]"
+              >
+                {t("mcp.add")}
+              </button>
+              {/* Rows can change outside this panel (API, another agent, a
+                  scoped rebind). Without a refresh the only way to see them was
+                  restarting the app. */}
+              <button
+                type="button"
+                onClick={() => void refresh()}
+                title={t("mcp.refresh")}
+                aria-label={t("mcp.refresh")}
+                className="px-2 py-0.5 border border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--accent)] hover:border-[var(--accent)] focus-visible:outline focus-visible:outline-1 focus-visible:outline-[var(--accent)]"
+              >
+                ↻
+              </button>
+            </div>
           )}
       </div>
     </CollapsibleSection>
