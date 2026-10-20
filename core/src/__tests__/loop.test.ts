@@ -133,6 +133,40 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("running");
   });
 
+  it("rolls the turn window while the board keeps advancing, and pauses when it stalls", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-turn-cap-"));
+    gitInitWithDirtyFile(root);
+    const agent = seedAgent("turn-cap", root);
+    const host = mockHost();
+    const mgr = new LoopManager(mockJobs(0, "ok"), mockHub(), host);
+    await mgr.start(agent.id, {
+      goal: "finish the board",
+      doneWhen: { kind: "file-contains", spec: "## DONE" },
+      maxTurnsPerIter: 2,
+    });
+    writeFileSync(join(root, "TASKS.md"), "- [ ] one\n- [ ] two\n");
+
+    // Turn 1: no new tick, window 1/2.
+    await mgr.onTurnSettled(agent.id, { lastText: "working" });
+    expect(mgr.view(agent.id)?.status).toBe("running");
+    expect(mgr.view(agent.id)?.innerTurns).toBe(1);
+
+    // Turn 2 ticks an item AND reaches the ceiling: the attempt continues in a
+    // fresh window instead of pausing a productive loop.
+    writeFileSync(join(root, "TASKS.md"), "- [x] one\n- [ ] two\n");
+    await mgr.onTurnSettled(agent.id, { lastText: "done one" });
+    expect(mgr.view(agent.id)?.status).toBe("running");
+    expect(mgr.view(agent.id)?.innerTurns).toBe(0);
+    expect(host.calls.some((c) => c.includes("turn window rolled over"))).toBe(true);
+
+    // Two more turns without a tick reach the ceiling again — this time the
+    // board did not move, so the loop pauses.
+    await mgr.onTurnSettled(agent.id, { lastText: "stuck" });
+    await mgr.onTurnSettled(agent.id, { lastText: "still stuck" });
+    expect(mgr.view(agent.id)?.status).toBe("paused");
+    expect(mgr.view(agent.id)?.iterations.at(-1)?.summary).toMatch(/inner-turn cap 2 reached/);
+  });
+
   it("resume refills an attempt budget that was already spent", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-resume-cap-"));
     gitInitWithDirtyFile(root);

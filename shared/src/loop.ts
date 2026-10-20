@@ -59,6 +59,9 @@ export interface LoopState {
   lastVerifyOk: boolean | null;
   lastVerifySummary: string;
   lastSnapshot: string | null;
+  /** Checked items in TASKS.md as of the previous turn, used to tell "still
+   *  working" from "spinning" when the per-attempt turn ceiling is reached. */
+  lastDoneCount: number;
   iterations: LoopIteration[];
 }
 
@@ -79,7 +82,10 @@ export interface LoopView {
 }
 
 export type LoopDecision =
-  | { action: "continue"; userInput: string }
+  // `resetTurns` opens a fresh turn window for the SAME attempt: the ceiling
+  // was reached, but the board advanced, so stopping would interrupt progress
+  // rather than brake a stall.
+  | { action: "continue"; userInput: string; resetTurns?: boolean }
   | { action: "outer-iter"; userInput: string; resetRuntime: boolean }
   | { action: "pause"; reason: string }
   | { action: "done"; summary: string }
@@ -195,6 +201,7 @@ export function emptyLoopState(): LoopState {
     lastVerifyOk: null,
     lastVerifySummary: "",
     lastSnapshot: null,
+    lastDoneCount: 0,
     iterations: [],
   };
 }
@@ -223,6 +230,8 @@ export function parseLoopState(raw: unknown): LoopState {
     lastVerifyOk: typeof r.lastVerifyOk === "boolean" ? r.lastVerifyOk : null,
     lastVerifySummary: typeof r.lastVerifySummary === "string" ? r.lastVerifySummary : "",
     lastSnapshot: typeof r.lastSnapshot === "string" ? r.lastSnapshot : null,
+    lastDoneCount:
+      typeof r.lastDoneCount === "number" && r.lastDoneCount >= 0 ? Math.floor(r.lastDoneCount) : 0,
     iterations,
   };
 }
@@ -315,10 +324,18 @@ export function decideLoopAfterVerify(input: {
   markerHit: boolean;
   hasDiff: boolean;
   reviewText?: string;
+  /** The board advanced this turn (new checked items). A productive attempt is
+   *  rolled into a fresh turn window instead of being paused at the ceiling:
+   *  the cap is a stall brake, not a progress brake. */
+  progressed?: boolean;
 }): LoopDecision {
-  const { config, state, verifyOk, summary, markerHit, hasDiff, reviewText } = input;
+  const { config, state, verifyOk, summary, markerHit, hasDiff, reviewText, progressed = false } = input;
   const turnCap = config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER;
   const turnCapReached = state.innerTurns >= turnCap;
+  const capDecision = (): LoopDecision =>
+    progressed
+      ? { action: "continue", userInput: loopContinuePrompt(config), resetTurns: true }
+      : { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
   const failPrompt = [
     "VERIFY FAIL. The completion condition is not met. Continue. Do not stop until it passes.",
     summary.trim() ? `Failure summary:\n${summary.trim()}` : "",
@@ -348,9 +365,7 @@ export function decideLoopAfterVerify(input: {
         userInput: failPrompt,
       };
     }
-    if (turnCapReached) {
-      return { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
-    }
+    if (turnCapReached) return capDecision();
     return { action: "continue", userInput: failPrompt };
   }
 
@@ -377,9 +392,7 @@ export function decideLoopAfterVerify(input: {
         reason: `no ## DONE and no further diff after ${state.consecutiveFails} turns`,
       };
     }
-    if (turnCapReached) {
-      return { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
-    }
+    if (turnCapReached) return capDecision();
     // Same attempt, next turn: the board is not finished yet. This does NOT
     // consume an attempt, so a 20-item board can run in one attempt.
     return {

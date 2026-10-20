@@ -5,6 +5,7 @@ import { readTail } from "./jobs.js";
 import { prisma, type Agent, type AgentLoop, type AgentLoopStatus } from "./db.js";
 import type { WSHub } from "./ws/hub.js";
 import {
+  DEFAULT_MAX_TURNS_PER_ITER,
   LOOP_CONSECUTIVE_FAIL_LIMIT,
   LOOP_ITERATION_LOG_CAP,
   LoopConfigError,
@@ -355,6 +356,12 @@ export class LoopManager {
       const markerHit = fileMarkerHit(markerPathText(root, config.doneWhen.spec || "TASKS.md"), config.doneWhen.spec);
       const git = root ? await readGitState(root).catch(() => null) : null;
       const hasDiff = git ? gitWorkTreeDirty(git) : false;
+      // Board progress is the honest "still working" signal. The per-attempt
+      // turn ceiling used to stop an agent that had just ticked 75 of 89 items
+      // simply because it was the 50th turn; now it only brakes a stall.
+      const doneCount = readTasks(root).filter((task) => task.done).length;
+      const progressed = doneCount > state.lastDoneCount;
+      state.lastDoneCount = doneCount;
       if (!verify.ok) state.consecutiveFails += 1;
       else if (config.doneWhen.kind === "file-contains" && !markerHit && !hasDiff) state.consecutiveFails += 1;
       else state.consecutiveFails = 0;
@@ -365,6 +372,7 @@ export class LoopManager {
         summary: verify.summary,
         markerHit,
         hasDiff,
+        progressed,
       });
       return await this.applyDecision(agentId, config, state, decision, verify.ok);
     } finally {
@@ -413,12 +421,24 @@ export class LoopManager {
     };
 
     if (decision.action === "continue") {
+      // The ceiling was reached with the board still advancing: open a fresh
+      // turn window for the SAME attempt rather than pausing productive work.
+      if (decision.resetTurns) state.innerTurns = 0;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
-      await this.host.persistLoopNotice(
-        agentId,
-        `VERIFY FAIL · iter ${state.iter} · consecutive ${state.consecutiveFails}/${LOOP_CONSECUTIVE_FAIL_LIMIT}\n${state.lastVerifySummary}`,
-      );
+      if (decision.resetTurns) {
+        await this.host.persistLoopNotice(
+          agentId,
+          `LOOP · turn window rolled over at ${config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER} (board advanced)`,
+        );
+      } else if (!verifyOk) {
+        // A green verifier on the "not finished yet" path is not a failure; it
+        // used to be announced as VERIFY FAIL, which read as a contradiction.
+        await this.host.persistLoopNotice(
+          agentId,
+          `VERIFY FAIL · iter ${state.iter} · consecutive ${state.consecutiveFails}/${LOOP_CONSECUTIVE_FAIL_LIMIT}\n${state.lastVerifySummary}`,
+        );
+      }
       return { userInput: decision.userInput };
     }
 
