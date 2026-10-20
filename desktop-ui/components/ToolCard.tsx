@@ -30,10 +30,12 @@ export function ToolCard({
   name,
   input,
   status,
+  result,
 }: {
   name: string;
   input: unknown;
   status?: ToolCardStatus;
+  result?: string;
 }) {
   const displayName = displayToolName(name);
   const isSubagent = isSubagentToolName(name);
@@ -92,6 +94,11 @@ export function ToolCard({
       {content && (
         <div className="text-[var(--text)] whitespace-pre-wrap break-words leading-snug">
           {content}
+        </div>
+      )}
+      {result && (
+        <div className="text-[var(--text)] whitespace-pre-wrap break-words leading-snug mt-1 pt-1 border-t border-[var(--border)]">
+          {result}
         </div>
       )}
     </div>

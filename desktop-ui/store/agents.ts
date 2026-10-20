@@ -31,6 +31,7 @@ import {
 } from "@agentorch/shared";
 import type { Locale } from "@/i18n/dict";
 import type { CloudAccount, CloudSession, CloudSnapshot, CloudWorkspace } from "@/lib/cloud-api";
+import { displayToolName } from "@/lib/tool-display";
 
 const LOCALE_KEY = "ensemble:locale";
 const INPUT_HISTORY_KEY = "ensemble:input-history";
@@ -78,6 +79,8 @@ export interface ChatTurn {
   text: string;
   toolName?: string;
   toolInput?: unknown;
+  toolId?: string;
+  toolResult?: string;
   streaming?: boolean;
   peerOrigin?: PeerOrigin;
   tone?: "error" | "warn";
@@ -457,7 +460,7 @@ const backgroundTaskTurn = (seq: number, msg: SdkMessage): ChatTurn | null => {
   };
 };
 
-type AssistantBlock = { type: string; text?: string; thinking?: string; name?: string; input?: unknown };
+type AssistantBlock = { type: string; id?: string; text?: string; thinking?: string; name?: string; input?: unknown };
 
 const assistantBlocks = (msg: SdkMessage): AssistantBlock[] =>
   (msg as { message?: { content?: AssistantBlock[] } }).message?.content ?? [];
@@ -468,6 +471,93 @@ const assistantTextOf = (blocks: AssistantBlock[]): string =>
     .map((b) => b.text!)
     .join("");
 
+const MAILBOX_RESULT_TOOLS = new Set([
+  "connect",
+  "dial",
+  "answer",
+  "send",
+  "send_file",
+  "inbox",
+  "inbox_wait",
+  "query",
+  "transcript",
+]);
+
+function toolResultText(content: unknown): string {
+  const parts: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v === "string" && v.trim()) parts.push(v);
+  };
+  if (typeof content === "string") push(content);
+  else if (Array.isArray(content)) {
+    for (const b of content) {
+      if (typeof b === "string") push(b);
+      else if (b && typeof b === "object" && "text" in b) push((b as { text?: unknown }).text);
+    }
+  }
+  return parts.join("\n");
+}
+
+function mailboxToolDisplay(content: unknown): string | undefined {
+  const raw = toolResultText(content);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { display?: unknown };
+    if (typeof parsed.display === "string" && parsed.display.trim()) return parsed.display;
+  } catch {
+    /* display-first MCP text */
+  }
+  const marker = raw.indexOf("\n---json---\n");
+  const visible = marker >= 0 ? raw.slice(0, marker).trim() : raw.trim();
+  if (
+    visible.includes("--- thread ---") ||
+    visible.startsWith("YOU SENT") ||
+    visible.startsWith("INCOMING") ||
+    visible.startsWith("CONNECTED") ||
+    visible.startsWith("STILL ON THE CALL") ||
+    visible.startsWith("NO LINE") ||
+    visible.startsWith("WAITING FOR CALL") ||
+    visible.startsWith("RINGING") ||
+    /^\[[0-9]{4}-/.test(visible)
+  ) {
+    return visible;
+  }
+  return undefined;
+}
+
+function applyMailboxToolResults(turns: ChatTurn[], content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  let changed = false;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as { type?: string; tool_use_id?: string; content?: unknown };
+    if (b.type !== "tool_result") continue;
+    const display = mailboxToolDisplay(b.content);
+    if (!display) continue;
+    let idx = -1;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i]!;
+      if (t.kind !== "tool_use") continue;
+      if (b.tool_use_id && t.toolId === b.tool_use_id) {
+        idx = i;
+        break;
+      }
+      if (
+        idx < 0 &&
+        !t.toolResult &&
+        MAILBOX_RESULT_TOOLS.has(displayToolName(t.toolName))
+      ) {
+        idx = i;
+      }
+    }
+    if (idx < 0) continue;
+    if (turns[idx]!.toolResult === display) continue;
+    turns[idx] = { ...turns[idx]!, toolResult: display };
+    changed = true;
+  }
+  return changed;
+}
+
 const toolUseTurns = (seq: number, blocks: AssistantBlock[]): ChatTurn[] =>
   blocks
     .filter((b) => b.type === "tool_use")
@@ -477,6 +567,7 @@ const toolUseTurns = (seq: number, blocks: AssistantBlock[]): ChatTurn[] =>
       text: `${b.name ?? "tool"}(...)`,
       toolName: b.name,
       toolInput: b.input,
+      toolId: b.id,
     }));
 
 const THINKING_PROGRESS_KEY = "thinking_tokens";
@@ -627,8 +718,7 @@ function sdkHistoryTurns(seq: number, msg: SdkMessage): ChatTurn[] {
         )
         .join("");
     }
-    if (!text) return [];
-    return [{ seq, kind: "user", text }];
+    return text ? [{ seq, kind: "user", text }] : [];
   }
   const turn = sdkMessageToTurn(seq, msg);
   return turn ? [turn] : [];
@@ -1023,6 +1113,12 @@ export const useStore = create<Store>((set) => ({
       for (const row of rows) {
         if (have.has(row.seq)) continue;
         extra.push(...sdkHistoryTurns(row.seq, row.msg));
+        if (row.msg.type === "user") {
+          applyMailboxToolResults(
+            extra,
+            (row.msg as { message?: { content?: unknown } }).message?.content,
+          );
+        }
       }
       if (extra.length === 0) return s;
       extra.sort((a, b) => a.seq - b.seq);
@@ -1072,6 +1168,8 @@ export const useStore = create<Store>((set) => ({
         // payloads so peer-relayed messages and history replay become visible. Dedupe
         // against the optimistic appendUserTurn that the local sender already pushed.
         const content = (msg as { message?: { content?: unknown } }).message?.content;
+        const turns = ag.turns.slice();
+        const attached = applyMailboxToolResults(turns, content);
         let text = "";
         if (typeof content === "string") {
           text = content;
@@ -1086,24 +1184,30 @@ export const useStore = create<Store>((set) => ({
             )
             .join("");
         }
-        if (!text) return s;
+        if (text) {
+          // Peer handoff: server attaches `_peerOrigin` for non-raw modes; raw mode
+          // stays on the legacy `[from X] body` text format (parsed in ChatPane).
+          let peerOrigin: PeerOrigin | undefined;
+          const peerMeta = (msg as { _peerOrigin?: { fromAgentName: string; mode: PeerMode } })._peerOrigin;
+          if (peerMeta && typeof peerMeta === "object") {
+            peerOrigin = { direction: "in", fromName: peerMeta.fromAgentName, mode: peerMeta.mode };
+            const stripped = stripPeerHandoff(text);
+            if (stripped) text = stripped;
+          }
 
-        // Peer handoff: server attaches `_peerOrigin` for non-raw modes; raw mode
-        // stays on the legacy `[from X] body` text format (parsed in ChatPane).
-        let peerOrigin: PeerOrigin | undefined;
-        const peerMeta = (msg as { _peerOrigin?: { fromAgentName: string; mode: PeerMode } })._peerOrigin;
-        if (peerMeta && typeof peerMeta === "object") {
-          peerOrigin = { direction: "in", fromName: peerMeta.fromAgentName, mode: peerMeta.mode };
-          const stripped = stripPeerHandoff(text);
-          if (stripped) text = stripped;
+          const last = turns[turns.length - 1];
+          if (!(last && last.kind === "user" && last.text === text)) {
+            const turn: ChatTurn = peerOrigin
+              ? { seq, kind: "user", text, peerOrigin }
+              : { seq, kind: "user", text };
+            turns.push(turn);
+          } else if (!attached) {
+            return s;
+          }
+          return { agents: { ...s.agents, [id]: { ...ag, turns } } };
         }
-
-        const last = ag.turns[ag.turns.length - 1];
-        if (last && last.kind === "user" && last.text === text) return s;
-        const turn: ChatTurn = peerOrigin
-          ? { seq, kind: "user", text, peerOrigin }
-          : { seq, kind: "user", text };
-        return { agents: { ...s.agents, [id]: { ...ag, turns: [...ag.turns, turn] } } };
+        if (!attached) return s;
+        return { agents: { ...s.agents, [id]: { ...ag, turns } } };
       }
 
       const turn = sdkMessageToTurn(seq, msg);

@@ -7,12 +7,14 @@
 // short forms (`peer_send`, `ask_user`, `Task`). To keep ToolCard and the
 // permission dialog runtime-agnostic, normalize on display.
 
-const MCP_PREFIX_RE = /^mcp__[^_]+(?:__[^_]+)*__/;
-
-/** Strip the SDK's `mcp__<server>__` prefix from tool names so Claude side's
- *  `mcp__agentorch-peer__peer_send` and OpenAI side's `peer_send` render
- *  identically in the UI. */
+/** Strip the SDK's `mcp__<server>__` prefix so `mcp__agentorch-peer__peer_send`
+ *  and `mcp__ensemble-postoffice__inbox_wait` render as the short tool name.
+ *  Split on `__` — a character-class regex cannot keep underscores in the tool. */
 export function displayToolName(raw: string | undefined | null): string {
   if (!raw) return "tool";
-  return raw.replace(MCP_PREFIX_RE, "");
+  if (raw.startsWith("mcp__")) {
+    const parts = raw.split("__");
+    if (parts.length >= 3) return parts.slice(2).join("__");
+  }
+  return raw;
 }

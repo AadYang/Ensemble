@@ -50,7 +50,7 @@ export function toolCardContent(toolName: string, input: unknown): string | unde
   if (!input || typeof input !== "object") return undefined;
   const name = displayToolName(toolName);
   const o = input as Record<string, unknown>;
-  if (name === "peer_send") {
+  if (name === "peer_send" || name === "send" || name === "send_file") {
     return firstString(o, PEER_BODY_KEYS);
   }
   if (name === "ask_user") {

@@ -1462,7 +1462,7 @@ const Turn = memo(function Turn({ t, tr }: { t: ChatTurn; tr: TranslateFn }) {
     if (isExitPlanModeTool(t.toolName)) {
       return <PlanDocument plan={planBodyFromToolInput(t.toolInput)} />;
     }
-    return <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} />;
+    return <ToolCard name={t.toolName ?? "tool"} input={t.toolInput} result={t.toolResult} />;
   }
 
   if (t.kind === "thinking") {
