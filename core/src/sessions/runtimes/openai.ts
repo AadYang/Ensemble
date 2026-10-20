@@ -34,6 +34,7 @@ import {
   NORMALIZED_TOOLS,
   toOpenAITool,
   makePeerSendTool,
+  makePeerAskTool,
   makePeerQueryTool,
   makeConversationSearchTool,
   makeAskUserTool,
@@ -290,6 +291,7 @@ async function* runTurnOnce(
     );
     const sessionAware: AnyNormalizedTool[] = [];
     if (opts.peerSend) sessionAware.push(makePeerSendTool(opts.peerSend));
+    if (opts.peerAsk) sessionAware.push(makePeerAskTool(opts.peerAsk));
     if (opts.peerQuery) sessionAware.push(makePeerQueryTool(opts.peerQuery));
     if (opts.conversationSearch) sessionAware.push(makeConversationSearchTool(opts.conversationSearch));
     if (opts.askUser) sessionAware.push(makeAskUserTool(opts.askUser));

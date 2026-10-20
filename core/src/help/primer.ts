@@ -43,6 +43,11 @@ Cross-agent communication tools you have:
                listed in TEAM CONTEXT. Never an agent outside the team — even one
                with the same name (that is a different agent; the tool refuses it).
                Ungrouped agents may only contact other ungrouped agents.
+  peer_ask   → ask a teammate a question and WAIT for the answer IN THIS TURN.
+               Use it ONLY on a real blocker you cannot resolve by reading the
+               repo or making a reasonable assumption. Never for status updates
+               or confirmations. A timeout is a failure: stop and report the
+               blocker — do not continue on a guess.
   peer_query → read another agent's recent text turns (synchronous, no run)
   conversation_search -> keyword search prior user/assistant messages
                (read-only DB lookup; default scope team, fallback self)

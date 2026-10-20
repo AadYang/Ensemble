@@ -98,6 +98,14 @@ export interface BridgeHandlers {
     causalRunId?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
+  /** Blocking peer question. Parks the tool call until the answer arrives;
+   *  a timeout is returned as a tool error, never as a silent success. */
+  peerAsk?: (args: {
+    target: string;
+    question: string;
+    blockingReason: string;
+    timeoutMs?: number;
+  }) => Promise<{ text: string; isError?: true }>;
   conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
   spawnTask?: (args: {
@@ -153,6 +161,7 @@ export function unregisterHandlers(agentId: string): void {
 export type InternalToolName =
   | "peer_send"
   | "peer_query"
+  | "peer_ask"
   | "conversation_search"
   | "ensemble_help"
   | "skill_list"
@@ -221,6 +230,17 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
         target: String(args.target ?? ""),
         limit: typeof args.limit === "number" ? args.limit : undefined,
       });
+    case "peer_ask": {
+      if (!handlers.peerAsk) throw new Error("peer_ask is not available for this agent");
+      const result = await handlers.peerAsk({
+        target: String(args.target ?? ""),
+        question: String(args.question ?? ""),
+        blockingReason: String(args.blockingReason ?? ""),
+        ...(typeof args.timeoutMs === "number" ? { timeoutMs: args.timeoutMs } : {}),
+      });
+      if (result.isError) throw new Error(result.text);
+      return result.text;
+    }
     case "conversation_search":
       if (!handlers.conversationSearch) throw new Error("conversation_search is not available for this agent");
       {
@@ -405,6 +425,18 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
     "Ask the human user a question and wait for their answer. Pass option labels; the returned string is the chosen label.",
     { question: z.string().min(1), options: z.array(z.string().min(1)).min(1) },
     async (args) => ({ content: [{ type: "text", text: await invoke("ask_user", args) }] }),
+  );
+  mcp.tool(
+    "peer_ask",
+    "Ask a teammate a question and wait for the answer IN THIS TURN. Use ONLY on a real blocker. " +
+      "A timeout is a failure, not permission to guess.",
+    {
+      target: z.string().min(1),
+      question: z.string().min(1),
+      blockingReason: z.string().min(8),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+    async (args) => ({ content: [{ type: "text", text: await invoke("peer_ask", args) }] }),
   );
   mcp.tool(
     "Task",
@@ -653,6 +685,25 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
         async (args) => {
           const text = await askUser(args);
           return { content: [{ type: "text", text }] };
+        },
+      );
+    }
+    if (handlers.peerAsk) {
+      const peerAsk = handlers.peerAsk;
+      mcp.tool(
+        "peer_ask",
+        "Ask a teammate a question and wait for the answer IN THIS TURN. Use ONLY on a real blocker. " +
+          "A timeout is a failure, not permission to guess.",
+        {
+          target: z.string().min(1),
+          question: z.string().min(1),
+          blockingReason: z.string().min(8),
+          timeoutMs: z.number().int().positive().optional(),
+        },
+        async (args) => {
+          const result = await peerAsk(args);
+          if (result.isError) throw new Error(result.text);
+          return { content: [{ type: "text", text: result.text }] };
         },
       );
     }

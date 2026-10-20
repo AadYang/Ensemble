@@ -1195,14 +1195,21 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
                     ? "text-[var(--warn)]"
                     : "text-[var(--accent)]"
               }
-              title={loop.lastVerifySummary || loop.config.goal}
+              title={
+                (loop.status === "paused"
+                  ? loop.iterations[loop.iterations.length - 1]?.summary
+                  : "") || loop.lastVerifySummary || loop.config.goal
+              }
             >
               {t("loop.chip.label")} {loop.iter}/{loop.maxIterations}
-              {loop.lastVerifyOk === false
-                ? ` · ${t("loop.chip.verifyFail")}`
-                : loop.lastVerifyOk === true
-                  ? ` · ${t("loop.chip.verifyOk")}`
-                  : ""}
+              {loop.status === "paused" ? ` · ${t("loop.chip.paused")}` : ""}
+              {loop.config.verifier
+                ? loop.lastVerifyOk === false
+                  ? ` · ${t("loop.chip.verifyFail")}`
+                  : loop.lastVerifyOk === true
+                    ? ` · ${t("loop.chip.verifyOk")}`
+                    : ""
+                : ` · ${t("loop.chip.verifyNone")}`}
             </span>
             {loop.status === "paused" ? (
               <button

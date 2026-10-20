@@ -92,6 +92,7 @@ import {
   makeConversationSearchHandler,
   PEER_MCP_SERVER_NAME,
   PEER_SEND_TOOL_NAME,
+  PEER_ASK_TOOL_NAME,
   PEER_QUERY_TOOL_NAME,
   CONVERSATION_SEARCH_TOOL_NAME,
 } from "../peer-mcp.js";
@@ -399,6 +400,10 @@ interface RunningSession {
    *  read when the plan is resolved, and the LivenessController does the timing. */
   idleTimeoutMs?: number;
   nonInteractive?: boolean;
+  /** How many blocking peer_ask calls this turn has already made. A turn that
+   *  asks over and over is not "blocked" — it is using peers as a search
+   *  engine, and the loop would drift while waiting. */
+  peerAskUsed?: number;
   blockedFreshnessAction?: FreshnessBlockedAction;
   freshnessContinuationUsed?: boolean;
   /** How many freshness-continuation turns have already chained to reconcile a
@@ -461,6 +466,27 @@ interface PendingUserQuestion {
   question: string;
   options: string[];
 }
+
+/** One in-flight blocking peer_ask. The sender's tool call is parked on
+ *  `resolve`; the peer's peer_send with `replyToCorrelationId` (or the only
+ *  open ask to that peer) hands the answer straight back into the SAME turn
+ *  instead of queueing a new one. */
+interface PendingPeerAsk {
+  resolve: (answer: string) => void;
+  askId: string;
+  fromAgentId: string;
+  targetAgentId: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const PEER_ASK_DEFAULT_TIMEOUT_MS = 15 * 60_000;
+const PEER_ASK_MAX_TIMEOUT_MS = 30 * 60_000;
+/** A real blocker is rare. Five per turn is already generous; past that the
+ *  agent should stop and report rather than keep interrogating its peers. */
+const PEER_ASK_MAX_PER_TURN = 5;
+const PEER_ASK_MIN_BLOCKING_REASON = 8;
+const PEER_ASK_TIMEOUT = "\u0000peer-ask-timeout";
+const PEER_ASK_ABORTED = "\u0000peer-ask-aborted";
 
 interface ForceStopOptions {
   expectedRunId?: string;
@@ -1456,6 +1482,7 @@ export class SessionManager {
   });
   private pending = new Map<string, Map<string, PendingPermission>>();
   private pendingQuestions = new Map<string, Map<string, PendingUserQuestion>>();
+  private pendingPeerAsks = new Map<string, PendingPeerAsk>();
   private contextUsageByAgent = new Map<string, ContextUsage>();
   private liveContextByAgent = new Map<string, LiveContextState>();
   /** The plan the LAST turn actually ran under, per agent. `/status` reads this
@@ -5659,6 +5686,7 @@ export class SessionManager {
         tools: runtimeToolNames,
         allowedTools: [
           PEER_SEND_TOOL_NAME,
+          PEER_ASK_TOOL_NAME,
           PEER_QUERY_TOOL_NAME,
           CONVERSATION_SEARCH_TOOL_NAME,
           ASK_USER_TOOL_NAME,
@@ -5791,6 +5819,8 @@ export class SessionManager {
         peerQuery: makePeerQueryHandler(this, sessionId),
         conversationSearch: makeConversationSearchHandler(this, sessionId),
         askUser: makeAskUserHandler(this, sessionId),
+        peerAsk: (args) =>
+          this.askPeer(sessionId, args.target, args.question, args.blockingReason, args.timeoutMs),
         spawnTask: ({ description, prompt, background, projectRoot: childRoot }) =>
           this.spawnTaskSubagent(sessionId, description, prompt, {
             background,
@@ -6491,6 +6521,9 @@ export class SessionManager {
           for (const [, q] of qb) q.resolve("[run ended before answer]");
           this.pendingQuestions.delete(sessionId);
         }
+        // A turn that ends (success, error or cancel) can no longer receive an
+        // answer; wake any parked peer_ask with an explicit failure.
+        this.abortPeerAsksFor(sessionId);
         // A running loop re-injects its own prompt at the end of every turn, and
         // the branch below hands that prompt straight to a new run. Anything
         // that arrived while this turn was in flight — a manager's peer_send, a
@@ -6693,6 +6726,175 @@ export class SessionManager {
     if (!entry) return;
     bucket!.delete(reqId);
     entry.resolve(choice);
+  }
+
+  /** Blocking request/response with a peer.
+   *
+   *  `peer_send` is fire-and-forget: its reply arrives at the next turn
+   *  boundary. Inside one long turn that is too late — the agent keeps working
+   *  on a stale assumption. This parks the tool call until the peer answers,
+   *  then returns the answer INTO THE SAME TURN so the model can correct
+   *  before producing more work.
+   *
+   *  Policy, not just plumbing: a real blocker is required (`blockingReason`),
+   *  the turn gets a small ask budget, and a timeout is a FAILURE — never a
+   *  silent "continue anyway", because guessing produces more wrong work. */
+  async askPeer(
+    fromAgentId: string,
+    target: string,
+    question: string,
+    blockingReason: string,
+    timeoutMs?: number,
+  ): Promise<{ text: string; isError?: true }> {
+    const reason = blockingReason.trim();
+    if (reason.length < PEER_ASK_MIN_BLOCKING_REASON) {
+      return {
+        text:
+          "ERROR: peer_ask needs a concrete blockingReason. Use it ONLY when you cannot " +
+          "proceed correctly without the answer; if a reasonable assumption would let you " +
+          "continue, proceed instead.",
+        isError: true,
+      };
+    }
+    const fromAgent = await prisma.agent.findUnique({ where: { id: fromAgentId } });
+    if (!fromAgent) return { text: "ERROR: source agent not found", isError: true };
+    const targetId = await this.resolvePeerTarget(fromAgentId, target);
+    if (!targetId) return { text: `ERROR: no peer agent matches "${target}"`, isError: true };
+    const targetAgent = await prisma.agent.findUnique({ where: { id: targetId } });
+    if (!targetAgent) return { text: "ERROR: peer agent not found", isError: true };
+    const refusal = await this.peerContactRefusal(fromAgentId, targetAgent);
+    if (refusal) return { text: refusal, isError: true };
+    if (readMetaBool(targetAgent.metadata, "closed")) {
+      return {
+        text: `ERROR: peer agent "${targetAgent.name}" is closed; the user must restart it before it can answer`,
+        isError: true,
+      };
+    }
+
+    const run = this.running.get(fromAgentId);
+    if (run && (run.peerAskUsed ?? 0) >= PEER_ASK_MAX_PER_TURN) {
+      return {
+        text:
+          `BLOCKED: peer_ask budget (${PEER_ASK_MAX_PER_TURN}) exhausted for this turn. ` +
+          "Stop and report the blocker instead of asking again.",
+        isError: true,
+      };
+    }
+    if (run) run.peerAskUsed = (run.peerAskUsed ?? 0) + 1;
+
+    const waitMs = Math.max(1, Math.min(timeoutMs ?? PEER_ASK_DEFAULT_TIMEOUT_MS, PEER_ASK_MAX_TIMEOUT_MS));
+    const askId = randomUUID();
+    if (run) this.liveness.noteUserInputWait(run.runId, Date.now());
+
+    // Register BEFORE sending: a fast peer must not beat the map.
+    const answerPromise = new Promise<string>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingPeerAsks.delete(askId);
+        resolve(PEER_ASK_TIMEOUT);
+      }, waitMs);
+      timer.unref?.();
+      this.pendingPeerAsks.set(askId, {
+        resolve,
+        askId,
+        fromAgentId,
+        targetAgentId: targetId,
+        timer,
+      });
+    });
+
+    try {
+      const body = [
+        `[peer_ask — blocking] ${question.trim()}`,
+        "",
+        `Why this blocks me: ${reason}`,
+        "",
+        `Reply with peer_send(target="${fromAgent.name}", mode="raw", replyToCorrelationId="${askId}", message="<your answer>").`,
+        "I am waiting inside this turn; do not treat this as a status message.",
+      ].join("\n");
+      const delivery = await this.sendPeerMessage(fromAgentId, targetId, body, "raw", {
+        correlationId: askId,
+        correlationKind: "request",
+      });
+      const accepted =
+        /^(delivered to|queued for|replaced stale queued peer handoff for|interrupted and delivered to|suppressed duplicate peer_send)/.test(
+          delivery,
+        );
+      if (!accepted) {
+        this.abortPeerAsk(askId, PEER_ASK_ABORTED);
+        return { text: `ERROR: could not deliver peer_ask: ${delivery}`, isError: true };
+      }
+
+      const answer = await answerPromise;
+      if (answer === PEER_ASK_TIMEOUT) {
+        const waited =
+          waitMs >= 60_000
+            ? `${Math.round(waitMs / 60_000)} minute(s)`
+            : `${Math.max(1, Math.round(waitMs / 1_000))} second(s)`;
+        return {
+          text:
+            `BLOCKED: "${targetAgent.name}" did not answer within ${waited}. ` +
+            "Do NOT continue on assumptions — stop and report this blocker.",
+          isError: true,
+        };
+      }
+      if (answer === PEER_ASK_ABORTED) {
+        return {
+          text: "BLOCKED: the turn ended before the peer answered. Do not continue on assumptions.",
+          isError: true,
+        };
+      }
+      return { text: `Answer from "${targetAgent.name}":\n${answer}` };
+    } finally {
+      this.abortPeerAsk(askId, PEER_ASK_ABORTED, { silent: true });
+      if (run) this.liveness.noteUserInputWait(run.runId, null);
+    }
+  }
+
+  /** Resolve one pending ask by id (or the single open ask between the two
+   *  agents when the model omitted replyToCorrelationId). Returns true when
+   *  the message WAS the answer — such a message must not be queued as a turn. */
+  private resolvePendingPeerAsk(
+    replyToId: string | undefined,
+    senderAgentId: string,
+    recipientAgentId: string,
+    body: string,
+  ): boolean {
+    const matches = (ask: PendingPeerAsk) =>
+      ask.fromAgentId === recipientAgentId && ask.targetAgentId === senderAgentId;
+    let pending: PendingPeerAsk | undefined;
+    if (replyToId) {
+      const byId = this.pendingPeerAsks.get(replyToId);
+      if (byId && matches(byId)) pending = byId;
+    }
+    if (!pending) {
+      const open = [...this.pendingPeerAsks.values()].filter(matches);
+      if (open.length === 1) pending = open[0];
+      else if (open.length > 1) {
+        // Ambiguous without an id: do not guess which question this answers.
+        return false;
+      }
+    }
+    if (!pending) return false;
+    this.pendingPeerAsks.delete(pending.askId);
+    clearTimeout(pending.timer);
+    pending.resolve(body);
+    return true;
+  }
+
+  private abortPeerAsk(askId: string, reason: string, opts: { silent?: boolean } = {}): void {
+    const pending = this.pendingPeerAsks.get(askId);
+    if (!pending) return;
+    this.pendingPeerAsks.delete(askId);
+    clearTimeout(pending.timer);
+    if (!opts.silent) pending.resolve(reason);
+  }
+
+  /** The turn owning these asks is over; nobody is left to receive an answer. */
+  private abortPeerAsksFor(sessionId: string): void {
+    for (const [askId, ask] of this.pendingPeerAsks) {
+      if (ask.fromAgentId !== sessionId) continue;
+      this.abortPeerAsk(askId, PEER_ASK_ABORTED);
+    }
   }
 
   // ── result artifacts ───────────────────────────────────────────────────────
@@ -7220,6 +7422,14 @@ export class SessionManager {
     if (refusal) return refusal;
     if (readMetaBool(targetAgent.metadata, "closed")) {
       return `error: peer agent "${targetAgent.name}" is closed; user must restart it before it can receive messages`;
+    }
+
+    // A reply to a blocking peer_ask is consumed HERE: it belongs to the
+    // parked tool call in the asker's CURRENT turn, not to a future turn.
+    // Queueing it instead would deliver the answer after the work it was
+    // meant to correct.
+    if (this.resolvePendingPeerAsk(opts.replyToCorrelationId?.trim(), fromAgent.id, targetAgent.id, body)) {
+      return `delivered to pending peer_ask from "${targetAgent.name}" (id=${targetId.slice(0, 8)})`;
     }
 
     const sourceRun = this.running.get(fromAgent.id);

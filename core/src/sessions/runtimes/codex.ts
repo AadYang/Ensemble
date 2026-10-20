@@ -739,6 +739,7 @@ export class CodexCliRuntime implements AgentRuntime {
     // Claude SDK side gets via per-call makePeer/AskUserMcpServer factories).
     registerHandlers(opts.sessionId, {
       peerSend: opts.peerSend,
+      peerAsk: opts.peerAsk,
       peerQuery: opts.peerQuery,
       conversationSearch: opts.conversationSearch,
       askUser: opts.askUser,
@@ -768,6 +769,7 @@ export class CodexCliRuntime implements AgentRuntime {
     const internalMcpServerName = `agentorch-internal-${opts.sessionId.slice(0, 8)}`;
     const wantsBridge =
       opts.peerSend ||
+      opts.peerAsk ||
       opts.peerQuery ||
       opts.conversationSearch ||
       opts.askUser ||

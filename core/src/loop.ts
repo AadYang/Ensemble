@@ -228,7 +228,13 @@ export class LoopManager {
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row) return null;
     const config = parseLoopConfig(row.config);
-    const next = this.upsert(agentId, { status: "running", config, state: parseLoopState(row.state) });
+    const state = parseLoopState(row.state);
+    // A manual resume opens a fresh turn budget for the current attempt.
+    // Without this, a loop paused by the per-attempt turn cap would pause
+    // again on its very next turn.
+    state.innerTurns = 0;
+    state.consecutiveFails = 0;
+    const next = this.upsert(agentId, { status: "running", config, state });
     this.broadcast(next);
     await this.host.persistLoopNotice(agentId, "LOOP RESUME");
     void this.host.sendMessage(agentId, loopStartPrompt(config));
@@ -379,8 +385,24 @@ export class LoopManager {
     }
 
     if (decision.action === "review-reject") {
+      // A rejected review is a finished attempt that FAILED: advance the
+      // attempt budget here, not on every turn the reviewer has not replied.
+      if (state.iter >= config.maxIterations) {
+        pushIter("fail", `iteration cap ${config.maxIterations} reached`);
+        const paused = this.upsert(agentId, { status: "paused", config, state });
+        this.broadcast(paused);
+        await this.host.persistLoopNotice(agentId, `LOOP PAUSED · iteration cap ${config.maxIterations} reached`);
+        return null;
+      }
+      state.iter += 1;
+      state.innerTurns = 0;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
+      if (config.session === "fresh-disk") await this.host.resetRuntimeSession(agentId);
+      await this.host.persistLoopNotice(
+        agentId,
+        `LOOP attempt ${state.iter}/${config.maxIterations} · reviewer rejected`,
+      );
       return { userInput: decision.userInput };
     }
 
@@ -394,14 +416,17 @@ export class LoopManager {
           if (committed.ok) snapshot = committed.sha;
         }
       }
-      pushIter("pass", state.lastVerifySummary, snapshot);
+      // `outer-iter` is only produced for a rejected full attempt now
+      // (## DONE written, verifier still red), so the iteration log records a
+      // failure and the notice says which attempt is starting.
+      pushIter("fail", state.lastVerifySummary, snapshot);
       state.iter += 1;
       state.innerTurns = 0;
       state.lastSnapshot = snapshot;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
       if (decision.resetRuntime) await this.host.resetRuntimeSession(agentId);
-      await this.host.persistLoopNotice(agentId, `LOOP iter ${state.iter}/${config.maxIterations}`);
+      await this.host.persistLoopNotice(agentId, `LOOP attempt ${state.iter}/${config.maxIterations}`);
       return { userInput: decision.userInput };
     }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_MAX_TURNS_PER_ITER,
   LoopConfigError,
   decideLoopAfterVerify,
   emptyLoopState,
@@ -107,7 +108,7 @@ describe("decideLoopAfterVerify", () => {
     expect(d.action).toBe("done");
   });
 
-  it("kicks the outer loop when ## DONE is missing", () => {
+  it("keeps working in the same attempt while ## DONE is missing", () => {
     const cfg = parseLoopConfig({ goal: "ship it" });
     const d = decideLoopAfterVerify({
       config: cfg,
@@ -117,15 +118,14 @@ describe("decideLoopAfterVerify", () => {
       markerHit: false,
       hasDiff: true,
     });
-    expect(d.action).toBe("outer-iter");
-    if (d.action === "outer-iter") {
-      expect(d.resetRuntime).toBe(false);
+    expect(d.action).toBe("continue");
+    if (d.action === "continue") {
       expect(d.userInput).toContain("## DONE");
       expect(d.userInput).toContain("ship it");
     }
   });
 
-  it("resets the runtime on fresh-disk when the marker is missing", () => {
+  it("does not restart a fresh-disk loop just because the board is unfinished", () => {
     const cfg = parseLoopConfig({
       goal: "ship it",
       session: "fresh-disk",
@@ -139,8 +139,63 @@ describe("decideLoopAfterVerify", () => {
       markerHit: false,
       hasDiff: true,
     });
+    expect(d.action).toBe("continue");
+  });
+
+  it("counts an attempt when ## DONE was written but verification failed", () => {
+    const cfg = parseLoopConfig({ goal: "ship it", session: "fresh-disk" });
+    const d = decideLoopAfterVerify({
+      config: cfg,
+      state,
+      verifyOk: false,
+      summary: "2 failing",
+      markerHit: true,
+      hasDiff: true,
+    });
     expect(d.action).toBe("outer-iter");
-    if (d.action === "outer-iter") expect(d.resetRuntime).toBe(true);
+    if (d.action === "outer-iter") {
+      expect(d.resetRuntime).toBe(true);
+      expect(d.userInput).toContain("VERIFY FAIL");
+    }
+  });
+
+  it("does not consume an attempt for a verifier that is still red mid-work", () => {
+    const cfg = parseLoopConfig({ goal: "ship it" });
+    const d = decideLoopAfterVerify({
+      config: cfg,
+      state: { ...state, consecutiveFails: 1 },
+      verifyOk: false,
+      summary: "1 failing",
+      markerHit: false,
+      hasDiff: true,
+    });
+    expect(d.action).toBe("continue");
+  });
+
+  it("pauses at the per-attempt turn cap while work is still in progress", () => {
+    const cfg = parseLoopConfig({ goal: "ship it", maxTurnsPerIter: 5 });
+    const d = decideLoopAfterVerify({
+      config: cfg,
+      state: { ...state, innerTurns: 5 },
+      verifyOk: true,
+      summary: "ok",
+      markerHit: false,
+      hasDiff: true,
+    });
+    expect(d).toEqual({ action: "pause", reason: "inner-turn cap 5 reached" });
+  });
+
+  it("uses the default turn cap when the config does not set one", () => {
+    const cfg = parseLoopConfig({ goal: "ship it" });
+    const d = decideLoopAfterVerify({
+      config: cfg,
+      state: { ...state, innerTurns: DEFAULT_MAX_TURNS_PER_ITER },
+      verifyOk: true,
+      summary: "ok",
+      markerHit: false,
+      hasDiff: true,
+    });
+    expect(d.action).toBe("pause");
   });
 
   it("pauses a goal-only loop that stalls with no diff", () => {

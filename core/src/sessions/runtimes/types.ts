@@ -219,6 +219,15 @@ export interface RuntimeOptions {
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;
+  /** Blocking request/response with a peer. The call parks until the answer
+   *  arrives (or the timeout, which is a FAILURE: guessing is worse than
+   *  stopping). See SessionManager.askPeer for the delivery rules. */
+  peerAsk?: (args: {
+    target: string;
+    question: string;
+    blockingReason: string;
+    timeoutMs?: number;
+  }) => Promise<{ text: string; isError?: true }>;
   spawnTask?: (args: { description: string; prompt: string; background?: boolean; projectRoot?: string | null }) => Promise<{ finalText: string; subagentId: string; background?: boolean }>;
   ensembleHelp?: (args: { topic?: string }) => Promise<string>;
   skillList?: () => Promise<string>;

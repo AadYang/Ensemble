@@ -24,6 +24,7 @@ export { readTool, writeTool, editTool, bashTool, grepTool, globTool, exitPlanMo
 export {
   makePeerSendTool,
   makePeerQueryTool,
+  makePeerAskTool,
   makeConversationSearchTool,
   makeAskUserTool,
   makeTaskTool,
@@ -62,6 +63,7 @@ const READ_ONLY_TOOL_NAMES = new Set(["Read", "Grep", "Glob"]);
 const SESSION_AWARE_FREE_TOOLS = new Set([
   "peer_send",
   "peer_query",
+  "peer_ask",
   "conversation_search",
   "ask_user",
   "Task",

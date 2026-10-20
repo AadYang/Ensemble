@@ -1,6 +1,6 @@
 {
   "name": "ensemble",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Many minds. One workspace. — desktop multi-agent AI workbench",
   "packageManager": "pnpm@9.12.0",

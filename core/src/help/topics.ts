@@ -512,9 +512,14 @@ Config (shared LoopConfig):
   verifier          optional command | job | file-marker | peer-review
   verifier.spec     only if verifier is set
   doneWhen          default file-contains ## DONE; exit-0 | peer-lgtm are advanced
-  maxIterations     outer-loop cap (default 20). Does NOT change global maxTurns.
+  maxIterations     cap on FAILED full attempts (default 20), not on tasks or
+                    turns. One attempt spans as many turns as the board needs;
+                    it only advances when ## DONE is written and the verifier
+                    still rejects it (or a reviewer rejects). Does NOT change
+                    global maxTurns.
+  maxTurnsPerIter   turn cap inside ONE attempt (default 50; overridable).
   session           resume (default) | fresh-disk. fresh-disk calls resetRuntimeSession
-                    each outer iter and re-injects the goal + TASKS.md reminder.
+                    when an attempt FAILS and re-injects the goal + TASKS.md reminder.
   snapshot          git-commit | none. Commits via argv (no shell, no --force).
                     Empty commit = skip. No git reset --hard in 1.0.
   permissionBump    acceptEdits | bypassPermissions | null; restored on stop.

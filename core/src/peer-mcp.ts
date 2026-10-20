@@ -6,6 +6,7 @@ import type { SessionManager } from "./sessions/SessionManager.js";
 
 export const PEER_MCP_SERVER_NAME = "agentorch-peer";
 export const PEER_SEND_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_send`;
+export const PEER_ASK_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_ask`;
 export const PEER_QUERY_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_query`;
 export const CONVERSATION_SEARCH_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__conversation_search`;
 
@@ -53,6 +54,21 @@ export function makePeerQueryHandler(
   return async (args) => sessions.fetchPeerHistory(fromAgentId, args.target, args.limit ?? 20);
 }
 
+/** Blocking query: parks the tool call until the peer answers, so the answer
+ *  lands in the SAME turn instead of a later one. */
+export function makePeerAskHandler(
+  sessions: Pick<SessionManager, "askPeer">,
+  fromAgentId: string,
+): (args: {
+  target: string;
+  question: string;
+  blockingReason: string;
+  timeoutMs?: number;
+}) => Promise<{ text: string; isError?: true }> {
+  return async (args) =>
+    sessions.askPeer(fromAgentId, args.target, args.question, args.blockingReason, args.timeoutMs);
+}
+
 export function makeConversationSearchHandler(
   sessions: Pick<SessionManager, "conversationSearch">,
   fromAgentId: string,
@@ -70,6 +86,7 @@ export function makePeerMcpServer(
   const sendHandler = makePeerSendHandler(sessions, fromAgentId);
   const queryHandler = makePeerQueryHandler(sessions, fromAgentId);
   const searchHandler = makeConversationSearchHandler(sessions, fromAgentId);
+  const askHandler = makePeerAskHandler(sessions, fromAgentId);
   const peerSend = tool(
     "peer_send",
     [
@@ -142,6 +159,38 @@ export function makePeerMcpServer(
       return { content: [{ type: "text" as const, text: result }] };
     },
   );
+  const peerAsk = tool(
+    "peer_ask",
+    [
+      "Ask a teammate a question and WAIT for the answer IN THIS TURN.",
+      "Use ONLY on a real blocker: you cannot proceed correctly without the answer.",
+      "Do NOT use it for status updates, confirmations, or anything you can decide yourself.",
+      "If a reasonable assumption would let you continue, continue instead.",
+      "The call parks until they reply; a timeout is a FAILURE, not permission to guess.",
+      "Prefer this over peer_send when acting on a wrong assumption would produce wrong work.",
+    ].join("\n"),
+    {
+      target: z.string().min(1).describe("Teammate name (preferred) or UUID. Outside your team is refused."),
+      question: z.string().min(1).describe("The one question you need answered in order to proceed."),
+      blockingReason: z
+        .string()
+        .min(8)
+        .describe("Why you cannot proceed correctly without this answer. Required."),
+      timeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Default 900000 (15 min); capped at 1800000 (30 min)."),
+    },
+    async (args) => {
+      const result = await askHandler(args);
+      return {
+        content: [{ type: "text" as const, text: result.text }],
+        ...(result.isError ? { isError: true } : {}),
+      };
+    },
+  );
   const peerQuery = tool(
     "peer_query",
     [
@@ -210,6 +259,6 @@ export function makePeerMcpServer(
   return createSdkMcpServer({
     name: PEER_MCP_SERVER_NAME,
     version: "0.3.0",
-    tools: [peerSend, peerQuery, conversationSearch],
+    tools: [peerSend, peerAsk, peerQuery, conversationSearch],
   });
 }

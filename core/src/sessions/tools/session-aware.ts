@@ -59,6 +59,13 @@ type PeerSendCallback = (args: {
 type PeerQueryCallback = (args: { target: string; limit?: number }) => Promise<string>;
 type ConversationSearchCallback = (args: ConversationSearchArgs) => Promise<string>;
 
+type PeerAskCallback = (args: {
+  target: string;
+  question: string;
+  blockingReason: string;
+  timeoutMs?: number;
+}) => Promise<{ text: string; isError?: true }>;
+
 type AskUserCallback = (args: { question: string; options: string[] }) => Promise<string>;
 
 type SpawnTaskCallback = (args: {
@@ -239,6 +246,43 @@ export function makeConversationSearchTool(
     parameters: CONVERSATION_SEARCH_SCHEMA,
     async execute(args) {
       return search(args);
+    },
+  };
+}
+
+const PEER_ASK_SCHEMA = z.object({
+  target: z.string().min(1).describe("Teammate name (preferred) or UUID. Outside your team is refused."),
+  question: z.string().min(1).describe("The one question you need answered in order to proceed."),
+  blockingReason: z
+    .string()
+    .min(8)
+    .describe("Why you cannot proceed correctly without this answer. Required."),
+  timeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Default 900000 (15 min); capped at 1800000 (30 min)."),
+});
+
+/** Blocking peer question. Unlike peer_send, this parks the tool call and
+ *  returns the answer into the SAME turn — the model can correct before it
+ *  produces more work on a stale assumption. */
+export function makePeerAskTool(ask: PeerAskCallback): NormalizedTool<typeof PEER_ASK_SCHEMA> {
+  return {
+    name: "peer_ask",
+    description: [
+      "Ask a teammate a question and WAIT for the answer in this turn.",
+      "Use ONLY on a real blocker: you cannot proceed correctly without the answer.",
+      "Do NOT use it for status updates, confirmations, or anything you can decide yourself.",
+      "If a reasonable assumption would let you continue, continue instead.",
+      "A timeout is a FAILURE, not permission to guess.",
+    ].join("\n"),
+    parameters: PEER_ASK_SCHEMA,
+    async execute(args) {
+      const result = await ask(args);
+      if (result.isError) throw new Error(result.text);
+      return result.text;
     },
   };
 }

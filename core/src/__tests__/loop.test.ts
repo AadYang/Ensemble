@@ -1,6 +1,7 @@
 import "./loop-env.js";
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,6 +63,19 @@ function seedAgent(name: string, root: string, extra: { teamId?: string } = {}) 
   });
 }
 
+/** A real repo with an uncommitted change, so `hasDiff` stays true and the
+ *  no-progress circuit breaker does not mask the turn/attempt accounting. */
+function gitInitWithDirtyFile(root: string): void {
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
+  git("init");
+  git("config", "user.email", "loop-test@example.test");
+  git("config", "user.name", "loop-test");
+  writeFileSync(join(root, "a.txt"), "a\n");
+  git("add", "-A");
+  git("commit", "-m", "init");
+  writeFileSync(join(root, "a.txt"), "a\nb\n");
+}
+
 describe("prefillLoopFromProject", () => {
   it("reads package.json scripts and AGENTS.md without touching settingSources", () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-prefill-"));
@@ -99,6 +113,26 @@ describe("ensureLoopSkills", () => {
 });
 
 describe("LoopManager stop-gate", () => {
+  it("spans a multi-item board inside one attempt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-board-"));
+    gitInitWithDirtyFile(root);
+    const agent = seedAgent("board-many", root);
+    const mgr = new LoopManager(mockJobs(0, "ok"), mockHub(), mockHost());
+    await mgr.start(agent.id, {
+      goal: "finish every item",
+      verifier: { kind: "command", spec: "npm test" },
+    });
+    for (let i = 0; i < 5; i += 1) {
+      const cont = await mgr.onTurnSettled(agent.id, { lastText: `item ${i + 1}` });
+      expect(cont?.userInput).toMatch(/## DONE/);
+    }
+    // Five turns of board work, still attempt #1: tasks do not consume the
+    // attempt budget. Only a failed full pass does.
+    expect(mgr.view(agent.id)?.iter).toBe(1);
+    expect(mgr.view(agent.id)?.innerTurns).toBe(5);
+    expect(mgr.view(agent.id)?.status).toBe("running");
+  });
+
   it("starts with only a goal and kicks until the agent writes ## DONE", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-agent-"));
     const agent = seedAgent("goal-only", root);
@@ -160,7 +194,7 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("paused");
   });
 
-  it("fresh-disk outer iter resets the runtime when the marker is missing", async () => {
+  it("fresh-disk keeps the same attempt while the marker is missing", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-fresh-"));
     const agent = seedAgent("fresh", root);
     const host = mockHost();
@@ -173,6 +207,25 @@ describe("LoopManager stop-gate", () => {
     });
     const cont = await mgr.onTurnSettled(agent.id, { lastText: "one item" });
     expect(cont?.userInput).toMatch(/TASKS.md/);
+    expect(host.calls.some((c) => c.startsWith("reset:"))).toBe(false);
+    expect(mgr.view(agent.id)?.status).toBe("running");
+    expect(mgr.view(agent.id)?.iter).toBe(1);
+  });
+
+  it("fresh-disk restarts only when ## DONE was written but the verifier failed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-fresh-fail-"));
+    writeFileSync(join(root, "TASKS.md"), "## DONE\n");
+    const agent = seedAgent("fresh-fail", root);
+    const host = mockHost();
+    const mgr = new LoopManager(mockJobs(1, "still red"), mockHub(), host);
+    await mgr.start(agent.id, {
+      goal: "ship it",
+      verifier: { kind: "command", spec: "npm test" },
+      doneWhen: { kind: "file-contains", spec: "## DONE" },
+      session: "fresh-disk",
+    });
+    const cont = await mgr.onTurnSettled(agent.id, { lastText: "declared done" });
+    expect(cont?.userInput).toContain("VERIFY FAIL");
     expect(host.calls.some((c) => c.startsWith("reset:"))).toBe(true);
     expect(mgr.view(agent.id)?.status).toBe("running");
     expect(mgr.view(agent.id)?.iter).toBe(2);

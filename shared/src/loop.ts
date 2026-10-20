@@ -103,6 +103,12 @@ export const DEFAULT_LOOP_DONE_WHEN: LoopDoneWhen = { kind: "file-contains", spe
 export const DEFAULT_LOOP_MAX_ITERATIONS = 20;
 export const LOOP_CONSECUTIVE_FAIL_LIMIT = 3;
 export const LOOP_ITERATION_LOG_CAP = 20;
+/** Turns allowed inside ONE attempt before the loop pauses. An attempt spans as
+ *  many turns as the work needs (one item per turn is the Ralph norm); this is
+ *  the runaway guard, the analogue of Claude Code's consecutive-continuation
+ *  cap. It is deliberately separate from maxIterations, which counts attempts
+ *  that ENDED in failure. */
+export const DEFAULT_MAX_TURNS_PER_ITER = 50;
 
 function textOf(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -279,7 +285,9 @@ export function loopStartPrompt(config: LoopConfig): string {
     config.goal.trim(),
     "",
     "You are in an Ensemble Loop. Keep working until the goal is fully met.",
-    "- Track remaining work in TASKS.md (create it if needed).",
+    "- Track remaining work in TASKS.md (create it if needed) as ONE `- [ ]` checklist.",
+    "- The moment an item is finished, change its line to `- [x]` in TASKS.md. The loop board reads checkboxes only; progress written as prose is invisible to it.",
+    "- Do not move finished items into narrative sections and do not leave them unchecked.",
     "- Write ## DONE in TASKS.md only when the entire goal is met. Do not write it early.",
     "- Do not stop just because you described a plan.",
   ];
@@ -295,7 +303,7 @@ export function loopContinuePrompt(config: LoopConfig): string {
   return [
     `Goal (still in force):\n${config.goal}`,
     "This loop is not done: TASKS.md does not contain ## DONE.",
-    "Continue the work. Update TASKS.md. Write ## DONE only when the entire goal is met.",
+    "Continue the work. Keep ONE `- [ ]` checklist in TASKS.md and mark every finished item `- [x]` in the same turn you finish it — the loop board only reads checkboxes. Write ## DONE only when the entire goal is met.",
   ].join("\n\n");
 }
 
@@ -309,6 +317,8 @@ export function decideLoopAfterVerify(input: {
   reviewText?: string;
 }): LoopDecision {
   const { config, state, verifyOk, summary, markerHit, hasDiff, reviewText } = input;
+  const turnCap = config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER;
+  const turnCapReached = state.innerTurns >= turnCap;
   const failPrompt = [
     "VERIFY FAIL. The completion condition is not met. Continue. Do not stop until it passes.",
     summary.trim() ? `Failure summary:\n${summary.trim()}` : "",
@@ -323,8 +333,23 @@ export function decideLoopAfterVerify(input: {
         reason: `verifier failed ${state.consecutiveFails} times with no further diff`,
       };
     }
-    if (config.maxTurnsPerIter != null && state.innerTurns >= config.maxTurnsPerIter) {
-      return { action: "pause", reason: `inner-turn cap ${config.maxTurnsPerIter} reached` };
+    // An ATTEMPT ends only when the agent declared completion (## DONE) and
+    // the verifier still rejected it. That is the sole normal way the attempt
+    // budget moves. A verifier that is red while the agent is still working is
+    // feedback, not a finished attempt — counting it per turn is what made a
+    // multi-task board exhaust maxIterations after N tasks.
+    if (config.doneWhen.kind === "file-contains" && markerHit) {
+      if (state.iter >= config.maxIterations) {
+        return { action: "pause", reason: `iteration cap ${config.maxIterations} reached` };
+      }
+      return {
+        action: "outer-iter",
+        resetRuntime: config.session === "fresh-disk",
+        userInput: failPrompt,
+      };
+    }
+    if (turnCapReached) {
+      return { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
     }
     return { action: "continue", userInput: failPrompt };
   }
@@ -352,12 +377,13 @@ export function decideLoopAfterVerify(input: {
         reason: `no ## DONE and no further diff after ${state.consecutiveFails} turns`,
       };
     }
-    if (state.iter >= config.maxIterations) {
-      return { action: "pause", reason: `iteration cap ${config.maxIterations} reached` };
+    if (turnCapReached) {
+      return { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
     }
+    // Same attempt, next turn: the board is not finished yet. This does NOT
+    // consume an attempt, so a 20-item board can run in one attempt.
     return {
-      action: "outer-iter",
-      resetRuntime: config.session === "fresh-disk",
+      action: "continue",
       userInput: loopContinuePrompt(config),
     };
   }
@@ -370,7 +396,9 @@ export function formatLoopStatusLines(view: LoopView): string[] {
   return [
     `loop            ${view.status}  ${view.iter}/${view.maxIterations}`,
     `verifier        ${v ? `${v.kind}  ${v.spec}` : "none"}  last=${
-      view.lastVerifyOk == null ? "n/a" : view.lastVerifyOk ? "pass" : "fail"
+      // No verifier means nothing was checked. Reporting `pass` here made
+      // "no command verifier" look like a green gate.
+      !v || view.lastVerifyOk == null ? "n/a" : view.lastVerifyOk ? "pass" : "fail"
     }`,
     `doneWhen        ${view.config.doneWhen.kind} ${view.config.doneWhen.spec}`.trim(),
     `session         ${view.config.session}`,
