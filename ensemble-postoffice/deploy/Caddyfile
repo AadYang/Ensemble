@@ -1,0 +1,35 @@
+{
+	auto_https disable_redirects
+}
+
+# Leftover catch-all on this VM (uvicorn :8000). Ensemble HTTP goes to HTTPS.
+:80 {
+	@ensemble host ensemble-ai.cn www.ensemble-ai.cn
+	handle @ensemble {
+		redir https://{host}{uri} permanent
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8000
+	}
+}
+
+https://ensemble-ai.cn, https://www.ensemble-ai.cn {
+	tls /etc/caddy/ssl/ensemble-ai/fullchain.crt /etc/caddy/ssl/ensemble-ai/server.key
+
+	redir /postoffice /postoffice/
+
+	handle_path /postoffice/* {
+		reverse_proxy 127.0.0.1:8790 {
+			flush_interval -1
+			transport http {
+				read_timeout 120s
+			}
+		}
+	}
+
+	handle {
+		root * /var/www/ensemble-site
+		try_files {path} /index.html
+		file_server
+	}
+}

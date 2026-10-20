@@ -3,3 +3,4 @@ packages:
   - core
   - desktop-ui
   - ensemble_server
+  - ensemble-postoffice/mcp

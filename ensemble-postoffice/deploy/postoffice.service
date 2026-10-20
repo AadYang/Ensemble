@@ -1,0 +1,19 @@
+[Unit]
+Description=Ensemble Postoffice MCP
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ensemble-postoffice/mcp
+Environment=PORT=8790
+Environment=INVITE_CODE=redtea-yzr
+Environment=PUBLIC_BASE=https://www.ensemble-ai.cn/postoffice
+Environment=DATA_DIR=/var/lib/ensemble-postoffice
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

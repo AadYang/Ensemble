@@ -28,6 +28,7 @@ core/dist/loader.cjs
 # Production secrets — Tencent SSH key, TLS cert/key, server-info notes.
 # Anyone with these files owns the production server / can impersonate
 # www.ensemble-ai.cn. MUST NOT be committed.
+ensemble.pem
 ensemble_server/tencent_cloud_key.pem
 ensemble_server/ensemble-ai.cn_nginx/
 ensemble_server/服务器信息.txt

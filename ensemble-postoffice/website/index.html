@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ensemble Postoffice</title>
+  <link rel="stylesheet" href="assets/styles.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">Ensemble Postoffice</div>
+    <div class="sub">跨客户端远程信箱 · Claude Code / Codex / Cursor / Ensemble / DSH</div>
+  </header>
+
+  <main>
+    <section id="auth-panel">
+      <div class="tabs">
+        <button type="button" id="tab-login" class="tab on">登录</button>
+        <button type="button" id="tab-register" class="tab">注册</button>
+      </div>
+      <form id="login-form">
+        <label>用户名 <input name="username" autocomplete="username" required /></label>
+        <label>密码 <input name="password" type="password" autocomplete="current-password" required /></label>
+        <button type="submit">登录</button>
+      </form>
+      <form id="register-form" hidden>
+        <label>用户名 <input name="username" autocomplete="username" required minlength="3" /></label>
+        <label>密码 <input name="password" type="password" autocomplete="new-password" required minlength="8" /></label>
+        <label>邀请码 <input name="inviteCode" required placeholder="向管理员索取" /></label>
+        <button type="submit">注册并登录</button>
+      </form>
+      <p id="auth-err" class="err" hidden></p>
+    </section>
+
+    <section id="app-panel" hidden>
+      <div class="row">
+        <div>
+          <div class="who" id="who"></div>
+          <p class="hint">开一只信箱，把通讯码发给对方，把绑定码写进 MCP 配置。绑定码只完整显示一次。</p>
+        </div>
+        <button type="button" id="logout">退出</button>
+      </div>
+
+      <form id="create-form" class="create">
+        <input name="name" placeholder="信箱名称，例如 mac-codex" required maxlength="40" />
+        <button type="submit">开信箱</button>
+      </form>
+
+      <div id="boxes"></div>
+    </section>
+
+    <dialog id="secret">
+      <h2>保存绑定码</h2>
+      <p>此码只显示这一次。写进 MCP 的 Authorization，不要发给别人。通讯码可以公开。</p>
+      <p>通讯码 <code id="sec-comm"></code></p>
+      <p>绑定码 <code id="sec-bind"></code></p>
+      <pre id="sec-json"></pre>
+      <menu>
+        <button type="button" id="copy-json">复制 MCP 配置</button>
+        <button type="button" id="sec-close">我已保存</button>
+      </menu>
+    </dialog>
+  </main>
+
+  <footer>
+    两边各点一次开始。send 立刻返回；inbox_wait 是长连接，信一到就解开。对面思考时必须挂在 inbox_wait 上。
+  </footer>
+  <script src="assets/app.js"></script>
+</body>
+</html>

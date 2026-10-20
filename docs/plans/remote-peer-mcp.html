@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>远程 Agent 邮局 MCP — 方案说明</title>
+<style>
+  :root{
+    --bg:#0a0e14; --pane:#0f1620; --elev:#131c28;
+    --border:#1f2937; --accent:#00d9ff; --ok:#00ff9c; --warn:#ff8800; --err:#ff3860;
+    --text:#c9d1d9; --dim:#7d8590; --faint:#4b5563;
+    --mono:"JetBrains Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  @page{size:A4;margin:12mm}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:12.5px/1.55 var(--mono);
+    padding:20px 24px 48px;
+  }
+  .wrap{max-width:860px;margin:0 auto}
+  header{border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:18px}
+  .kicker{color:var(--accent);letter-spacing:.14em;font-size:10px;text-transform:uppercase}
+  h1{font-size:22px;margin:8px 0 8px;letter-spacing:-.02em}
+  h1 em{font-style:normal;color:var(--accent)}
+  .lead{color:var(--dim);margin:0;max-width:720px}
+  h2{font-size:14px;color:var(--accent);margin:22px 0 8px}
+  h2 .n{color:var(--faint);margin-right:8px}
+  p,li{margin:6px 0}
+  ul{padding-left:18px;margin:6px 0}
+  strong{color:#e6edf3}
+  code{background:var(--elev);border:1px solid var(--border);padding:.05em .3em;color:var(--accent);font-size:11.5px}
+  a{color:var(--accent)}
+  table{width:100%;border-collapse:collapse;margin:8px 0 4px;font-size:11.5px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+  thead th{color:var(--dim);background:var(--pane);font-size:10px;letter-spacing:.06em}
+  .ok{color:var(--ok)} .warn{color:var(--warn)}
+  .box{border:1px solid var(--border);background:var(--pane);padding:10px 12px;margin:10px 0}
+  .box b.t{display:block;color:var(--accent);font-size:10px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px}
+  .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:10px 0}
+  .grid4{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+  .card{border:1px solid var(--border);background:var(--pane);padding:10px}
+  .card h4{margin:0 0 6px;color:var(--accent);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+  .flow{
+    display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:10px 0;
+    font-size:11.5px
+  }
+  .node{
+    border:1px solid var(--accent);color:var(--accent);padding:8px 10px;background:rgba(0,217,255,.06);
+    min-width:7.2rem;text-align:center
+  }
+  .node.human{border-color:var(--ok);color:var(--ok);background:rgba(0,255,156,.06)}
+  .node.srv{border-color:#c9d1d9;color:#c9d1d9}
+  .arr{color:var(--faint)}
+  .foot{margin-top:22px;border-top:1px solid var(--border);padding-top:10px;color:var(--faint);font-size:10px}
+  @media(max-width:720px){.grid,.grid4{grid-template-columns:1fr}}
+  @media print{
+    body{background:#fff;color:#222;padding:0;font-size:11px;line-height:1.45}
+    h1,strong{color:#111} h2,.kicker,a,code,.card h4,.box b.t{color:#046}
+    .node{color:#046;border-color:#046;background:#eef} .node.human{color:#060;border-color:#060}
+    th,td{border-color:#ccc} thead th{background:#f3f3f3;color:#444}
+    .box,.card{background:#fafafa;border-color:#ddd}
+    a{text-decoration:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="kicker">Ensemble · 产品方案 · 约 5 页</div>
+  <h1>远程 Agent 邮局 <em>MCP</em></h1>
+  <p class="lead">让不同电脑、不同软件里的 Agent，像打电话一样互相发话、互相查看近况。人在网页开号，Agent 用绑定码占用这个号。</p>
+</header>
+
+<h2><span class="n">01</span>结论：可行，做成邮局，不要做成电话交换机</h2>
+<p><strong>方案可行。</strong> 服务器上跑一个 MCP（Agent 用的工具插头），网页给人开号。Agent 注册后，用对方的「通讯码」发消息、读对方近期发言——对应 Ensemble 本机已经有的 <code>peer_send</code> 和 <code>peer_query</code>。</p>
+<p><strong>必须能自动多轮。</strong> 做法是 MCP 提供长轮询工具 <code>inbox_wait</code>（和 Ensemble 已有的 <code>job_wait</code> 同类：这一轮先不结束，挂在工具上等到有信或超时）。服务器自己空转查信箱叫醒不了闲着的窗口——轮询必须发生在<strong>Agent 已经打开的这一轮里</strong>。</p>
+
+<div class="grid">
+  <div class="card"><h4>身份证 · ID</h4>系统内部编号。一个人一个，不给别人看、不能改。</div>
+  <div class="card"><h4>电话号码 · 通讯码</h4>公开给别人打你。可以写在纸上、发给同事。</div>
+  <div class="card"><h4>SIM 卡 PIN · 绑定码</h4>只有拿到这串码的 Agent 能占用这个号。用一次（或直到你重置）。保密。</div>
+</div>
+<p>网页再填一个<strong>名称</strong>（名片上的名字，方便人认，不保证全球不重名）。通讯靠通讯码，不靠名字。</p>
+
+<h2><span class="n">02</span>人怎么开号，Agent 怎么占用</h2>
+<div class="flow">
+  <div class="node human">你在网页<br>起名、开号</div>
+  <span class="arr">→</span>
+  <div class="node srv">服务器生成<br>ID / 通讯码 / 绑定码</div>
+  <span class="arr">→</span>
+  <div class="node">把 MCP 地址<br>+ 绑定码交给 Agent</div>
+  <span class="arr">→</span>
+  <div class="node">Agent 调用注册<br>占用这个号</div>
+</div>
+<p>注册规则：<strong>一个 ID 同时只给一个在线 Agent</strong>。已占用再拿同一绑定码注册 → 拒绝。掉线后允许原绑定码重新占用（像拔掉网线再插上）。换一台电脑占用：你在网页点「重置绑定码」，旧码作废。</p>
+<p>MCP 注册成功后必须用白话告诉 Agent：你的名字和通讯码是什么、怎么给别人发、怎么查信箱、绑定码不要写进回复里。工具说明本身就是说明书，不必另做一本手册给模型。</p>
+
+<h2><span class="n">03</span>自动多轮：在 MCP 里长轮询，不要只空查信箱</h2>
+<p>可以。<strong>轮询加在 MCP 工具里</strong>，不是服务器在后台空转。Agent 发完信调用 <code>inbox_wait(最多等 N 秒)</code>：有信立刻返回，没信就挂着。对方一投递，这边这一轮还在，拆信、回复、再 wait——乒乓自动转。和本机等任务结束的 <code>job_wait</code> 同一类。</p>
+<div class="flow">
+  <div class="node">人各点一次<br>开始（两边都要）</div>
+  <span class="arr">→</span>
+  <div class="node">A send<br>然后 inbox_wait</div>
+  <span class="arr">信到</span>
+  <div class="node">B 正在 wait<br>醒来 → 回复 → wait</div>
+  <span class="arr">信到</span>
+  <div class="node">A 醒来<br>直到双方说完</div>
+</div>
+<div class="box">
+  <b class="t">轮询能做什么、不能做什么</b>
+  服务器自己 while 查数据库，客户端没在跑工具 → 窗口仍是闲的，<strong>等于没轮询</strong>。长轮询只服务「这一轮已经开始」的人。因此人仍须<strong>两边都点一次开始</strong>（或一边先开口、一边已经 wait）。之后不必每轮都靠人按回车。超时（建议上限 60–120 秒，可连 wait）后工具返回「暂无新信」；说明书要求再 wait，或外面包 Ensemble Loop 当保险，防止模型忘了续。
+</div>
+<p>「投递即叫醒」（邮局通知 Ensemble 自动新开一轮）能叫醒完全闲着的窗口，要改客户端、验身份，作第二步，不是替代 <code>inbox_wait</code>。</p>
+
+<h2><span class="n">04</span>两个 Agent 怎么说话</h2>
+<div class="flow">
+  <div class="node">设计师 Agent<br>通讯码 A-77</div>
+  <span class="arr">发信 →</span>
+  <div class="node srv">云邮局<br>按通讯码投递</div>
+  <span class="arr">→ 信箱</span>
+  <div class="node">程序员 Agent<br>通讯码 B-19</div>
+</div>
+<table>
+  <thead><tr><th>人话</th><th>Agent 用的工具</th><th>对应 Ensemble 本机</th></tr></thead>
+  <tbody>
+    <tr><td>给对方留一句，请对方接着干 / 评审 / 换思路</td><td><code>send</code>（带简单模式：继续 / 评审 / 换路 / 原话）</td><td><code>peer_send</code></td></tr>
+    <tr><td>只看对方最近说了什么，不打扰对方</td><td><code>query</code></td><td><code>peer_query</code></td></tr>
+    <tr><td>看自己信箱有没有新信</td><td><code>inbox</code></td><td>本机没有信箱——直接塞进对话</td></tr>
+    <tr><td>挂着等下一封，用来自动多轮</td><td><code>inbox_wait</code></td><td>类似 <code>job_wait</code>，不是 peer_send</td></tr>
+    <tr><td>把文件当附件寄出</td><td><code>send_file</code></td><td>本机是同一磁盘；远程必须经邮局中转</td></tr>
+    <tr><td>取回寄给自己的附件</td><td><code>file_get</code></td><td>类似本机 <code>artifact_read</code></td></tr>
+    <tr><td>我是谁、别人怎么打给我</td><td><code>whoami</code></td><td>TEAM CONTEXT 里的名单</td></tr>
+  </tbody>
+</table>
+<p>文件像<strong>信封里的附件</strong>，不另开一条网盘。发信时可带上文件（代码、图片、小压缩包）。邮局代存，收件人用 <code>file_get</code> 取走。上限建议单文件 20MB、一封信几个附件；过期自动删（如 7 天）。只许收件人取，别人拿编号也取不到。说明书：需要对方看文件时用附件，不要把整份文件糊进聊天正文。</p>
+<div class="box">
+  <b class="t">和本机 peer 不要混为一谈</b>
+  同一台 Ensemble 里的 Agent 继续用原来的 peer_send。这个 MCP 解决的是<strong>跨机器、跨软件</strong>（例如家里一台、公司一台，或 Claude 和 Ensemble 各一个）。通讯码打不到本机树里那个 UUID，两套地址不要混用。
+</div>
+
+<h2><span class="n">05</span>网上已有什么，我们抄哪一层</h2>
+<table>
+  <thead><tr><th>项目</th><th>像什么</th><th>对我们</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://github.com/danielrosehill/Agent-Junction">Agent Junction</a></td><td>局域网上的 MCP 对讲机：注册、列表、发信、读信</td><td class="ok">最像。我们补上网页开号 + 绑定码 + 部署到公网。</td></tr>
+    <tr><td><a href="https://github.com/andrealaforgia/agents-mailbox">agents-mailbox</a> · <a href="https://github.com/EllGree/mailbox-mcp">mailbox-mcp</a></td><td>同一台电脑共享文件夹当信箱</td><td>不能给「用户各自在自己电脑」用。</td></tr>
+    <tr><td><a href="https://github.com/biswajitpatra/agentbus">agentbus</a></td><td>本机「把信塞进正在跑的窗口」</td><td>叫醒问题写得很清楚；那是客户端的事，不是第一版服务器的事。</td></tr>
+    <tr><td><a href="https://github.com/a2aproject/A2A">A2A</a>（原 Google，现 Linux 基金会；IBM ACP 已并入）</td><td>Agent 当网站互相调用的行业标准</td><td class="warn">太重。MCP 是「给一个 Agent 工具」；A2A 是「Agent 当服务」。第一版用 MCP 邮局即可，以后要对接外面生态再加 A2A 门牌。</td></tr>
+  </tbody>
+</table>
+<p>官方也说：<strong>MCP 管工具，A2A 管 Agent 与 Agent</strong>。用 MCP 做邮局是借工具通道传信，业界有成例，不是歪路。不要第一版就宣称「我们兼容 A2A」。</p>
+
+<h2><span class="n">06</span>第一版做这些，别做那些</h2>
+<div class="grid4">
+  <div class="card">
+    <h4>做</h4>
+    <ul>
+      <li>网页：起名、生成三码、重置绑定、吊销号</li>
+      <li>MCP：注册、发信、附件、inbox、inbox_wait、query、whoami</li>
+      <li>说明书写死：发完必须 wait，直到目标完成</li>
+      <li>HTTPS + 绑定码；一号同时一人</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>不做（第一版）</h4>
+    <ul>
+      <li>只在服务器空转查库却不挂工具（假轮询）</li>
+      <li>投递即叫醒留第二步</li>
+      <li>不限大小的网盘、直播流、可执行文件当默认可跑（只当附件存）</li>
+      <li>通讯录公开广场（避免被扫号）</li>
+      <li>冒充 Ensemble 本机的团队边界（远程另有一份「谁能打谁」，默认：知道通讯码就能发，可选加「必须互加好友」）</li>
+    </ul>
+  </div>
+</div>
+<p><strong>安全底线：</strong>绑定码只显示一次、可重置；通讯码不要当密码；附件只给收件人、带校验哈希、过期删除；日志不写绑定码。</p>
+<p><strong>用户怎么接到 Ensemble：</strong>在 Agent 设置里加一条远程 MCP（网页上复制地址）。三个运行时（Claude / OpenAI / Codex）都能挂 HTTP MCP，这是现成能力，不必改内核协议。</p>
+
+<div class="foot">
+  审核结论：自动多轮 = 邮局送信 + MCP 长轮询挂住回合。两边先各开一轮。同类开源里 Agent Junction 最近。文档供拍板，不是实现说明书。
+</div>
+</div>
+</body>
+</html>
