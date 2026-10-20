@@ -22,8 +22,24 @@ export interface LoopSuggest {
 
 async function throwIfBad(res: Response, fallback: string): Promise<void> {
   if (res.ok) return;
-  const body = (await res.json().catch(() => null)) as { message?: string; error?: string } | null;
-  throw new Error(body?.message || body?.error || `${fallback}: ${res.status}`);
+  const body = (await res.json().catch(() => null)) as
+    | { message?: string; error?: string; detail?: unknown }
+    | null;
+  // A bare `error: "invalid"` tells the user nothing. The 400 carries zod's
+  // issues in `detail`; surface the field path so a rejected payload is
+  // diagnosable from the dialog instead of guessing which field was wrong.
+  const detail = Array.isArray(body?.detail)
+    ? body.detail
+        .map((d) => {
+          const issue = d as { path?: unknown[]; message?: string };
+          const path = Array.isArray(issue?.path) ? issue.path.join(".") : "";
+          return path && issue?.message ? `${path}: ${issue.message}` : (issue?.message ?? "");
+        })
+        .filter(Boolean)
+        .join("; ")
+    : "";
+  const text = body?.message || [body?.error, detail].filter(Boolean).join(" · ");
+  throw new Error(text || `${fallback}: ${res.status}`);
 }
 
 export async function listLoops(): Promise<LoopView[]> {

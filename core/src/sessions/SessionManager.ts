@@ -4266,6 +4266,17 @@ export class SessionManager {
     return { preferPeerAfterId: run.pendingTurnHighWaterId };
   }
 
+  /** Any turn parked for this agent? Delivery has priority over the loop's own
+   *  next prompt — see the turn-finally guard that consults this. */
+  private hasQueuedTurn(sessionId: string): boolean {
+    return (
+      prisma.pendingTurn.findFirst({
+        where: { agentId: sessionId },
+        orderBy: { id: "asc" },
+      }) !== null
+    );
+  }
+
   private drainQueuedTurns(sessionId: string, drainOpts: DrainQueuedOptions = {}): void {
     if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) {
       if (Object.keys(drainOpts).length > 0) this.pendingDrainOptions.set(sessionId, drainOpts);
@@ -6480,7 +6491,14 @@ export class SessionManager {
           for (const [, q] of qb) q.resolve("[run ended before answer]");
           this.pendingQuestions.delete(sessionId);
         }
-        if (!autoRecoverAfterRun && loopEligible && this.loops) {
+        // A running loop re-injects its own prompt at the end of every turn, and
+        // the branch below hands that prompt straight to a new run. Anything
+        // that arrived while this turn was in flight — a manager's peer_send, a
+        // user message — is parked in PendingTurn, and that branch never drains
+        // it, so the queue is starved for as long as the loop keeps continuing.
+        // Deliver the queued work first; the loop decides again after that turn.
+        const queuedBeforeLoop = this.hasQueuedTurn(sessionId);
+        if (!autoRecoverAfterRun && loopEligible && this.loops && !queuedBeforeLoop) {
           try {
             const cont = await this.loops.onTurnSettled(sessionId, { lastText: finalText });
             if (cont) autoRecoverAfterRun = { userInput: cont.userInput, opts: {} };

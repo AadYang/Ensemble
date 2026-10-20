@@ -1740,10 +1740,17 @@ fastify.get<{ Params: { id: string } }>("/agents/:id/status", async (req, reply)
 
 const LoopStartSchema = z.object({
   goal: z.string().min(1),
-  verifier: z.object({
-    kind: z.enum(["command", "job", "file-marker", "peer-review"]),
-    spec: z.string().min(1),
-  }),
+  // Optional, and nullable, because "no command verifier" is a supported loop
+  // shape (`runVerifier` returns ok when it is absent) and the dialog omits the
+  // field whenever the advanced box is empty. Requiring it here made the normal
+  // path fail with a bare `invalid` before it ever reached `parseLoopConfig`.
+  verifier: z
+    .object({
+      kind: z.enum(["command", "job", "file-marker", "peer-review"]),
+      spec: z.string().min(1),
+    })
+    .nullable()
+    .optional(),
   doneWhen: z
     .object({
       kind: z.enum(["exit-0", "file-contains", "peer-lgtm"]),
