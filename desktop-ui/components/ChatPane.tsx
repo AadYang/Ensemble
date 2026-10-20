@@ -8,7 +8,6 @@ import {
   measureChatInputHeight,
   thinkingDomText,
   formatLoopStatusLines,
-  DEFAULT_MAX_TURNS_PER_ITER,
   type RunPlanStatusView,
   type SdkMessage,
 } from "@agentorch/shared";
@@ -1204,14 +1203,8 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
                   : "") || loop.lastVerifySummary || loop.config.goal
               }
             >
-              {/* The moving number leads: turns inside the current attempt.
-                  The attempt counter only moves when a whole attempt fails, so
-                  leading with it made a working loop look frozen. */}
-              {t("loop.chip.label")} {loop.innerTurns}/
-              {loop.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER}
-              {loop.iter > 1
-                ? ` · ${t("loop.chip.attempt", { n: loop.iter, max: loop.maxIterations })}`
-                : ""}
+              {t("loop.chip.label")} {t("loop.chip.attempt", { n: loop.iter, max: loop.maxIterations })}
+              {` · ${t("loop.chip.turns", { n: loop.innerTurns })}`}
               {loop.status === "paused" ? ` · ${t("loop.chip.paused")}` : ""}
               {loop.config.verifier
                 ? loop.lastVerifyOk === false

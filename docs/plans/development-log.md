@@ -552,3 +552,11 @@
 - OpenAI in-process (`openai-local` / `openai-compat`): retains layered application summaries and transactional archives. Native runtimes never silently fall back to this path.
 - Normal cancellation preserves native session metadata; actual native thread IDs and resume signatures are saved when first observed. Explicit reset/provider changes retain their invalidation semantics. Native compaction preserves Ensemble message rows rather than claiming to summarize unrelated native sessions.
 - Regression cases added/updated for native cancellation, absent sessions, failed compaction, Codex protocol acknowledgement/completion/cancellation, and the in-process summary path. Per user workflow, no tests, typecheck, builds, live compaction or database repair were run. Windows and macOS runtime validation remain pending; no release claim.
+
+
+### 2026-10-20 - One overall attempt budget for Loop
+
+- maxIterations is the only configurable budget. Legacy maxTurnsPerIter is ignored; turns remain informational and are preserved on ordinary resume.
+- Incomplete boards continue in the same attempt; command checks and peer review wait for completion (explicit exit-0 remains command-driven). Rejected acceptance advances the attempt and clears its completion marker.
+- Stall detection compares board content plus git HEAD/index and dirty/untracked file metadata between turns, not the mere existence of a dirty tree. It detects activity, not semantic correctness; inaccessible git state is not treated as no progress.
+- Shared decision, core manager, chip, board, status/help and regression cases updated across all runtimes. No standalone tests run per team policy; Windows packaging follows. macOS validation pending.

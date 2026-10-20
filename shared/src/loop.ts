@@ -26,7 +26,8 @@ export interface LoopConfig {
   verifier: LoopVerifier | null;
   doneWhen: LoopDoneWhen;
   maxIterations: number;
-  maxTurnsPerIter: number | null;
+  /** Legacy field accepted for persisted configs; no longer a budget. */
+  maxTurnsPerIter: null;
   session: LoopSessionPolicy;
   snapshot: LoopSnapshotPolicy;
   permissionBump: string | null;
@@ -59,9 +60,9 @@ export interface LoopState {
   lastVerifyOk: boolean | null;
   lastVerifySummary: string;
   lastSnapshot: string | null;
-  /** Checked items in TASKS.md as of the previous turn, used to tell "still
-   *  working" from "spinning" when the per-attempt turn ceiling is reached. */
+  /** Checked items as of the previous turn; retained for existing saved states. */
   lastDoneCount: number;
+  lastProgressFingerprint: string | null;
   iterations: LoopIteration[];
 }
 
@@ -82,11 +83,7 @@ export interface LoopView {
 }
 
 export type LoopDecision =
-  // `extendTurns` raises the ceiling for the SAME attempt: the limit was
-  // reached, but the board advanced, so stopping would interrupt progress
-  // rather than brake a stall. The counter keeps climbing instead of resetting
-  // to 0 — a number that jumps backwards reads as a bug.
-  | { action: "continue"; userInput: string; extendTurns?: boolean }
+  | { action: "continue"; userInput: string }
   | { action: "outer-iter"; userInput: string; resetRuntime: boolean }
   | { action: "pause"; reason: string }
   | { action: "done"; summary: string }
@@ -110,12 +107,6 @@ export const DEFAULT_LOOP_DONE_WHEN: LoopDoneWhen = { kind: "file-contains", spe
 export const DEFAULT_LOOP_MAX_ITERATIONS = 20;
 export const LOOP_CONSECUTIVE_FAIL_LIMIT = 3;
 export const LOOP_ITERATION_LOG_CAP = 20;
-/** Turns allowed inside ONE attempt before the loop pauses. An attempt spans as
- *  many turns as the work needs (one item per turn is the Ralph norm); this is
- *  the runaway guard, the analogue of Claude Code's consecutive-continuation
- *  cap. It is deliberately separate from maxIterations, which counts attempts
- *  that ENDED in failure. */
-export const DEFAULT_MAX_TURNS_PER_ITER = 50;
 
 function textOf(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -161,11 +152,6 @@ export function parseLoopConfig(raw: unknown): LoopConfig {
     typeof maxIterationsRaw === "number" && Number.isFinite(maxIterationsRaw) && maxIterationsRaw >= 1
       ? Math.min(Math.floor(maxIterationsRaw), 200)
       : DEFAULT_LOOP_MAX_ITERATIONS;
-  const maxTurnsRaw = r.maxTurnsPerIter;
-  const maxTurnsPerIter =
-    typeof maxTurnsRaw === "number" && Number.isFinite(maxTurnsRaw) && maxTurnsRaw >= 1
-      ? Math.floor(maxTurnsRaw)
-      : null;
   const session = r.session === "fresh-disk" ? "fresh-disk" : "resume";
   const snapshot = r.snapshot === "git-commit" ? "git-commit" : "none";
   const cmds = Array.isArray(r.allowedVerifierCmds)
@@ -179,7 +165,7 @@ export function parseLoopConfig(raw: unknown): LoopConfig {
     verifier,
     doneWhen,
     maxIterations,
-    maxTurnsPerIter,
+    maxTurnsPerIter: null,
     session,
     snapshot,
     permissionBump: textOf(r.permissionBump) || null,
@@ -203,6 +189,7 @@ export function emptyLoopState(): LoopState {
     lastVerifySummary: "",
     lastSnapshot: null,
     lastDoneCount: 0,
+    lastProgressFingerprint: null,
     iterations: [],
   };
 }
@@ -233,6 +220,7 @@ export function parseLoopState(raw: unknown): LoopState {
     lastSnapshot: typeof r.lastSnapshot === "string" ? r.lastSnapshot : null,
     lastDoneCount:
       typeof r.lastDoneCount === "number" && r.lastDoneCount >= 0 ? Math.floor(r.lastDoneCount) : 0,
+    lastProgressFingerprint: typeof r.lastProgressFingerprint === "string" ? r.lastProgressFingerprint : null,
     iterations,
   };
 }
@@ -303,7 +291,7 @@ export function loopStartPrompt(config: LoopConfig): string {
   ];
   if (config.verifier) {
     lines.push(
-      `- Ensemble will also run this check after you stop: ${config.verifier.kind} ${config.verifier.spec}. Do not claim done if it would fail.`,
+      `- After the whole goal is marked complete, Ensemble will run this check: ${config.verifier.kind} ${config.verifier.spec}. Do not claim done if it would fail.`,
     );
   }
   return lines.join("\n");
@@ -325,18 +313,8 @@ export function decideLoopAfterVerify(input: {
   markerHit: boolean;
   hasDiff: boolean;
   reviewText?: string;
-  /** The board advanced this turn (new checked items). A productive attempt is
-   *  rolled into a fresh turn window instead of being paused at the ceiling:
-   *  the cap is a stall brake, not a progress brake. */
-  progressed?: boolean;
 }): LoopDecision {
-  const { config, state, verifyOk, summary, markerHit, hasDiff, reviewText, progressed = false } = input;
-  const turnCap = config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER;
-  const turnCapReached = state.innerTurns >= turnCap;
-  const capDecision = (): LoopDecision =>
-    progressed
-      ? { action: "continue", userInput: loopContinuePrompt(config), extendTurns: true }
-      : { action: "pause", reason: `inner-turn cap ${turnCap} reached` };
+  const { config, state, verifyOk, summary, markerHit, hasDiff, reviewText } = input;
   const failPrompt = [
     "VERIFY FAIL. The completion condition is not met. Continue. Do not stop until it passes.",
     summary.trim() ? `Failure summary:\n${summary.trim()}` : "",
@@ -356,7 +334,7 @@ export function decideLoopAfterVerify(input: {
     // budget moves. A verifier that is red while the agent is still working is
     // feedback, not a finished attempt — counting it per turn is what made a
     // multi-task board exhaust maxIterations after N tasks.
-    if (config.doneWhen.kind === "file-contains" && markerHit) {
+    if (markerHit || config.doneWhen.kind === "exit-0") {
       if (state.iter >= config.maxIterations) {
         return { action: "pause", reason: `iteration cap ${config.maxIterations} reached` };
       }
@@ -366,8 +344,22 @@ export function decideLoopAfterVerify(input: {
         userInput: failPrompt,
       };
     }
-    if (turnCapReached) return capDecision();
     return { action: "continue", userInput: failPrompt };
+  }
+
+  if (config.doneWhen.kind !== "exit-0" && !markerHit && reviewText === undefined) {
+    if (state.consecutiveFails >= LOOP_CONSECUTIVE_FAIL_LIMIT && !hasDiff) {
+      return {
+        action: "pause",
+        reason: `no ## DONE and no further diff after ${state.consecutiveFails} turns`,
+      };
+    }
+    // Same attempt, next turn: the board is not finished yet. This does NOT
+    // consume an attempt, so a 20-item board can run in one attempt.
+    return {
+      action: "continue",
+      userInput: loopContinuePrompt(config),
+    };
   }
 
   if (config.doneWhen.kind === "peer-lgtm") {
@@ -386,21 +378,6 @@ export function decideLoopAfterVerify(input: {
     };
   }
 
-  if (config.doneWhen.kind === "file-contains" && !markerHit) {
-    if (state.consecutiveFails >= LOOP_CONSECUTIVE_FAIL_LIMIT && !hasDiff) {
-      return {
-        action: "pause",
-        reason: `no ## DONE and no further diff after ${state.consecutiveFails} turns`,
-      };
-    }
-    if (turnCapReached) return capDecision();
-    // Same attempt, next turn: the board is not finished yet. This does NOT
-    // consume an attempt, so a 20-item board can run in one attempt.
-    return {
-      action: "continue",
-      userInput: loopContinuePrompt(config),
-    };
-  }
 
   return { action: "done", summary: summary.trim() || "loop complete" };
 }
@@ -408,11 +385,7 @@ export function decideLoopAfterVerify(input: {
 export function formatLoopStatusLines(view: LoopView): string[] {
   const v = view.config.verifier;
   return [
-    // `iter` counts ATTEMPTS and only moves when a full attempt fails; the turn
-    // figure is the one that advances while one attempt spans a long board.
-    `loop            ${view.status}  turn ${view.innerTurns}/${
-      view.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER
-    }  attempt ${view.iter}/${view.maxIterations}`,
+    `loop            ${view.status}  attempt ${view.iter}/${view.maxIterations}  turns ${view.innerTurns}`,
     `verifier        ${v ? `${v.kind}  ${v.spec}` : "none"}  last=${
       // No verifier means nothing was checked. Reporting `pass` here made
       // "no command verifier" look like a green gate.

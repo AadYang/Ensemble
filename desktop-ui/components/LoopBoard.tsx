@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { DEFAULT_MAX_TURNS_PER_ITER, type LoopView } from "@agentorch/shared";
+import { type LoopView } from "@agentorch/shared";
 import { useT } from "@/i18n/useT";
 import { patchLoop, putLoopTasks } from "@/lib/loop-api";
 
@@ -10,21 +10,13 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
   const last = loop.lastVerifyOk;
   const done = loop.tasks.filter((task) => task.done).length;
   const [capDraft, setCapDraft] = useState(String(loop.maxIterations));
-  // The per-attempt turn ceiling: the counter that actually advances while one
-  // attempt is spanning a long board. Without it the attempts figure looks
-  // frozen and the only visible cap is the one that never moves.
-  const turnCap = loop.config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER;
-  const [turnsDraft, setTurnsDraft] = useState(String(turnCap));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
     setCapDraft(String(loop.maxIterations));
   }, [loop.maxIterations]);
-  useEffect(() => {
-    setTurnsDraft(String(turnCap));
-  }, [turnCap]);
 
-  const run = (body: { maxIterations?: number; maxTurnsPerIter?: number; resetAttempts?: boolean }) => {
+  const run = (body: { maxIterations?: number; resetAttempts?: boolean }) => {
     setBusy(true);
     setError("");
     void patchLoop(agentId, body)
@@ -34,15 +26,9 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
   // An exhausted budget (iter >= max) is a dead end: every later attempt
   // pauses on sight. Both controls re-arm it — `set` raises the cap, `reset`
   // clears the counter — so the operator is never stuck at 10/10.
-  const spent = loop.iter >= loop.maxIterations;
+  const spent = loop.status === "paused" && loop.iter >= loop.maxIterations;
   const draft = Number(capDraft);
   const draftValid = Number.isFinite(draft) && draft >= 1 && draft <= 200 && Math.floor(draft) === draft;
-  const turnsDraftValue = Number(turnsDraft);
-  const turnsValid =
-    Number.isFinite(turnsDraftValue) &&
-    turnsDraftValue >= 1 &&
-    turnsDraftValue <= 500 &&
-    Math.floor(turnsDraftValue) === turnsDraftValue;
   return (
     <aside className="hidden @[560px]:flex flex-col w-[min(17rem,42%)] shrink-0 min-w-0 min-h-0 border-l border-[var(--border)] bg-[var(--bg)] p-3 text-[11px] overflow-y-auto">
       <div className="text-[var(--accent)] tracking-wider uppercase mb-2">{t("loop.board.title")}</div>
@@ -85,34 +71,8 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
         {spent && <span className="text-[var(--warn)] w-full">{t("loop.board.spent")}</span>}
         {error && <span className="text-[var(--err)] w-full break-words">{error}</span>}
       </div>
-      <div className="flex flex-wrap items-center gap-1 mb-2 text-[var(--text-dim)]">
-        <span className="text-[var(--text-faint)] tracking-wider uppercase">{t("loop.board.turns")}</span>
-        <span
-          className={
-            loop.innerTurns >= turnCap ? "tabular-nums text-[var(--warn)]" : "tabular-nums text-[var(--text)]"
-          }
-          title={t("loop.board.turnsHint")}
-        >
-          {loop.innerTurns}/{turnCap}
-        </span>
-        <input
-          type="number"
-          min={1}
-          max={500}
-          value={turnsDraft}
-          onChange={(e) => setTurnsDraft(e.target.value)}
-          aria-label={t("loop.board.maxTurns")}
-          title={t("loop.board.maxTurns")}
-          className="w-12 bg-[var(--bg-pane)] border border-[var(--border)] px-1 tabular-nums text-[var(--text)] focus-visible:outline focus-visible:outline-1 focus-visible:outline-[var(--accent)]"
-        />
-        <button
-          type="button"
-          disabled={busy || !turnsValid || turnsDraftValue === turnCap}
-          className="px-1 border border-[var(--border)] hover:text-[var(--accent)] disabled:opacity-40"
-          onClick={() => run({ maxTurnsPerIter: Math.floor(turnsDraftValue) })}
-        >
-          {t("loop.board.setCap")}
-        </button>
+      <div className="mb-2 text-[var(--text-dim)] tabular-nums" title={t("loop.board.turnsHint")}>
+        {t("loop.chip.turns", { n: loop.innerTurns })}
       </div>
       <div className="flex items-center justify-between mb-1">
         <span className="text-[var(--text-faint)] tracking-wider uppercase">{t("loop.board.tasks")}</span>

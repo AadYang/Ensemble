@@ -20,9 +20,11 @@
 // with git's own stderr, and the user decides what to do about their changes.
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { inspectProjectRoot } from "./sessions/project-root.js";
+
 import {
   localNameForRemoteRef,
   parseGitStatusV2,
@@ -543,4 +545,26 @@ export async function addLoopWorktree(
   const run = await runGit(cwd, ["worktree", "add", "-b", branch, worktreePath], timeoutMs);
   if (!run.ok) return { ok: false, error: run.stderr.trim() || run.message || "git worktree add failed" };
   return { ok: true, path: worktreePath };
+}
+
+/** Compare work between loop turns, rather than treating an old dirty tree as progress.
+ * File metadata also covers edits to an already-dirty or untracked file without
+ * reading potentially huge build artifacts. This detects activity, not correctness. */
+export async function loopWorkspaceFingerprint(root: string, head: string | null): Promise<string | null> {
+  const [files, index] = await Promise.all([
+    runGit(root, ["ls-files", "-m", "-o", "--exclude-standard", "-z"], GIT_TIMEOUT_MS),
+    runGit(root, ["diff", "--cached", "--raw", "--no-abbrev", "--no-ext-diff"], GIT_TIMEOUT_MS),
+  ]);
+  if (!files.ok || !index.ok) return null;
+  const hash = createHash("sha256").update(head ?? "").update(index.stdout);
+  for (const path of [...new Set(files.stdout.split("\0").filter(Boolean))].sort()) {
+    try {
+      const stat = statSync(join(root, path));
+      hash.update(JSON.stringify([path, stat.size, stat.mtimeMs, stat.ctimeMs]));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      hash.update(JSON.stringify([path, "deleted"]));
+    }
+  }
+  return hash.digest("hex");
 }

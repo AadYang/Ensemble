@@ -516,12 +516,12 @@ Config (shared LoopConfig):
   verifier          optional command | job | file-marker | peer-review
   verifier.spec     only if verifier is set
   doneWhen          default file-contains ## DONE; exit-0 | peer-lgtm are advanced
-  maxIterations     cap on FAILED full attempts (default 20), not on tasks or
+  maxIterations     maximum overall attempts (default 20), not on tasks or
                     turns. One attempt spans as many turns as the board needs;
                     it only advances when ## DONE is written and the verifier
                     still rejects it (or a reviewer rejects). Does NOT change
                     global maxTurns.
-  maxTurnsPerIter   turn cap inside ONE attempt (default 50; overridable).
+  Turn counts are informational only; there is no per-attempt turn cap.
   session           resume (default) | fresh-disk. fresh-disk calls resetRuntimeSession
                     when an attempt FAILS and re-injects the goal + TASKS.md reminder.
   snapshot          git-commit | none. Commits via argv (no shell, no --force).
@@ -531,10 +531,11 @@ Config (shared LoopConfig):
 Lifecycle (core LoopManager, hooked from SessionManager.sendMessage finally):
   1. The turn runs on the agent's existing runtime (Claude / OpenAI / Codex).
   2. On a successful result that was not aborted, SessionManager asks LoopManager.
-  3. Optional command verifier runs as a JobManager job if configured.
+  3. After ## DONE, the optional command verifier runs as a JobManager job.
+     Explicit exit-0 mode instead uses that command as its acceptance condition.
   4. Command fail → VERIFY FAIL notice + auto-continue with the tail.
-     Missing ## DONE → re-inject the goal (outer iter). Three consecutive
-     no-progress turns (fail or no diff) → paused.
+     Missing ## DONE → continue the SAME attempt. Three consecutive
+     unchanged progress observations → paused.
   5. ## DONE present (and optional command green) → LOOP DONE.
   6. peer-review: command/job must be green, then peer_send(mode=review) to the
      reviewer; status=awaiting_review until LGTM (or reject back to the runner).

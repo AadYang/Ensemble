@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { JobManager } from "./jobs.js";
@@ -5,7 +6,6 @@ import { readTail } from "./jobs.js";
 import { prisma, type Agent, type AgentLoop, type AgentLoopStatus } from "./db.js";
 import type { WSHub } from "./ws/hub.js";
 import {
-  DEFAULT_MAX_TURNS_PER_ITER,
   LOOP_CONSECUTIVE_FAIL_LIMIT,
   LOOP_ITERATION_LOG_CAP,
   LoopConfigError,
@@ -26,7 +26,7 @@ import {
   type LoopTask,
   type LoopView,
 } from "@agentorch/shared";
-import { addLoopWorktree, commitLoopSnapshot, gitWorkTreeDirty, readGitState } from "./git.js";
+import { addLoopWorktree, commitLoopSnapshot, loopWorkspaceFingerprint, readGitState } from "./git.js";
 import { inspectProjectRoot, scratchDirFor } from "./sessions/project-root.js";
 import { ensureLoopSkills, loopSkillName } from "./loop-skills.js";
 import { prefillLoopFromProject } from "./loop-prefill.js";
@@ -95,6 +95,18 @@ function markerPathText(root: string | null, spec: string): string {
   } catch {
     return "";
   }
+}
+
+function clearCompletionMarker(root: string | null, config: LoopConfig): void {
+  if (!root || config.doneWhen.kind === "exit-0") return;
+  const marker = config.doneWhen.kind === "file-contains" ? config.doneWhen.spec : "## DONE";
+  const path = join(root, marker.includes(".md") ? marker : "TASKS.md");
+  if (!existsSync(path)) return;
+  const before = readFileSync(path, "utf8");
+  const after = before.split(/(\r?\n)/).map((line) =>
+    line.trim() === (marker || "## DONE") || line.trim() === "ALL_COMPLETE" ? "" : line,
+  ).join("");
+  if (after !== before) writeFileSync(path, after, "utf8");
 }
 
 function usableRoot(projectRoot: string | null | undefined, agentId: string): string | null {
@@ -230,10 +242,7 @@ export class LoopManager {
     if (!row) return null;
     const config = parseLoopConfig(row.config);
     const state = parseLoopState(row.state);
-    // A manual resume opens a fresh turn budget for the current attempt.
-    // Without this, a loop paused by the per-attempt turn cap would pause
-    // again on its very next turn.
-    state.innerTurns = 0;
+    // Resume keeps the informational turn count within the same attempt.
     state.consecutiveFails = 0;
     // The attempt cap is a safety valve, not a verdict: a human clicking
     // "resume" outranks it. Resuming an already-exhausted budget would leave
@@ -251,6 +260,7 @@ export class LoopManager {
         },
       ].slice(-LOOP_ITERATION_LOG_CAP);
       state.iter = 1;
+      state.innerTurns = 0;
     }
     const next = this.upsert(agentId, { status: "running", config, state });
     this.broadcast(next);
@@ -267,7 +277,6 @@ export class LoopManager {
     raw: {
       doneWhen?: unknown;
       maxIterations?: number;
-      maxTurnsPerIter?: number | null;
       resetAttempts?: boolean;
     },
   ): Promise<LoopView | null> {
@@ -278,9 +287,6 @@ export class LoopManager {
       ...(row.config as object),
       ...(raw.doneWhen !== undefined ? { doneWhen: raw.doneWhen } : {}),
       ...(raw.maxIterations !== undefined ? { maxIterations: raw.maxIterations } : {}),
-      ...(raw.maxTurnsPerIter !== undefined
-        ? { maxTurnsPerIter: raw.maxTurnsPerIter ?? undefined }
-        : {}),
       verifier: base.verifier,
       goal: base.goal,
     });
@@ -346,24 +352,33 @@ export class LoopManager {
 
     this.verifying.add(agentId);
     try {
-      const verify = await this.runVerifier(agentId, config);
       const state = parseLoopState(row.state);
       state.innerTurns += 1;
-      state.lastVerifyOk = verify.ok;
+      const root = config.boardRoot ?? this.agentRoot(agentId);
+      const marker = config.doneWhen.kind === "file-contains" ? config.doneWhen.spec : "## DONE";
+      const board = markerPathText(root, marker || "TASKS.md");
+      const markerHit = fileMarkerHit(board, marker);
+      const ready = config.doneWhen.kind === "exit-0" || markerHit;
+      const verify = ready
+        ? await this.runVerifier(agentId, config)
+        : { ok: true, summary: "Work in progress; completion check not run" };
+      state.lastVerifyOk = ready ? verify.ok : null;
       state.lastVerifySummary = verify.summary;
 
-      const root = config.boardRoot ?? this.agentRoot(agentId);
-      const markerHit = fileMarkerHit(markerPathText(root, config.doneWhen.spec || "TASKS.md"), config.doneWhen.spec);
       const git = root ? await readGitState(root).catch(() => null) : null;
-      const hasDiff = git ? gitWorkTreeDirty(git) : false;
-      // Board progress is the honest "still working" signal. The per-attempt
-      // turn ceiling used to stop an agent that had just ticked 75 of 89 items
-      // simply because it was the 50th turn; now it only brakes a stall.
-      const doneCount = readTasks(root).filter((task) => task.done).length;
-      const progressed = doneCount > state.lastDoneCount;
-      state.lastDoneCount = doneCount;
-      if (!verify.ok) state.consecutiveFails += 1;
-      else if (config.doneWhen.kind === "file-contains" && !markerHit && !hasDiff) state.consecutiveFails += 1;
+      const workspace = git?.state === "ok" && git.root
+        ? await loopWorkspaceFingerprint(git.root, git.head)
+        : null;
+      // Unknown repository state is not evidence of a stall. Outside git, the
+      // board is the observable progress record that the loop asks to maintain.
+      const observable = git?.state === "not-a-repo" || workspace !== null;
+      const fingerprint = observable
+        ? createHash("sha256").update(board).update(workspace ?? "").digest("hex")
+        : null;
+      const hasDiff = fingerprint === null || state.lastProgressFingerprint === null || fingerprint !== state.lastProgressFingerprint;
+      state.lastProgressFingerprint = fingerprint;
+      state.lastDoneCount = readTasks(root).filter((task) => task.done).length;
+      if (!hasDiff && (!ready || !verify.ok)) state.consecutiveFails += 1;
       else state.consecutiveFails = 0;
       const decision = decideLoopAfterVerify({
         config,
@@ -372,7 +387,6 @@ export class LoopManager {
         summary: verify.summary,
         markerHit,
         hasDiff,
-        progressed,
       });
       return await this.applyDecision(agentId, config, state, decision, verify.ok);
     } finally {
@@ -421,24 +435,9 @@ export class LoopManager {
     };
 
     if (decision.action === "continue") {
-      // The ceiling was reached with the board still advancing: raise it for
-      // the SAME attempt rather than pausing productive work. The counter keeps
-      // climbing — resetting it to 0 looked like lost progress.
-      let extendedFrom: number | null = null;
-      let extendedTo: number | null = null;
-      if (decision.extendTurns) {
-        extendedFrom = config.maxTurnsPerIter ?? DEFAULT_MAX_TURNS_PER_ITER;
-        extendedTo = extendedFrom * 2;
-        config = { ...config, maxTurnsPerIter: extendedTo };
-      }
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
-      if (extendedTo !== null) {
-        await this.host.persistLoopNotice(
-          agentId,
-          `LOOP · turn ceiling extended ${extendedFrom} → ${extendedTo} (board advanced)`,
-        );
-      } else if (!verifyOk) {
+      if (!verifyOk) {
         // A green verifier on the "not finished yet" path is not a failure; it
         // used to be announced as VERIFY FAIL, which read as a contradiction.
         await this.host.persistLoopNotice(
@@ -450,6 +449,7 @@ export class LoopManager {
     }
 
     if (decision.action === "pause") {
+      if (!verifyOk) clearCompletionMarker(config.boardRoot ?? this.agentRoot(agentId), config);
       pushIter("fail", decision.reason);
       const next = this.upsert(agentId, { status: "paused", config, state });
       this.broadcast(next);
@@ -468,6 +468,8 @@ export class LoopManager {
     }
 
     if (decision.action === "review-reject") {
+      clearCompletionMarker(config.boardRoot ?? this.agentRoot(agentId), config);
+      pushIter("fail", decision.userInput);
       // A rejected review is a finished attempt that FAILED: advance the
       // attempt budget here, not on every turn the reviewer has not replied.
       if (state.iter >= config.maxIterations) {
@@ -479,6 +481,7 @@ export class LoopManager {
       }
       state.iter += 1;
       state.innerTurns = 0;
+      state.consecutiveFails = 0;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
       if (config.session === "fresh-disk") await this.host.resetRuntimeSession(agentId);
@@ -490,6 +493,7 @@ export class LoopManager {
     }
 
     if (decision.action === "outer-iter") {
+      clearCompletionMarker(config.boardRoot ?? this.agentRoot(agentId), config);
       let snapshot: string | null = state.lastSnapshot;
       if (config.snapshot === "git-commit") {
         const root = config.boardRoot ?? this.agentRoot(agentId);
@@ -505,6 +509,7 @@ export class LoopManager {
       pushIter("fail", state.lastVerifySummary, snapshot);
       state.iter += 1;
       state.innerTurns = 0;
+      state.consecutiveFails = 0;
       state.lastSnapshot = snapshot;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);

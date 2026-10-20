@@ -85,7 +85,6 @@ export async function patchLoop(
   body: {
     doneWhen?: LoopStartBody["doneWhen"];
     maxIterations?: number;
-    maxTurnsPerIter?: number | null;
     resetAttempts?: boolean;
   },
 ): Promise<LoopView> {

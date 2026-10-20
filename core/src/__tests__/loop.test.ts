@@ -123,6 +123,7 @@ describe("LoopManager stop-gate", () => {
       verifier: { kind: "command", spec: "npm test" },
     });
     for (let i = 0; i < 5; i += 1) {
+      writeFileSync(join(root, "TASKS.md"), `- [ ] remaining\nprogress ${i}\n`);
       const cont = await mgr.onTurnSettled(agent.id, { lastText: `item ${i + 1}` });
       expect(cont?.userInput).toMatch(/## DONE/);
     }
@@ -133,39 +134,24 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("running");
   });
 
-  it("extends the turn ceiling while the board keeps advancing, and pauses when it stalls", async () => {
-    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-turn-cap-"));
+  it("ignores legacy turn caps but pauses on an unchanged dirty workspace", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-no-turn-cap-"));
     gitInitWithDirtyFile(root);
-    const agent = seedAgent("turn-cap", root);
-    const host = mockHost();
-    const mgr = new LoopManager(mockJobs(0, "ok"), mockHub(), host);
-    await mgr.start(agent.id, {
-      goal: "finish the board",
-      doneWhen: { kind: "file-contains", spec: "## DONE" },
-      maxTurnsPerIter: 2,
-    });
-    writeFileSync(join(root, "TASKS.md"), "- [ ] one\n- [ ] two\n");
-
-    // Turn 1: no new tick, window 1/2.
-    await mgr.onTurnSettled(agent.id, { lastText: "working" });
-    expect(mgr.view(agent.id)?.status).toBe("running");
-    expect(mgr.view(agent.id)?.innerTurns).toBe(1);
-
-    // Turn 2 ticks an item AND reaches the ceiling: the ceiling is raised and
-    // the counter keeps climbing — it must not jump back to 0.
-    writeFileSync(join(root, "TASKS.md"), "- [x] one\n- [ ] two\n");
-    await mgr.onTurnSettled(agent.id, { lastText: "done one" });
-    expect(mgr.view(agent.id)?.status).toBe("running");
-    expect(mgr.view(agent.id)?.innerTurns).toBe(2);
-    expect(mgr.view(agent.id)?.config.maxTurnsPerIter).toBe(4);
-    expect(host.calls.some((c) => c.includes("turn ceiling extended 2 → 4"))).toBe(true);
-
-    // Turns without a tick still advance the counter; reaching the NEW ceiling
-    // with no progress pauses the loop.
-    await mgr.onTurnSettled(agent.id, { lastText: "stuck" });
-    await mgr.onTurnSettled(agent.id, { lastText: "still stuck" });
+    const agent = seedAgent("no-turn-cap", root);
+    const mgr = new LoopManager(mockJobs(0, "ok"), mockHub(), mockHost());
+    await mgr.start(agent.id, { goal: "finish the board", maxTurnsPerIter: 2 });
+    for (let i = 0; i < 55; i += 1) {
+      writeFileSync(join(root, "TASKS.md"), `- [ ] remaining\nprogress ${i}\n`);
+      expect(await mgr.onTurnSettled(agent.id, { lastText: "working" })).not.toBeNull();
+    }
+    expect(mgr.view(agent.id)?.iter).toBe(1);
+    expect(mgr.view(agent.id)?.innerTurns).toBe(55);
+    expect(mgr.view(agent.id)?.config.maxTurnsPerIter).toBeNull();
+    for (let i = 0; i < 3; i += 1) await mgr.onTurnSettled(agent.id, { lastText: "unchanged" });
     expect(mgr.view(agent.id)?.status).toBe("paused");
-    expect(mgr.view(agent.id)?.iterations.at(-1)?.summary).toMatch(/inner-turn cap 4 reached/);
+    expect(mgr.view(agent.id)?.iterations.at(-1)?.summary).toMatch(/no further diff/);
+    await mgr.resume(agent.id);
+    expect(mgr.view(agent.id)?.innerTurns).toBe(58);
   });
 
   it("resume refills an attempt budget that was already spent", async () => {
@@ -268,12 +254,13 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("done");
   });
 
-  it("pauses after three consecutive fails with no diff", async () => {
+  it("pauses after exhausting three failed acceptance attempts", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-pause-"));
     const agent = seedAgent("pause", root);
     const mgr = new LoopManager(mockJobs(1, "still red"), mockHub(), mockHost());
     await mgr.start(agent.id, {
       goal: "green",
+      maxIterations: 3,
       verifier: { kind: "command", spec: "npm test" },
       doneWhen: { kind: "exit-0", spec: "" },
     });
@@ -348,6 +335,7 @@ describe("LoopManager stop-gate", () => {
       doneWhen: { kind: "peer-lgtm", spec: "LGTM" },
       reviewerAgentId: reviewer.id,
     });
+    writeFileSync(join(root, "TASKS.md"), "- [x] all\n\n## DONE\n");
     const cont = await mgr.onTurnSettled(runner.id, { lastText: "please review" });
     expect(cont).toBeNull();
     expect(mgr.view(runner.id)?.status).toBe("awaiting_review");

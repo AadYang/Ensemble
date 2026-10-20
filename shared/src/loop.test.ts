@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_MAX_TURNS_PER_ITER,
   LoopConfigError,
   decideLoopAfterVerify,
   emptyLoopState,
@@ -66,7 +65,7 @@ describe("loopStartPrompt", () => {
 describe("decideLoopAfterVerify", () => {
   const state = emptyLoopState();
 
-  it("continues on a failed optional verifier", () => {
+  it("starts another attempt after a failed exit-0 acceptance check", () => {
     const config = parseLoopConfig({ ...withCommand, doneWhen: { kind: "exit-0", spec: "" } });
     const d = decideLoopAfterVerify({
       config,
@@ -76,7 +75,7 @@ describe("decideLoopAfterVerify", () => {
       markerHit: false,
       hasDiff: true,
     });
-    expect(d.action).toBe("continue");
+    expect(d.action).toBe("outer-iter");
   });
 
   it("pauses after consecutive fails with no diff", () => {
@@ -172,48 +171,19 @@ describe("decideLoopAfterVerify", () => {
     expect(d.action).toBe("continue");
   });
 
-  it("pauses at the per-attempt turn cap when the board did not advance", () => {
-    const cfg = parseLoopConfig({ goal: "ship it", maxTurnsPerIter: 5 });
-    const d = decideLoopAfterVerify({
-      config: cfg,
-      state: { ...state, innerTurns: 5 },
-      verifyOk: true,
-      summary: "ok",
-      markerHit: false,
-      hasDiff: true,
-      progressed: false,
-    });
-    expect(d).toEqual({ action: "pause", reason: "inner-turn cap 5 reached" });
+  it.each([5, 50, 5000])("keeps working after %s turns without a second budget", (turns) => {
+    const config = parseLoopConfig({ goal: "ship it", maxTurnsPerIter: 5 });
+    expect(config.maxTurnsPerIter).toBeNull();
+    expect(decideLoopAfterVerify({ config, state: { ...state, innerTurns: turns },
+      verifyOk: true, summary: "working", markerHit: false, hasDiff: true,
+    }).action).toBe("continue");
   });
 
-  it("extends the turn ceiling instead of pausing when the board advanced", () => {
-    // A 50-turn ceiling stopped an agent that had just ticked 75 of 89 items.
-    // Progress, not tick count, decides whether the ceiling brakes.
-    const cfg = parseLoopConfig({ goal: "ship it", maxTurnsPerIter: 5 });
-    const d = decideLoopAfterVerify({
-      config: cfg,
-      state: { ...state, innerTurns: 5 },
-      verifyOk: true,
-      summary: "ok",
-      markerHit: false,
-      hasDiff: true,
-      progressed: true,
-    });
-    expect(d.action).toBe("continue");
-    expect(d).toMatchObject({ extendTurns: true });
-  });
-
-  it("uses the default turn cap when the config does not set one", () => {
-    const cfg = parseLoopConfig({ goal: "ship it" });
-    const d = decideLoopAfterVerify({
-      config: cfg,
-      state: { ...state, innerTurns: DEFAULT_MAX_TURNS_PER_ITER },
-      verifyOk: true,
-      summary: "ok",
-      markerHit: false,
-      hasDiff: true,
-    });
-    expect(d.action).toBe("pause");
+  it("does not send unfinished work to the reviewer", () => {
+    const config = parseLoopConfig({ goal: "ship it", doneWhen: { kind: "peer-lgtm", spec: "LGTM" } });
+    expect(decideLoopAfterVerify({ config, state, verifyOk: true, summary: "working",
+      markerHit: false, hasDiff: true,
+    }).action).toBe("continue");
   });
 
   it("pauses a goal-only loop that stalls with no diff", () => {
