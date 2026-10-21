@@ -179,6 +179,46 @@ fn derive_device_id(cache_path: &std::path::Path) -> String {
         })
 }
 
+/// Only the current sidecar SPA may replace the main document after startup.
+fn is_main_app_url(url: &tauri::Url, port: u16) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port_or_known_default() == Some(port)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "/" | "/index.html")
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::is_main_app_url;
+
+    #[test]
+    fn permits_current_app_reload_and_fragments() {
+        for path in ["/", "/index.html", "/?view=chat#agent"] {
+            let url = format!("http://127.0.0.1:52386{path}").parse().unwrap();
+            assert!(is_main_app_url(&url, 52386));
+        }
+    }
+
+    #[test]
+    fn rejects_history_targets_outside_the_current_app() {
+        for target in [
+            "about:blank",
+            "tauri://localhost/",
+            "http://tauri.localhost/",
+            "data:text/html,blank",
+            "blob:http://127.0.0.1:52386/old-page",
+            "http://127.0.0.1:52385/",
+            "http://127.0.0.1:52386/api/agents",
+            "http://127.0.0.1:52386/missing-page",
+            "https://example.com/",
+        ] {
+            assert!(!is_main_app_url(&target.parse().unwrap(), 52386), "{target}");
+        }
+    }
+}
+
 /// Plugin that gates webview navigation. Without this, a stray `<a href>` to
 /// an API endpoint replaces the entire window with the raw JSON response
 /// (white background, no close button, no way back) — the user-reported
@@ -187,7 +227,26 @@ fn derive_device_id(cache_path: &std::path::Path) -> String {
 /// still tries to navigate the webview off loopback is blocked.
 fn ensemble_nav_guard<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
     PluginBuilder::new("ensemble-nav-guard")
-        .on_navigation(|_webview, url| {
+        .on_navigation(|webview, url| {
+            // Once the sidecar is ready, history navigation must not leave the
+            // main SPA for about:blank, the bootstrap page, or an old port.
+            // This also catches gestures mapped to browser Back by a driver,
+            // independently of the WebView's swipe-navigation setting.
+            if webview.label() == "main" {
+                let port = webview
+                    .try_state::<SidecarPort>()
+                    .and_then(|state| *state.0.lock().unwrap());
+                if let Some(port) = port {
+                    let allowed = is_main_app_url(url, port);
+                    if !allowed {
+                        log::warn!(
+                            "nav-guard: blocked main-window navigation scheme={} host={:?} port={:?} path={}",
+                            url.scheme(), url.host_str(), url.port(), url.path()
+                        );
+                    }
+                    return allowed;
+                }
+            }
             // Tauri-internal schemes (asset protocol, devtools, data URIs)
             // bypass any policy — they're never API endpoints.
             let scheme = url.scheme();
