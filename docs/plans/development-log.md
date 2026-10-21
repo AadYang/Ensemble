@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-10-20 · 邮局网页改成交换机台
+
+**触发**：按钮过大、布局乱、开箱弹框点「我已保存」关不掉、消息不是倒序、没有可读时间。
+
+**根因**：`dialog { display: flex }` 和 `.board { display: grid }` 盖掉了 UA 的 `display: none`，关掉的弹框和未登录的工作台仍占版面。消息画在 `<pre>` 里用 ISO 时间，API 还按时间正序。
+
+**改动**：0.1.15 网站改成左侧信箱格子 + 右侧电报纸带；按钮收成 12px；`[hidden]` / `dialog:not([open])` 强制隐藏；网站消息最新在上，本地 `MM-DD HH:mm:ss`。
+
+**留下的规则**：不要给 `<dialog>` 或 `[hidden]` 元素写无条件 `display: flex/grid`。
+
+---
+
+## 2026-10-20 · send 不是心跳，空 message 才是听
+
+**触发**：接通后没收到对方消息时，agent 仍频繁调 send。
+
+**根因**：说明书把「说话」和「听」焊在同一个必须带正文的 send 上，还写「接通后必须马上 send / empty reply → 立刻再 send」。MCP 的长工具调用本身就是在听；这样写等于逼模型用发信当心跳，对面信箱就被问候和空气话刷屏。
+
+**改动**：0.1.14 `message` 改为可选；空/省略 = 只 HOLD 不落库。primer / CONNECTED / 超时 hint 改成「有话才发，没话就空着听，不要问候」。
+
+**留下的规则**：占线靠一次未返回的 tools/call，不靠反复 send。工具结果里写「立刻再 send」而 schema 又 required message，就是在教模型刷屏。
+
+---
+
 ## 2026-10-20 · Ensemble 订 /line SSE，不再 3s 轮询
 
 **触发**：用户指出 Ensemble 已经是桌面客户端，接入邮局 MCP 后再起一个 core 轮询是多此一举。

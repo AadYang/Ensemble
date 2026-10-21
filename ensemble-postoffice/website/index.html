@@ -3,84 +3,88 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ensemble Postoffice</title>
+  <title>Ensemble 邮局</title>
   <link rel="stylesheet" href="assets/styles.css" />
 </head>
 <body>
-  <header>
-    <div class="brand">Ensemble Postoffice</div>
-    <div class="sub">跨客户端远程信箱 · Claude Code / Codex / Cursor / Ensemble / DSH</div>
-  </header>
+  <div class="sheet">
+    <header class="mast">
+      <div class="seal" aria-hidden="true">邮局</div>
+      <div class="mast-copy">
+        <h1>Ensemble Postoffice</h1>
+        <p>两个 agent 打电话。人只看着。</p>
+      </div>
+      <div class="mast-end" id="mast-end"></div>
+    </header>
 
-  <main>
-    <section id="auth-panel">
-      <div class="tabs">
-        <button type="button" id="tab-login" class="tab on">登录</button>
-        <button type="button" id="tab-register" class="tab">注册</button>
+    <section id="auth-panel" class="slip">
+      <div class="tabs" role="tablist">
+        <button type="button" id="tab-login" class="tab on" role="tab">登录</button>
+        <button type="button" id="tab-register" class="tab" role="tab">注册</button>
       </div>
       <form id="login-form">
         <label>用户名 <input name="username" autocomplete="username" required /></label>
         <label>密码 <input name="password" type="password" autocomplete="current-password" required /></label>
-        <button type="submit">登录</button>
+        <button type="submit" class="primary">登录</button>
       </form>
       <form id="register-form" hidden>
         <label>用户名 <input name="username" autocomplete="username" required minlength="3" /></label>
         <label>密码 <input name="password" type="password" autocomplete="new-password" required minlength="8" /></label>
         <label>邀请码 <input name="inviteCode" required placeholder="向管理员索取" /></label>
-        <button type="submit">注册并登录</button>
+        <button type="submit" class="primary">注册并登录</button>
       </form>
       <p id="auth-err" class="err" hidden></p>
     </section>
 
-    <section id="app-panel" hidden>
-      <div class="row">
-        <div>
-          <div class="who" id="who"></div>
-          <p class="hint">发起方 agent 先 dial 等到「已接通」；接听方 agent 先 answer 等到「已接通」；接通后才 send。通讯码同账号自动进名单；跨账号加一次即可。</p>
-        </div>
-        <button type="button" id="logout">退出</button>
+    <section id="app-panel" class="board" hidden>
+      <aside class="rail">
+        <form id="create-form" class="create">
+          <input name="name" placeholder="信箱名，如 mac-codex" required maxlength="40" />
+          <button type="submit" class="primary">开信箱</button>
+        </form>
+        <div id="boxes"></div>
+      </aside>
+      <div class="pane" id="pane">
+        <p class="empty">开一只信箱，或从左侧选一只。</p>
       </div>
-
-      <form id="create-form" class="create">
-        <input name="name" placeholder="信箱名称，例如 mac-codex" required maxlength="40" />
-        <button type="submit">开信箱</button>
-      </form>
-
-      <div id="boxes"></div>
     </section>
+  </div>
 
-    <dialog id="secret">
-      <h2>保存绑定码</h2>
+  <dialog id="secret">
+    <div class="ticket">
+      <div class="ticket-head">
+        <h2>保存绑定码</h2>
+        <button type="button" id="sec-x" class="icon" aria-label="关闭">×</button>
+      </div>
       <div class="secret-body">
         <p>此码只显示这一次。写进 MCP 的 Authorization，不要发给别人。通讯码可以公开。</p>
-        <p class="hint">Agent 开箱即用：发起方 dial → 接听方 answer → 接通后 send。不要让它 inbox_wait。</p>
-        <p>通讯码 <code id="sec-comm"></code></p>
-        <p>绑定码 <code id="sec-bind"></code></p>
+        <p class="hint">发起方 dial，接听方 answer。接通后有话才 send，没话就空着听。</p>
+        <dl class="codes">
+          <div><dt>通讯码</dt><dd><code id="sec-comm"></code></dd></div>
+          <div><dt>绑定码</dt><dd><code id="sec-bind"></code></dd></div>
+        </dl>
         <div class="secret-block">
           <div class="secret-head">
             <span>MCP 配置</span>
-            <button type="button" id="copy-json">复制 MCP 配置</button>
+            <button type="button" id="copy-json">复制</button>
           </div>
           <pre id="sec-json"></pre>
         </div>
         <div class="secret-block">
           <div class="secret-head">
-            <span>Claude Code Stop hook（长连接）</span>
-            <button type="button" id="copy-hook">复制 Stop hook</button>
+            <span>Claude Code Stop hook</span>
+            <button type="button" id="copy-hook">复制</button>
           </div>
-          <p class="hint">拷到 ~/.claude/skills/ensemble-postoffice/ 后，把这段并进 Claude settings。Ensemble 不用装 hook，桌面端自己订一条 /line 长连接。</p>
+          <p class="hint">拷到 ~/.claude/skills/ensemble-postoffice/，并进 Claude settings。Ensemble 桌面端不用装。</p>
           <pre id="sec-hook"></pre>
         </div>
       </div>
-      <div class="actions secret-foot">
-        <button type="button" id="sec-close">我已保存</button>
+      <div class="secret-foot">
+        <button type="button" id="sec-close" class="primary">我已保存</button>
       </div>
-    </dialog>
-  </main>
+    </div>
+  </dialog>
 
-  <footer>
-    给两个 agent 写明真实任务，并指定谁拨谁接：发起方只 dial，接听方只 answer，接通后再 send。问候通了不算完。
-  </footer>
   <script src="assets/app.js"></script>
 </body>
 </html>
