@@ -448,7 +448,7 @@ export class Store {
     const n = Math.min(100, Math.max(1, limit));
     const rows = this.db
       .prepare(
-        `SELECT * FROM Message WHERE fromId = ? OR toId = ? ORDER BY createdAt DESC LIMIT ?`,
+        `SELECT * FROM Message WHERE fromId = ? OR toId = ? ORDER BY createdAt DESC, rowid DESC LIMIT ?`,
       )
       .all(mailboxId, mailboxId, n) as MessageRow[];
     return this.hydrate(rows.reverse());

@@ -297,6 +297,7 @@ describe("postoffice", () => {
       name: "send",
       arguments: { to: b.commCode, message: "from-a", wait_sec: 0 },
     });
+    await new Promise((r) => setTimeout(r, 5));
     await rpc(b.bindCode, "sess-b", "tools/call", {
       name: "send",
       arguments: { to: a.commCode, message: "from-b", wait_sec: 0 },
@@ -317,8 +318,9 @@ describe("postoffice", () => {
       headers: { authorization: `Bearer ${aTok}` },
     });
     expect(listed.statusCode).toBe(200);
-    const body = listed.json() as { messages: { body: string }[] };
-    expect(body.messages.map((m) => m.body).sort()).toEqual(["from-a", "from-b"]);
+    const body = listed.json() as { messages: { body: string; createdAt: number }[] };
+    expect(body.messages.map((m) => m.body)).toEqual(["from-b", "from-a"]);
+    expect(body.messages[0]?.createdAt).toBeGreaterThanOrEqual(body.messages[1]?.createdAt ?? 0);
 
     const forbidden = await app.inject({
       method: "GET",
@@ -409,6 +411,44 @@ describe("postoffice", () => {
     expect(toolJson(answered)).toMatchObject({ connected: true });
     expect(toolText(pickup)).toContain("CONNECTED");
     expect(toolJson(pickup)).toMatchObject({ connected: true });
+  });
+
+  it("empty send listens without depositing a message", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    const ringing = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "dial",
+      arguments: { timeout_sec: 8 },
+    }, 20);
+    await new Promise((r) => setTimeout(r, 40));
+    await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "answer",
+      arguments: { timeout_sec: 8 },
+    }, 21);
+    expect(toolJson(await ringing)).toMatchObject({ connected: true });
+
+    const listening = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "send",
+      arguments: { wait_sec: 8 },
+    }, 22);
+    await new Promise((r) => setTimeout(r, 80));
+    await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "send",
+      arguments: { message: "only-real-work", wait_sec: 0 },
+    }, 23);
+    const heard = await listening;
+    expect(toolJson(heard)).toMatchObject({ delivered: false, listening: true, connected: true });
+    expect(toolText(heard)).toContain("only-real-work");
+    expect(toolText(heard)).toContain("nothing sent");
+
+    const thread = await rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "transcript",
+      arguments: {},
+    }, 24);
+    const messages = (toolJson(thread).messages as { from: string; body: string }[]) ?? [];
+    expect(messages.filter((m) => m.from === a.commCode)).toEqual([]);
+    expect(messages.map((m) => m.body)).toContain("only-real-work");
   });
 
   it("send without a line tells the agent to dial or answer", async () => {

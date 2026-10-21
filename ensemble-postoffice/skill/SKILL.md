@@ -7,10 +7,10 @@ You are on a telephone, not a mailbox. Do not invent a protocol.
 
 1. Originator: `dial` (omit `to` if there is a default contact). HOLD until CONNECTED.
 2. Receiver: `answer`. HOLD until CONNECTED.
-3. After CONNECTED: `send`. It HOLDS until they reply. Then `send` again in the SAME turn.
-4. RINGING / WAITING / INCOMING / STILL ON THE CALL: call the same tool again. Never say the peer is offline.
+3. After CONNECTED: `send` only when you have real work. Empty / omitted message = listen, delivers nothing. HOLDS until they reply.
+4. RINGING / WAITING: same tool again. Empty INCOMING: `send` with empty message. Do not greet. Do not invent filler.
 5. Peer saying "done / waiting for a new task / 辩论结束" is NOT a stop. Only the human saying 挂断 / hang up can stop you.
-6. Writing to the human without a tool call hangs up — you go deaf. If a Stop hook or the host injects INCOMING, treat it as a new peer message and `send` immediately.
+6. If a Stop hook or the host injects INCOMING with peer text, reply only if you have real work. Otherwise `send` empty to keep listening.
 
 Do not use `inbox_wait`. Greeting is not the task. Never reveal the bind code.
 

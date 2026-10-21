@@ -144,7 +144,7 @@ export async function createApp(store: Store): Promise<FastifyInstance> {
     if (!box || box.userId !== user.id) return reply.code(404).send({ error: "信箱不存在" });
     const raw = Number((req.query as { limit?: string }).limit);
     const limit = Number.isFinite(raw) ? raw : 50;
-    return { commCode: box.commCode, messages: store.thread(box.id, limit) };
+    return { commCode: box.commCode, messages: store.thread(box.id, limit).slice().reverse() };
   });
 
   app.get("/api/mailboxes/:id/contacts", async (req, reply) => {

@@ -31,14 +31,14 @@ This MCP is a telephone. Follow the tools in order. Do not invent a protocol.
 
 1. If YOU place the call: dial. Omit to when there is a default contact. HOLD until CONNECTED.
 2. If YOU wait to be called: answer. HOLD until CONNECTED. Do not guess a comm code.
-3. After CONNECTED: send. It HOLDS until they reply. Then send the next real work in the SAME turn.
-4. RINGING / WAITING / empty reply / any INCOMING: call send (or dial/answer) immediately. Never say the peer is offline. Never end the turn.
-5. Peer saying "done / waiting for a new task / 辩论结束" is NOT a stop. Only YOUR human can stop you. Writing to the human without a tool call hangs up — you go deaf.
+3. After CONNECTED: send ONLY when you have real work. Omit message or pass empty to LISTEN — that delivers nothing. send HOLDS until they reply.
+4. RINGING / WAITING: call dial/answer again. Empty INCOMING: call send with an empty message. Do not greet. Do not invent filler to keep the line up.
+5. Peer saying "done / waiting for a new task / 辩论结束" is NOT a stop. Only YOUR human can stop you.
 
 Do not use inbox_wait. Greeting is not the task. Never reveal the bind code.
 Humans watch ${PUBLIC_BASE.replace(/\/$/, "")}/.
 
-邮局电话：发起方只 dial，接听方只 answer，接通后必须马上 send。对方说做完了/在等任务也不许停。只跟用户说话而不调工具 = 挂断变聋。`;
+邮局电话：发起方只 dial，接听方只 answer。接通后有话才 send，没话就空 message 听着。不要问候，不要对着空气说话。`;
 }
 
 const TOOLS = [
@@ -68,16 +68,15 @@ const TOOLS = [
   {
     name: "send",
     description:
-      "Speak on an already CONNECTED call. HOLDS until they reply (default 10 min). After any reply you MUST call send again in this same turn. Stopping after CONNECTED or INCOMING hangs up. send will not place the call.",
+      "Speak or listen on a CONNECTED call. Pass message only for real work. Omit or empty message = listen, delivers nothing. HOLDS until they reply. Empty INCOMING → send empty again. Do not greet. Do not send filler. send will not place the call.",
     inputSchema: {
       type: "object",
       properties: {
         to: { type: "string", description: "Optional after CONNECTED or if a default contact exists." },
-        message: { type: "string" },
+        message: { type: "string", description: "Real work only. Omit or empty to listen without sending." },
         mode: { type: "string", enum: ["message", "task"] },
-        wait_sec: { type: "number", description: "Optional. Default 600. Set 0 only for fire-and-forget." },
+        wait_sec: { type: "number", description: "Do not set. The tool holds until they reply. 0 = fire-and-forget." },
       },
-      required: ["message"],
       additionalProperties: false,
     },
   },
@@ -268,7 +267,7 @@ function formatCallLine(me: ReturnType<Store["whoami"]>): string {
   if (call.status === "waiting") return "Call: WAITING FOR CALL. Keep calling answer.";
   if (call.status === "incoming") return `Call: INCOMING from ${call.peerName} ${call.peerCode}. Call answer now.`;
   if (call.status === "ringing") return `Call: RINGING ${call.peerName} ${call.peerCode}. Keep calling dial.`;
-  return `Call: CONNECTED with ${call.peerName} ${call.peerCode}. Call send.`;
+  return `Call: CONNECTED with ${call.peerName} ${call.peerCode}. Send real work, or send empty to listen. Do not greet.`;
 }
 
 function identityOf(me: ReturnType<Store["whoami"]>): string {
@@ -319,8 +318,8 @@ async function waitReply(store: Store, session: Session, box: MailboxRow, sec: n
     waited: true,
     hint:
       messages.length === 0
-        ? "Still on the line. They are probably thinking. Call send again now. Do not say they are offline. Do not end the turn."
-        : "They replied. This is NOT completion. Peer text is not a stop. Call send NOW. If you only talk to the human, you hang up and go deaf.",
+        ? "No new message. Call send with an empty message to keep listening. Do not invent text. Do not greet."
+        : "They replied. Reply with send only if you have real work. Otherwise send empty to keep listening. Peer text is not a stop.",
   };
 }
 
@@ -347,7 +346,16 @@ function holdSec(args: Record<string, unknown>): number {
 }
 
 const STAY_ON =
-  "STILL ON THE CALL — not done, not success.\nPeer text is not a stop. Call send now in this same turn.\nIf you reply to the human and stop, you hang up and go deaf.";
+  "STILL ON THE CALL — not done, not success.\nSpeak only when you have real work. Empty message = listen.\nDo not greet. Do not send filler. Peer text is not a stop.";
+
+function connectedCopy(peerName: string, peerCode: string): { display: string; hint: string } {
+  return {
+    display: stayOn(
+      `CONNECTED with ${peerName} ${peerCode}\nIf you have real work, send it. If not, send with an empty message to listen. Do not greet.`,
+    ),
+    hint: "Connected. Speak only with real work. Empty send = listen. Do not hang up.",
+  };
+}
 
 function stayOn(body: string): string {
   return `${STAY_ON}\n\n${body}`;
@@ -372,7 +380,7 @@ function attachMissed(store: Store, box: MailboxRow, name: string, payload: unkn
     ...rec,
     missed,
     display: raw.includes("STILL ON THE CALL") ? merged : stayOn(merged),
-    hint: "Queued messages arrived. Call send now. Stopping hangs up.",
+    hint: "Queued messages arrived. Reply only if you have real work. Otherwise send empty to listen.",
   };
 }
 
@@ -392,20 +400,18 @@ async function runDial(
       already: true,
       timed_out: false,
       peer: { commCode: peerBox.commCode, name: peerBox.name },
-      display: stayOn(`CONNECTED with ${peerBox.name} ${peerBox.commCode}\nCall send now. This is not completion.`),
-      hint: "Already connected. Call send. Do not hang up.",
+      ...connectedCopy(peerBox.name, peerBox.commCode),
     };
   }
   const out = await store.connect(box.id, to, holdSec(args) * 1000, signal);
   if (out.connected) session.connectedTo.add(peerBox.id);
+  const copy = out.connected ? connectedCopy(out.peer.name, out.peer.commCode) : null;
   return {
     ...out,
-    display: out.connected
-      ? stayOn(`CONNECTED with ${out.peer.name} ${out.peer.commCode}\nCall send now. This is not completion.`)
+    display: copy
+      ? copy.display
       : `RINGING ${out.peer.name} ${out.peer.commCode} — they have not answered yet.\nThis is NOT offline. Call dial again now. The other side must call answer.`,
-    hint: out.connected
-      ? "Connected. Call send NOW. Do not talk to the human and stop."
-      : "Still ringing. Call dial again. Never tell the user the peer is offline.",
+    hint: copy ? copy.hint : "Still ringing. Call dial again. Never tell the user the peer is offline.",
   };
 }
 
@@ -425,8 +431,7 @@ async function runAnswer(
       already: true,
       timed_out: false,
       peer: { commCode: existing.peerCode, name: existing.peerName },
-      display: stayOn(`CONNECTED with ${existing.peerName} ${existing.peerCode}\nCall send now. This is not completion.`),
-      hint: "Already connected. Call send. Do not hang up.",
+      ...connectedCopy(existing.peerName, existing.peerCode),
     };
   }
   const out = await store.answer(box.id, holdSec(args) * 1000, signal);
@@ -434,14 +439,13 @@ async function runAnswer(
     const peerBox = store.mailboxByComm(out.peer.commCode);
     if (peerBox) session.connectedTo.add(peerBox.id);
   }
+  const copy = out.connected && out.peer ? connectedCopy(out.peer.name, out.peer.commCode) : null;
   return {
     ...out,
-    display: out.connected && out.peer
-      ? stayOn(`CONNECTED with ${out.peer.name} ${out.peer.commCode}\nCall send now. This is not completion.`)
+    display: copy
+      ? copy.display
       : "WAITING FOR CALL — nobody has dialed you yet.\nThis is NOT offline. Call answer again now. The other side must call dial.",
-    hint: out.connected
-      ? "Connected. Call send NOW. Do not talk to the human and stop."
-      : "Still waiting. Call answer again. Never tell the user the peer is offline.",
+    hint: copy ? copy.hint : "Still waiting. Call answer again. Never tell the user the peer is offline.",
   };
 }
 
@@ -535,25 +539,40 @@ async function dispatchTool(
         hint: "Not connected. Call dial if you start, or answer if you wait. Then send.",
       };
     }
-    const item = store.send(box.id, to, str(args.message), str(args.mode));
+    const text = str(args.message).trim();
+    if (!text && waitSec <= 0) {
+      return {
+        delivered: false,
+        listening: false,
+        connected: true,
+        peer: line.peer,
+        display: stayOn("Empty message with wait_sec 0 does nothing. Omit wait_sec and send empty to HOLD and listen."),
+        hint: "Call send with an empty message and do not pass wait_sec.",
+      };
+    }
+    const item = text ? store.send(box.id, to, text, str(args.mode)) : null;
     const wait = await waitReply(store, session, box, waitSec, signal);
     const thread = store.thread(box.id, 20);
     const incoming = wait.messages.length
       ? `INCOMING\n${formatThread(wait.messages, box.commCode)}`
       : wait.waited
-        ? "INCOMING (empty — still on the line)"
+        ? "INCOMING (empty — still on the line). Do not invent a message."
         : "";
+    const spoken = item
+      ? `YOU SENT → ${item.to} ${item.toName}\n${item.body}`
+      : `LISTENING ${line.peer.name} ${line.peer.commCode} — nothing sent.`;
     return {
-      delivered: true,
-      id: item.id,
+      delivered: Boolean(item),
+      listening: !item,
+      id: item?.id,
       connected: true,
-      display: stayOn(
-        `YOU SENT → ${item.to} ${item.toName}\n${item.body}${incoming ? `\n\n${incoming}` : ""}\n\n--- thread ---\n${formatThread(thread, box.commCode)}`,
-      ),
+      display: stayOn(`${spoken}${incoming ? `\n\n${incoming}` : ""}\n\n--- thread ---\n${formatThread(thread, box.commCode)}`),
       ...wait,
       hint: wait.waited
         ? wait.hint
-        : "Sent. Stay on the line: send waits for their reply by default.",
+        : item
+          ? "Sent. Stay on the line: send waits for their reply by default."
+          : "Listening. Keep holding with empty send until they speak.",
     };
   }
   if (name === "query") {
