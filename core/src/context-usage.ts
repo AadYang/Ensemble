@@ -405,6 +405,27 @@ export function shouldCompactForHeadroom(args: {
   return args.usedTokens >= args.window - Math.max(reserve, tenth);
 }
 
+/** Occupancy at which Ensemble asks for a native compact between turns.
+ *
+ *  Quality is already in the red zone of the context bar (>40%). 50% is the
+ *  handoff policy so LOOP / queued peer / idle peer-send do not start another
+ *  turn on a rotting window. Headroom (see shouldCompactForHeadroom) still
+ *  fires earlier when the output reserve is a large fraction of the window. */
+export const AUTO_COMPACT_OCCUPANCY_RATIO = 0.5;
+
+/** Compact when occupancy is at least AUTO_COMPACT_OCCUPANCY_RATIO of the
+ *  effective window, or when the next request cannot fit the output reserve.
+ *  Unknown used/window must not invent a trigger. */
+export function shouldCompactForOccupancy(args: {
+  usedTokens: number;
+  window: number;
+  outputReserve: number | null;
+}): boolean {
+  if (!(args.usedTokens > 0) || !(args.window > 0)) return false;
+  if (args.usedTokens / args.window >= AUTO_COMPACT_OCCUPANCY_RATIO) return true;
+  return shouldCompactForHeadroom(args);
+}
+
 /** Build a ContextUsage from locally-tokenized transcript text. */
 export function contextUsageFromTranscript(
   model: string,

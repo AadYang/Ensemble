@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-10-27 · 回合间 native compact（占用门 50%）
+
+**触发**：长回合结束后 LOOP / 队列 / peer 立刻开下一脚，用户插不进 `/compact`。超过 80% 还在跑。不希望重启 session。
+
+**根因**：自动压缩只剩 dispatch 前的 headroom（约 84–90%），且只覆盖 `runtime-session`。空闲 agent 被 `peer_send` 时同一道过晚的门。旧的条数/字符启发式已经关过，不能加回来。
+
+**改动**：有效窗口占用 ≥50%（或 headroom）时，在 settle 后、下一脚前走 native compact（Claude/Codex 保留 `lastSessionId`；OpenAI local-rebuild 走现有 `compactNow`；server-conversation 不本地摘要）。pre-dispatch 共用同一道门。不清队列、不 cancel。失败仍发下一脚。刚压完占用清空，避免同一周期连压两次。不拆进行中的 query。
+
+**留下的规则**：编排层只在回合之间请 CLI compact，不要在 live stream 里插入 `/compact`。占用未知不发明触发。不要把 `previous_response_id` 留着的同时本地换历史。
+
+---
+
+## 2026-10-26 · Loop 一轮改回 Stop-gate
+
+**触发**：把「全部开发完成」当成一轮之后，chip 永远停在第一轮，回合数却一直涨。LOOP 看不见了。
+
+**根因**：为了不让 20 项任务用光 `maxIterations=20`，`decideLoopAfterVerify` 只在写了 `## DONE` 且 verifier 仍红时才 `outer-iter`。未完成走 `continue`，只加 `innerTurns`。这和 Ralph / Anthropic Stop hook / `/goal` 相反：那些把「agent 停一次」算一轮，完成承诺结束的是整个环。
+
+**改动**：未完成一律 `outer-iter`；`## DONE` 只结束整环；默认帽 50；prompt 改成一轮一件任务；`fresh-disk` 每轮 reset。无 diff 连停 3 次仍 pause。
+
+**留下的规则**：外环 iteration = Stop-gate。完成条件不是轮次。省钱靠 stall 和 `maxIterations`，不要靠把轮次藏进「尝试」。
+
+---
+
+## 2026-10-21 · 重置绑定码仍显示已接通
+
+**触发**：网页点「重置绑定码」后旧 MCP 失效，格子上仍写「已接通」。
+
+**根因**：`callState` 是进程内存，不跟 bindHash 走。`resetBind` 只轮换绑定码并清 occupancy，网站 `listMailboxes.call` 继续读这份通话状态。
+
+**改动**：0.1.16 重置/删除信箱时 `hangUp`：拆掉本端和对端 `callState`，拒掉未完成的 dial waiter，叫醒 `/line` watcher。
+
+**留下的规则**：绑定码管「谁能进这只信箱」。通话状态是另一份内存。换绑或拆箱必须挂断，否则网页和 SSE 会继续显示已接通。
+
+---
+
 ## 2026-10-20 · 邮局网页改成交换机台
 
 **触发**：按钮过大、布局乱、开箱弹框点「我已保存」关不掉、消息不是倒序、没有可读时间。

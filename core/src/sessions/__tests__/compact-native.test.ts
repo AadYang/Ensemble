@@ -12,6 +12,8 @@ process.env.AGENTORCH_DB_PATH = ":memory:";
 const captured: RuntimeOptions[] = [];
 let nativeCompactMode: "success" | "silent" = "success";
 let failNextUserPrompt = false;
+let nextInputTokens: number | null = null;
+let firstQueryGate: Promise<void> | null = null;
 
 vi.mock("../runtimes/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../runtimes/index.js")>()),
@@ -35,6 +37,11 @@ vi.mock("../runtimes/index.js", async (importOriginal) => ({
           },
         };
         return;
+      }
+      if (firstQueryGate && opts.prompt !== "/compact") {
+        const gate = firstQueryGate;
+        firstQueryGate = null;
+        await gate;
       }
       if (opts.resume && opts.prompt === "/compact") {
         if (nativeCompactMode === "success") {
@@ -68,16 +75,28 @@ vi.mock("../runtimes/index.js", async (importOriginal) => ({
         };
         return;
       }
+      const inputTokens = nextInputTokens;
+      nextInputTokens = null;
       yield {
         type: "sdk_message" as const,
         payload: {
           type: "assistant" as const,
-          message: { content: [{ type: "text", text: "local layered summary" }] },
+          message: {
+            content: [{ type: "text", text: "local layered summary" }],
+            ...(inputTokens != null
+              ? { usage: { input_tokens: inputTokens, output_tokens: 80 } }
+              : {}),
+          },
         },
       };
       yield {
         type: "sdk_message" as const,
-        payload: { type: "result" as const, subtype: "success", session_id: "local", modelUsage: {} },
+        payload: {
+          type: "result" as const,
+          subtype: "success",
+          session_id: opts.resume ?? "local",
+          modelUsage: { [opts.model]: { contextWindow: 200_000 } },
+        },
       };
     },
   }),
@@ -106,6 +125,8 @@ beforeEach(() => {
   captured.length = 0;
   nativeCompactMode = "success";
   failNextUserPrompt = false;
+  nextInputTokens = null;
+  firstQueryGate = null;
 });
 
 async function seedTurns(agentId: string): Promise<void> {
@@ -278,5 +299,181 @@ describe("compact delegates to the native CLI when a session exists", () => {
       unknown
     >;
     expect(meta.lastSessionId).toBe("native-session-id");
+  });
+
+  async function seedResume(agentId: string, systemPrompt: string): Promise<void> {
+    const promptHash = hashStableSystemPrompt({
+      permissionMode: "default",
+      teamContext: "",
+      baseSystemPrompt: systemPrompt,
+    });
+    await prisma.agent.update({
+      where: { id: agentId },
+      data: { metadata: { lastSessionId: "native-session-id", systemPromptHash: promptHash } },
+    });
+  }
+
+  it("compacts natively before a LOOP continuation when occupancy is at least half the window", async () => {
+    nextInputTokens = 120_000;
+    const root = mkdtempSync(join(tmpdir(), "compact-loop-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-loop-compact",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    const sessions = new SessionManager(new StubHub() as never);
+    let continues = 1;
+    sessions.attachLoops({
+      onTurnSettled: async () => (continues-- > 0 ? { userInput: "LOOP CONTINUE" } : null),
+    } as never);
+    await sessions.sendMessage(agent.id, "keep going");
+    for (let i = 0; i < 50 && !captured.some((opts) => opts.prompt === "LOOP CONTINUE"); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const prompts = captured.map((opts) => opts.prompt);
+    expect(prompts[0]).toBe("keep going");
+    expect(prompts).toContain("/compact");
+    expect(prompts.indexOf("/compact")).toBeLessThan(prompts.indexOf("LOOP CONTINUE"));
+    expect(
+      (await prisma.agent.findUnique({ where: { id: agent.id } }))?.metadata,
+    ).toMatchObject({ lastSessionId: "local" });
+  });
+
+  it("compacts natively before draining a queued turn when occupancy is at least half the window", async () => {
+    nextInputTokens = 120_000;
+    let release!: () => void;
+    firstQueryGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const root = mkdtempSync(join(tmpdir(), "compact-queue-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-queue-compact",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    const sessions = new SessionManager(new StubHub() as never);
+    const first = sessions.sendMessage(agent.id, "first turn");
+    for (let i = 0; i < 50 && captured.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(captured[0]?.prompt).toBe("first turn");
+    const queued = sessions.sendMessage(agent.id, "queued follow-up");
+    release();
+    await first;
+    await queued;
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const prompts = captured.map((opts) => opts.prompt);
+    expect(prompts[0]).toBe("first turn");
+    expect(prompts).toContain("/compact");
+    expect(prompts.indexOf("/compact")).toBeLessThan(prompts.indexOf("queued follow-up"));
+  });
+
+  it("compacts natively before dispatching to an idle session at half occupancy", async () => {
+    const root = mkdtempSync(join(tmpdir(), "compact-idle-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-idle-compact",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    await seedResume(agent.id, agent.systemPrompt ?? "");
+    const sessions = new SessionManager(new StubHub() as never);
+    (sessions as unknown as { setContextUsage: (id: string, usage: object) => void }).setContextUsage(
+      agent.id,
+      { usedTokens: 120_000, contextWindow: 200_000, percent: 60 },
+    );
+    await sessions.sendMessage(agent.id, "next after idle");
+
+    const prompts = captured.map((opts) => opts.prompt);
+    expect(prompts[0]).toBe("/compact");
+    expect(prompts).toContain("next after idle");
+    expect(
+      (await prisma.agent.findUnique({ where: { id: agent.id } }))?.metadata,
+    ).toMatchObject({ lastSessionId: "native-session-id" });
+  });
+
+  it("does not compact when occupancy is unknown", async () => {
+    const root = mkdtempSync(join(tmpdir(), "compact-unknown-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-unknown-compact",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    await seedResume(agent.id, agent.systemPrompt ?? "");
+    const sessions = new SessionManager(new StubHub() as never);
+    await sessions.sendMessage(agent.id, "no occupancy yet");
+    expect(captured.every((opts) => opts.prompt !== "/compact")).toBe(true);
+    expect(captured.some((opts) => opts.prompt === "no occupancy yet")).toBe(true);
+  });
+
+  it("still dispatches the next turn when occupancy compact fails", async () => {
+    nativeCompactMode = "silent";
+    const root = mkdtempSync(join(tmpdir(), "compact-fail-kick-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-fail-kick",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    await seedResume(agent.id, agent.systemPrompt ?? "");
+    const sessions = new SessionManager(new StubHub() as never);
+    (sessions as unknown as { setContextUsage: (id: string, usage: object) => void }).setContextUsage(
+      agent.id,
+      { usedTokens: 120_000, contextWindow: 200_000, percent: 60 },
+    );
+    await sessions.sendMessage(agent.id, "keep going anyway");
+    const prompts = captured.map((opts) => opts.prompt);
+    expect(prompts).toContain("/compact");
+    expect(prompts).toContain("keep going anyway");
+  });
+
+  it("summarizes locally for openai-compat occupancy instead of sending /compact", async () => {
+    const root = mkdtempSync(join(tmpdir(), "compact-openai-occupancy-"));
+    const provider = await prisma.provider.create({
+      data: {
+        name: "occupancy-openai-compat",
+        kind: "openai-compat",
+        apiKey: "sk-test",
+        models: ["gpt-4o"],
+      },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        name: "openai-occupancy",
+        model: "gpt-4o",
+        providerId: provider.id,
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    const sessions = new SessionManager(new StubHub() as never);
+    (sessions as unknown as { setContextUsage: (id: string, usage: object) => void }).setContextUsage(
+      agent.id,
+      { usedTokens: 120_000, contextWindow: 200_000, percent: 60 },
+    );
+    await sessions.sendMessage(agent.id, "openai next");
+    expect(captured.every((opts) => opts.prompt !== "/compact")).toBe(true);
+    expect(captured.some((opts) => opts.prompt === "openai next")).toBe(true);
   });
 });

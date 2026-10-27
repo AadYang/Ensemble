@@ -40,7 +40,7 @@ import {
   occupancyTokensFromLastCall,
   occupancyTokensFromResultContextUsage,
   reportedContextWindowFromResult,
-  shouldCompactForHeadroom,
+  shouldCompactForOccupancy,
   estimateStreamTokens,
   shouldEncodeLiveStreamOccupancy,
   shouldPublishLiveContext,
@@ -3024,6 +3024,44 @@ export class SessionManager {
     }
   }
 
+  private occupancyNeedsCompact(sessionId: string, plan: ResolvedRunPlan): boolean {
+    const usage = this.contextUsageByAgent.get(sessionId);
+    const window = plan.context.effectiveWindow ?? usage?.contextWindow ?? null;
+    const used = usage?.usedTokens ?? null;
+    if (used == null || window == null) return false;
+    return shouldCompactForOccupancy({
+      usedTokens: used,
+      window,
+      outputReserve: plan.context.outputReserve,
+    });
+  }
+
+  /** Native compact for Claude/Codex; local summary for OpenAI local-rebuild.
+   *  Server-side conversations are left to Responses contextManagement — a
+   *  local summary while previous_response_id is still stored would desync. */
+  private async compactBetweenTurns(
+    cur: DbAgent,
+    plan: ResolvedRunPlan,
+    strategy: RunPlanHistoryStrategy,
+    upperBoundSeq?: number,
+  ): Promise<boolean> {
+    if (strategy === "server-conversation") return false;
+    if (runtimeOwnsNativeCompact(plan.identity.runtime)) {
+      return this.tryNativeCompact(cur, plan, upperBoundSeq);
+    }
+    if (strategy !== "local-rebuild") return false;
+    try {
+      await this.compactNow(cur, plan, undefined, upperBoundSeq);
+      return true;
+    } catch (err) {
+      console.error(
+        `[compact] occupancy compact did not complete for agent=${cur.id.slice(0, 8)}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
   private async compactViaNativeSession(
     cur: DbAgent,
     plan: ResolvedRunPlan,
@@ -5109,6 +5147,8 @@ export class SessionManager {
     let contextOverflowKeepResume = false;
     let autoRecoverAfterRun: { userInput: string; opts: SendMessageOptions } | null = null;
     let loopEligible = false;
+    let settledPlan: ResolvedRunPlan | null = null;
+    let settledHistoryStrategy: RunPlanHistoryStrategy | null = null;
     let autoRecoveryPromise: Promise<{ finalText: string } | null> | null = null;
     // Declared outside the try so the detached-subagent notification in the
     // `finally` block can read the child's final output.
@@ -5269,6 +5309,7 @@ export class SessionManager {
       projectRoot: projectRootOf(agent),
     });
     this.runPlanByAgent.set(sessionId, turnPlan);
+    settledPlan = turnPlan;
     // NO broadcast here. At this point the plan has no history and no skills
     // attached, so its `history` is the placeholder (`status: "unavailable"`,
     // `counting: "unmeasured"`) — broadcasting it as `source: "last-turn"`
@@ -5649,6 +5690,7 @@ export class SessionManager {
         : serverConversation.id
           ? "server-conversation"
           : "local-rebuild";
+      settledHistoryStrategy = historyStrategy;
       // The reason is read from the same decision the strategy is. An invalidated
       // resume is the one case where "local-rebuild" is NOT the default: the
       // agent HAD a session and dropped it, and a report that cannot say which
@@ -5681,6 +5723,7 @@ export class SessionManager {
       // matching the new plan against the old objects would hand the runtime an
       // empty history and a summary nothing points at.
       let priorTurnsForDispatch = priorTurns;
+      let occupancyCompactedAtDispatch = false;
       if (historyOutcome.history.overflow && historyStrategy === "local-rebuild") {
         // Over budget on content the runtime has to be handed locally, and no
         // summary covers it yet. Compacting FIRST is the only alternative to
@@ -5703,6 +5746,7 @@ export class SessionManager {
           // (deleting it) and then write its summary at a seq the runtime's own
           // events are about to want.
           await this.compactNow(agent, turnPlan, undefined, priorCutSeq - 1);
+          occupancyCompactedAtDispatch = true;
           const compacted = await prisma.agent.findUnique({ where: { id: sessionId } });
           if (compacted) agent.metadata = compacted.metadata;
           const reread = await prisma.message.findMany({
@@ -5730,28 +5774,39 @@ export class SessionManager {
           );
         }
       }
-      if (historyStrategy === "runtime-session") {
-        const usage = this.contextUsageByAgent.get(sessionId);
-        const window = turnPlan.context.effectiveWindow ?? usage?.contextWindow ?? null;
-        const used = usage?.usedTokens ?? null;
-        if (
-          used != null &&
-          window != null &&
-          shouldCompactForHeadroom({
-            usedTokens: used,
-            window,
-            outputReserve: turnPlan.context.outputReserve,
-          })
-        ) {
-          console.log(
-            `[history] agent=${sessionId.slice(0, 8)} occupancy ${used}/${window} leaves too little headroom — compacting native session before dispatch`,
+      if (!occupancyCompactedAtDispatch && this.occupancyNeedsCompact(sessionId, turnPlan)) {
+        const used = this.contextUsageByAgent.get(sessionId)?.usedTokens;
+        const window = turnPlan.context.effectiveWindow ?? this.contextUsageByAgent.get(sessionId)?.contextWindow;
+        console.log(
+          `[history] agent=${sessionId.slice(0, 8)} occupancy ${used}/${window} — compacting before dispatch`,
+        );
+        const compacted = await this.compactBetweenTurns(
+          agent,
+          turnPlan,
+          historyStrategy,
+          priorCutSeq - 1,
+        );
+        occupancyCompactedAtDispatch = compacted;
+        effectiveHistory.history.diagnostics.push(
+          compacted
+            ? "this turn compacted before dispatch because context occupancy was at least half the effective window"
+            : "this turn wanted an occupancy compact before dispatch but compaction did not complete; the turn proceeds",
+        );
+        if (compacted && historyStrategy === "local-rebuild") {
+          const after = await prisma.agent.findUnique({ where: { id: sessionId } });
+          if (after) agent.metadata = after.metadata;
+          const reread = await prisma.message.findMany({
+            where: { agentId: sessionId },
+            orderBy: { seq: "asc" },
+          });
+          const refreshed = runtimeHistoryTurnsFromCompletedRows(
+            reread.filter((m) => m.seq < priorCutSeq),
           );
-          const compacted = await this.tryNativeCompact(agent, turnPlan, priorCutSeq - 1);
-          effectiveHistory.history.diagnostics.push(
-            compacted
-              ? "this turn asked the native CLI to compact before dispatch because remaining context headroom was below the output reserve"
-              : "this turn wanted a native compact before dispatch (headroom below the output reserve) but the CLI did not compact; the turn proceeds",
-          );
+          effectiveHistory = resolveHistoryBudget({
+            ...budgetRequest,
+            turns: refreshed.map((entry) => entry.turn),
+          });
+          priorTurnsForDispatch = refreshed;
         }
       }
       // The budget is a limit, not a forecast. When the content that must be
@@ -5786,6 +5841,7 @@ export class SessionManager {
         planSkillsFromSelection(skillSelection, `selected for this turn against a ${skillSelection.counting} skill budget`),
       );
       this.runPlanByAgent.set(sessionId, turnPlan);
+      settledPlan = turnPlan;
       // After the history and skill attachments, so what the UI is handed is the
       // plan the runtime is about to be dispatched with — not the one from
       // before the transcript was sized.
@@ -6663,7 +6719,6 @@ export class SessionManager {
         this.liveness.noteStopRequested(runId);
         this.liveness.end(runId, "completed", "completed");
         this.clearLiveContext(sessionId);
-        this.running.delete(sessionId);
         this.pending.delete(sessionId);
         const qb = this.pendingQuestions.get(sessionId);
         if (qb) {
@@ -6697,6 +6752,21 @@ export class SessionManager {
             console.error(`[loop] onTurnSettled failed for ${sessionId}:`, err);
           }
         }
+        const nextKick = Boolean(autoRecoverAfterRun) || queuedBeforeLoop;
+        if (
+          nextKick &&
+          !abort.signal.aborted &&
+          settledPlan &&
+          settledHistoryStrategy &&
+          this.occupancyNeedsCompact(sessionId, settledPlan)
+        ) {
+          const cur = (await prisma.agent.findUnique({ where: { id: sessionId } })) ?? agent;
+          console.log(
+            `[history] agent=${sessionId.slice(0, 8)} occupancy compact before next kick`,
+          );
+          await this.compactBetweenTurns(cur, settledPlan, settledHistoryStrategy);
+        }
+        this.running.delete(sessionId);
         if (autoRecoverAfterRun) {
           const recoveryDrainToken = this.beginDrain(sessionId);
           autoRecoveryPromise = this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)

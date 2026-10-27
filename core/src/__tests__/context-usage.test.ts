@@ -11,6 +11,7 @@ import {
   occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
   shouldCompactForHeadroom,
+  shouldCompactForOccupancy,
   promptTokensFromLastCall,
   promptTokensFromResultContextUsage,
   reportedContextWindowFromResult,
@@ -672,5 +673,27 @@ describe("shouldCompactForHeadroom", () => {
   it("does not invent a trigger from missing occupancy or a missing window", () => {
     expect(shouldCompactForHeadroom({ usedTokens: 0, window: 200_000, outputReserve: 32_000 })).toBe(false);
     expect(shouldCompactForHeadroom({ usedTokens: 199_000, window: 0, outputReserve: 32_000 })).toBe(false);
+  });
+});
+
+describe("shouldCompactForOccupancy", () => {
+  it("fires at half of the effective window", () => {
+    expect(
+      shouldCompactForOccupancy({ usedTokens: 100_000, window: 200_000, outputReserve: 32_000 }),
+    ).toBe(true);
+    expect(
+      shouldCompactForOccupancy({ usedTokens: 99_999, window: 200_000, outputReserve: 32_000 }),
+    ).toBe(false);
+  });
+
+  it("still fires on headroom when occupancy is below half", () => {
+    expect(
+      shouldCompactForOccupancy({ usedTokens: 90_000, window: 200_000, outputReserve: 120_000 }),
+    ).toBe(true);
+  });
+
+  it("does not invent a trigger from missing occupancy or a missing window", () => {
+    expect(shouldCompactForOccupancy({ usedTokens: 0, window: 200_000, outputReserve: 32_000 })).toBe(false);
+    expect(shouldCompactForOccupancy({ usedTokens: 199_000, window: 0, outputReserve: 32_000 })).toBe(false);
   });
 });
