@@ -384,6 +384,33 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
   const rafIdRef = useRef<number | null>(null);
   const lastTickRef = useRef(0);
   const expectedTopRef = useRef(0);
+  const initialBottomSnapRef = useRef(true);
+  const initialBottomReleaseTimerRef = useRef<number | null>(null);
+
+  const cancelScrollAnim = useCallback(() => {
+    if (rafIdRef.current != null) cancelAnimationFrame(rafIdRef.current);
+    rafIdRef.current = null;
+  }, []);
+
+  const jumpToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    cancelScrollAnim();
+    const target = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = target;
+    expectedTopRef.current = el.scrollTop;
+    followBottomRef.current = true;
+  }, [cancelScrollAnim]);
+
+  const scheduleInitialBottomRelease = useCallback(() => {
+    if (initialBottomReleaseTimerRef.current != null) {
+      window.clearTimeout(initialBottomReleaseTimerRef.current);
+    }
+    initialBottomReleaseTimerRef.current = window.setTimeout(() => {
+      initialBottomReleaseTimerRef.current = null;
+      initialBottomSnapRef.current = false;
+    }, 150);
+  }, []);
 
   const kickScrollAnim = useCallback(() => {
     if (rafIdRef.current != null) return;
@@ -413,27 +440,37 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
 
   useEffect(() => {
     return () => {
-      if (rafIdRef.current != null) cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
+      cancelScrollAnim();
+      if (initialBottomReleaseTimerRef.current != null) {
+        window.clearTimeout(initialBottomReleaseTimerRef.current);
+        initialBottomReleaseTimerRef.current = null;
+      }
     };
-  }, []);
+  }, [cancelScrollAnim]);
 
-  // Jump (no animation) to the bottom when switching agents. Animating
-  // through 200 historical turns would be silly.
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    expectedTopRef.current = el.scrollTop;
-    followBottomRef.current = true;
-  }, [agentId]);
+  // Initial history hydrate is async; keep it pinned instantly until the
+  // first content-size burst settles, then restore reader-speed following.
+  useLayoutEffect(() => {
+    initialBottomSnapRef.current = true;
+    if (initialBottomReleaseTimerRef.current != null) {
+      window.clearTimeout(initialBottomReleaseTimerRef.current);
+      initialBottomReleaseTimerRef.current = null;
+    }
+    jumpToBottom();
+  }, [agentId, jumpToBottom]);
 
   // Kick animation when visible scroll-affecting state changes. This covers
   // appended rows and streaming deltas that rewrite the final assistant row
   // without depending on the whole turns array object.
   useLayoutEffect(() => {
-    if (followBottomRef.current) kickScrollAnim();
-  }, [scrollFollowSignal, kickScrollAnim]);
+    if (!followBottomRef.current) return;
+    if (initialBottomSnapRef.current) {
+      jumpToBottom();
+      if ((agent?.turns.length ?? 0) > 0) scheduleInitialBottomRelease();
+      return;
+    }
+    kickScrollAnim();
+  }, [agent?.turns.length, scrollFollowSignal, jumpToBottom, scheduleInitialBottomRelease, kickScrollAnim]);
 
   // Watch the inner content for size changes so streaming deltas (which
   // extend the last turn in place and don't change turns.length) also
@@ -447,7 +484,13 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
       if (!followBottomRef.current || frame !== null) return;
       frame = requestAnimationFrame(() => {
         frame = null;
-        if (followBottomRef.current) kickScrollAnim();
+        if (!followBottomRef.current) return;
+        if (initialBottomSnapRef.current) {
+          jumpToBottom();
+          if ((agent?.turns.length ?? 0) > 0) scheduleInitialBottomRelease();
+          return;
+        }
+        kickScrollAnim();
       });
     };
     const ro = new ResizeObserver(requestKick);
@@ -457,7 +500,7 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
       ro.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [agentId, scrollObserverReady, kickScrollAnim]);
+  }, [agentId, agent?.turns.length, scrollObserverReady, jumpToBottom, scheduleInitialBottomRelease, kickScrollAnim]);
 
   useEffect(() => {
     const kickIfFollowing = () => {
@@ -1048,6 +1091,11 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
   };
 
   const onInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const isComposing = e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+    if (isComposing && e.key === "Enter") {
+      return;
+    }
+
     // Tab / RightArrow-at-end → accept ghost text (CLI-style).
     // Tab is unconditional (anywhere in the input). RightArrow only when the
     // cursor sits at the end of current input — otherwise users navigating
