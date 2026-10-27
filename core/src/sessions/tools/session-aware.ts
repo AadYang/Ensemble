@@ -291,8 +291,9 @@ const ASK_USER_SCHEMA = z.object({
   question: z.string().min(1).describe("Question text shown to the user."),
   options: z
     .array(z.string().min(1))
-    .min(1)
-    .describe("List of choice labels the user can pick from. At least one."),
+    .optional()
+    .default([])
+    .describe("Optional button labels. The user can still type a custom answer. Empty = open question."),
 });
 
 /** ask_user NormalizedTool factory. Mirror of Claude side ask-user-mcp.ts. */
@@ -300,13 +301,12 @@ export function makeAskUserTool(ask: AskUserCallback): NormalizedTool<typeof ASK
   return {
     name: "ask_user",
     description:
-      "Ask the human user a question and wait for their answer. Pass a list of options " +
-      "(button labels). The tool returns the option string the user picked. Use this when " +
-      "you need a decision before proceeding (clarification / branching / approval beyond " +
-      "simple yes-no).",
+      "Ask the HUMAN a question and wait. Optional `options` appear as buttons; the user may " +
+      "click one OR type a free-text answer. The tool returns whatever they submitted. Omit " +
+      "options or pass [] for an open question.",
     parameters: ASK_USER_SCHEMA,
     async execute(args) {
-      return ask(args);
+      return ask({ question: args.question, options: args.options ?? [] });
     },
   };
 }

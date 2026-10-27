@@ -6881,8 +6881,8 @@ export class SessionManager {
     }
   }
 
-  /** Called by ask_user MCP tool. Suspends until the user clicks an option. */
-  async askUser(sessionId: string, question: string, options: string[]): Promise<string> {
+  /** Called by ask_user MCP tool. Suspends until the user answers. */
+  async askUser(sessionId: string, question: string, options: string[] = []): Promise<string> {
     const run = this.running.get(sessionId);
     if (run?.nonInteractive) {
       return "freshness-blocked: ask_user is disabled for this non-interactive freshness continuation. Reconcile the queued peer message(s) without human input.";

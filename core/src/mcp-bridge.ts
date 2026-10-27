@@ -422,8 +422,8 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   );
   mcp.tool(
     "ask_user",
-    "Ask the human user a question and wait for their answer. Pass option labels; the returned string is the chosen label.",
-    { question: z.string().min(1), options: z.array(z.string().min(1)).min(1) },
+    "Ask the HUMAN a question and wait. Optional `options` appear as buttons; the user may click one OR type a free-text answer. The tool returns whatever they submitted. Omit options or pass [] for an open question.",
+    { question: z.string().min(1), options: z.array(z.string().min(1)).optional().default([]) },
     async (args) => ({ content: [{ type: "text", text: await invoke("ask_user", args) }] }),
   );
   mcp.tool(
@@ -677,10 +677,10 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const askUser = handlers.askUser;
       mcp.tool(
         "ask_user",
-        "Ask the human user a question and wait for their answer. Pass option labels; the returned string is the chosen label.",
+        "Ask the HUMAN a question and wait. Optional `options` appear as buttons; the user may click one OR type a free-text answer. The tool returns whatever they submitted. Omit options or pass [] for an open question.",
         {
           question: z.string().min(1),
-          options: z.array(z.string().min(1)).min(1),
+          options: z.array(z.string().min(1)).optional().default([]),
         },
         async (args) => {
           const text = await askUser(args);

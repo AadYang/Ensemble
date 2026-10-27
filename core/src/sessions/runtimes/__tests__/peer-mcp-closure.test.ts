@@ -141,4 +141,18 @@ describe("ask-user-mcp closure binding", () => {
       { from: "agent-B", question: "q2?" },
     ]);
   });
+
+  it("forwards an open question when options are omitted", async () => {
+    const calls: Array<{ from: string; options: string[] }> = [];
+    const mockSessions = {
+      askUser: async (from: string, _question: string, options: string[]) => {
+        calls.push({ from, options });
+        return "typed";
+      },
+    } as unknown as SessionManager;
+
+    const handler = makeAskUserHandler(mockSessions, "agent-A");
+    await handler({ question: "which path?" });
+    expect(calls).toEqual([{ from: "agent-A", options: [] }]);
+  });
 });

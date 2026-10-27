@@ -70,7 +70,7 @@ Ensemble 有 server / cloud infrastructure：Cloud beta 负责账号、workspace
 1. 下载安装包，双击装好（30 秒）
 2. 如果要用本地 Claude 或 Codex，先在系统终端安装并登录对应 CLI：`claude` / `codex login`
 3. 启动 Ensemble，打开 Providers，添加 Claude / OpenAI / Codex / 兼容供应商；本地 CLI provider 会复用本机凭证，Ensemble 不存 CLI token
-4. 点击「+ team」创建团队并为每个成员选择 provider、model 和角色；也可以先新建单个 agent 开聊
+4. 点击「+ 团队」创建团队并为每个成员选择供应商、模型和角色；也可以先新建单个 agent 开聊。完整步骤和 JumpoAI项目组示例见 [组建 AI 团队](creating-a-team.md)。
 
 普通使用不用装 Python、Node 或 Docker。只有本地 Claude / Codex provider 需要你先安装并登录对应官方 CLI；缺失 CLI 或登录态不可用时，Ensemble 会在应用内提醒。中文界面默认开启，记得你的选择，升级不丢。
 

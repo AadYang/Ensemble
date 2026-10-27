@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-10-27 · ask_user 只能点按钮
+
+**触发**：问人时用户没法手填路径、说明或「其他」，只能点模型给的选项。
+
+**根因**：AskUserDialog 只渲染 `options` 按钮。三条 runtime 的 schema 还要求 `options.min(1)`，开放题过不了校验。协议里 `user_answer.choice` 本来就是任意字符串。
+
+**改动**：弹窗始终带输入框 + 发送；点按钮或提交手填都走现有 `choice`。`options` 改为可选（空 = 开放题）。Claude / OpenAI / Codex 工具描述与 primer 写明可以手填。
+
+**留下的规则**：人机问答默认允许手填。不要为「其他」再加协议字段；`choice` 已经能装。
+
+---
+
+## 2026-10-27 · primer 漏了 ask_user
+
+**触发**：agent 不再弹 ask_user 选项，改在对话里提问或去 peer_ask 同事。
+
+**根因**：三条 runtime 都还挂着 ask_user。全局 primer 列出了 peer_send / peer_ask / peer_query，没有 ask_user。LOOP 加上 peer_ask 之后，「问」被理解成问队友。团队角色若写「向经理提出」，工程师更不会问人。
+
+**改动**：primer 和 help 写明 ask_user 是问人、等按钮；peer_ask 只问队友。聊天里写问题不算等待。
+
+**留下的规则**：协调工具进 primer 时，问人和问队友必须分开写。工具在 MCP 里不等于模型会用。
+
+---
+
 ## 2026-10-27 · 回合间 native compact（占用门 50%）
 
 **触发**：长回合结束后 LOOP / 队列 / peer 立刻开下一脚，用户插不进 `/compact`。超过 80% 还在跑。不希望重启 session。

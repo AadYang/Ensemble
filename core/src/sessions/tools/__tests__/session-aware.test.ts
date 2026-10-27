@@ -124,6 +124,25 @@ describe("makeAskUserTool", () => {
     expect(result).toBe("yes");
     expect(observed).toBe("go?|yes,no");
   });
+
+  it("accepts an open question with empty or omitted options", async () => {
+    const seen: string[][] = [];
+    const ask = async (args: { question: string; options: string[] }) => {
+      seen.push(args.options);
+      return "typed path";
+    };
+    const tool = makeAskUserTool(ask);
+    expect(tool.parameters.parse({ question: "which path?" })).toEqual({
+      question: "which path?",
+      options: [],
+    });
+    expect(tool.parameters.parse({ question: "which path?", options: [] })).toEqual({
+      question: "which path?",
+      options: [],
+    });
+    expect(await tool.execute({ question: "which path?", options: [] }, CTX)).toBe("typed path");
+    expect(seen).toEqual([[]]);
+  });
 });
 
 describe("makeTaskTool", () => {
