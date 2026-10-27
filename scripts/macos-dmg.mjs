@@ -56,6 +56,27 @@ function sign(pathToSign, extraArgs = []) {
   run("codesign", args);
 }
 
+/** LaunchServices path — the framework helper, not on PATH. */
+const LSREGISTER =
+  "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+/** Forget an app bundle LaunchServices indexed while the DMG was mounted.
+ *
+ *  The engine records every bundle it sees, and the record outlives the mount:
+ *  after a few builds Spotlight and "Open With" list several stale "Ensemble"
+ *  apps pointing at /Volumes/Ensemble, /Volumes/Ensemble 2, the temp mount
+ *  roots, and so on. Unregistering is best-effort — a missing helper or a
+ *  locked database must never fail a release build. */
+function unregisterAppBundle(appBundle) {
+  if (!existsSync(LSREGISTER)) return;
+  try {
+    execFileSync(LSREGISTER, ["-u", appBundle], { stdio: "ignore" });
+    console.log(`[macos-dmg] unregistered from LaunchServices: ${appBundle}`);
+  } catch {
+    // best-effort
+  }
+}
+
 function adHocOrDeveloperSignApp() {
   const macosDir = path.join(appPath, "Contents", "MacOS");
   const runtimeArgs = signingIdentity === "-" ? [] : ["--options", "runtime"];
@@ -81,6 +102,8 @@ const stagingDir = mkdtempSync(path.join(tmpdir(), "ensemble-dmg-"));
 const intermediateDmg = path.join(tmpdir(), `ensemble-rw-${Date.now()}.dmg`);
 const mountRoot = mkdtempSync(path.join(tmpdir(), "ensemble-mount-"));
 let mountPoint = null;
+/** Kept past `mountPoint = null` so the finally block can unregister the app. */
+let mountedAppPath = null;
 try {
   const stagedApp = path.join(stagingDir, `${productName}.app`);
   console.log(`[macos-dmg] staging ${stagedApp}`);
@@ -135,6 +158,7 @@ try {
     .map((l) => l.trim())
     .find((l) => l.includes(mountRoot));
   mountPoint = mountLine?.split("\t").pop()?.trim() ?? path.join(mountRoot, productName);
+  mountedAppPath = path.join(mountPoint, `${productName}.app`);
   console.log(`[macos-dmg] mounted at ${mountPoint}`);
 
   const layoutScript = `
@@ -199,6 +223,7 @@ end tell
       // best-effort
     }
   }
+  if (mountedAppPath) unregisterAppBundle(mountedAppPath);
   rmSync(intermediateDmg, { force: true });
   rmSync(mountRoot, { recursive: true, force: true });
   rmSync(stagingDir, { recursive: true, force: true });
