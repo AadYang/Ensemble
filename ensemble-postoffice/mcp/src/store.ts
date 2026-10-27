@@ -311,12 +311,14 @@ export class Store {
     this.db
       .prepare("UPDATE Mailbox SET bindHash = ?, boundSessionId = NULL, lastSeenAt = NULL WHERE id = ?")
       .run(hashBind(bindCode), mailboxId);
+    this.hangUp(mailboxId);
     return { bindCode };
   }
 
   deleteMailbox(userId: string, mailboxId: string): void {
     const box = this.mailbox(mailboxId);
     if (!box || box.userId !== userId) throw Object.assign(new Error("信箱不存在"), { status: 404 });
+    this.hangUp(mailboxId);
     this.db.prepare("DELETE FROM Mailbox WHERE id = ?").run(mailboxId);
   }
 
@@ -612,6 +614,23 @@ export class Store {
 
   leaveLine(mailboxId: string): void {
     this.onLine.delete(mailboxId);
+  }
+
+  private hangUp(mailboxId: string): void {
+    const mine = this.callState.get(mailboxId);
+    const caller = mine?.peerId ? null : this.findCallerOf(mailboxId);
+    const peerId = mine?.peerId || caller?.id || "";
+    const ids = peerId && peerId !== mailboxId ? [mailboxId, peerId] : [mailboxId];
+    for (const id of ids) {
+      this.callState.delete(id);
+      this.leaveLine(id);
+    }
+    for (const [fromId, set] of this.callWaiters) {
+      for (const w of [...set]) {
+        if (ids.includes(fromId) || ids.includes(w.toId)) w.resolve(false);
+      }
+    }
+    for (const id of ids) this.notify(id);
   }
 
   private isListening(mailboxId: string): boolean {

@@ -413,6 +413,54 @@ describe("postoffice", () => {
     expect(toolJson(pickup)).toMatchObject({ connected: true });
   });
 
+  it("reset-bind hangs up both ends so the website is not still connected", async () => {
+    const tok = await register("alice");
+    const a = await openBox(tok, "desk");
+    const b = await openBox(tok, "phone");
+    const ringing = rpc(a.bindCode, "sess-a", "tools/call", {
+      name: "dial",
+      arguments: { timeout_sec: 8 },
+    }, 40);
+    await new Promise((r) => setTimeout(r, 40));
+    await rpc(b.bindCode, "sess-b", "tools/call", {
+      name: "answer",
+      arguments: { timeout_sec: 8 },
+    }, 41);
+    expect(toolJson(await ringing)).toMatchObject({ connected: true });
+
+    const before = await app.inject({
+      method: "GET",
+      url: "/api/mailboxes",
+      headers: { authorization: `Bearer ${tok}` },
+    });
+    const beforeBoxes = (before.json() as { mailboxes: { id: string; call: { status: string } | null }[] }).mailboxes;
+    expect(beforeBoxes.find((x) => x.id === a.id)?.call?.status).toBe("connected");
+    expect(beforeBoxes.find((x) => x.id === b.id)?.call?.status).toBe("connected");
+
+    const reset = await app.inject({
+      method: "POST",
+      url: `/api/mailboxes/${a.id}/reset-bind`,
+      headers: { authorization: `Bearer ${tok}` },
+    });
+    expect(reset.statusCode).toBe(200);
+    const { bindCode } = reset.json() as { bindCode: string };
+
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/mailboxes",
+      headers: { authorization: `Bearer ${tok}` },
+    });
+    const afterBoxes = (after.json() as { mailboxes: { id: string; call: unknown }[] }).mailboxes;
+    expect(afterBoxes.find((x) => x.id === a.id)?.call).toBeNull();
+    expect(afterBoxes.find((x) => x.id === b.id)?.call).toBeNull();
+
+    const sent = await rpc(bindCode, "sess-a2", "tools/call", {
+      name: "send",
+      arguments: { message: "after-reset", wait_sec: 8 },
+    });
+    expect(toolJson(sent)).toMatchObject({ delivered: false, connected: false });
+  });
+
   it("empty send listens without depositing a message", async () => {
     const tok = await register("alice");
     const a = await openBox(tok, "desk");
