@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,9 +56,15 @@ describe("runtime-critical SDK versions", () => {
   it("has the pinned version actually installed", () => {
     for (const [name, spec] of Object.entries(deps())) {
       if (!(name in RUNTIME_CRITICAL)) continue;
-      const installed = readJson(join(CORE, "node_modules", name, "package.json")) as {
-        version: string;
-      };
+      // `.npmrc` sets node-linker=hoisted (Windows junction workaround), so a
+      // workspace dep can live in core/node_modules or in the root one —
+      // accept either instead of hardcoding the isolated layout.
+      const pkgPath = [
+        join(CORE, "node_modules", name, "package.json"),
+        join(CORE, "..", "node_modules", name, "package.json"),
+      ].find((candidate) => existsSync(candidate));
+      expect(pkgPath, `${name} is not installed`).toBeDefined();
+      const installed = readJson(pkgPath!) as { version: string };
       expect(installed.version, `${name} installed != pinned`).toBe(spec);
     }
   });

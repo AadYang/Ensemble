@@ -109,17 +109,38 @@ export async function fetchLatestManifest(): Promise<UpdateManifest> {
   }
 }
 
+/** Platform key resolved by the Rust shell (compile-time cfg). Preferred over
+ *  UA sniffing because WKWebView reports `Intel Mac OS X` on Apple Silicon too
+ *  — every Mac used to resolve to `macos-x64` and get offered the Intel DMG. */
+let runtimePlatformKey: PlatformKey | null = null;
+
+async function readRuntimePlatformKey(): Promise<PlatformKey | null> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const key = await invoke<string | null>("get_platform_key");
+    return (key as PlatformKey | null) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Cache the runtime key before any sync resolve runs. No-op outside Tauri. */
+export async function primePlatformKey(): Promise<void> {
+  if (runtimePlatformKey) return;
+  runtimePlatformKey = await readRuntimePlatformKey();
+}
+
 /** Detect this client's platform/arch in the shape used by the manifest's
  *  `platforms` keys (e.g. "macos-arm64"). Returns null when we can't infer
  *  one — in that case the caller falls back to the legacy single URL. */
 export function detectPlatformKey(): PlatformKey | null {
+  if (runtimePlatformKey) return runtimePlatformKey;
   if (typeof navigator === "undefined") return null;
   const ua = navigator.userAgent.toLowerCase();
   // navigator.platform is deprecated but still the most reliable signal we
-  // have inside the webview without a Tauri IPC round-trip. The Tauri-side
-  // `platform` env var was already plumbed to ENSEMBLE_PLATFORM but the
-  // webview can't read it directly; UA sniff is good enough for picking
-  // between windows / macos / linux + arm64 / x64.
+  // have inside the webview without a Tauri IPC round-trip. This is the
+  // FALLBACK path only — see primePlatformKey() for why UA arch is wrong.
   const platform = ((navigator as { platform?: string }).platform ?? "").toLowerCase();
   const isMac = platform.includes("mac") || ua.includes("mac os x") || ua.includes("macintosh");
   const isWin = platform.includes("win") || ua.includes("windows");
@@ -193,6 +214,7 @@ export async function checkForUpdates(): Promise<UpdateState | null> {
     console.warn("[update] manifest fetch failed", err);
     return null;
   }
+  await primePlatformKey();
   const currentVersion = await getCurrentVersion();
   const release = resolveReleaseForThisPlatform(manifest);
   if (!release) return null;

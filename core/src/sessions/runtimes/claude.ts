@@ -20,6 +20,7 @@ import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sd
 import type { LivenessProbeKind, SdkMessage } from "@agentorch/shared";
 import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOptions } from "./types.js";
 import { takeUntilAbort } from "../abort-iterable.js";
+import { childEnv } from "../../cli-config.js";
 import { claudeLocalRebuildPrompt } from "../local-rebuild-prompt.js";
 
 /** Phase 4: spawn the Claude Code child ourselves, so the run has a PROCESS we
@@ -65,6 +66,10 @@ export function makeClaudeSpawner(
       signal: options.signal,
       env: options.env as NodeJS.ProcessEnv,
       windowsHide: true,
+      // POSIX: own process group so killClaudeChildTree can signal the CLI and
+      // the MCP servers it spawned. A child-only kill left survivors holding
+      // our stdout/stderr open, so `close` never fired after Cancel.
+      detached: process.platform !== "win32",
     });
     started = true;
     liveness?.childProcessStarted({ pid: proc.pid ?? null });
@@ -110,6 +115,14 @@ function killClaudeChildTree(child: ChildProcess): void {
       return;
     } catch {
       /* fall through */
+    }
+  }
+  if (process.platform !== "win32" && typeof child.pid === "number") {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      /* group already gone or never created — fall through */
     }
   }
   try {
@@ -160,12 +173,9 @@ function seedClaudeChildEnv(overlay: Record<string, string>): Record<string, str
   // not a merge. Handing only the auth/window overlay drops USERPROFILE/HOME/
   // APPDATA/PATH, so Claude Code cannot find or rewrite ~/.claude credentials
   // and OAuth refresh dies with "session expired and could not be refreshed".
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (typeof v === "string") env[k] = v;
-  }
-  Object.assign(env, overlay);
-  return env;
+  // childEnv also repairs the launchd PATH a Finder-launched macOS app starts
+  // with, which is what makes the CLI's own `node`/`rg` calls resolve.
+  return childEnv(overlay);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

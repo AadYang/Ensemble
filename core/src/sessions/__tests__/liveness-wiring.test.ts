@@ -72,6 +72,7 @@ vi.mock("../runtimes/index.js", async (importOriginal) => ({
 vi.mock("../../cli-config.js", () => ({
   getClaudeCliPath: vi.fn(async () => "mock-claude"),
   getCodexCliPath: vi.fn(async () => "mock-codex"),
+  childEnv: () => ({ ...process.env }),
 }));
 
 let prisma: typeof import("../../db.js").prisma;

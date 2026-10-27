@@ -27,7 +27,10 @@ if (forceMac && process.platform !== "darwin") {
 }
 
 if (process.platform === "darwin" || forceMac) {
-  const tauriArgs = ["dlx", "@tauri-apps/cli@latest", "build", "--bundles", "app"];
+  // Same pinned CLI as the Windows path (`desktop:build:tauri`): `dlx ...@latest`
+  // made macOS silently build with whatever CLI was newest, so a CLI
+  // bundling/signing change could break only the Mac release.
+  const tauriArgs = ["exec", "tauri", "build", "--bundles", "app"];
   if (targetTriple) {
     tauriArgs.push("--target", targetTriple);
   }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -157,8 +157,18 @@ describe("readGitState", () => {
     expect(state.branch).toBe("main");
     // The root is the WORK TREE's, not the subdirectory's — that is the
     // directory a branch actually belongs to. (`--show-toplevel` reports
-    // forward slashes even on Windows, hence the normalization.)
-    const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    // forward slashes even on Windows, hence the normalization.) macOS also
+    // reports the resolved path: /var/folders/... comes back as
+    // /private/var/folders/..., so both sides go through realpath first.
+    const norm = (p: string) => {
+      let resolved = p;
+      try {
+        resolved = realpathSync.native(p);
+      } catch {
+        // Path does not exist yet — compare as given.
+      }
+      return resolved.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    };
     expect(norm(state.root ?? "")).toBe(norm(dir));
     expect(norm(state.root ?? "")).not.toBe(norm(sub));
   });

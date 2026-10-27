@@ -55,6 +55,7 @@ import { randomUUID } from "node:crypto";
 import { ensureDataDir } from "./paths.js";
 import { prisma, type Job, type JobStatus } from "./db.js";
 import { shellFor } from "./sessions/tools/bash.js";
+import { childEnv } from "./cli-config.js";
 
 /** Bytes of log returned to an agent by `job_status`. Big enough for a build's
  *  last error plus its summary; small enough that polling does not become the
@@ -184,7 +185,14 @@ export function killByPid(pid: number): void {
         windowsHide: true,
       });
     } else {
-      process.kill(pid, "SIGKILL");
+      // Jobs are spawned detached on POSIX, so the pid is also the process
+      // group id: signal the whole tree, not just the shell. Falls back to the
+      // single pid for a job started by a core that predates the group spawn.
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        process.kill(pid, "SIGKILL");
+      }
     }
   } catch {
     // Already gone.
@@ -202,6 +210,15 @@ export function killJobTree(child: ChildProcess): void {
   if (process.platform === "win32" && typeof child.pid === "number") {
     killByPid(child.pid);
     return;
+  }
+  if (process.platform !== "win32" && typeof child.pid === "number") {
+    try {
+      // Negative pid signals the group created by `detached: true` at spawn.
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // Group is already gone (or was never created) — kill the shell itself.
+    }
   }
   try {
     child.kill("SIGKILL");
@@ -365,14 +382,18 @@ export class JobManager {
     const logPath = join(JobManager.logDir(), `${id}.log`);
     const { cmd, args: shellArgs } = shellForJob(args.command, args.shell);
 
-    // Not `detached`: core still OWNS this child, so a core crash cannot leave
-    // an untracked process behind. What lets the job outlive a session is that
-    // core — not the session — is its parent.
+    // `detached` only on POSIX: it puts the shell in its own process group so
+    // `killJobTree` can signal the whole tree (`kill(-pid)`). Without a group
+    // the pid we hold is just the shell, and cancelling a `pnpm build` left the
+    // build running — the row said `running` forever. Windows keeps it off:
+    // there the tree is walked with taskkill /T instead.
     const child = spawn(cmd, shellArgs, {
       cwd: args.cwd,
-      env: process.env,
+      // macOS GUI launches inherit launchd's PATH — see childEnv().
+      env: childEnv(),
       shell: false,
       windowsHide: true,
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
 

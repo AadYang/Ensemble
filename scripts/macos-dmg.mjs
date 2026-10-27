@@ -67,7 +67,7 @@ function adHocOrDeveloperSignApp() {
 
 if (!existsSync(appPath) || !lstatSync(appPath).isDirectory()) {
   console.error(`[macos-dmg] missing app bundle: ${appPath}`);
-  console.error("[macos-dmg] run `pnpm dlx @tauri-apps/cli@latest build --bundles app` first");
+  console.error("[macos-dmg] run `pnpm exec tauri build --bundles app` first");
   process.exit(1);
 }
 

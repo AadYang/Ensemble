@@ -60,7 +60,7 @@ import {
   registerHandlers,
   unregisterHandlers,
 } from "../../mcp-bridge.js";
-import { CLI_INSTALL_INFO, getCodexCliPath } from "../../cli-config.js";
+import { childEnv, CLI_INSTALL_INFO, getCodexCliPath } from "../../cli-config.js";
 import {
   requestedRuntimeWindow,
   vendorScopeForModel,
@@ -213,9 +213,10 @@ const DEFAULT_CODEX_SANDBOX: SandboxMode = "danger-full-access";
  *  state forever, no way to recover short of restarting Ensemble.
  *
  *  taskkill /F /T walks the whole tree by PID and SIGKILL-equivalents every
- *  process in it. On non-Windows the regular child.kill() is sufficient
- *  because POSIX signals propagate to the foreground process group (codex
- *  is spawned as session leader in a process group). */
+ *  process in it. On POSIX codex is spawned `detached`, so its pid is also the
+ *  process group id and `kill(-pid)` reaches the MCP grandchildren. Plain
+ *  `child.kill()` does NOT propagate — codex sits in core's group, so the
+ *  grandchildren survive and keep our stdout/stderr pipes open. */
 export function killCodexChildTree(child: ChildProcess): void {
   if (child.exitCode !== null) return;
   if (process.platform === "win32" && typeof child.pid === "number") {
@@ -230,6 +231,14 @@ export function killCodexChildTree(child: ChildProcess): void {
       // Fall through — process may have already exited between the check and
       // taskkill, or taskkill itself errored. Either way, try the generic
       // kill so we at least signal the immediate child.
+    }
+  }
+  if (process.platform !== "win32" && typeof child.pid === "number") {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // Group already gone or never created — kill the immediate child.
     }
   }
   try {
@@ -849,11 +858,7 @@ export class CodexCliRuntime implements AgentRuntime {
     //
     // Always seed from process.env. SessionManager's opts.env / providerEnv
     // layer on top so explicit overrides still win.
-    const codexEnv: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (typeof v === "string") codexEnv[k] = v;
-    }
-    Object.assign(codexEnv, opts.env ?? {});
+    const codexEnv = childEnv(opts.env ?? undefined);
     if (bridgeBaseUrl && wantsBridge) codexEnv.ENSEMBLE_MCP_BEARER = BRIDGE_TOKEN;
     let codexHome: string | null = null;
     if (Object.keys(mcpServersForCodex).length > 0) {
@@ -974,6 +979,10 @@ export class CodexCliRuntime implements AgentRuntime {
         env: codexEnv,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
+        // POSIX: own process group so killCodexChildTree can reach the MCP
+        // grandchildren. They inherit codex's stdio, so a child-only kill left
+        // `close` pending forever — the "Cancel does nothing" hang.
+        detached: process.platform !== "win32",
       });
       childForCleanup = child;
       // The handle we are holding right now is what makes this route

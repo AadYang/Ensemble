@@ -33,6 +33,27 @@ fn get_sidecar_port(app: tauri::AppHandle, state: tauri::State<'_, SidecarPort>)
     Some(port)
 }
 
+/// Platform/arch key in the same shape as the update manifest's `platforms`
+/// map ("macos-arm64", "windows-x64"). Compiled in, so it is exact — the
+/// webview cannot be asked instead: WKWebView's UA reports "Intel Mac OS X"
+/// on Apple Silicon, which made every Mac resolve to the Intel asset.
+#[tauri::command]
+fn get_platform_key() -> String {
+    let platform = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    };
+    format!("{platform}-{arch}")
+}
+
 /// Open a URL or local file with the OS default handler. Chat markdown links
 /// must not navigate the webview (nav-guard blocks that, and `/D:/…` would
 /// otherwise become a sidecar path). Keep `shell:allow-open` scoped to the
@@ -307,7 +328,7 @@ pub fn run() {
         .plugin(ensemble_nav_guard())
         .manage(SidecarHandle(Mutex::new(None)))
         .manage(SidecarPort(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![get_sidecar_port, open_in_os])
+        .invoke_handler(tauri::generate_handler![get_sidecar_port, get_platform_key, open_in_os])
         .setup(|app| {
             // macOS: force Regular activation policy so the Dock icon shows
             // and the app activates on launch. Tauri 2 sometimes infers

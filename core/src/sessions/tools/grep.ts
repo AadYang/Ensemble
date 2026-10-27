@@ -14,6 +14,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { z } from "zod";
+import { childEnv } from "../../cli-config.js";
 import type { NormalizedTool } from "./types.js";
 import { finalizeLineSearch, lineList, openToolOutputSpool } from "./tool-output.js";
 
@@ -33,7 +34,8 @@ const GREP_SCHEMA = z.object({
 const RG_PATH: string | null = (() => {
   try {
     const cmd = process.platform === "win32" ? "where.exe rg" : "which rg";
-    const out = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    // Merged PATH: a Finder-launched macOS app cannot see homebrew/cargo rg.
+    const out = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: childEnv() });
     const first = out.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
     if (first && existsSync(first)) return first;
   } catch {

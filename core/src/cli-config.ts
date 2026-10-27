@@ -1,5 +1,5 @@
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, readdirSync, statSync, type Dirent } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, statSync, type Dirent } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { prisma } from "./db.js";
@@ -405,7 +405,18 @@ function commonCliRoots(): string[] {
 
 function nestedNodeCliRoots(): string[] {
   const home = homedir();
+  // ~/.local/node-<version>-<os>-<arch>/bin is where this project stages the
+  // official Node used for SEA builds — and, on this Mac, where the global
+  // `claude` lives. Without it a Finder-launched app reports "not installed"
+  // while the user's terminal finds the CLI fine.
+  const local = join(home, ".local");
+  const localNodeBins = existsSync(local)
+    ? readdirSync(local, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && e.name.startsWith("node-"))
+        .map((e) => join(local, e.name, "bin"))
+    : [];
   return [
+    ...localNodeBins,
     join(home, ".nvm", "versions", "node"),
     join(home, ".fnm", "node-versions"),
     join(home, ".asdf", "installs", "nodejs"),
@@ -423,6 +434,30 @@ function cliSearchRoots(): string[] {
 
 function mergedCliSearchPath(): string {
   return cliSearchRoots().join(delimiter);
+}
+
+/** Environment for every child process we spawn (Bash tool, jobs, agent CLIs).
+ *
+ *  A macOS app launched from Finder/Dock inherits launchd's PATH —
+ *  `/usr/bin:/bin:/usr/sbin:/sbin` — not the user's shell PATH, so anything
+ *  installed by homebrew/nvm/pnpm (`node`, `rg`, `claude`, `codex`) is
+ *  invisible to the sidecar. Discovery already compensated via
+ *  `mergedCliSearchPath()`, but that only reached the `which` calls; children
+ *  still got the truncated PATH and died with "command not found". Hand the
+ *  merged path down so an agent's Bash tool sees the same tools the user does. */
+export function childEnv(overlay?: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") env[k] = v;
+  }
+  // Windows only: leave PATH untouched. A GUI launch there inherits the full
+  // user PATH from the registry, and rewriting the key would add a "PATH"
+  // next to the existing "Path" — Windows env lookup is case-insensitive, so
+  // which duplicate wins is undefined. POSIX has the launchd problem and is
+  // case-sensitive, so the merge is safe (and necessary) there.
+  if (process.platform !== "win32") env.PATH = mergedCliSearchPath();
+  if (overlay) Object.assign(env, overlay);
+  return env;
 }
 
 function expandHome(value: string): string {
@@ -452,7 +487,7 @@ function resolveCliExecutable(kind: CliKind, candidate: string): string | null {
 
 export function resolveClaudeExecutable(candidate: string): string | null {
   const exeFileName = process.platform === "win32" ? "claude.exe" : "claude";
-  if (candidate.toLowerCase().endsWith(exeFileName) && existsSync(candidate)) return candidate;
+  const existingCandidate = existsSync(candidate) ? candidate : null;
 
   let dir = dirname(candidate);
   const seen = new Set<string>();
@@ -473,7 +508,7 @@ export function resolveClaudeExecutable(candidate: string): string | null {
     if (parent === dir) break;
     dir = parent;
   }
-  return null;
+  return existingCandidate && existingCandidate.toLowerCase().endsWith(exeFileName) ? existingCandidate : null;
 }
 
 function findFileUnder(root: string, fileName: string): string | null {
@@ -489,7 +524,20 @@ function findFileUnder(root: string, fileName: string): string | null {
     }
     for (const e of entries) {
       const full = join(dir, e.name);
-      if (e.isFile() && e.name.toLowerCase() === fileName.toLowerCase()) return full;
+      if (e.name.toLowerCase() === fileName.toLowerCase()) {
+        if (e.isFile()) return full;
+        // npm installs CLIs as symlinks into lib/node_modules (here `claude`
+        // points at the vendored Mach-O binary). Dirent.isFile() is false for
+        // a symlink, so without this the GUI-launch search walked right past
+        // an installed CLI and reported "not found".
+        if (e.isSymbolicLink()) {
+          try {
+            if (statSync(full).isFile()) return full;
+          } catch {
+            // dangling link — keep walking
+          }
+        }
+      }
       if (e.isDirectory()) stack.push({ dir: full, depth: depth + 1 });
     }
   }
@@ -525,7 +573,17 @@ export function resolveCodexExecutable(candidate: string): string | null {
 
 function isSpawnableCliPath(path: string): boolean {
   if (!existsSync(path) || !statSync(path).isFile()) return false;
-  if (process.platform !== "win32") return true;
+  if (process.platform !== "win32") {
+    // POSIX has no PATHEXT: an existing file is only a CLI if it is executable.
+    // Without this the health panel reports "found" for any stray file and the
+    // spawn fails later, far from the setting the user would need to fix.
+    try {
+      accessSync(path, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   return /\.(exe|cmd|bat)$/i.test(path);
 }
 

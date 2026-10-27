@@ -620,3 +620,32 @@
 - Incomplete boards continue in the same attempt; command checks and peer review wait for completion (explicit exit-0 remains command-driven). Rejected acceptance advances the attempt and clears its completion marker.
 - Stall detection compares board content plus git HEAD/index and dirty/untracked file metadata between turns, not the mere existence of a dirty tree. It detects activity, not semantic correctness; inaccessible git state is not treated as no progress.
 - Shared decision, core manager, chip, board, status/help and regression cases updated across all runtimes. No standalone tests run per team policy; Windows packaging follows. macOS validation pending.
+
+
+### 2026-10-27 macOS 适配收尾 + 1.0.8 arm64 安装包
+
+**触发**：仓库以 Windows 为主，用户要求补齐 macOS 适配并产出可用安装包（1.0.8）。
+
+**根因**：
+1. `childEnv` 缺位 —— Finder/Dock 启动的 app 只继承 launchd 的 `PATH`（`/usr/bin:/bin:/usr/sbin:/sbin`），`mergedCliSearchPath()` 只喂给了 `which` 调用，Bash 工具 / jobs / claude / codex 子进程仍带截断 PATH，`node`、`rg` 等直接 command not found。
+2. 全局 CLI 是 npm 符号链接（`~/.local/node-*/bin/claude` → vendored 二进制），`findFileUnder` 用 `Dirent.isFile()` 判断，符号链接被跳过 → GUI 启动时健康面板报"未安装"。
+3. POSIX 杀树缺少进程组：jobs / codex / claude 的 spawn 没有 `detached`，`child.kill()` 只杀直接子进程，孙进程攥着 stdout 导致 `close` 永不触发（Cancel 无效、job 永远 running）。
+4. 更新检查用 UA 判架构，但 WKWebView 在 Apple Silicon 上仍报 `Intel Mac OS X` → 所有 Mac 判成 `macos-x64`。
+5. macOS 构建路径走 `pnpm dlx @tauri-apps/cli@latest`，与 Windows 的 lockfile 版本不一致。
+
+**改动**：
+- `core/src/cli-config.ts`：新增 `childEnv()`（合并 PATH 的完整子进程环境）；`nestedNodeCliRoots()` 加 `~/.local/node-*/bin`；`findFileUnder` 接受指向文件的符号链接；POSIX 的 `isSpawnableCliPath` 要求 `X_OK`。
+- `bash.ts` / `jobs.ts` / `claude.ts` / `codex.ts` 统一用 `childEnv()`；三个 spawn 在 POSIX 加 `detached`，`killJobTree` / `killCodexChildTree` / `killClaudeChildTree` 用 `kill(-pid, SIGKILL)` 失败再回退单 pid。
+- `grep.ts` 的 `which rg` 走合并 PATH；`update-check.ts` 新增 `primePlatformKey()`，优先用 `get_platform_key`（`src-tauri/src/lib.rs` 新命令，`cfg!` 编译期判定），UA 仅作非 Tauri 兜底。
+- `scripts/desktop-build.mjs` 的 macOS 分支改用仓库内 `@tauri-apps/cli`。
+- 测试：`liveness-wiring` 的 cli-config mock 补 `childEnv`；`git.test` 比较前走 `realpath`（macOS `/var` → `/private/var`）；`sdk-contract` 兼容 `.npmrc` 的 `node-linker=hoisted`。
+
+**验证**：
+- `pnpm desktop:build` 通过；产物 `Ensemble_1.0.8_aarch64.dmg`（arm64，67.9 MB，sha256 `2194da43…c2052`），挂载后含 `Ensemble.app` + `/Applications` 软链，`codesign --verify --deep --strict` 通过；无 Developer ID，故 `spctl` 仍拒绝（需右键打开）。
+- 冒烟（临时 HOME + `PATH=/usr/bin:/bin:/usr/sbin:/sbin` 模拟 Finder 启动）：sidecar 监听、前端资源与 API 200、`/settings/cli` 可发现 `claude`（`~/.local/node-*/bin`）与 `codex`（`/opt/homebrew/bin`）。
+- `core` 单测 1085 通过 / 5 失败，5 个失败（phase3-turn-wiring、background-subagent-finish、claude-baseline、openai-responses-transport、tool-output-budget）在改动前的 HEAD 上同样失败；`core` typecheck 的 5 处报错（openai.ts / SessionManager.ts / 3 个测试）同为上游既有。
+- 未做：Developer ID 签名 + 公证（本机无证书）；macOS 原生标题栏（当前仍是自绘 traffic-light，属 UX 后续）。
+
+**Windows 影响**：`childEnv()` 在 win32 上**不重写 PATH**（Windows GUI 进程从注册表继承完整 PATH；且 `Path`/`PATH` 大小写重复键在 Windows 环境块里胜负未定义）。`detached`、`taskkill`、`.exe/.cmd/.bat` 分支、Windows 构建脚本全部保持原样；`findFileUnder` 新增的符号链接兜底是纯增量（junction 也能命中）。`get_platform_key` 在 Windows 上返回 `windows-x64/arm64`，与旧 UA 结果一致（ARM64 反而是修正）。
+
+**留下的规则**：macOS GUI 进程永远不能依赖继承的 `PATH`；新增 spawn 一律走 `childEnv()`；POSIX 上要杀子进程树就必须 `detached: true` + `kill(-pid)`；平台/架构判定用编译期常量，不要读 webview UA。

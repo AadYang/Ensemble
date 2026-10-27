@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { z } from "zod";
+import { childEnv } from "../../cli-config.js";
 import type { NormalizedTool } from "./types.js";
 import { finalizeToolOutput, openToolOutputSpool, toolOutputResult } from "./tool-output.js";
 
@@ -71,7 +72,8 @@ export const bashTool: NormalizedTool<typeof BASH_SCHEMA> = {
     // resolved against it would run in the wrong tree silently.
     const child = spawn(cmd, args, {
       cwd: cwd ?? ctx.projectRoot,
-      env: process.env,
+      // macOS GUI launches inherit launchd's PATH — see childEnv().
+      env: childEnv(),
       shell: false,
       windowsHide: true,
     });
