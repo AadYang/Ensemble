@@ -242,12 +242,7 @@ export class LoopManager {
     if (!row) return null;
     const config = parseLoopConfig(row.config);
     const state = parseLoopState(row.state);
-    // Resume keeps the informational turn count within the same attempt.
     state.consecutiveFails = 0;
-    // The attempt cap is a safety valve, not a verdict: a human clicking
-    // "resume" outranks it. Resuming an already-exhausted budget would leave
-    // the chip at 10/10 and pause again on the next failed attempt, so refill
-    // the counter and record that a human did it.
     const spent = state.iter >= config.maxIterations;
     if (spent) {
       state.iterations = [
@@ -255,7 +250,7 @@ export class LoopManager {
         {
           n: 1,
           result: "skip" as const,
-          summary: `manual resume: attempt counter reset (was ${state.iter}/${config.maxIterations})`,
+          summary: `manual resume: iteration counter reset (was ${state.iter}/${config.maxIterations})`,
           snapshot: null,
         },
       ].slice(-LOOP_ITERATION_LOG_CAP);
@@ -266,7 +261,7 @@ export class LoopManager {
     this.broadcast(next);
     await this.host.persistLoopNotice(
       agentId,
-      spent ? `LOOP RESUME · attempt 1/${config.maxIterations} (budget was spent)` : "LOOP RESUME",
+      spent ? `LOOP RESUME · iter 1/${config.maxIterations} (budget was spent)` : "LOOP RESUME",
     );
     void this.host.sendMessage(agentId, loopStartPrompt(config));
     return this.view(agentId);
@@ -303,7 +298,7 @@ export class LoopManager {
         {
           n: 1,
           result: "skip" as const,
-          summary: `attempt counter reset by user (was ${was}/${config.maxIterations})`,
+          summary: `iteration counter reset by user (was ${was}/${config.maxIterations})`,
           snapshot: null,
         },
       ].slice(-LOOP_ITERATION_LOG_CAP);
@@ -427,26 +422,12 @@ export class LoopManager {
     decision: LoopDecision,
     verifyOk: boolean,
   ): Promise<{ userInput: string } | null> {
-    const pushIter = (result: "pass" | "fail" | "skip", summary: string, snapshot?: string | null) => {
+    const pushIter = (result: "pass" | "fail" | "skip" | "progress", summary: string, snapshot?: string | null) => {
       state.iterations = [
         ...state.iterations,
         { n: state.iter, result, summary, snapshot: snapshot ?? null },
       ].slice(-LOOP_ITERATION_LOG_CAP);
     };
-
-    if (decision.action === "continue") {
-      const next = this.upsert(agentId, { status: "running", config, state });
-      this.broadcast(next);
-      if (!verifyOk) {
-        // A green verifier on the "not finished yet" path is not a failure; it
-        // used to be announced as VERIFY FAIL, which read as a contradiction.
-        await this.host.persistLoopNotice(
-          agentId,
-          `VERIFY FAIL · iter ${state.iter} · consecutive ${state.consecutiveFails}/${LOOP_CONSECUTIVE_FAIL_LIMIT}\n${state.lastVerifySummary}`,
-        );
-      }
-      return { userInput: decision.userInput };
-    }
 
     if (decision.action === "pause") {
       if (!verifyOk) clearCompletionMarker(config.boardRoot ?? this.agentRoot(agentId), config);
@@ -470,8 +451,6 @@ export class LoopManager {
     if (decision.action === "review-reject") {
       clearCompletionMarker(config.boardRoot ?? this.agentRoot(agentId), config);
       pushIter("fail", decision.userInput);
-      // A rejected review is a finished attempt that FAILED: advance the
-      // attempt budget here, not on every turn the reviewer has not replied.
       if (state.iter >= config.maxIterations) {
         pushIter("fail", `iteration cap ${config.maxIterations} reached`);
         const paused = this.upsert(agentId, { status: "paused", config, state });
@@ -481,13 +460,12 @@ export class LoopManager {
       }
       state.iter += 1;
       state.innerTurns = 0;
-      state.consecutiveFails = 0;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
       if (config.session === "fresh-disk") await this.host.resetRuntimeSession(agentId);
       await this.host.persistLoopNotice(
         agentId,
-        `LOOP attempt ${state.iter}/${config.maxIterations} · reviewer rejected`,
+        `LOOP iter ${state.iter}/${config.maxIterations} · reviewer rejected`,
       );
       return { userInput: decision.userInput };
     }
@@ -503,18 +481,18 @@ export class LoopManager {
           if (committed.ok) snapshot = committed.sha;
         }
       }
-      // `outer-iter` is only produced for a rejected full attempt now
-      // (## DONE written, verifier still red), so the iteration log records a
-      // failure and the notice says which attempt is starting.
-      pushIter("fail", state.lastVerifySummary, snapshot);
+      pushIter(decision.result, state.lastVerifySummary || decision.userInput, snapshot);
       state.iter += 1;
       state.innerTurns = 0;
-      state.consecutiveFails = 0;
       state.lastSnapshot = snapshot;
       const next = this.upsert(agentId, { status: "running", config, state });
       this.broadcast(next);
       if (decision.resetRuntime) await this.host.resetRuntimeSession(agentId);
-      await this.host.persistLoopNotice(agentId, `LOOP attempt ${state.iter}/${config.maxIterations}`);
+      const failBit = !verifyOk ? `VERIFY FAIL · ` : "";
+      await this.host.persistLoopNotice(
+        agentId,
+        `${failBit}LOOP iter ${state.iter}/${config.maxIterations}`,
+      );
       return { userInput: decision.userInput };
     }
 

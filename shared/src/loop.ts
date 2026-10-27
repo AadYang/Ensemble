@@ -43,7 +43,7 @@ export interface LoopConfig {
 
 export interface LoopIteration {
   n: number;
-  result: "pass" | "fail" | "skip";
+  result: "pass" | "fail" | "skip" | "progress";
   summary: string;
   snapshot?: string | null;
 }
@@ -83,8 +83,7 @@ export interface LoopView {
 }
 
 export type LoopDecision =
-  | { action: "continue"; userInput: string }
-  | { action: "outer-iter"; userInput: string; resetRuntime: boolean }
+  | { action: "outer-iter"; userInput: string; resetRuntime: boolean; result: "progress" | "fail" }
   | { action: "pause"; reason: string }
   | { action: "done"; summary: string }
   | { action: "awaiting_review"; userInput: string }
@@ -104,9 +103,9 @@ const VERIFIER_KINDS = new Set<LoopVerifierKind>(["command", "job", "file-marker
 const DONE_KINDS = new Set<LoopDoneWhenKind>(["exit-0", "file-contains", "peer-lgtm"]);
 export const DEFAULT_LOOP_DONE_WHEN: LoopDoneWhen = { kind: "file-contains", spec: "## DONE" };
 
-export const DEFAULT_LOOP_MAX_ITERATIONS = 20;
+export const DEFAULT_LOOP_MAX_ITERATIONS = 50;
 export const LOOP_CONSECUTIVE_FAIL_LIMIT = 3;
-export const LOOP_ITERATION_LOG_CAP = 20;
+export const LOOP_ITERATION_LOG_CAP = 50;
 
 function textOf(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -207,7 +206,10 @@ export function parseLoopState(raw: unknown): LoopState {
         .filter((row): row is LoopIteration => {
           if (!row || typeof row !== "object") return false;
           const it = row as LoopIteration;
-          return typeof it.n === "number" && (it.result === "pass" || it.result === "fail" || it.result === "skip");
+          return (
+            typeof it.n === "number" &&
+            (it.result === "pass" || it.result === "fail" || it.result === "skip" || it.result === "progress")
+          );
         })
         .slice(-LOOP_ITERATION_LOG_CAP)
     : [];
@@ -282,16 +284,17 @@ export function loopStartPrompt(config: LoopConfig): string {
   const lines = [
     config.goal.trim(),
     "",
-    "You are in an Ensemble Loop. Keep working until the goal is fully met.",
+    "You are in an Ensemble Loop. Each time you stop, Ensemble starts the next iteration.",
     "- Track remaining work in TASKS.md (create it if needed) as ONE `- [ ]` checklist.",
-    "- The moment an item is finished, change its line to `- [x]` in TASKS.md. The loop board reads checkboxes only; progress written as prose is invisible to it.",
+    "- This iteration: do only the first unfinished item. Mark it `- [x]` in TASKS.md, then stop.",
+    "- Do not finish the whole board in one turn. The loop board reads checkboxes only; progress written as prose is invisible to it.",
     "- Do not move finished items into narrative sections and do not leave them unchecked.",
-    "- Write ## DONE in TASKS.md only when the entire goal is met. Do not write it early.",
+    "- Write ## DONE in TASKS.md only when every item is done and the entire goal is met. Do not write it early.",
     "- Do not stop just because you described a plan.",
   ];
   if (config.verifier) {
     lines.push(
-      `- After the whole goal is marked complete, Ensemble will run this check: ${config.verifier.kind} ${config.verifier.spec}. Do not claim done if it would fail.`,
+      `- Ensemble may run this check: ${config.verifier.kind} ${config.verifier.spec}. Do not write ## DONE if it would fail.`,
     );
   }
   return lines.join("\n");
@@ -300,9 +303,25 @@ export function loopStartPrompt(config: LoopConfig): string {
 export function loopContinuePrompt(config: LoopConfig): string {
   return [
     `Goal (still in force):\n${config.goal}`,
-    "This loop is not done: TASKS.md does not contain ## DONE.",
-    "Continue the work. Keep ONE `- [ ]` checklist in TASKS.md and mark every finished item `- [x]` in the same turn you finish it — the loop board only reads checkboxes. Write ## DONE only when the entire goal is met.",
+    "This loop is not done. Next iteration: do only the first unfinished item in TASKS.md. Mark it `- [x]`, then stop. Write ## DONE only when the entire goal is met.",
   ].join("\n\n");
+}
+
+function nextIteration(
+  config: LoopConfig,
+  state: LoopState,
+  userInput: string,
+  result: "progress" | "fail",
+): LoopDecision {
+  if (state.iter >= config.maxIterations) {
+    return { action: "pause", reason: `iteration cap ${config.maxIterations} reached` };
+  }
+  return {
+    action: "outer-iter",
+    resetRuntime: config.session === "fresh-disk",
+    userInput,
+    result,
+  };
 }
 
 export function decideLoopAfterVerify(input: {
@@ -316,7 +335,7 @@ export function decideLoopAfterVerify(input: {
 }): LoopDecision {
   const { config, state, verifyOk, summary, markerHit, hasDiff, reviewText } = input;
   const failPrompt = [
-    "VERIFY FAIL. The completion condition is not met. Continue. Do not stop until it passes.",
+    "VERIFY FAIL. The completion condition is not met. Do the next unfinished item, then stop. Ensemble will start the next iteration.",
     summary.trim() ? `Failure summary:\n${summary.trim()}` : "",
   ]
     .filter(Boolean)
@@ -329,22 +348,7 @@ export function decideLoopAfterVerify(input: {
         reason: `verifier failed ${state.consecutiveFails} times with no further diff`,
       };
     }
-    // An ATTEMPT ends only when the agent declared completion (## DONE) and
-    // the verifier still rejected it. That is the sole normal way the attempt
-    // budget moves. A verifier that is red while the agent is still working is
-    // feedback, not a finished attempt — counting it per turn is what made a
-    // multi-task board exhaust maxIterations after N tasks.
-    if (markerHit || config.doneWhen.kind === "exit-0") {
-      if (state.iter >= config.maxIterations) {
-        return { action: "pause", reason: `iteration cap ${config.maxIterations} reached` };
-      }
-      return {
-        action: "outer-iter",
-        resetRuntime: config.session === "fresh-disk",
-        userInput: failPrompt,
-      };
-    }
-    return { action: "continue", userInput: failPrompt };
+    return nextIteration(config, state, failPrompt, "fail");
   }
 
   if (config.doneWhen.kind !== "exit-0" && !markerHit && reviewText === undefined) {
@@ -354,12 +358,7 @@ export function decideLoopAfterVerify(input: {
         reason: `no ## DONE and no further diff after ${state.consecutiveFails} turns`,
       };
     }
-    // Same attempt, next turn: the board is not finished yet. This does NOT
-    // consume an attempt, so a 20-item board can run in one attempt.
-    return {
-      action: "continue",
-      userInput: loopContinuePrompt(config),
-    };
+    return nextIteration(config, state, loopContinuePrompt(config), hasDiff ? "progress" : "fail");
   }
 
   if (config.doneWhen.kind === "peer-lgtm") {
@@ -378,14 +377,13 @@ export function decideLoopAfterVerify(input: {
     };
   }
 
-
   return { action: "done", summary: summary.trim() || "loop complete" };
 }
 
 export function formatLoopStatusLines(view: LoopView): string[] {
   const v = view.config.verifier;
   return [
-    `loop            ${view.status}  attempt ${view.iter}/${view.maxIterations}  turns ${view.innerTurns}`,
+    `loop            ${view.status}  iter ${view.iter}/${view.maxIterations}`,
     `verifier        ${v ? `${v.kind}  ${v.spec}` : "none"}  last=${
       // No verifier means nothing was checked. Reporting `pass` here made
       // "no command verifier" look like a green gate.

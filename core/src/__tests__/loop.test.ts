@@ -64,7 +64,7 @@ function seedAgent(name: string, root: string, extra: { teamId?: string } = {}) 
 }
 
 /** A real repo with an uncommitted change, so `hasDiff` stays true and the
- *  no-progress circuit breaker does not mask the turn/attempt accounting. */
+ *  no-progress circuit breaker does not mask iteration accounting. */
 function gitInitWithDirtyFile(root: string): void {
   const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
   git("init");
@@ -113,7 +113,7 @@ describe("ensureLoopSkills", () => {
 });
 
 describe("LoopManager stop-gate", () => {
-  it("spans a multi-item board inside one attempt", async () => {
+  it("advances one iteration per stop-gate on a multi-item board", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-board-"));
     gitInitWithDirtyFile(root);
     const agent = seedAgent("board-many", root);
@@ -127,10 +127,8 @@ describe("LoopManager stop-gate", () => {
       const cont = await mgr.onTurnSettled(agent.id, { lastText: `item ${i + 1}` });
       expect(cont?.userInput).toMatch(/## DONE/);
     }
-    // Five turns of board work, still attempt #1: tasks do not consume the
-    // attempt budget. Only a failed full pass does.
-    expect(mgr.view(agent.id)?.iter).toBe(1);
-    expect(mgr.view(agent.id)?.innerTurns).toBe(5);
+    expect(mgr.view(agent.id)?.iter).toBe(6);
+    expect(mgr.view(agent.id)?.iterations.filter((it) => it.result === "progress")).toHaveLength(5);
     expect(mgr.view(agent.id)?.status).toBe("running");
   });
 
@@ -139,22 +137,22 @@ describe("LoopManager stop-gate", () => {
     gitInitWithDirtyFile(root);
     const agent = seedAgent("no-turn-cap", root);
     const mgr = new LoopManager(mockJobs(0, "ok"), mockHub(), mockHost());
-    await mgr.start(agent.id, { goal: "finish the board", maxTurnsPerIter: 2 });
-    for (let i = 0; i < 55; i += 1) {
+    await mgr.start(agent.id, { goal: "finish the board", maxTurnsPerIter: 2, maxIterations: 200 });
+    for (let i = 0; i < 8; i += 1) {
       writeFileSync(join(root, "TASKS.md"), `- [ ] remaining\nprogress ${i}\n`);
       expect(await mgr.onTurnSettled(agent.id, { lastText: "working" })).not.toBeNull();
     }
-    expect(mgr.view(agent.id)?.iter).toBe(1);
-    expect(mgr.view(agent.id)?.innerTurns).toBe(55);
+    expect(mgr.view(agent.id)?.iter).toBe(9);
     expect(mgr.view(agent.id)?.config.maxTurnsPerIter).toBeNull();
     for (let i = 0; i < 3; i += 1) await mgr.onTurnSettled(agent.id, { lastText: "unchanged" });
     expect(mgr.view(agent.id)?.status).toBe("paused");
     expect(mgr.view(agent.id)?.iterations.at(-1)?.summary).toMatch(/no further diff/);
     await mgr.resume(agent.id);
-    expect(mgr.view(agent.id)?.innerTurns).toBe(58);
+    expect(mgr.view(agent.id)?.status).toBe("running");
+    expect(mgr.view(agent.id)?.iter).toBe(11);
   });
 
-  it("resume refills an attempt budget that was already spent", async () => {
+  it("resume refills an iteration budget that was already spent", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-resume-cap-"));
     gitInitWithDirtyFile(root);
     const agent = seedAgent("cap-spent", root);
@@ -179,10 +177,10 @@ describe("LoopManager stop-gate", () => {
     expect(resumed?.iter).toBe(1);
     expect(resumed?.iterations.some((it) => /manual resume/.test(it.summary))).toBe(true);
     // The mock host truncates notices to 40 chars, so match the prefix.
-    expect(host.calls.some((c) => c.includes("LOOP RESUME · attempt 1/1 (budget"))).toBe(true);
+    expect(host.calls.some((c) => c.includes("LOOP RESUME · iter 1/1 (budget"))).toBe(true);
   });
 
-  it("patch can clear a spent attempt counter without kicking a turn", async () => {
+  it("patch can clear a spent iteration counter without kicking a turn", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-reset-cap-"));
     gitInitWithDirtyFile(root);
     const agent = seedAgent("cap-reset", root);
@@ -225,7 +223,7 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("done");
   });
 
-  it("continues after a failed verifier", async () => {
+  it("kicks the next iteration after a failed exit-0 verifier", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-fail-"));
     const agent = seedAgent("fail", root);
     const host = mockHost();
@@ -233,10 +231,12 @@ describe("LoopManager stop-gate", () => {
     await mgr.start(agent.id, {
       goal: "green",
       verifier: { kind: "command", spec: "npm test" },
+      doneWhen: { kind: "exit-0", spec: "" },
     });
     const cont = await mgr.onTurnSettled(agent.id, { lastText: "I tried" });
     expect(cont?.userInput).toMatch(/VERIFY FAIL/);
     expect(mgr.view(agent.id)?.status).toBe("running");
+    expect(mgr.view(agent.id)?.iter).toBe(2);
     expect(host.calls.some((c) => c.includes("VERIFY FAIL"))).toBe(true);
   });
 
@@ -254,7 +254,7 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("done");
   });
 
-  it("pauses after exhausting three failed acceptance attempts", async () => {
+  it("pauses after exhausting three failed acceptance iterations", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-pause-"));
     const agent = seedAgent("pause", root);
     const mgr = new LoopManager(mockJobs(1, "still red"), mockHub(), mockHost());
@@ -271,7 +271,7 @@ describe("LoopManager stop-gate", () => {
     expect(mgr.view(agent.id)?.status).toBe("paused");
   });
 
-  it("fresh-disk keeps the same attempt while the marker is missing", async () => {
+  it("fresh-disk resets the runtime when the marker is missing", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-fresh-"));
     const agent = seedAgent("fresh", root);
     const host = mockHost();
@@ -284,12 +284,12 @@ describe("LoopManager stop-gate", () => {
     });
     const cont = await mgr.onTurnSettled(agent.id, { lastText: "one item" });
     expect(cont?.userInput).toMatch(/TASKS.md/);
-    expect(host.calls.some((c) => c.startsWith("reset:"))).toBe(false);
+    expect(host.calls.some((c) => c.startsWith("reset:"))).toBe(true);
     expect(mgr.view(agent.id)?.status).toBe("running");
-    expect(mgr.view(agent.id)?.iter).toBe(1);
+    expect(mgr.view(agent.id)?.iter).toBe(2);
   });
 
-  it("fresh-disk restarts only when ## DONE was written but the verifier failed", async () => {
+  it("fresh-disk restarts when ## DONE was written but the verifier failed", async () => {
     const root = mkdtempSync(join(tmpdir(), "ensemble-loop-fresh-fail-"));
     writeFileSync(join(root, "TASKS.md"), "## DONE\n");
     const agent = seedAgent("fresh-fail", root);

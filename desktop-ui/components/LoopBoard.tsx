@@ -23,9 +23,8 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
       .catch((err) => setError((err as Error).message))
       .finally(() => setBusy(false));
   };
-  // An exhausted budget (iter >= max) is a dead end: every later attempt
-  // pauses on sight. Both controls re-arm it — `set` raises the cap, `reset`
-  // clears the counter — so the operator is never stuck at 10/10.
+  // An exhausted budget (iter >= max) pauses on the next stop-gate. Both
+  // controls re-arm it — `set` raises the cap, `reset` clears the counter.
   const spent = loop.status === "paused" && loop.iter >= loop.maxIterations;
   const draft = Number(capDraft);
   const draftValid = Number.isFinite(draft) && draft >= 1 && draft <= 200 && Math.floor(draft) === draft;
@@ -71,9 +70,6 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
         {spent && <span className="text-[var(--warn)] w-full">{t("loop.board.spent")}</span>}
         {error && <span className="text-[var(--err)] w-full break-words">{error}</span>}
       </div>
-      <div className="mb-2 text-[var(--text-dim)] tabular-nums" title={t("loop.board.turnsHint")}>
-        {t("loop.chip.turns", { n: loop.innerTurns })}
-      </div>
       <div className="flex items-center justify-between mb-1">
         <span className="text-[var(--text-faint)] tracking-wider uppercase">{t("loop.board.tasks")}</span>
         {loop.tasks.length > 0 && (
@@ -107,7 +103,17 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
         <details key={`${idx}-${it.n}`} className="border-b border-dashed border-[var(--border)] py-0.5">
           <summary className="flex justify-between gap-2 cursor-pointer text-[var(--text-dim)] hover:text-[var(--text)]">
             <span>#{it.n}</span>
-            <span className={it.result === "fail" ? "text-[var(--err)]" : "text-[var(--ok)]"}>
+            <span
+              className={
+                it.result === "fail"
+                  ? "text-[var(--err)]"
+                  : it.result === "progress"
+                    ? "text-[var(--accent)]"
+                    : it.result === "skip"
+                      ? "text-[var(--text-dim)]"
+                      : "text-[var(--ok)]"
+              }
+            >
               {it.result}
               {it.snapshot ? ` · ${it.snapshot.slice(0, 7)}` : ""}
             </span>

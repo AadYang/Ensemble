@@ -1890,8 +1890,6 @@ fastify.patch<{ Params: { id: string } }>("/agents/:id/loop", async (req, reply)
     .object({
       doneWhen: LoopStartSchema.shape.doneWhen,
       maxIterations: z.number().int().positive().optional(),
-      // Per-attempt turn ceiling. `null` restores the default (50). This is the
-      // counter that actually moves while one attempt spans a long board.
       maxTurnsPerIter: z.number().int().positive().max(500).nullable().optional(),
       resetAttempts: z.boolean().optional(),
     })

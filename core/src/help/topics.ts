@@ -516,14 +516,12 @@ Config (shared LoopConfig):
   verifier          optional command | job | file-marker | peer-review
   verifier.spec     only if verifier is set
   doneWhen          default file-contains ## DONE; exit-0 | peer-lgtm are advanced
-  maxIterations     maximum overall attempts (default 20), not on tasks or
-                    turns. One attempt spans as many turns as the board needs;
-                    it only advances when ## DONE is written and the verifier
-                    still rejects it (or a reviewer rejects). Does NOT change
-                    global maxTurns.
-  Turn counts are informational only; there is no per-attempt turn cap.
-  session           resume (default) | fresh-disk. fresh-disk calls resetRuntimeSession
-                    when an attempt FAILS and re-injects the goal + TASKS.md reminder.
+  maxIterations     outer-loop cap (default 50). Each Stop-gate — the agent
+                    stops, Ensemble kicks the next turn — is one iteration.
+                    ## DONE ends the WHOLE loop, it does not define a round.
+                    Does NOT change global maxTurns.
+  session           resume (default) | fresh-disk. fresh-disk calls
+                    resetRuntimeSession at every outer iteration.
   snapshot          git-commit | none. Commits via argv (no shell, no --force).
                     Empty commit = skip. No git reset --hard in 1.0.
   permissionBump    acceptEdits | bypassPermissions | null; restored on stop.
@@ -533,18 +531,19 @@ Lifecycle (core LoopManager, hooked from SessionManager.sendMessage finally):
   2. On a successful result that was not aborted, SessionManager asks LoopManager.
   3. After ## DONE, the optional command verifier runs as a JobManager job.
      Explicit exit-0 mode instead uses that command as its acceptance condition.
-  4. Command fail → VERIFY FAIL notice + auto-continue with the tail.
-     Missing ## DONE → continue the SAME attempt. Three consecutive
-     unchanged progress observations → paused.
-  5. ## DONE present (and optional command green) → LOOP DONE.
-  6. peer-review: command/job must be green, then peer_send(mode=review) to the
-     reviewer; status=awaiting_review until LGTM (or reject back to the runner).
+  4. Not done → outer-iter (iter += 1, optional snapshot / fresh-disk reset)
+     and auto-send the next-item prompt. Command fail → VERIFY FAIL + next iter.
+  5. Three consecutive unchanged progress observations → paused.
+     Hitting maxIterations → paused.
+  6. ## DONE present (and optional command green) → LOOP DONE.
+  7. peer-review: the board must be marked done, then peer_send(mode=review) to
+     the reviewer; status=awaiting_review until LGTM (or reject back to the runner).
 
 Team Loop: one TASKS.md board, N isolated runners (they do not peer_send
 continue to each other), optional one reviewer, optional git worktree add to a
 sibling directory. Stopping the loop does NOT delete the worktree.
 
-UI: /loop opens the dialog (goal is a textarea; command check is advanced). Header chip shows 3/20 plus
+UI: /loop opens the dialog (goal is a textarea; command check is advanced). Header chip shows iter 3/50 plus
 VERIFY OK/FAIL and pause/stop. Right drawer is a view of project-root TASKS.md.
 Recipes loop-tdd / loop-ralph / loop-pr-gate live in DATA_DIR/skills and are
 force-on when selected. Project hints (package.json scripts, AGENTS.md, a

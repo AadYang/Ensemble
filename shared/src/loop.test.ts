@@ -23,7 +23,7 @@ describe("parseLoopConfig", () => {
     expect(cfg.verifier).toBeNull();
     expect(cfg.doneWhen).toEqual({ kind: "file-contains", spec: "## DONE" });
     expect(cfg.session).toBe("resume");
-    expect(cfg.maxIterations).toBe(20);
+    expect(cfg.maxIterations).toBe(50);
   });
 
   it("treats an empty verifier spec as no verifier", () => {
@@ -53,19 +53,21 @@ describe("parseLoopConfig", () => {
 });
 
 describe("loopStartPrompt", () => {
-  it("tells the agent to write ## DONE and does not ask the user for a script", () => {
+  it("tells the agent to do one item per iteration and write ## DONE only at the end", () => {
     const cfg = parseLoopConfig({ goal: "add dark mode" });
     const text = loopStartPrompt(cfg);
     expect(text).toContain("add dark mode");
     expect(text).toContain("## DONE");
     expect(text).toContain("TASKS.md");
+    expect(text).toContain("first unfinished");
+    expect(text).toContain("next iteration");
   });
 });
 
 describe("decideLoopAfterVerify", () => {
   const state = emptyLoopState();
 
-  it("starts another attempt after a failed exit-0 acceptance check", () => {
+  it("starts another iteration after a failed exit-0 acceptance check", () => {
     const config = parseLoopConfig({ ...withCommand, doneWhen: { kind: "exit-0", spec: "" } });
     const d = decideLoopAfterVerify({
       config,
@@ -76,6 +78,7 @@ describe("decideLoopAfterVerify", () => {
       hasDiff: true,
     });
     expect(d.action).toBe("outer-iter");
+    if (d.action === "outer-iter") expect(d.result).toBe("fail");
   });
 
   it("pauses after consecutive fails with no diff", () => {
@@ -107,7 +110,7 @@ describe("decideLoopAfterVerify", () => {
     expect(d.action).toBe("done");
   });
 
-  it("keeps working in the same attempt while ## DONE is missing", () => {
+  it("opens the next iteration while ## DONE is missing", () => {
     const cfg = parseLoopConfig({ goal: "ship it" });
     const d = decideLoopAfterVerify({
       config: cfg,
@@ -117,14 +120,17 @@ describe("decideLoopAfterVerify", () => {
       markerHit: false,
       hasDiff: true,
     });
-    expect(d.action).toBe("continue");
-    if (d.action === "continue") {
+    expect(d.action).toBe("outer-iter");
+    if (d.action === "outer-iter") {
+      expect(d.result).toBe("progress");
+      expect(d.resetRuntime).toBe(false);
       expect(d.userInput).toContain("## DONE");
       expect(d.userInput).toContain("ship it");
+      expect(d.userInput).toContain("first unfinished");
     }
   });
 
-  it("does not restart a fresh-disk loop just because the board is unfinished", () => {
+  it("resets a fresh-disk runtime when the board is unfinished", () => {
     const cfg = parseLoopConfig({
       goal: "ship it",
       session: "fresh-disk",
@@ -138,10 +144,11 @@ describe("decideLoopAfterVerify", () => {
       markerHit: false,
       hasDiff: true,
     });
-    expect(d.action).toBe("continue");
+    expect(d.action).toBe("outer-iter");
+    if (d.action === "outer-iter") expect(d.resetRuntime).toBe(true);
   });
 
-  it("counts an attempt when ## DONE was written but verification failed", () => {
+  it("starts the next iteration when ## DONE was written but verification failed", () => {
     const cfg = parseLoopConfig({ goal: "ship it", session: "fresh-disk" });
     const d = decideLoopAfterVerify({
       config: cfg,
@@ -154,11 +161,12 @@ describe("decideLoopAfterVerify", () => {
     expect(d.action).toBe("outer-iter");
     if (d.action === "outer-iter") {
       expect(d.resetRuntime).toBe(true);
+      expect(d.result).toBe("fail");
       expect(d.userInput).toContain("VERIFY FAIL");
     }
   });
 
-  it("does not consume an attempt for a verifier that is still red mid-work", () => {
+  it("counts a mid-work red verifier as an iteration", () => {
     const cfg = parseLoopConfig({ goal: "ship it" });
     const d = decideLoopAfterVerify({
       config: cfg,
@@ -168,22 +176,37 @@ describe("decideLoopAfterVerify", () => {
       markerHit: false,
       hasDiff: true,
     });
-    expect(d.action).toBe("continue");
+    expect(d.action).toBe("outer-iter");
+    if (d.action === "outer-iter") expect(d.result).toBe("fail");
   });
 
-  it.each([5, 50, 5000])("keeps working after %s turns without a second budget", (turns) => {
+  it.each([5, 50, 5000])("ignores legacy per-turn caps after %s inner turns", (turns) => {
     const config = parseLoopConfig({ goal: "ship it", maxTurnsPerIter: 5 });
     expect(config.maxTurnsPerIter).toBeNull();
-    expect(decideLoopAfterVerify({ config, state: { ...state, innerTurns: turns },
+    const d = decideLoopAfterVerify({ config, state: { ...state, innerTurns: turns },
       verifyOk: true, summary: "working", markerHit: false, hasDiff: true,
-    }).action).toBe("continue");
+    });
+    expect(d.action).toBe("outer-iter");
   });
 
   it("does not send unfinished work to the reviewer", () => {
     const config = parseLoopConfig({ goal: "ship it", doneWhen: { kind: "peer-lgtm", spec: "LGTM" } });
     expect(decideLoopAfterVerify({ config, state, verifyOk: true, summary: "working",
       markerHit: false, hasDiff: true,
-    }).action).toBe("continue");
+    }).action).toBe("outer-iter");
+  });
+
+  it("pauses at the iteration cap while the board is still unfinished", () => {
+    const config = parseLoopConfig({ goal: "ship it", maxIterations: 3 });
+    const d = decideLoopAfterVerify({
+      config,
+      state: { ...state, iter: 3 },
+      verifyOk: true,
+      summary: "working",
+      markerHit: false,
+      hasDiff: true,
+    });
+    expect(d).toEqual({ action: "pause", reason: "iteration cap 3 reached" });
   });
 
   it("pauses a goal-only loop that stalls with no diff", () => {

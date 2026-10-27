@@ -1204,7 +1204,6 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
               }
             >
               {t("loop.chip.label")} {t("loop.chip.attempt", { n: loop.iter, max: loop.maxIterations })}
-              {` · ${t("loop.chip.turns", { n: loop.innerTurns })}`}
               {loop.status === "paused" ? ` · ${t("loop.chip.paused")}` : ""}
               {loop.config.verifier
                 ? loop.lastVerifyOk === false

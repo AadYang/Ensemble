@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { DEFAULT_LOOP_MAX_ITERATIONS } from "@agentorch/shared";
 import { useT } from "@/i18n/useT";
 import { MenuSelect } from "./MenuSelect";
 import { startLoop, startTeamLoop, suggestLoop, type LoopStartBody } from "@/lib/loop-api";
@@ -29,7 +30,7 @@ export function LoopDialog({
   const [doneSpec, setDoneSpec] = useState("## DONE");
   const [session, setSession] = useState<"fresh-disk" | "resume">("resume");
   const [snapshot, setSnapshot] = useState<"none" | "git-commit">("none");
-  const [maxIterations, setMaxIterations] = useState("20");
+  const [maxIterations, setMaxIterations] = useState(String(DEFAULT_LOOP_MAX_ITERATIONS));
   const [permissionBump, setPermissionBump] = useState<"acceptEdits" | "bypassPermissions" | "">("acceptEdits");
   const [recipe, setRecipe] = useState<"" | "tdd" | "ralph" | "pr-gate">("");
   const [worktree, setWorktree] = useState(false);
@@ -87,7 +88,7 @@ export function LoopDialog({
       goal: goal.trim(),
       ...(spec ? { verifier: { kind: verifierKind, spec } } : {}),
       doneWhen: { kind: doneKind, spec: doneSpec.trim() },
-      maxIterations: Math.max(1, Number(maxIterations) || 20),
+      maxIterations: Math.max(1, Number(maxIterations) || DEFAULT_LOOP_MAX_ITERATIONS),
       session,
       snapshot,
       permissionBump: permissionBump || null,
