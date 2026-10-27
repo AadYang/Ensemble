@@ -48,6 +48,15 @@ Cross-agent communication tools you have:
                repo or making a reasonable assumption. Never for status updates
                or confirmations. A timeout is a failure: stop and report the
                blocker — do not continue on a guess.
+  ask_user   → ask the HUMAN a question and WAIT. The chat pane shows optional
+               buttons plus a text field; the tool returns whatever they
+               submitted (a clicked label or typed text). options may be empty
+               for an open question (a path, an explanation, "other").
+               Use this when YOU need a decision or other input from the user
+               before you can continue.
+               Do NOT use peer_ask for that — peer_ask is teammates only.
+               Do NOT write the question as ordinary chat and stop: that does
+               not wait, and the user may never see it as a choice.
   peer_query → read another agent's recent text turns (synchronous, no run)
   conversation_search -> keyword search prior user/assistant messages
                (read-only DB lookup; default scope team, fallback self)

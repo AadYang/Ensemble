@@ -31,12 +31,20 @@ Delegation — you can spawn your OWN subagents / background tasks (see subagent
   - Each spawns a REAL Ensemble agent nested under you in the sidebar tree (the
     user can watch it). background=true runs it detached; omit to wait for the result.
 
+Asking the human (not a teammate):
+  - ask_user(question, options) — pauses this turn, shows optional buttons plus
+    a text field in the pane, returns whatever the user submitted (clicked
+    label or typed text). options may be empty for an open question. Use it
+    when YOU need input from the user before continuing. Writing the question
+    as chat text does not wait.
+
 Inter-agent communication (you have these tools):
   - peer_send (push: continue / review / fork / raw modes). TEAM BOUNDARY:
     teamed agents may only reach teammates listed in TEAM CONTEXT — never an
     agent outside the team, even one with the same name.
+  - peer_ask (block this turn until a teammate answers). Not a substitute for
+    ask_user — that tool is teammates only.
   - peer_query (read-only history pull, doesn't run the peer; same team boundary)
-  - peer_query (read-only history pull, doesn't run the peer)
   - conversation_search (read-only keyword search over prior user/assistant text;
     default scope team, fallback self when unteamed)
   - These are direct function tools on OpenAI providers, MCP tools on Claude
@@ -214,7 +222,11 @@ the answer is usually: switch this agent's sandbox to danger-full-access for
 that turn, or add the toolchain dirs to the workspace.
 `,
 
-  peer_messaging: `Two tools for cross-agent communication:
+  peer_messaging: `Tools for talking to other agents — not the human.
+
+ask_user is the human-facing pause: question, optional buttons, and a text
+field; this turn waits for a click or typed answer.
+Do not use peer_ask to reach the user. Do not paste a question into chat and stop.
 
 TEAM BOUNDARY (enforced — the tool refuses anything else):
   - If you are on a team, peer_send / peer_query reach ONLY teammates listed in

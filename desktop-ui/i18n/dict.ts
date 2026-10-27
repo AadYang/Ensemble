@@ -512,7 +512,9 @@ const en: Dict = {
   "ask.title": "AGENT IS ASKING",
   "ask.fromAgent": "agent: {name}",
   "ask.pending": "+{n} pending",
-  "ask.note": "agent is paused on ask_user; pick an option to continue",
+  "ask.custom.placeholder": "or type your own answer…",
+  "ask.custom.submit": "send",
+  "ask.note": "agent is paused on ask_user; pick a button or type an answer",
 
   // peer-talk
   "peer.btn.title": "send a message to another agent",
@@ -1213,7 +1215,9 @@ const zh: Dict = {
   "ask.title": "AGENT 在向你提问",
   "ask.fromAgent": "agent：{name}",
   "ask.pending": "还有 {n} 项",
-  "ask.note": "agent 已在 ask_user 暂停；点选项继续",
+  "ask.custom.placeholder": "也可以自己填写答案…",
+  "ask.custom.submit": "发送",
+  "ask.note": "agent 已在 ask_user 暂停；点选项，或在下面填写后发送",
 
   // peer-talk
   "peer.btn.title": "发消息给其他 agent",

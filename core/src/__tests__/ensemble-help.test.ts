@@ -64,11 +64,14 @@ describe("buildEnsemblePrimer", () => {
     }
   });
 
-  it("mentions peer_send, peer_query, and conversation_search", () => {
+  it("mentions peer_send, peer_query, conversation_search, and ask_user", () => {
     const p = buildEnsemblePrimer();
     expect(p).toContain("peer_send");
     expect(p).toContain("peer_query");
     expect(p).toContain("conversation_search");
+    expect(p).toContain("ask_user");
+    expect(p).toMatch(/ask the HUMAN/i);
+    expect(p).toMatch(/typed text/i);
   });
 
   it("tells the agent peer_send cannot reach outside the team", () => {

@@ -17,6 +17,7 @@ export function AskUserDialog() {
 
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const [mounted, setMounted] = useState(false);
+  const [custom, setCustom] = useState("");
   const dragOffsetRef = useRef<{ dx: number; dy: number } | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -28,6 +29,7 @@ export function AskUserDialog() {
   useEffect(() => {
     if (!mounted || !head) return;
     setPos(null);
+    setCustom("");
   }, [mounted, head?.reqId]);
 
   useEffect(() => {
@@ -69,14 +71,18 @@ export function AskUserDialog() {
   const agentName = agent?.summary.name ?? head.sessionId.slice(0, 8);
 
   const onPick = (choice: string) => {
+    const text = choice.trim();
+    if (!text) return;
     ws.send({
       type: "user_answer",
       sessionId: head.sessionId,
       reqId: head.reqId,
-      choice,
+      choice: text,
     });
     clearUserQuestion(head.reqId);
   };
+
+  const onSubmitCustom = () => onPick(custom);
 
   const onHeaderMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -120,17 +126,41 @@ export function AskUserDialog() {
         <div className="text-sm whitespace-pre-wrap break-words text-[var(--text)]">
           {head.question}
         </div>
+        {head.options.length > 0 && (
+          <div className="flex flex-col gap-1.5 mt-1">
+            {head.options.map((opt, i) => (
+              <button
+                key={`${head.reqId}-${i}`}
+                onClick={() => onPick(opt)}
+                className="px-3 py-1.5 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black transition-colors text-left text-xs"
+              >
+                <span className="text-[var(--text-faint)] mr-2">{i + 1}.</span>
+                {opt}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="flex flex-col gap-1.5 mt-1">
-          {head.options.map((opt, i) => (
-            <button
-              key={`${head.reqId}-${i}`}
-              onClick={() => onPick(opt)}
-              className="px-3 py-1.5 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black transition-colors text-left text-xs"
-            >
-              <span className="text-[var(--text-faint)] mr-2">{i + 1}.</span>
-              {opt}
-            </button>
-          ))}
+          <textarea
+            value={custom}
+            onChange={(e) => setCustom(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                onSubmitCustom();
+              }
+            }}
+            rows={2}
+            placeholder={t("ask.custom.placeholder")}
+            className="bg-[var(--bg-pane)] border border-[var(--border)] px-2 py-1.5 outline-none focus:border-[var(--accent)] text-xs resize-y min-h-[44px]"
+          />
+          <button
+            onClick={onSubmitCustom}
+            disabled={!custom.trim()}
+            className="self-end px-3 py-1 border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-black disabled:opacity-30 transition-colors"
+          >
+            {t("ask.custom.submit")}
+          </button>
         </div>
         <div className="text-[10px] text-[var(--text-faint)] leading-tight">
           {t("ask.note")}
