@@ -8,6 +8,7 @@ import {
   occupancyAfterPersistedMessage,
   occupancyDeltaFromStreamEvent,
   occupancyTokensFromLastCall,
+  occupancyTokensFromModelReport,
   occupancyTokensFromResultContextUsage,
   promptTextFromMessage,
   shouldCompactForHeadroom,
@@ -387,7 +388,7 @@ describe("promptTokensFromResultContextUsage", () => {
 });
 
 describe("occupancyTokensFromLastCall", () => {
-  it("adds output to the anthropic prompt (input + cache)", () => {
+  it("matches Claude Code used_percentage: input + cache, no output", () => {
     const rows = [
       assistantWithUsage({
         input_tokens: 209,
@@ -395,12 +396,12 @@ describe("occupancyTokensFromLastCall", () => {
         output_tokens: 40,
       }),
     ];
-    expect(occupancyTokensFromLastCall(rows)).toBe(165_881);
+    expect(occupancyTokensFromLastCall(rows)).toBe(165_841);
   });
 
-  it("adds completion_tokens to the chat-completions prompt", () => {
+  it("does not add completion_tokens to the chat-completions prompt", () => {
     const rows = [assistantWithUsage({ prompt_tokens: 50_000, completion_tokens: 12 })];
-    expect(occupancyTokensFromLastCall(rows)).toBe(50_012);
+    expect(occupancyTokensFromLastCall(rows)).toBe(50_000);
   });
 });
 
@@ -425,7 +426,7 @@ describe("occupancyTokensFromResultContextUsage", () => {
     ).toBeNull();
   });
 
-  it("reads Claude SDK result.usage when contextUsage is absent", () => {
+  it("reads Claude SDK result.usage when contextUsage is absent, excluding output", () => {
     expect(
       occupancyTokensFromResultContextUsage({
         type: "result",
@@ -436,7 +437,31 @@ describe("occupancyTokensFromResultContextUsage", () => {
           output_tokens: 40,
         },
       }),
-    ).toBe(128_052);
+    ).toBe(128_012);
+  });
+});
+
+describe("occupancyTokensFromModelReport", () => {
+  it("reads occupancy the runtime forwarded from a token_count tick", () => {
+    expect(
+      occupancyTokensFromModelReport({
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: 420,
+        occupancy_tokens: 90_000,
+        context_window: 828_400,
+      }),
+    ).toEqual({ used: 90_000, window: 828_400 });
+  });
+
+  it("ignores thinking heartbeats that carry no occupancy", () => {
+    expect(
+      occupancyTokensFromModelReport({
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: 420,
+      }),
+    ).toBeNull();
   });
 });
 
@@ -453,14 +478,14 @@ describe("live occupancy helpers", () => {
     expect(estimateStreamTokens(5)).toBe(2);
   });
 
-  it("keeps the live running count when the persisted row has no usage", () => {
+  it("keeps the last model-reported number when the persisted row has no usage", () => {
     expect(
       occupancyAfterPersistedMessage({
         providerOccupancy: null,
         livePromptTokens: 539_000,
         streamedTokens: 12,
       }),
-    ).toBe(539_012);
+    ).toBe(539_000);
   });
 
   it("prefers provider occupancy over the live count", () => {

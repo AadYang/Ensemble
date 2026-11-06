@@ -42,6 +42,16 @@ describe("claudeSupportedModelsToCatalog", () => {
     ]);
   });
 
+  it("keeps a contextWindow when the CLI reports one", () => {
+    expect(
+      claudeSupportedModelsToCatalog([
+        { value: "opus", resolvedModel: "claude-opus-4-8", contextWindow: 1_000_000 },
+      ]),
+    ).toEqual([
+      { id: "opus", resolvedId: "claude-opus-4-8", contextWindow: 1_000_000 },
+    ]);
+  });
+
   it("returns null when the CLI listed nothing usable", () => {
     expect(claudeSupportedModelsToCatalog([])).toBeNull();
     expect(claudeSupportedModelsToCatalog(null)).toBeNull();

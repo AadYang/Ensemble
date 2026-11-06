@@ -59,6 +59,53 @@ describe("parseCodexModelCatalog", () => {
       defaultReasoningLevel: "high",
     }]);
   });
+
+  it("keeps object-shaped supported_reasoning_levels from current Codex catalogs", () => {
+    expect(
+      parseCodexModelCatalog(JSON.stringify({
+        models: [{
+          slug: "gpt-6.1-sol",
+          visibility: "list",
+          supported_in_api: true,
+          display_name: "GPT-6.1-Sol",
+          default_reasoning_level: "low",
+          supported_reasoning_levels: [
+            { effort: "low" },
+            { effort: "medium" },
+            { effort: "high" },
+            { effort: "xhigh" },
+            { effort: "max" },
+            { effort: "ultra" },
+          ],
+        }],
+      })),
+    ).toEqual([{
+      id: "gpt-6.1-sol",
+      displayName: "GPT-6.1-Sol",
+      reasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningLevel: "low",
+    }]);
+  });
+
+  it("keeps context_window and max_context_window from current Codex catalogs", () => {
+    expect(
+      parseCodexModelCatalog(JSON.stringify({
+        models: [{
+          slug: "gpt-6.1-sol",
+          visibility: "list",
+          supported_in_api: true,
+          context_window: 272_000,
+          max_context_window: 872_000,
+          effective_context_window_percent: 95,
+        }],
+      })),
+    ).toEqual([{
+      id: "gpt-6.1-sol",
+      contextWindow: 272_000,
+      maxContextWindow: 872_000,
+      effectiveContextWindowPercent: 95,
+    }]);
+  });
 });
 
 describe("readCodexModelCache", () => {

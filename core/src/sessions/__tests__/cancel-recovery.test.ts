@@ -1756,6 +1756,12 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(meta.lastSessionId).toBeUndefined();
     expect(meta.codexUsageSnapshot).toBeUndefined();
     expect(meta.codexResumeSignature).toBeUndefined();
+    const usageReset = hub.sessionMessages.find((m) => m.msg.type === "context_usage");
+    expect(usageReset?.msg.usage).toBeNull();
+    const planMsg = hub.sessionMessages.find((m) => m.msg.type === "run_plan");
+    const plan = planMsg?.msg.plan as { source?: string; identity?: { modelId?: string } } | undefined;
+    expect(plan?.source).toBe("fresh-resolution");
+    expect(plan?.identity?.modelId).toBe("gpt-5.5");
   });
 
   it("patchAgent preserves permissionMode while clearing resume metadata for model+permission changes", async () => {

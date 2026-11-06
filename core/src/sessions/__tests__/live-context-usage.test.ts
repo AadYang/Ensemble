@@ -117,7 +117,7 @@ function contextUsages(hub: StubHub): Array<{ usedTokens: number; contextWindow?
 }
 
 describe("live context occupancy", () => {
-  it("publishes a rising usedTokens while the turn is still streaming", async () => {
+  it("publishes the model-reported occupancy, not a stream character estimate", async () => {
     const provider = await prisma.provider.create({
       data: { name: "live-ctx-provider", kind: "anthropic-local", models: ["claude-sonnet-4-6"] },
     });
@@ -130,16 +130,14 @@ describe("live context occupancy", () => {
     const turn = sessions.sendMessage(agent.id, "please stream a long answer");
     await waitForTurnStart();
 
-    const mid = contextUsages(hub);
-    expect(mid.length).toBeGreaterThanOrEqual(1);
-    expect(mid[0]!.usedTokens).toBeGreaterThan(0);
+    expect(contextUsages(hub)).toEqual([]);
 
     gate.open();
     await turn;
 
     const after = contextUsages(hub);
     const last = after[after.length - 1]!;
-    expect(last.usedTokens).toBeGreaterThanOrEqual(1_280);
+    expect(last.usedTokens).toBe(1_200);
     expect(last.contextWindow).toBe(200_000);
   }, 30_000);
 
@@ -157,9 +155,10 @@ describe("live context occupancy", () => {
     const started = Date.now();
     const turn = sessions.sendMessage(agent.id, "please stream a burst of deltas");
     await waitForTurnStart();
-    expect(contextUsages(hub).some((u) => u.usedTokens > 0)).toBe(true);
     gate.open();
     await turn;
     expect(Date.now() - started).toBeLessThan(5_000);
+    const last = contextUsages(hub).at(-1);
+    expect(last?.usedTokens).toBe(1_200);
   }, 30_000);
 });

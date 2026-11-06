@@ -70,10 +70,14 @@
 // still surface the advertised figure it does know.
 //
 // THE POLICY RULE (separate from display, on purpose — reading facts must not
-// write config): `requestedRuntimeWindow(model, scope)` is the only thing a
-// runtime may declare, and it returns a value ONLY when the catalog value is
-// `confirmed` AND that runtime's config key has verified semantics. An
-// unverified / legacy / family-analogy number must never reach a config file.
+// write config): `requestedRuntimeWindow(model, scope, discovered?)` is the only
+// thing a runtime may declare. It returns a value when the runtime's config key
+// has verified semantics AND either (a) the catalog value is `confirmed`, or
+// (b) the live CLI/HTTP catalog reported a `max_context_window` (or a single
+// `context_window` when max is absent). An unverified / legacy / family-analogy
+// number must never reach a config file. The small Codex default
+// `context_window` is never declared when `max_context_window` is present —
+// that is the 272k trap.
 //
 // `REVIEWED_SNAPSHOT_DISAGREEMENTS` records every case where a confirmed catalog
 // value intentionally differs from the vendored LiteLLM snapshot, with the
@@ -82,8 +86,8 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { isReasoningToken } from "@agentorch/shared";
-import type { ContextWindowConfidence } from "@agentorch/shared";
+import { discoveredDeclareWindow, isReasoningToken } from "@agentorch/shared";
+import type { ContextWindowConfidence, ProviderModelInfo } from "@agentorch/shared";
 import builtInContextWindows from "./context-windows.json" with { type: "json" };
 import { ensureDataDir } from "./paths.js";
 
@@ -1146,19 +1150,30 @@ export function compactionThreshold(model: string, scope: WindowScope): number |
 }
 
 /** THE POLICY GATE. The only function a runtime may use to write config. It
- *  returns a value only when the runtime's key semantics are verified AND the
- *  catalog value is `confirmed` — a family analogy, a legacy override, or an
+ *  returns a value only when the runtime's key semantics are verified AND
+ *  either the catalog value is `confirmed` or the live CLI/HTTP catalog
+ *  reported a backend cap. A family analogy, a legacy override, or an
  *  unverified snapshot must never reach a config file. Display never calls
  *  this; reading must not write config.
  *
  *  Legacy entries are skipped rather than consulted: a hand-written number must
  *  not be declared, but neither may it DISABLE a confirmed declaration we
  *  already hold (that would re-create the very misconfiguration this refactor
- *  removes — codex left on its 272k default because of a stale override). */
-export function requestedRuntimeWindow(model: string, scope: WindowScope): number | null {
+ *  removes — codex left on its 272k default because of a stale override).
+ *
+ *  A confirmed catalog still outranks the CLI row: docs 1.05M for gpt-5.6-sol
+ *  must not be replaced by Codex's 872k backend cap. The CLI is the source for
+ *  models the built-in catalog has not caught up with. */
+export function requestedRuntimeWindow(
+  model: string,
+  scope: WindowScope,
+  discovered?: ProviderModelInfo | null,
+): number | null {
   const spec = RUNTIME_DECLARES_WINDOW[norm(scope.runtime)];
   if (!spec?.verified) return null;
   const entry = catalogEntry(model, scope.vendor, { ignoreLegacy: true });
-  if (!entry || entry.confidence !== "confirmed") return null;
-  return entry.advertisedContextWindow > 0 ? entry.advertisedContextWindow : null;
+  if (entry?.confidence === "confirmed" && entry.advertisedContextWindow > 0) {
+    return entry.advertisedContextWindow;
+  }
+  return discoveredDeclareWindow(discovered, model);
 }

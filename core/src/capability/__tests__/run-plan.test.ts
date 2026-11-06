@@ -79,6 +79,21 @@ describe("resolveRunPlan", () => {
     expect(plan.context.advertisedContextWindow).toBe(1_050_000);
   });
 
+  it("declares the CLI max_context_window for a model the catalog has not caught up with", () => {
+    const plan = m.resolveRunPlan({
+      model: "gpt-6.1-sol",
+      runtime: "codex",
+      discoveredModel: {
+        id: "gpt-6.1-sol",
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      },
+    });
+    expect(plan.context.requestedRuntimeWindow).toBe(872_000);
+    expect(plan.context.advertisedContextWindow).toBe(872_000);
+    expect(plan.context.effectiveWindow).toBeNull();
+  });
+
   it("takes the compaction threshold from the caller, defaulting to unknown", () => {
     expect(basePlan().context.compactionThreshold).toBeNull();
     expect(basePlan({ compactionThreshold: 258_400 }).context.compactionThreshold).toBe(258_400);

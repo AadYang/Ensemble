@@ -1,7 +1,8 @@
 // Compute a per-turn ContextUsage for the agent-pane context-fill indicator.
 //
-// Two numerators, picked by what the runtime can tell us — both measure "how
-// many tokens is the next request going to carry", neither is a billing sum:
+// The bar's numerator is what the MODEL reported as context occupancy — the
+// same figure the CLI meter uses. Invented counts (character/4, prompt+output
+// on Claude, input-only on Codex) are not occupancy.
 //
 //   1. PROVIDER-REPORTED per-call prompt size (Claude runtime, including
 //      third-party anthropic-compat upstreams like DeepSeek). Every persisted
@@ -24,12 +25,10 @@
 //      prefix OUT of `inputTokens` for billing, so the prompt size is
 //      `inputTokens + cacheReadInputTokens + cacheCreationInputTokens`.
 //
-//   3. LOCAL tokenizer count of the exact history the runtime replays — the
-//      fallback when 1 and 2 are both absent (today: Codex, whose
-//      `turn.completed.usage` is a cumulative thread total, not a per-request
-//      prompt). Those prompts are reconstructed from the DB by
-//      `buildRuntimeHistoryForTurn`, so counting that same trimmed history is a
-//      faithful model of it rather than a guess.
+//   3. CODEX: `last_token_usage.total_tokens` from the rollout / live
+//      `token_count` event, against `model_context_window`. That is the same
+//      pair Codex CLI's meter reads (`tokens_in_context_window`). The
+//      cumulative `turn.completed.usage` snapshot is billing, never occupancy.
 //
 // In every case the percentage is capped at 100 (OpenHands does
 // `Math.min(100, …)`) while the raw `usedTokens` is NOT clamped, so the tooltip
@@ -131,25 +130,13 @@ export function promptTokensFromLastCall(rows: readonly Row[]): number | null {
   return null;
 }
 
-/** Occupancy of the last completed API call: prompt + that call's output.
- *  The bar's numerator during/after a turn is how full the window is, not
- *  how large the next request's prefix will be. */
+/** Occupancy the model itself reported on the last API call.
+ *
+ *  Claude Code's `context_window.used_percentage` is input + cache, excluding
+ *  output. Adding output here was an Ensemble invention and diverged from the
+ *  CLI meter the bar is supposed to track. */
 export function occupancyTokensFromLastCall(rows: readonly Row[]): number | null {
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i]!;
-    if (row.type !== "assistant") continue;
-    const usage = (row.payload as { message?: { usage?: Record<string, unknown> } } | null)
-      ?.message?.usage;
-    if (!usage || typeof usage !== "object") continue;
-    const promptTokens = num(usage.prompt_tokens);
-    if (promptTokens > 0) return promptTokens + num(usage.completion_tokens);
-    const anthropic =
-      num(usage.input_tokens) +
-      num(usage.cache_read_input_tokens) +
-      num(usage.cache_creation_input_tokens);
-    if (anthropic > 0) return anthropic + num(usage.output_tokens);
-  }
-  return null;
+  return promptTokensFromLastCall(rows);
 }
 
 export const LIVE_CONTEXT_MIN_EMIT_MS = 200;
@@ -167,9 +154,7 @@ export function liveOccupancy(promptTokens: number, streamedTokens: number): num
 /** Occupancy after persisting an assistant/user row mid-turn.
  *
  *  Provider per-call usage wins when the row carries it (Claude). Otherwise
- *  keep the live running count: recounting `buildRuntimeHistoryForTurn` here
- *  is tiktoken on the Node event loop per tool_use, which is how a large
- *  openai-compat session stops answering cancel and WS until restart. */
+ *  keep the last model-reported number. Streamed characters are not occupancy. */
 export function occupancyAfterPersistedMessage(opts: {
   providerOccupancy: number | null;
   livePromptTokens: number;
@@ -178,7 +163,7 @@ export function occupancyAfterPersistedMessage(opts: {
   if (opts.providerOccupancy != null && opts.providerOccupancy > 0) {
     return opts.providerOccupancy;
   }
-  return liveOccupancy(opts.livePromptTokens, opts.streamedTokens);
+  return Math.max(0, opts.livePromptTokens);
 }
 
 export function shouldPublishLiveContext(opts: {
@@ -261,11 +246,12 @@ export function occupancyTokensFromResultContextUsage(msg: unknown): number | nu
   const prompt = promptTokensFromResultContextUsage(msg);
   if (prompt !== null) {
     const usage = (msg as ResultPayload).contextUsage;
+    // Codex writes occupancy remainder into outputTokens (total − prompt).
+    // OpenAI writes the last response's API output. Both are model-reported.
     return prompt + num(usage?.outputTokens);
   }
   // Claude SDK results carry Anthropic `usage`, not W22 `contextUsage`.
-  // Treating those as "no number" forced a full-transcript tiktoken at every
-  // turn start — the bar froze the Node event loop on a long DeepSeek session.
+  // used_percentage on the CLI excludes output.
   const payload = msg as { type?: unknown; usage?: Record<string, unknown> } | null;
   if (!payload || payload.type !== "result" || !payload.usage || typeof payload.usage !== "object") {
     return null;
@@ -273,8 +259,23 @@ export function occupancyTokensFromResultContextUsage(msg: unknown): number | nu
   const u = payload.usage;
   const anthropic =
     num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens);
-  if (anthropic <= 0) return null;
-  return anthropic + num(u.output_tokens);
+  return anthropic > 0 ? anthropic : null;
+}
+
+/** Live occupancy the runtime forwarded from a model token-count / usage tick. */
+export function occupancyTokensFromModelReport(msg: unknown): { used: number; window: number | null } | null {
+  if (!msg || typeof msg !== "object") return null;
+  const rec = msg as { type?: unknown; subtype?: unknown; occupancy_tokens?: unknown; context_window?: unknown };
+  if (rec.type !== "system" || rec.subtype !== "thinking_tokens") return null;
+  const used = typeof rec.occupancy_tokens === "number" && Number.isFinite(rec.occupancy_tokens)
+    ? Math.trunc(rec.occupancy_tokens)
+    : 0;
+  if (used <= 0) return null;
+  const window =
+    typeof rec.context_window === "number" && Number.isFinite(rec.context_window) && rec.context_window > 0
+      ? Math.trunc(rec.context_window)
+      : null;
+  return { used, window };
 }
 
 /** Text of one history message as the model receives it: user content (string)

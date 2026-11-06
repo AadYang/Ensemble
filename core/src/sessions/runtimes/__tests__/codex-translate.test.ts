@@ -172,6 +172,28 @@ describe("translateEvent token_count", () => {
       MODEL,
     );
     expect(out.thinkingTokens).toBe(420);
+    expect(out.occupancyTokens).toBe(800420);
     expect(out.streamEvent).toBeUndefined();
+  });
+
+  it("forwards last_token_usage.total_tokens as occupancy", () => {
+    const out = translateEvent(
+      {
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            total_tokens: 90_000,
+            input_tokens: 80_000,
+            output_tokens: 10_000,
+            reasoning_output_tokens: 4_000,
+          },
+          model_context_window: 828_400,
+        },
+      },
+      SESSION,
+      MODEL,
+    );
+    expect(out.occupancyTokens).toBe(90_000);
+    expect(out.occupancyWindow).toBe(828_400);
   });
 });

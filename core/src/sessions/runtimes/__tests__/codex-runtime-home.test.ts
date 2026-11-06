@@ -412,6 +412,22 @@ describe("Codex runtime isolated CODEX_HOME", () => {
     expect(toml).not.toContain("model_context_window");
   });
 
+  it("writes the planner's declared window, including a CLI-discovered cap", () => {
+    const sessionId = `test-cli-window-${Date.now()}`;
+    runtimeSessionIds.push(sessionId);
+    const home = prepareCodexHomeForRuntime(
+      sessionId,
+      { "agentorch-internal-abcd1234": { url: "http://127.0.0.1:1234/api/mcp/internal/agent" } },
+      "gpt-6.1-sol",
+      undefined,
+      undefined,
+      null,
+      null,
+      872_000,
+    );
+    expect(readFileSync(join(home, "config.toml"), "utf8")).toContain("model_context_window = 872000");
+  });
+
   // Every gpt-5.6 variant now has its own vendor page, so each may be declared
   // — including the small-window one, which must not inherit the family value.
   it("declares the documented window for each individually verified model", () => {

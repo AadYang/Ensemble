@@ -9,7 +9,9 @@ import type {
   LivenessProbeKind,
   LivenessTerminalReason,
   PeerContactIdentity,
+  ProviderModelInfo,
   RunPlanSettingField,
+  RunPlanSource,
   RunPlanStatusView,
   SdkMessage,
   SettingInvalidation,
@@ -35,9 +37,9 @@ import {
 import {
   contextUsageFromUsedTokens,
   liveOccupancy,
-  occupancyDeltaFromStreamEvent,
   occupancyAfterPersistedMessage,
   occupancyTokensFromLastCall,
+  occupancyTokensFromModelReport,
   occupancyTokensFromResultContextUsage,
   reportedContextWindowFromResult,
   shouldCompactForOccupancy,
@@ -1495,6 +1497,9 @@ export class SessionManager {
   private pendingPeerAsks = new Map<string, PendingPeerAsk>();
   private contextUsageByAgent = new Map<string, ContextUsage>();
   private liveContextByAgent = new Map<string, LiveContextState>();
+  /** Occupancy was explicitly cleared (/clear, /compact, model switch). The next
+   *  number must come from the model, not from a previous turn's result row. */
+  private occupancyAwaitingReport = new Set<string>();
   /** The plan the LAST turn actually ran under, per agent. `/status` reads this
    *  rather than resolving its own: a status report that re-derives the
    *  transport can disagree with the request the runtime sent, which is the
@@ -1694,14 +1699,55 @@ export class SessionManager {
    *  model name — which is exactly the second resolver the view-model exists to
    *  remove.
    *
-   *  `source: "last-turn"` always: this is a turn's OWN plan, the snapshot the
-   *  runtime was handed, never a status read's prediction. */
-  private broadcastRunPlan(sessionId: string, plan: ResolvedRunPlan): void {
+   *  A turn always publishes `source: "last-turn"`. A model/provider switch
+   *  publishes `fresh-resolution`: the previous turn's plan is no longer what
+   *  this agent is, and keeping it on the wire is how the header kept showing
+   *  the old model. */
+  private broadcastRunPlan(sessionId: string, plan: ResolvedRunPlan, source: RunPlanSource = "last-turn"): void {
     this.hub.sendToSession(sessionId, {
       type: "run_plan",
       sessionId,
-      plan: runPlanStatusView({ plan, source: "last-turn" }),
+      plan: runPlanStatusView({ plan, source }),
     });
+  }
+
+  /** Last-turn occupancy and plan belong to the model that produced them.
+   *  After a model/provider switch they must not stay on the pane: the header
+   *  would keep the old id and the bar would keep the old window until the
+   *  next send. Drop them, then publish a no-probe prediction so advertised
+   *  window/ladder update immediately. Not stored as last-turn — nothing has
+   *  run under the new identity yet. */
+  private async republishLiveCapability(
+    id: string,
+    agent: { model: string; providerId: string | null; metadata: unknown; projectRoot: string | null },
+  ): Promise<void> {
+    this.runPlanByAgent.delete(id);
+    this.invalidateOccupancy(id);
+    try {
+      const provider = agent.providerId
+        ? await prisma.provider.findUnique({ where: { id: agent.providerId } })
+        : null;
+      const plan = await this.resolveTurnPlan({
+        provider: provider
+          ? {
+              id: provider.id,
+              kind: provider.kind,
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey,
+              metadata: provider.metadata,
+            }
+          : null,
+        model: agent.model,
+        reasoningEffort: readReasoningEffortOverride(agent.metadata),
+        maxRunDurationMs: readMaxRunDurationMsOverride(agent.metadata),
+        allowProbe: false,
+        agentId: id,
+        projectRoot: projectRootOf(agent),
+      });
+      this.broadcastRunPlan(id, plan, "fresh-resolution");
+    } catch {
+      // The pane falls back to summary.model and an empty bar until a turn runs.
+    }
   }
 
   /** Build the reporting surface a runtime is handed for ONE run. Every call
@@ -2630,6 +2676,12 @@ export class SessionManager {
     const updated = await prisma.agent.update({ where: { id }, data });
     const summary = agentRowToSummary(updated);
     this.hub.broadcast({ type: "agent_updated", agent: summary });
+    const identityChanged =
+      (patch.model !== undefined && patch.model !== cur.model) ||
+      (patch.providerId !== undefined && patch.providerId !== cur.providerId);
+    if (identityChanged) {
+      await this.republishLiveCapability(id, updated);
+    }
     if (nameChanged && cur.teamId) {
       await this.clearResumeForTeamMembers(cur.teamId, id);
     }
@@ -2857,8 +2909,7 @@ export class SessionManager {
       data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
     });
     this.hub.broadcast({ type: "agent_history_reset", sessionId: id, reason: "clear" });
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
+    this.invalidateOccupancy(id);
     return true;
   }
 
@@ -3247,8 +3298,7 @@ export class SessionManager {
       "Native context compacted. Ensemble conversation history was preserved.";
     // The CLI compacted its own context, not the union of all Ensemble turns.
     // Keep the transcript intact: it can include other threads and runtimes.
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
+    this.invalidateOccupancy(id);
     await this.appendCompactStatusMessage(id, `${plan.identity.runtime} native context compacted. Conversation history preserved.`);
     return { summary };
   }
@@ -3334,8 +3384,7 @@ export class SessionManager {
       reason: "compact",
       summary,
     });
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
+    this.invalidateOccupancy(id);
     return { summary };
   }
 
@@ -4838,10 +4887,17 @@ export class SessionManager {
   private setContextUsage(sessionId: string, usage: ContextUsage | null): void {
     if (usage) {
       this.contextUsageByAgent.set(sessionId, usage);
+      this.occupancyAwaitingReport.delete(sessionId);
     } else {
       this.contextUsageByAgent.delete(sessionId);
     }
     this.hub.sendToSession(sessionId, { type: "context_usage", sessionId, usage });
+  }
+
+  private invalidateOccupancy(sessionId: string): void {
+    this.occupancyAwaitingReport.add(sessionId);
+    this.clearLiveContext(sessionId);
+    this.setContextUsage(sessionId, null);
   }
 
   private clearLiveContext(sessionId: string): void {
@@ -4853,6 +4909,7 @@ export class SessionManager {
     providerKind: string,
     providerId: string | null,
     sessionObserved: number | null,
+    discovered?: ProviderModelInfo | null,
   ): Promise<EffectiveWindowContext> {
     const windowCtx = scopeForAgent(
       model,
@@ -4863,7 +4920,7 @@ export class SessionManager {
     return {
       ...windowCtx,
       sessionObserved,
-      requested: requestedRuntimeWindow(model, windowCtx),
+      requested: requestedRuntimeWindow(model, windowCtx, discovered),
     };
   }
 
@@ -4874,8 +4931,9 @@ export class SessionManager {
     _systemPrompt: string | null | undefined,
   ): Promise<void> {
     const stored = this.contextUsageByAgent.get(sessionId)?.usedTokens ?? null;
-    const fromLastResult =
-      stored != null && stored > 0
+    const fromLastResult = this.occupancyAwaitingReport.has(sessionId)
+      ? null
+      : stored != null && stored > 0
         ? stored
         : ((await this.latestResultOccupancy(sessionId)) ?? (await this.latestOccupancyTokens(sessionId, 0)));
     const promptTokens = fromLastResult != null && fromLastResult > 0 ? fromLastResult : 0;
@@ -4929,14 +4987,18 @@ export class SessionManager {
     this.setContextUsage(sessionId, usage);
   }
 
-  private noteLiveStreamOccupancy(sessionId: string, msg: unknown): void {
-    const delta = occupancyDeltaFromStreamEvent(msg);
-    if (delta === null) return;
+  private noteReportedOccupancy(sessionId: string, msg: unknown): void {
+    const reported = occupancyTokensFromModelReport(msg);
+    if (!reported) return;
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
-    const firstStream = live.streamedTokens === 0 && live.pendingStreamText.length === 0;
-    live.pendingStreamText += delta;
-    this.publishLiveContext(sessionId, { force: firstStream });
+    if (reported.window && reported.window > 0) {
+      live.windowInput = { ...live.windowInput, sessionObserved: reported.window };
+    }
+    live.promptTokens = reported.used;
+    live.streamedTokens = 0;
+    live.pendingStreamText = "";
+    this.publishLiveContext(sessionId, { force: true });
   }
 
   private async refreshLiveContextAfterPersist(
@@ -6054,6 +6116,7 @@ export class SessionManager {
           providerKindForContext,
           resolvedProvider?.id ?? null,
           this.contextUsageByAgent.get(sessionId)?.contextWindow ?? null,
+          findProviderModel(readProviderModelCatalog(resolvedProvider?.metadata), agent.model),
         ),
         mergedSystemPrompt,
       );
@@ -6122,6 +6185,7 @@ export class SessionManager {
           // (the API streams pings, not thinking_delta). Broadcast it so
           // the pane can show "thinking…" instead of looking idle; do not
           // persist — it is a heartbeat, not resume context.
+          this.noteReportedOccupancy(sessionId, msg);
           this.streamWs.flush(sessionId);
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
           await yieldEventLoop();
@@ -6131,7 +6195,6 @@ export class SessionManager {
         this.recordLiveTranscript(sessionId, msg);
 
         if (msg.type === "stream_event") {
-          this.noteLiveStreamOccupancy(sessionId, msg);
           this.streamWs.push(sessionId, msg);
           await yieldEventLoop();
           if (abort.signal.aborted || !this.isRunOwner(sessionId, runId)) break;
@@ -6260,17 +6323,16 @@ export class SessionManager {
             }
           }
 
-          // Refresh the live context-usage indicator from this result. Occupancy
-          // is prompt + this call's output, so the bar does not drop when the
-          // stream ends. Prefer per-call usage on assistant rows (Claude), else
-          // the result payload's `contextUsage` (OpenAI / Codex). Live occupancy
-          // wins when the provider number is smaller (Codex currently reports
-          // outputTokens: 0). Fall back to a local count of the replayed history.
+          // Refresh occupancy from what the MODEL reported this turn. Prefer
+          // per-call usage on assistant rows (Claude input+cache), else the
+          // result payload's `contextUsage` (OpenAI last response / Codex
+          // total_tokens). Do not take max with a character estimate.
           const windowInput = await this.contextWindowInput(
             agent.model,
             providerKind,
             resolvedProvider?.id ?? null,
             reportedContextWindowFromResult(msg, agent.model) ?? null,
+            findProviderModel(readProviderModelCatalog(resolvedProvider?.metadata), agent.model),
           );
           const live = this.liveContextByAgent.get(sessionId);
           if (live) {
@@ -6284,8 +6346,8 @@ export class SessionManager {
             (await this.latestOccupancyTokens(sessionId, userPersisted?.seq ?? 0)) ??
             occupancyTokensFromResultContextUsage(msg);
           const used =
-            providerTokens !== null
-              ? Math.max(providerTokens, liveUsed)
+            providerTokens !== null && providerTokens > 0
+              ? providerTokens
               : liveUsed > 0
                 ? liveUsed
                 : null;
