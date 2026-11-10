@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { CLI_INSTALL_INFO, compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable, toSpawnableCliPath } from "../cli-config.js";
+import { homedir, tmpdir } from "node:os";
+import { CLI_INSTALL_INFO, codexAuthPath, compareSemver, MIN_CODEX_VERSION, resolveClaudeExecutable, toSpawnableCliPath } from "../cli-config.js";
 
 describe("compareSemver", () => {
   it("returns 0 for identical versions", () => {
@@ -52,6 +52,13 @@ describe("MIN_CODEX_VERSION boundary", () => {
     expect(compareSemver("0.132.0", MIN_CODEX_VERSION)).toBe(0);
     expect(compareSemver("0.132.1", MIN_CODEX_VERSION)).toBe(1);
     expect(compareSemver("0.140.0", MIN_CODEX_VERSION)).toBe(1);
+  });
+});
+
+describe("codexAuthPath", () => {
+  it("points at the current user's ~/.codex/auth.json", () => {
+    expect(codexAuthPath()).toBe(join(homedir(), ".codex", "auth.json"));
+    expect(typeof existsSync(codexAuthPath())).toBe("boolean");
   });
 });
 

@@ -19,7 +19,7 @@
 // at the same time; a single group-level `source` could only describe that by
 // being wrong about two of the three.
 
-import { isReasoningToken, type ProviderModelInfo } from "@agentorch/shared";
+import { discoveredDeclareWindow, isReasoningToken, type ProviderModelInfo } from "@agentorch/shared";
 import {
   catalogEntry,
   compactionThreshold,
@@ -389,24 +389,80 @@ export function resolveModelCapabilities(req: ResolutionRequest): ResolvedCapabi
   const entry = catalogEntry(req.model, vendor, winOpts);
   const advertisedRungs: ConsideredRung[] = [];
   let advertised = unknownCapability<number>("no documented context window is known for this model");
-  if (entry && entry.advertisedContextWindow > 0) {
-    const origin = originFromWindow(entry.confidence);
-    advertisedRungs.push({ origin, outcome: "used", reason: entry.source });
-    if (entry.confidence !== "confirmed") {
+  const fromCatalog = Boolean(entry && entry.advertisedContextWindow > 0);
+  const snapshotOnly = Boolean(
+    fromCatalog &&
+      entry!.confidence === "unverified" &&
+      /LiteLLM snapshot/i.test(entry!.source),
+  );
+  const catalogForDisplay = fromCatalog && !snapshotOnly;
+  const discoveredCap = discoveredDeclareWindow(req.discoveredModel, req.model);
+
+  if (catalogForDisplay) {
+    const origin = originFromWindow(entry!.confidence);
+    advertisedRungs.push({ origin, outcome: "used", reason: entry!.source });
+    if (entry!.confidence !== "confirmed") {
       advertisedRungs.push({
         origin: "catalog-confirmed",
-        outcome: entry.confidence === "legacy" ? "overruled" : "rejected",
+        outcome: entry!.confidence === "legacy" ? "overruled" : "rejected",
         reason:
-          entry.confidence === "legacy"
+          entry!.confidence === "legacy"
             ? "the value came from the legacy override shape; display only, no declaration rights"
-            : `confidence is "${entry.confidence}", so this figure may be shown but never declared`,
+            : `confidence is "${entry!.confidence}", so this figure may be shown but never declared`,
+      });
+    }
+    if (discoveredCap) {
+      advertisedRungs.push({
+        origin: "provider-discovered",
+        outcome: "overruled",
+        reason: "a confirmed or user-supplied catalog figure outranks the live CLI window for display",
       });
     }
     advertised = resolved(
-      entry.advertisedContextWindow,
+      entry!.advertisedContextWindow,
       origin,
-      confidenceFromWindow(entry.confidence),
-      entry.source,
+      confidenceFromWindow(entry!.confidence),
+      entry!.source,
+      advertisedRungs,
+    );
+  } else if (discoveredCap) {
+    advertisedRungs.push({
+      origin: "catalog-confirmed",
+      outcome: fromCatalog ? "overruled" : "absent",
+      reason: fromCatalog
+        ? "the live provider catalog outranks an unverified snapshot"
+        : "no catalog entry for this model in this vendor scope",
+    });
+    advertisedRungs.push({
+      origin: "provider-discovered",
+      outcome: "used",
+      reason: `provider catalog for "${req.model}"`,
+    });
+    advertised = resolved(
+      discoveredCap,
+      "provider-discovered",
+      "observed",
+      `provider catalog for "${req.model}"`,
+      advertisedRungs,
+    );
+  } else if (fromCatalog) {
+    const origin = originFromWindow(entry!.confidence);
+    advertisedRungs.push({ origin, outcome: "used", reason: entry!.source });
+    if (entry!.confidence !== "confirmed") {
+      advertisedRungs.push({
+        origin: "catalog-confirmed",
+        outcome: entry!.confidence === "legacy" ? "overruled" : "rejected",
+        reason:
+          entry!.confidence === "legacy"
+            ? "the value came from the legacy override shape; display only, no declaration rights"
+            : `confidence is "${entry!.confidence}", so this figure may be shown but never declared`,
+      });
+    }
+    advertised = resolved(
+      entry!.advertisedContextWindow,
+      origin,
+      confidenceFromWindow(entry!.confidence),
+      entry!.source,
       advertisedRungs,
     );
   } else {
@@ -428,7 +484,10 @@ export function resolveModelCapabilities(req: ResolutionRequest): ResolvedCapabi
         }
       : {
           field: "facts.advertisedContextWindow",
-          status: advertised.confidence === "confirmed" ? "resolved" : "degraded",
+          status:
+            advertised.confidence === "confirmed" || advertised.confidence === "observed"
+              ? "resolved"
+              : "degraded",
           origin: advertised.origin,
           confidence: advertised.confidence,
           detail: `${advertised.value} tokens, documented at ${advertised.source}`,

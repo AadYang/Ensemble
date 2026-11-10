@@ -32,12 +32,12 @@ describe("peer-mcp closure binding", () => {
     // fromAgentId, calls[1].from would be "agent-A".
     await handlerA({ target: "x", message: "m1" });
     await handlerB({ target: "y", message: "m2" });
-    await handlerA({ target: "z", message: "m3", mode: "review" });
+    await handlerA({ target: "z", message: "m3" });
 
     expect(calls).toEqual([
       { from: "agent-A", target: "x", mode: "raw" },
       { from: "agent-B", target: "y", mode: "raw" },
-      { from: "agent-A", target: "z", mode: "review" },
+      { from: "agent-A", target: "z", mode: "raw" },
     ]);
   });
 

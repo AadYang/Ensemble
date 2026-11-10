@@ -5,10 +5,43 @@ import { describe, expect, it } from "vitest";
 import {
   codexUsageSnapshotToDelta,
   normalizeCodexUsageSnapshot,
+  occupancyFromLastTokenUsage,
   parseCodexTurnContextTail,
   readCodexTurnContext,
   readCodexUsageSnapshot,
 } from "../codex-usage.js";
+
+describe("occupancyFromLastTokenUsage", () => {
+  it("prefers total_tokens, the field Codex CLI's meter reads", () => {
+    expect(
+      occupancyFromLastTokenUsage({
+        total_tokens: 90_000,
+        input_tokens: 80_000,
+        output_tokens: 10_000,
+        reasoning_output_tokens: 8_000,
+      }),
+    ).toBe(90_000);
+  });
+
+  it("reconstructs input + output when total_tokens is absent", () => {
+    expect(
+      occupancyFromLastTokenUsage({
+        input_tokens: 81_990,
+        output_tokens: 2_000,
+        reasoning_output_tokens: 1_500,
+      }),
+    ).toBe(83_990);
+  });
+
+  it("includes reasoning when output is missing", () => {
+    expect(
+      occupancyFromLastTokenUsage({
+        input_tokens: 81_990,
+        reasoning_output_tokens: 500,
+      }),
+    ).toBe(82_490);
+  });
+});
 
 describe("Codex usage accounting", () => {
   it("normalizes usage snapshots defensively", () => {
@@ -111,6 +144,7 @@ describe("Codex usage accounting", () => {
     expect(parseCodexTurnContextTail(tail)).toEqual({
       promptTokens: 81_990,
       cachedInputTokens: 77_568,
+      occupancyTokens: 81_990,
       contextWindow: 258_400,
     });
   });
@@ -133,6 +167,7 @@ describe("Codex usage accounting", () => {
     expect(parseCodexTurnContextTail(tail)).toEqual({
       promptTokens: 4_120,
       cachedInputTokens: 0,
+      occupancyTokens: 4_120,
       contextWindow: 258_400,
     });
   });
@@ -186,6 +221,7 @@ describe("Codex usage accounting", () => {
       expect(readCodexTurnContext(path)).toEqual({
         promptTokens: 87_332,
         cachedInputTokens: 81_792,
+        occupancyTokens: 87_332,
         contextWindow: 258_400,
       });
       // Missing / empty paths must not throw — the caller falls back to a local

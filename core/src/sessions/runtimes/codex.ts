@@ -45,6 +45,7 @@ export function codexChildProbe(state: { exited: boolean; turnCompleted: boolean
 import {
   codexUsageSnapshotToDelta,
   normalizeCodexUsageSnapshot,
+  occupancyFromCodexTokenCountEvent,
   readCodexTurnContext,
   readCodexUsageSnapshot,
   type CodexUsageSnapshot,
@@ -66,6 +67,11 @@ import {
   vendorScopeForModel,
   type WindowScope,
 } from "../../context-window.js";
+import {
+  MODEL_CAPACITY_MAX_ATTEMPTS,
+  shouldRetryModelCapacity,
+  waitForCapacityRetry,
+} from "./model-capacity.js";
 
 /** This runtime's scope for a model. `runtimeVersion` is left null: the policy
  *  gate does not consult it, and any compaction observation needs a version we
@@ -502,6 +508,11 @@ export function prepareCodexHomeForRuntime(
   trustedProjectPath?: string,
   sandboxMode?: SandboxMode | null,
   reasoningEffort?: string | null,
+  /** The window the planner already gated. When supplied, config.toml writes
+   *  that number instead of looking it up again, so the durable safety net
+   *  cannot disagree with `-c model_context_window`. `undefined` keeps the
+   *  catalog lookup for callers that have no plan (tests). */
+  declaredWindow?: number | null,
 ): string {
   // Read login state from the user's normal Codex home by default, but never
   // inherit CODEX_HOME from Ensemble's parent process. Ensemble sets CODEX_HOME
@@ -528,7 +539,9 @@ export function prepareCodexHomeForRuntime(
       sandboxMode ?? null,
       reasoningEffort ?? null,
       inheritedUserConfig,
-      requestedRuntimeWindow(model ?? "", codexScopeFor(model)),
+      declaredWindow !== undefined
+        ? declaredWindow
+        : requestedRuntimeWindow(model ?? "", codexScopeFor(model)),
     ),
     "utf8",
   );
@@ -876,6 +889,7 @@ export class CodexCliRuntime implements AgentRuntime {
         cwd,
         sandbox,
         reasoningEffort,
+        opts.runPlan.context.requestedRuntimeWindow,
       );
       codexEnv.CODEX_HOME = codexHome;
       reloadSkills();
@@ -972,8 +986,22 @@ export class CodexCliRuntime implements AgentRuntime {
     // mid-turn (which is).
     let childExited = false;
     let reportedError = false;
-    try {
-      const input = canResumeNative ? buildCurrentTurnPrompt(opts.prompt) : buildPromptWithHistory(opts);
+    let yieldedVisible = false;
+    const input = canResumeNative ? buildCurrentTurnPrompt(opts.prompt) : buildPromptWithHistory(opts);
+    const initialTurnMarks = turnMarks;
+
+    async function* execOnce(attempt: number): AsyncGenerator<RuntimeEvent, "done" | "capacity"> {
+      accumulatedText = "";
+      lastUsage = null;
+      turnStarted = false;
+      turnCompleted = false;
+      reportedError = false;
+      childExited = false;
+      childForCleanup = null;
+      if (attempt > 1) turnMarks = initialTurnMarks.slice();
+
+      let onAbort: (() => void) | undefined;
+      try {
       const child = spawn(codexPath, cliArgs, {
         cwd,
         env: codexEnv,
@@ -1011,7 +1039,7 @@ export class CodexCliRuntime implements AgentRuntime {
       const closePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         child.once("close", (code, signal) => resolve({ code, signal }));
       });
-      const onAbort = () => {
+      onAbort = () => {
         // Hard-kill the entire codex process tree. See killCodexChildTree
         // for why a plain child.kill() can leave Windows pipes pinned by
         // grandchild MCP processes and hang the await closePromise below.
@@ -1020,15 +1048,17 @@ export class CodexCliRuntime implements AgentRuntime {
       opts.abortController.signal.addEventListener("abort", onAbort, { once: true });
       child.stdin.end(input, "utf8");
 
-      yield {
-        type: "sdk_message",
-        payload: {
-          type: "system",
-          subtype: "init",
-          ...(canResumeNative ? { session_id: codexSessionId } : {}),
-          model: opts.model,
-        },
-      };
+      if (attempt === 1) {
+        yield {
+          type: "sdk_message",
+          payload: {
+            type: "system",
+            subtype: "init",
+            ...(canResumeNative ? { session_id: codexSessionId } : {}),
+            model: opts.model,
+          },
+        };
+      }
 
       const lines = createInterface({ input: child.stdout });
       const reasoningCursor = new Map<string, string>();
@@ -1060,38 +1090,53 @@ export class CodexCliRuntime implements AgentRuntime {
         if (isRecord(ev) && (ev.type === "turn.started" || ev.type === "turn.failed")) turnStarted = true;
         if (isRecord(ev) && ev.type === "turn.completed") turnCompleted = true;
         const out = translateEvent(ev, codexSessionId, opts.model, reasoningCursor);
-        if (out.thinkingTokens) {
+        if (out.thinkingTokens || out.occupancyTokens) {
+          if (out.thinkingTokens) yieldedVisible = true;
           yield {
             type: "sdk_message",
             payload: {
               type: "system",
               subtype: "thinking_tokens",
               session_id: codexSessionId,
-              estimated_tokens: out.thinkingTokens,
+              estimated_tokens: out.thinkingTokens ?? 0,
+              ...(out.occupancyTokens ? { occupancy_tokens: out.occupancyTokens } : {}),
+              ...(out.occupancyWindow ? { context_window: out.occupancyWindow } : {}),
             } as SdkMessage,
           };
         }
         if (out.streamEvent) {
           // Emit as stream_event for streaming UX (frontend already
           // handles content_block_delta + text_delta from W17 work).
+          yieldedVisible = true;
           yield { type: "sdk_message", payload: out.streamEvent as SdkMessage };
           if (out.deltaText) accumulatedText += out.deltaText;
         }
         if (out.assistantMessage) {
+          yieldedVisible = true;
           yield { type: "sdk_message", payload: out.assistantMessage as SdkMessage };
         }
         if (out.usage) lastUsage = out.usage;
         if (out.errorMessage) {
+          if (
+            shouldRetryModelCapacity({
+              message: out.errorMessage,
+              attempt,
+              yieldedVisible,
+              aborted: opts.abortController.signal.aborted,
+            })
+          ) {
+            return "capacity";
+          }
           reportedError = true;
           yield buildCodexRuntimeErrorEvent(out.errorMessage, {
             usedNativeResume: canResumeNative,
             turnStarted,
             turnCompleted,
           });
-          return;
+          return "done";
         }
       }
-      opts.abortController.signal.removeEventListener("abort", onAbort);
+      if (onAbort) opts.abortController.signal.removeEventListener("abort", onAbort);
       // Race the close event against a deadline. If we killed the child
       // (abort path) and the 'close' event still hasn't fired after 5s,
       // give up waiting — the OS will reap the zombie eventually but we
@@ -1109,16 +1154,24 @@ export class CodexCliRuntime implements AgentRuntime {
         );
       } else if (!opts.abortController.signal.aborted && close.code !== 0) {
         const stderr = stderrChunks.join("").trim();
+        const message = `codex exec exited with code ${close.code}${close.signal ? ` (${close.signal})` : ""}${stderr ? `\n${stderr}` : ""}`;
+        if (
+          shouldRetryModelCapacity({
+            message,
+            attempt,
+            yieldedVisible,
+            aborted: opts.abortController.signal.aborted,
+          })
+        ) {
+          return "capacity";
+        }
         reportedError = true;
-        yield buildCodexRuntimeErrorEvent(
-          `codex exec exited with code ${close.code}${close.signal ? ` (${close.signal})` : ""}${stderr ? `\n${stderr}` : ""}`,
-          {
-            usedNativeResume: canResumeNative,
-            turnStarted,
-            turnCompleted,
-          },
-        );
-        return;
+        yield buildCodexRuntimeErrorEvent(message, {
+          usedNativeResume: canResumeNative,
+          turnStarted,
+          turnCompleted,
+        });
+        return "done";
       }
       if (!opts.abortController.signal.aborted && turnStarted && !turnCompleted) {
         reportedError = true;
@@ -1127,7 +1180,7 @@ export class CodexCliRuntime implements AgentRuntime {
           turnStarted,
           turnCompleted,
         });
-        return;
+        return "done";
       }
 
       // Synthesize a Claude-shaped `result` with modelUsage so the W17
@@ -1201,7 +1254,7 @@ export class CodexCliRuntime implements AgentRuntime {
                 contextUsage: {
                   model: opts.model,
                   inputTokens: Math.max(0, turnContext.promptTokens - turnContext.cachedInputTokens),
-                  outputTokens: 0,
+                  outputTokens: Math.max(0, turnContext.occupancyTokens - turnContext.promptTokens),
                   cacheReadInputTokens: turnContext.cachedInputTokens,
                   cacheCreationInputTokens: 0,
                 },
@@ -1209,27 +1262,34 @@ export class CodexCliRuntime implements AgentRuntime {
             : {}),
         },
       };
+      return "done";
     } catch (err) {
-      if (opts.abortController.signal.aborted) return;
-      reportedError = true;
+      if (opts.abortController.signal.aborted) return "done";
       const msg = err instanceof Error ? err.message : String(err);
+      if (
+        shouldRetryModelCapacity({
+          message: msg,
+          attempt,
+          yieldedVisible,
+          aborted: opts.abortController.signal.aborted,
+        })
+      ) {
+        return "capacity";
+      }
+      reportedError = true;
       yield buildCodexRuntimeErrorEvent(msg, {
         usedNativeResume: canResumeNative,
         turnStarted,
         turnCompleted,
       });
+      return "done";
     } finally {
-      // Phase 4: report the process and the stream at the one moment the
-      // runtime can CLASSIFY them. Deliberately not at the raw 'exit' event: a
-      // codex child that exits after `turn.completed` is a turn finishing
-      // normally, and telling the liveness controller "the process is gone"
-      // while it still believes the run has work outstanding would be a false
-      // positive it is required to act on. `abnormal` is limited to a close
-      // nothing has explained yet — an error the runtime already reported, an
-      // abort, or a completed turn are all explained.
-      // Only an exit we actually OBSERVED is reported. A child we are about to
-      // kill is not a child that exited, and saying it did would hand the
-      // controller an observation the OS never made.
+      if (onAbort) opts.abortController.signal.removeEventListener("abort", onAbort);
+      // Phase 4: report the process at the one moment the runtime can CLASSIFY
+      // it. Deliberately not at the raw 'exit' event: a codex child that exits
+      // after `turn.completed` is a turn finishing normally. `streamClosed` is
+      // the outer loop's job so a capacity retry does not look like an
+      // unexplained close.
       if (childExited) {
         opts.liveness?.childProcessExited({
           pid: childForCleanup?.pid ?? null,
@@ -1237,15 +1297,27 @@ export class CodexCliRuntime implements AgentRuntime {
           signal: childForCleanup?.signalCode ?? null,
         });
       }
+      if (childForCleanup) killCodexChildTree(childForCleanup);
+    }
+    }
+
+    try {
+      for (let attempt = 1; attempt <= MODEL_CAPACITY_MAX_ATTEMPTS; attempt++) {
+        if (opts.abortController.signal.aborted) return;
+        if (attempt > 1) {
+          if (!(await waitForCapacityRetry(opts.abortController.signal, attempt - 1))) return;
+          console.warn(
+            `[codex] model at capacity; retry ${attempt}/${MODEL_CAPACITY_MAX_ATTEMPTS} session=${opts.sessionId.slice(0, 8)}`,
+          );
+        }
+        const status = yield* execOnce(attempt);
+        if (status === "done") return;
+      }
+    } finally {
       opts.liveness?.streamClosed(
         !turnCompleted && !reportedError && !opts.abortController.signal.aborted,
       );
-      // Guarantee no codex process (or its grandchild MCP subprocesses)
-      // outlives this turn holding the thread-store writer lock. Idempotent:
-      // killCodexChildTree no-ops if the process already exited cleanly.
       if (childForCleanup) killCodexChildTree(childForCleanup);
-      // Tear down bridge handler entry so a later turn for a different
-      // agent can't accidentally inherit this agent's closures.
       unregisterHandlers(opts.sessionId);
     }
   }
@@ -1354,6 +1426,8 @@ interface TranslateOut {
   usage?: CodexUsageSnapshot | null;
   errorMessage?: string;
   thinkingTokens?: number;
+  occupancyTokens?: number;
+  occupancyWindow?: number;
 }
 
 function reasoningSummaryText(summary: unknown): string {
@@ -1573,7 +1647,13 @@ export function translateEvent(
       );
     case "token_count": {
       const thinkingTokens = thinkingTokensFromCodexEvent(ev);
-      return thinkingTokens ? { thinkingTokens } : {};
+      const occupancy = occupancyFromCodexTokenCountEvent(ev);
+      return {
+        ...(thinkingTokens ? { thinkingTokens } : {}),
+        ...(occupancy
+          ? { occupancyTokens: occupancy.used, ...(occupancy.window ? { occupancyWindow: occupancy.window } : {}) }
+          : {}),
+      };
     }
     case "agent_message":
     case "assistant_message":

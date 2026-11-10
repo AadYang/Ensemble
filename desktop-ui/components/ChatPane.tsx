@@ -327,6 +327,10 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
   // for it since the connection opened, which renders as nothing at all.
   const liveness = useStore((s) => s.livenessByAgent[agentId]);
   const loop = useStore((s) => s.loopsByAgent[agentId]);
+  const pendingAskReqId = useStore(
+    (s) => s.pendingUserQuestions.find((q) => q.sessionId === agentId)?.reqId ?? null,
+  );
+  const clearUserQuestion = useStore((s) => s.clearUserQuestion);
   const ingestOlderTurns = useStore((s) => s.ingestOlderTurns);
   const [loopDialogOpen, setLoopDialogOpen] = useState(false);
   const [historyExtra, setHistoryExtra] = useState(0);
@@ -620,9 +624,16 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
 
   // Built before the early return: a hook after `if (!agent)` white-screens
   // the pane once the agent hydrates (Rules of Hooks).
+  const livePlan =
+    plan &&
+    agent &&
+    plan.identity.modelId === agent.summary.model &&
+    (plan.identity.providerId ?? null) === (agent.summary.providerId ?? null)
+      ? plan
+      : undefined;
   const capability = useMemo(
-    () => capabilityView(plan ?? null, agent?.contextUsage?.contextWindow ?? null),
-    [plan, agent?.contextUsage?.contextWindow],
+    () => capabilityView(livePlan ?? null, agent?.contextUsage?.contextWindow ?? null),
+    [livePlan, agent?.contextUsage?.contextWindow],
   );
 
   const loadEarlier = useCallback(async () => {
@@ -1029,6 +1040,17 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
       void handleSlash(text);
       return;
     }
+    if (pendingAskReqId) {
+      appendUserTurn(agentId, text);
+      ws.send({
+        type: "user_answer",
+        sessionId: agentId,
+        reqId: pendingAskReqId,
+        choice: text,
+      });
+      clearUserQuestion(pendingAskReqId);
+      return;
+    }
     if (summary.status !== "running") appendUserTurn(agentId, text);
     ws.send({ type: "send_message", sessionId: agentId, text });
   };
@@ -1194,22 +1216,20 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
       <div className="px-3 py-1.5 border-b border-[var(--border)] flex flex-wrap items-center gap-x-2 gap-y-1 text-xs min-w-0">
         <span className={`status-dot ${summary.status}`} />
         <span className="font-bold truncate max-w-[10rem]">{summary.name}</span>
-        {/* The model the LAST TURN actually used, when we have a plan. `summary
-            .model` is the configured value and can differ from what ran, and a
-            header that shows the configuration as if it were the fact is a
-            small lie the plan lets us avoid. Falls back to the configured value
-            only when there is no plan at all — never to a guess. */}
-        <span className="text-[var(--text-dim)] truncate max-w-[12rem]">{plan?.identity.modelId ?? summary.model}</span>
+        {/* The model this agent is NOW. A last-turn plan is only shown when it
+            still matches the configured identity; after /model the old plan is
+            stale and the header must not keep the previous id. */}
+        <span className="text-[var(--text-dim)] truncate max-w-[12rem]">{livePlan?.identity.modelId ?? summary.model}</span>
         {/* The project this agent actually works in. Shown only when the plan
             established one: absent means "we do not know", which is NOT the same
             as "unbound", and rendering `(unbound)` for it would invent a state
             the user never chose. */}
-        {plan?.projectRoot.value && (
+        {livePlan?.projectRoot.value && (
           <span
             className="text-[var(--text-dim)] opacity-70"
-            title={plan.projectRoot.value}
+            title={livePlan.projectRoot.value}
           >
-            {basename(plan.projectRoot.value)}
+            {basename(livePlan.projectRoot.value)}
           </span>
         )}
         {summary.projectRoot && (
@@ -1234,7 +1254,7 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
         {/* Occupancy bar: glyph + percent + used/window. `null` is a real
             state (nothing has run yet, or the server has not reported since
             we subscribed). */}
-        <ContextBar context={contextUsage} capability={capability} />
+        <ContextBar context={livePlan ? contextUsage : null} capability={capability} />
         {loopActive && loop ? (
           <span className="flex items-center gap-1 shrink-0">
             <span

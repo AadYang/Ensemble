@@ -605,12 +605,16 @@ export function resolveRunPlan(opts: ResolveRunPlanOptions): ResolvedRunPlan {
     },
     context: {
       effectiveWindow: facts.runtimeEffectiveWindow.value ?? null,
-      requestedRuntimeWindow: requestedRuntimeWindow(opts.model, {
-        runtime: facts.scope.runtime,
-        vendor: opts.vendor?.trim() || vendorScopeForModel(opts.model),
-        runtimeVersion: facts.scope.runtimeVersion,
-        providerId: facts.scope.providerId,
-      }),
+      requestedRuntimeWindow: requestedRuntimeWindow(
+        opts.model,
+        {
+          runtime: facts.scope.runtime,
+          vendor: opts.vendor?.trim() || vendorScopeForModel(opts.model),
+          runtimeVersion: facts.scope.runtimeVersion,
+          providerId: facts.scope.providerId,
+        },
+        opts.discoveredModel,
+      ),
       advertisedContextWindow: facts.advertisedContextWindow.value ?? null,
       outputReserve: valueOf<number | null>("maxOutputTokens"),
       compactionThreshold: opts.compactionThreshold ?? null,

@@ -114,5 +114,9 @@ Ensemble 自 0.0.18 起两条平台线并行维护。每个改动必须考虑两
 - **共享类型放 `shared/`**（沿用 §3.2）。三 runtime 共用的 union（`PeerMode`、`SandboxMode`、`PermissionMode` 等）禁止在 runtime 内本地重复定义。
 - **自查清单**：改完一处问自己——"Claude 用户、OpenAI(-compat) 用户、Codex 用户分别按现在的描述跑一遍，行为/UX 一致吗？" 否则在 [`docs/plans/development-log.md`](docs/plans/development-log.md) 里记清楚为什么有意拆开。
 
+### 2.4 操作必须出现在窗口（强制）
+
+改变会话、上下文、历史或自动续跑的操作，必须在该 agent 聊天窗口留下人能看见的记录。禁止只打日志、只改库、只发占用条 / chip。占用条和 LOOP chip **不算**已经告诉用户。写 transcript 走该回合的 `seq` 游标。
+
 ---
 

@@ -51,6 +51,11 @@ import { toOpenAIMcpServers, connectAll, closeAll } from "./mcp-adapter.js";
 import { chatTextForLocalRebuild } from "../local-rebuild-prompt.js";
 import { countTokens, countTokensMany } from "../../local-tokenizer.js";
 import { rejectWhenAborted, takeUntilAbort } from "../abort-iterable.js";
+import {
+  MODEL_CAPACITY_MAX_ATTEMPTS,
+  shouldRetryModelCapacity,
+  waitForCapacityRetry,
+} from "./model-capacity.js";
 
 /** The SDK's own `modelSettings` type, taken from the `Agent` constructor rather
  *  than restated: the SDK does not export the effort union from its umbrella
@@ -115,12 +120,42 @@ export class OpenAIAgentRuntime implements AgentRuntime {
     let settled = false;
     for (let i = 0; i < attempts.length; i++) {
       const transport = attempts[i]!;
-      const outcome = yield* runTurnOnce(opts, transport === "responses", sessionId);
-      if (!outcome.error) {
-        settled = true;
-        opts.liveness?.streamClosed(false);
-        return;
+      let outcome: { error?: unknown; emittedOutput: boolean; sawResponseDone: boolean } | undefined;
+      for (let cap = 1; cap <= MODEL_CAPACITY_MAX_ATTEMPTS; cap++) {
+        if (cap > 1) {
+          if (!(await waitForCapacityRetry(opts.abortController.signal, cap - 1))) {
+            opts.liveness?.streamClosed(false);
+            return;
+          }
+          console.warn(
+            `[openai-runtime] model at capacity; retry ${cap}/${MODEL_CAPACITY_MAX_ATTEMPTS} for ${label}`,
+          );
+        }
+        outcome = yield* runTurnOnce(opts, transport === "responses", sessionId);
+        if (!outcome.error) {
+          settled = true;
+          opts.liveness?.streamClosed(false);
+          return;
+        }
+        if (opts.abortController.signal.aborted) {
+          opts.liveness?.streamClosed(false);
+          return;
+        }
+        const classified = classifyTransportError(outcome.error);
+        if (
+          shouldRetryModelCapacity({
+            message: classified.message,
+            attempt: cap,
+            yieldedVisible: outcome.emittedOutput || outcome.sawResponseDone,
+            aborted: opts.abortController.signal.aborted,
+            rateLimited: classified.classification === "rate-limit",
+          })
+        ) {
+          continue;
+        }
+        break;
       }
+      if (!outcome?.error) continue;
       if (opts.abortController.signal.aborted) {
         opts.liveness?.streamClosed(false);
         return;

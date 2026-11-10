@@ -431,6 +431,61 @@ describe("requestedRuntimeWindow (policy gate)", () => {
   it("refuses to declare for an unknown model", () => {
     expect(m.requestedRuntimeWindow("not-a-real-model-12345", codexSol())).toBeNull();
   });
+
+  it("declares the CLI max_context_window when the catalog has no confirmed entry", () => {
+    expect(
+      m.requestedRuntimeWindow("gpt-6.1-sol", codexSol(), {
+        id: "gpt-6.1-sol",
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      }),
+    ).toBe(872_000);
+  });
+
+  it("does not declare the small Codex context_window when max is present", () => {
+    expect(
+      m.requestedRuntimeWindow("gpt-6.1-sol", codexSol(), {
+        id: "gpt-6.1-sol",
+        contextWindow: 272_000,
+      }),
+    ).toBe(272_000);
+    expect(
+      m.requestedRuntimeWindow("gpt-6.1-sol", codexSol(), {
+        id: "gpt-6.1-sol",
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      }),
+    ).not.toBe(272_000);
+  });
+
+  it("does not let a CLI cap replace a confirmed catalog declaration", () => {
+    expect(
+      m.requestedRuntimeWindow("gpt-5.6-sol", codexSol(), {
+        id: "gpt-5.6-sol",
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      }),
+    ).toBe(1_050_000);
+  });
+
+  it("declares a Claude CLI window for a model the catalog has not caught up with", () => {
+    expect(
+      m.requestedRuntimeWindow(
+        "some-claude-alias",
+        { runtime: "claude", vendor: "anthropic" },
+        { id: "some-claude-alias", contextWindow: 1_000_000 },
+      ),
+    ).toBe(1_000_000);
+  });
+
+  it("still refuses a CLI window for a runtime whose key is unverified", () => {
+    expect(
+      m.requestedRuntimeWindow("gpt-6.1-sol", { runtime: "openai", vendor: "openai" }, {
+        id: "gpt-6.1-sol",
+        maxContextWindow: 872_000,
+      }),
+    ).toBeNull();
+  });
 });
 
 // ── Overrides: field-scoped, scope-aware, and legacy-compatible ───────────

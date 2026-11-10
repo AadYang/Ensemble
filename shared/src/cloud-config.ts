@@ -248,16 +248,16 @@ export function buildCloudSnapshotFromLocal(input: {
   teams: TeamSummary[];
   messagesByAgent: Record<string, PersistedMessageLike[]>;
 }): CloudSnapshotInput {
-  const teams: CloudTeam[] = input.teams.map((team, index) => ({
+  const teams: CloudTeam[] = input.teams.map((team) => ({
     id: team.id,
     name: team.name,
     description: team.description,
-    sortOrder: index,
+    sortOrder: team.sortOrder,
     revision: 0,
     updatedAt: team.createdAt,
   }));
 
-  const agents: CloudAgent[] = input.agents.map((agent, index) => ({
+  const agents: CloudAgent[] = input.agents.map((agent) => ({
     id: agent.id,
     parentId: agent.parentId,
     teamId: agent.teamId,
@@ -288,7 +288,7 @@ export function buildCloudSnapshotFromLocal(input: {
       // sync noticing.
       maxRunDurationMs: agent.maxRunDurationMs,
     },
-    sortOrder: index,
+    sortOrder: agent.sortOrder,
     revision: 0,
     updatedAt: agent.createdAt,
   }));

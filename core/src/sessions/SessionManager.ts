@@ -9,7 +9,9 @@ import type {
   LivenessProbeKind,
   LivenessTerminalReason,
   PeerContactIdentity,
+  ProviderModelInfo,
   RunPlanSettingField,
+  RunPlanSource,
   RunPlanStatusView,
   SdkMessage,
   SettingInvalidation,
@@ -35,9 +37,9 @@ import {
 import {
   contextUsageFromUsedTokens,
   liveOccupancy,
-  occupancyDeltaFromStreamEvent,
   occupancyAfterPersistedMessage,
   occupancyTokensFromLastCall,
+  occupancyTokensFromModelReport,
   occupancyTokensFromResultContextUsage,
   reportedContextWindowFromResult,
   shouldCompactForOccupancy,
@@ -230,7 +232,7 @@ import { summarizeLayered, type CompactSourceTurn } from "../capability/layered-
 import type { WebSocket } from "@fastify/websocket";
 import type { WSHub } from "../ws/hub.js";
 import { createStreamEventWsBatcher } from "../ws/stream-event-batch.js";
-import { CLI_INSTALL_INFO, getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
+import { CLI_INSTALL_INFO, codexAuthPresent, getClaudeCliPath, getCodexCliPath } from "../cli-config.js";
 import { ensureDataDir } from "../paths.js";
 import {
   ProjectRootRejected,
@@ -284,8 +286,9 @@ export type SubagentRetirementReason = "task-completed" | "task-failed" | "inter
 // transcript, the plan or /status to say so. History is now sized by the token
 // budget the plan carries (`capability/history-budget.ts`), and anything that
 // does not fit is reported as overflow for the ranged compact path to cover.
-const COMPACT_START_TEXT = "Compacting conversation context...";
-const COMPACT_FAILURE_PREFIX = "Context compact failed:";
+const COMPACT_START_TEXT = "正在压缩对话上下文…";
+const COMPACT_DONE_TEXT = "已自动压缩对话上下文，聊天记录已保留。";
+const COMPACT_FAILURE_PREFIX = "压缩对话上下文失败：";
 /** Claude Code / Codex treat this as their own slash, not as a user sentence. */
 const NATIVE_COMPACT_SLASH = "/compact";
 // Phase 4: these are SUSPICION thresholds. They used to be kill deadlines —
@@ -552,7 +555,7 @@ type FreshnessBlockedAction = {
   correlationId?: string;
   replyToCorrelationId?: string;
   /** Preserved outbound peer_send draft. When a peer_send is freshness-blocked
-   *  the body/mode would otherwise be discarded — recovery then depends on the
+   *  the body would otherwise be discarded — recovery then depends on the
    *  agent reconstructing it from volatile context (silent loss if the context
    *  was compacted or the agent misjudges). Keeping the exact draft lets the
    *  automatic freshness-continuation turn re-present it verbatim so the message
@@ -971,6 +974,11 @@ class MessagePersistenceError extends Error {
     );
     this.name = "MessagePersistenceError";
   }
+}
+
+function isMessageSeqCollision(cause: unknown): boolean {
+  const text = cause instanceof Error ? cause.message : String(cause);
+  return /UNIQUE constraint failed:\s*Message\.agentId,\s*Message\.seq/i.test(text);
 }
 
 const runtimeErrorFromEvent = (event: RuntimeErrorEvent): Error & RuntimeErrorDetails => {
@@ -1474,8 +1482,44 @@ export const agentRowToSummary = (row: DbAgent): AgentSummary => ({
   disabledSkills: Array.from(readSkillBlocklist(row.metadata)),
   closed: readMetaBool(row.metadata, "closed"),
   hasResumeInfo: readMetaString(row.metadata, "lastSessionId") !== null,
+  sortOrder: row.sortOrder,
   createdAt: row.createdAt.toISOString(),
 });
+
+export class DirectoryOrderError extends Error {
+  constructor(
+    message: string,
+    readonly status: 400 | 404 = 400,
+  ) {
+    super(message);
+    this.name = "DirectoryOrderError";
+  }
+}
+
+export function isDirectoryOrderError(err: unknown): err is DirectoryOrderError {
+  return err instanceof DirectoryOrderError;
+}
+
+function nextTeamSortOrder(): number {
+  const last = prisma.team.findFirst({ orderBy: { sortOrder: "desc" } });
+  return (last?.sortOrder ?? -1) + 1;
+}
+
+function effectiveParentId(agent: DbAgent, memberIds: Set<string>): string | null {
+  return agent.parentId && memberIds.has(agent.parentId) ? agent.parentId : null;
+}
+
+function nextAgentSortOrder(teamId: string | null, parentId: string | null): number {
+  const members = prisma.agent.findMany({ where: { teamId } });
+  const memberIds = new Set(members.map((m) => m.id));
+  const want = parentId && memberIds.has(parentId) ? parentId : null;
+  let max = -1;
+  for (const m of members) {
+    if (effectiveParentId(m, memberIds) !== want) continue;
+    if (m.sortOrder > max) max = m.sortOrder;
+  }
+  return max + 1;
+}
 
 export class SessionManager {
   private running = new Map<string, RunningSession>();
@@ -1495,6 +1539,9 @@ export class SessionManager {
   private pendingPeerAsks = new Map<string, PendingPeerAsk>();
   private contextUsageByAgent = new Map<string, ContextUsage>();
   private liveContextByAgent = new Map<string, LiveContextState>();
+  /** Occupancy was explicitly cleared (/clear, /compact, model switch). The next
+   *  number must come from the model, not from a previous turn's result row. */
+  private occupancyAwaitingReport = new Set<string>();
   /** The plan the LAST turn actually ran under, per agent. `/status` reads this
    *  rather than resolving its own: a status report that re-derives the
    *  transport can disagree with the request the runtime sent, which is the
@@ -1528,17 +1575,19 @@ export class SessionManager {
     await this.persistSystemNotice(sessionId, "loop", text);
   }
 
-  private async persistSystemNotice(sessionId: string, subtype: string, text: string): Promise<void> {
+  private async persistSystemNotice(sessionId: string, subtype: string, text: string): Promise<number> {
     const payload = { type: "system" as const, subtype, text };
-    const row = await prisma.message.create({
-      data: { agentId: sessionId, seq: this.nextMessageSeq(sessionId), type: "system", payload },
-    });
+    const run = this.running.get(sessionId);
+    const preferred = run?.seq ?? this.nextMessageSeq(sessionId);
+    const row = await this.persistTurnMessage(sessionId, preferred, "system", payload);
+    if (run && row.seq >= run.seq) run.seq = row.seq + 1;
     this.hub.sendToSession(sessionId, {
       type: "message",
       sessionId,
       seq: row.seq,
       msg: payload as never,
     });
+    return row.seq;
   }
 
   /** MCP servers that failed to connect during the CURRENT turn, keyed
@@ -1694,14 +1743,55 @@ export class SessionManager {
    *  model name — which is exactly the second resolver the view-model exists to
    *  remove.
    *
-   *  `source: "last-turn"` always: this is a turn's OWN plan, the snapshot the
-   *  runtime was handed, never a status read's prediction. */
-  private broadcastRunPlan(sessionId: string, plan: ResolvedRunPlan): void {
+   *  A turn always publishes `source: "last-turn"`. A model/provider switch
+   *  publishes `fresh-resolution`: the previous turn's plan is no longer what
+   *  this agent is, and keeping it on the wire is how the header kept showing
+   *  the old model. */
+  private broadcastRunPlan(sessionId: string, plan: ResolvedRunPlan, source: RunPlanSource = "last-turn"): void {
     this.hub.sendToSession(sessionId, {
       type: "run_plan",
       sessionId,
-      plan: runPlanStatusView({ plan, source: "last-turn" }),
+      plan: runPlanStatusView({ plan, source }),
     });
+  }
+
+  /** Last-turn occupancy and plan belong to the model that produced them.
+   *  After a model/provider switch they must not stay on the pane: the header
+   *  would keep the old id and the bar would keep the old window until the
+   *  next send. Drop them, then publish a no-probe prediction so advertised
+   *  window/ladder update immediately. Not stored as last-turn — nothing has
+   *  run under the new identity yet. */
+  private async republishLiveCapability(
+    id: string,
+    agent: { model: string; providerId: string | null; metadata: unknown; projectRoot: string | null },
+  ): Promise<void> {
+    this.runPlanByAgent.delete(id);
+    this.invalidateOccupancy(id);
+    try {
+      const provider = agent.providerId
+        ? await prisma.provider.findUnique({ where: { id: agent.providerId } })
+        : null;
+      const plan = await this.resolveTurnPlan({
+        provider: provider
+          ? {
+              id: provider.id,
+              kind: provider.kind,
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey,
+              metadata: provider.metadata,
+            }
+          : null,
+        model: agent.model,
+        reasoningEffort: readReasoningEffortOverride(agent.metadata),
+        maxRunDurationMs: readMaxRunDurationMsOverride(agent.metadata),
+        allowProbe: false,
+        agentId: id,
+        projectRoot: projectRootOf(agent),
+      });
+      this.broadcastRunPlan(id, plan, "fresh-resolution");
+    } catch {
+      // The pane falls back to summary.model and an empty bar until a turn runs.
+    }
   }
 
   /** Build the reporting surface a runtime is handed for ONE run. Every call
@@ -1920,6 +2010,7 @@ export class SessionManager {
         // left on the row for a later backfill to re-read.
         ...(projectRoot !== undefined ? { projectRoot, codexWorkspace: null } : {}),
         ...(teamId !== undefined ? { teamId } : {}),
+        sortOrder: nextAgentSortOrder(teamId ?? null, opts.parentId ?? null),
       },
     });
     this.hub.broadcast({ type: "agent_created", agent: agentRowToSummary(row) });
@@ -1934,7 +2025,11 @@ export class SessionManager {
 
   async createTeam(opts: { name: string; description?: string }): Promise<string> {
     const row = await prisma.team.create({
-      data: { name: opts.name, description: opts.description ?? null },
+      data: {
+        name: opts.name,
+        description: opts.description ?? null,
+        sortOrder: nextTeamSortOrder(),
+      },
     });
     this.hub.broadcast({ type: "team_created", team: await this.teamSummary(row.id) });
     return row.id;
@@ -1973,6 +2068,7 @@ export class SessionManager {
         where: { id: m.id },
         data: {
           teamId: null,
+          sortOrder: nextAgentSortOrder(null, m.parentId),
           metadata: removeMetadataKeys(m.metadata, [...RESUME_METADATA_KEYS]),
         },
       });
@@ -1996,7 +2092,7 @@ export class SessionManager {
   }
 
   async listTeams(): Promise<Awaited<ReturnType<typeof this.teamSummary>>[]> {
-    const rows = await prisma.team.findMany({ orderBy: { createdAt: "asc" } });
+    const rows = await prisma.team.findMany({ orderBy: { sortOrder: "asc", createdAt: "asc" } });
     const out = [];
     for (const r of rows) out.push(await this.teamSummary(r.id));
     return out;
@@ -2014,8 +2110,54 @@ export class SessionManager {
       name: t.name,
       description: t.description,
       memberIds: members.map((m) => m.id),
+      sortOrder: t.sortOrder,
       createdAt: t.createdAt.toISOString(),
     };
+  }
+
+  async reorderTeams(ids: string[]): Promise<void> {
+    if (new Set(ids).size !== ids.length) throw new DirectoryOrderError("duplicate ids");
+    const all = await prisma.team.findMany();
+    if (ids.length !== all.length || all.some((t) => !ids.includes(t.id))) {
+      throw new DirectoryOrderError("ids must list every team");
+    }
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]!;
+      await prisma.team.update({ where: { id }, data: { sortOrder: i } });
+      this.hub.broadcast({ type: "team_updated", team: await this.teamSummary(id) });
+    }
+  }
+
+  async reorderAgents(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    if (new Set(ids).size !== ids.length) throw new DirectoryOrderError("duplicate ids");
+    const rows: DbAgent[] = [];
+    for (const id of ids) {
+      const row = await prisma.agent.findUnique({ where: { id } });
+      if (!row) throw new DirectoryOrderError("not found", 404);
+      rows.push(row);
+    }
+    const teamId = rows[0]!.teamId;
+    if (rows.some((r) => r.teamId !== teamId)) {
+      throw new DirectoryOrderError("agents are not in the same team");
+    }
+    const members = await prisma.agent.findMany({ where: { teamId } });
+    const memberIds = new Set(members.map((m) => m.id));
+    const parent = effectiveParentId(rows[0]!, memberIds);
+    if (rows.some((r) => effectiveParentId(r, memberIds) !== parent)) {
+      throw new DirectoryOrderError("agents are not siblings");
+    }
+    const siblings = members.filter((m) => effectiveParentId(m, memberIds) === parent);
+    if (siblings.length !== ids.length || siblings.some((s) => !ids.includes(s.id))) {
+      throw new DirectoryOrderError("ids must list every sibling");
+    }
+    for (let i = 0; i < ids.length; i++) {
+      const updated = await prisma.agent.update({
+        where: { id: ids[i]! },
+        data: { sortOrder: i },
+      });
+      this.hub.broadcast({ type: "agent_updated", agent: agentRowToSummary(updated) });
+    }
   }
 
   /** W21: produce the "TEAM CONTEXT" block injected into systemPrompt for
@@ -2107,11 +2249,12 @@ export class SessionManager {
     lines.push("");
     lines.push("EVERY cross-agent action goes through one of these two calls:");
     lines.push("");
-    lines.push("  peer_send(target=\"<name>\", mode=<mode>, message=\"<cover note>\")");
+    lines.push("  peer_send(target=\"<name>\", message=\"<what you want them to do>\")");
     lines.push("       Fires a new turn for <target>. Returns immediately —");
     lines.push("       it does NOT wait for them to reply. Their answer (if any)");
     lines.push("       arrives later as a fresh turn directed at YOU.");
-    lines.push("       includeSource defaults to auto: raw=false, continue/review/fork=true.");
+    lines.push("       Put the ask in the message (review, continue, redo — same tool).");
+    lines.push("       includeSource=true attaches your latest output; default is message only.");
     lines.push("       Emergency only: interrupt=true requires interruptReason and may");
     lines.push("       stop the target's current run. Do not use it for ordinary messages.");
     lines.push("");
@@ -2123,21 +2266,19 @@ export class SessionManager {
     lines.push("");
     lines.push("Intent → exact call:");
     lines.push("");
-    lines.push("  notify / inform / report status .......... peer_send mode=raw");
-    lines.push("  ask a question ........................... peer_send mode=raw");
+    lines.push("  notify / inform / report status .......... peer_send");
+    lines.push("  ask a question ........................... peer_send");
     lines.push("                                              (answer comes back");
     lines.push("                                              as a future turn)");
-    lines.push("  rebut / disagree / push back ............. peer_send mode=raw");
-    lines.push("  request they do something ................ peer_send mode=raw");
-    lines.push("  hand off your in-progress work ........... peer_send mode=continue");
-    lines.push("  ask for an audit / second opinion ........ peer_send mode=review");
-    lines.push("  ask for an independent take .............. peer_send mode=fork");
+    lines.push("  rebut / disagree / push back ............. peer_send");
+    lines.push("  request they do something ................ peer_send");
+    lines.push("  hand off work / ask for a review / redo .. peer_send (say so in the message)");
     lines.push("  multiple recipients ...................... one peer_send per target");
     lines.push("  read context before deciding ............. peer_query first");
     lines.push("  broadcast a statement to all .............. peer_send to each");
     lines.push("");
-    lines.push("Raw peer_send does not embed source-output by default. For continue/review/fork,");
-    lines.push("`message` is the cover note and Ensemble adds a bounded source-output block.");
+    lines.push("peer_send does not embed source-output by default. Set includeSource=true");
+    lines.push("when the recipient needs your latest output attached.");
     lines.push("");
     lines.push("Async, not synchronous: peer_send ends your turn. If you need a");
     lines.push("teammate's answer in real-time, you can't — wait for their reply");
@@ -2419,6 +2560,7 @@ export class SessionManager {
       codexWorkspace?: string | null;
       systemPrompt?: string | null;
       teamId?: string | null;
+      sortOrder?: number;
     } = {};
     // Confirm-on-invalidate, before ANY write-side bookkeeping runs. Several
     // branches below drop a stored value (a sandbox override on a provider
@@ -2509,6 +2651,7 @@ export class SessionManager {
       // Team membership affects the TEAM CONTEXT injected into systemPrompt
       // at runtime; drop lastSessionId so the next turn rebuilds context fresh.
       if (teamChanged) {
+        data.sortOrder = nextAgentSortOrder(patch.teamId, cur.parentId);
         clearResumeMetadata();
       }
     }
@@ -2630,6 +2773,12 @@ export class SessionManager {
     const updated = await prisma.agent.update({ where: { id }, data });
     const summary = agentRowToSummary(updated);
     this.hub.broadcast({ type: "agent_updated", agent: summary });
+    const identityChanged =
+      (patch.model !== undefined && patch.model !== cur.model) ||
+      (patch.providerId !== undefined && patch.providerId !== cur.providerId);
+    if (identityChanged) {
+      await this.republishLiveCapability(id, updated);
+    }
     if (nameChanged && cur.teamId) {
       await this.clearResumeForTeamMembers(cur.teamId, id);
     }
@@ -2857,8 +3006,7 @@ export class SessionManager {
       data: { metadata: removeMetadataKeys(cur.metadata, [...RESUME_METADATA_KEYS]) },
     });
     this.hub.broadcast({ type: "agent_history_reset", sessionId: id, reason: "clear" });
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
+    this.invalidateOccupancy(id);
     return true;
   }
 
@@ -3046,18 +3194,33 @@ export class SessionManager {
     upperBoundSeq?: number,
   ): Promise<boolean> {
     if (strategy === "server-conversation") return false;
-    if (runtimeOwnsNativeCompact(plan.identity.runtime)) {
-      return this.tryNativeCompact(cur, plan, upperBoundSeq);
-    }
-    if (strategy !== "local-rebuild") return false;
+    if (!runtimeOwnsNativeCompact(plan.identity.runtime) && strategy !== "local-rebuild") return false;
     try {
-      await this.compactNow(cur, plan, undefined, upperBoundSeq);
-      return true;
+      await this.appendCompactStatusMessage(cur.id, COMPACT_START_TEXT);
+      let ok = false;
+      if (runtimeOwnsNativeCompact(plan.identity.runtime)) {
+        ok = await this.tryNativeCompact(cur, plan, upperBoundSeq);
+      } else {
+        await this.compactNow(cur, plan, undefined, upperBoundSeq);
+        ok = true;
+      }
+      if (!ok) {
+        await this.appendCompactStatusMessage(cur.id, `${COMPACT_FAILURE_PREFIX} 未能完成`);
+      }
+      return ok;
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       console.error(
-        `[compact] occupancy compact did not complete for agent=${cur.id.slice(0, 8)}: ` +
-          `${err instanceof Error ? err.message : String(err)}`,
+        `[compact] occupancy compact did not complete for agent=${cur.id.slice(0, 8)}: ${message}`,
       );
+      try {
+        await this.appendCompactStatusMessage(cur.id, `${COMPACT_FAILURE_PREFIX} ${message}`);
+      } catch (noticeErr) {
+        console.error(
+          `[compact] could not persist compact failure notice for agent=${cur.id.slice(0, 8)}:`,
+          noticeErr,
+        );
+      }
       return false;
     }
   }
@@ -3247,9 +3410,8 @@ export class SessionManager {
       "Native context compacted. Ensemble conversation history was preserved.";
     // The CLI compacted its own context, not the union of all Ensemble turns.
     // Keep the transcript intact: it can include other threads and runtimes.
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
-    await this.appendCompactStatusMessage(id, `${plan.identity.runtime} native context compacted. Conversation history preserved.`);
+    this.invalidateOccupancy(id);
+    await this.appendCompactStatusMessage(id, COMPACT_DONE_TEXT);
     return { summary };
   }
 
@@ -3334,8 +3496,8 @@ export class SessionManager {
       reason: "compact",
       summary,
     });
-    this.clearLiveContext(id);
-    this.setContextUsage(id, null);
+    this.invalidateOccupancy(id);
+    await this.appendCompactStatusMessage(id, COMPACT_DONE_TEXT);
     return { summary };
   }
 
@@ -4022,6 +4184,7 @@ export class SessionManager {
         // to the ungrouped top level — the tree groups by teamId first, then
         // builds the parent/child nesting within each group.
         teamId: parent.teamId,
+        sortOrder: nextAgentSortOrder(parent.teamId, parentId),
         metadata: {
           taskDepth: parentDepth + 1,
           spawnedAsTaskFor: parentId,
@@ -4409,11 +4572,11 @@ export class SessionManager {
       const targetLabel = action?.targetAgentName ?? action?.targetAgentId ?? "peer";
       lines.push(
         "",
-        `Your earlier peer_send to "${targetLabel}" (mode=${draft.mode}) was blocked and NOT delivered. ` +
+        `Your earlier peer_send to "${targetLabel}" was blocked and NOT delivered. ` +
           "Its exact content is preserved below so you do not need to reconstruct it. " +
           "After reading the fresh inbox, RESEND it with peer_send if it is still valid (merge the new context if helpful), " +
           "or explicitly skip it only if the fresh input makes it obsolete. If you do nothing it will not be delivered.",
-        `<blocked-outbound-draft tool="peer_send" target="${targetLabel}" mode="${draft.mode}">`,
+        `<blocked-outbound-draft tool="peer_send" target="${targetLabel}">`,
         // Whole, not head+tail clipped: this is the message the agent is being
         // told to resend, and a clipped draft is a different message that it
         // would then send believing it was the same one.
@@ -4430,7 +4593,6 @@ export class SessionManager {
       lines.push(
         `--- message ${idx + 1} id=${row.id} queuedAt=${row.createdAt.toISOString()}`,
         `From: ${origin?.fromAgentName ?? "unknown"}${origin?.fromAgentId ? ` (id=${origin.fromAgentId.slice(0, 8)})` : ""}`,
-        `Mode: ${origin?.mode ?? "raw"}`,
       );
       if (origin?.correlationId) lines.push(`Correlation: ${origin.correlationId}`);
       if (origin?.correlationKind) lines.push(`Correlation kind: ${origin.correlationKind}`);
@@ -4478,6 +4640,10 @@ export class SessionManager {
     );
   }
 
+  private hasQueuedPeerTurn(sessionId: string): boolean {
+    return this.queuedPeerTurnsSince(sessionId, 0).length > 0;
+  }
+
   private drainQueuedTurns(sessionId: string, drainOpts: DrainQueuedOptions = {}): void {
     if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) {
       if (Object.keys(drainOpts).length > 0) this.pendingDrainOptions.set(sessionId, drainOpts);
@@ -4520,7 +4686,12 @@ export class SessionManager {
         ? normalizeQueuedTurnOpts(nextRows[0]!.opts)
         : undefined;
     const drainToken = this.beginDrain(sessionId);
-    void this.runMessageNow(sessionId, userInput, runOpts)
+    void (async () => {
+      if (drainOpts.freshnessContinuationRun) {
+        await this.persistVisibleQueuedPeerTurns(sessionId, nextRows);
+      }
+      return this.runMessageNow(sessionId, userInput, runOpts);
+    })()
       .then((result) => {
         for (const resolve of resolvers) resolve(result);
       })
@@ -4531,6 +4702,29 @@ export class SessionManager {
       .finally(() => {
         this.finishDrain(sessionId, drainToken);
       });
+  }
+
+  private async persistVisibleQueuedPeerTurns(sessionId: string, rows: DbPendingTurn[]): Promise<void> {
+    for (const row of rows) {
+      const origin = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      const payload = {
+        type: "user" as const,
+        message: { role: "user" as const, content: row.userInput },
+        ...(origin ? { _peerOrigin: origin } : {}),
+      };
+      const persisted = await this.persistTurnMessage(
+        sessionId,
+        this.nextMessageSeq(sessionId),
+        "user",
+        payload,
+      );
+      this.hub.sendToSession(sessionId, {
+        type: "message",
+        sessionId,
+        seq: persisted.seq,
+        msg: payload as never,
+      });
+    }
   }
 
   private takeNextQueuedTurnSegment(rows: DbPendingTurn[], opts: DrainQueuedOptions = {}): DbPendingTurn[] {
@@ -4560,7 +4754,6 @@ export class SessionManager {
       lines.push(
         `--- message ${idx + 1} id=${row.id} queuedAt=${row.createdAt.toISOString()}`,
         `From: ${origin?.fromAgentName ?? "unknown"}${origin?.fromAgentId ? ` (id=${origin.fromAgentId.slice(0, 8)})` : ""}`,
-        `Mode: ${origin?.mode ?? "raw"}`,
       );
       if (origin?.messageId) lines.push(`Message id: ${origin.messageId}`);
       if (origin?.correlationId) lines.push(`Correlation: ${origin.correlationId}`);
@@ -4655,6 +4848,32 @@ export class SessionManager {
       orderBy: { seq: "desc" },
     });
     return (last?.seq ?? -1) + 1;
+  }
+
+  /** Side writers (occupancy compact, loop notices) use `nextMessageSeq` while
+   *  the live turn still holds a copied cursor. Re-read before the stream so
+   *  the first runtime event does not reuse a seq those writers already took. */
+  private adoptLatestMessageSeq(agentId: string, runId: string, localSeq: number): number {
+    const next = Math.max(localSeq, this.nextMessageSeq(agentId));
+    const run = this.running.get(agentId);
+    if (run?.runId === runId) run.seq = next;
+    return next;
+  }
+
+  private async persistTurnMessage(
+    agentId: string,
+    seq: number,
+    type: string,
+    payload: object,
+  ): Promise<DbMessage> {
+    try {
+      return await prisma.message.create({ data: { agentId, seq, type, payload } });
+    } catch (cause) {
+      if (!isMessageSeqCollision(cause)) throw cause;
+      return await prisma.message.create({
+        data: { agentId, seq: this.nextMessageSeq(agentId), type, payload },
+      });
+    }
   }
 
   private isRunOwner(sessionId: string, runId: string): boolean {
@@ -4813,22 +5032,7 @@ export class SessionManager {
   }
 
   private async appendCompactStatusMessage(sessionId: string, text: string): Promise<number> {
-    const payload = { type: "system" as const, subtype: "compact_status", text };
-    const row = await prisma.message.create({
-      data: {
-        agentId: sessionId,
-        seq: this.nextMessageSeq(sessionId),
-        type: "system",
-        payload,
-      },
-    });
-    this.hub.sendToSession(sessionId, {
-      type: "message",
-      sessionId,
-      seq: row.seq,
-      msg: payload as never,
-    });
-    return row.seq;
+    return this.persistSystemNotice(sessionId, "compact_status", text);
   }
 
   /** Update (or clear) the live context-usage indicator for one agent and push
@@ -4838,10 +5042,17 @@ export class SessionManager {
   private setContextUsage(sessionId: string, usage: ContextUsage | null): void {
     if (usage) {
       this.contextUsageByAgent.set(sessionId, usage);
+      this.occupancyAwaitingReport.delete(sessionId);
     } else {
       this.contextUsageByAgent.delete(sessionId);
     }
     this.hub.sendToSession(sessionId, { type: "context_usage", sessionId, usage });
+  }
+
+  private invalidateOccupancy(sessionId: string): void {
+    this.occupancyAwaitingReport.add(sessionId);
+    this.clearLiveContext(sessionId);
+    this.setContextUsage(sessionId, null);
   }
 
   private clearLiveContext(sessionId: string): void {
@@ -4853,6 +5064,7 @@ export class SessionManager {
     providerKind: string,
     providerId: string | null,
     sessionObserved: number | null,
+    discovered?: ProviderModelInfo | null,
   ): Promise<EffectiveWindowContext> {
     const windowCtx = scopeForAgent(
       model,
@@ -4863,7 +5075,7 @@ export class SessionManager {
     return {
       ...windowCtx,
       sessionObserved,
-      requested: requestedRuntimeWindow(model, windowCtx),
+      requested: requestedRuntimeWindow(model, windowCtx, discovered),
     };
   }
 
@@ -4874,8 +5086,9 @@ export class SessionManager {
     _systemPrompt: string | null | undefined,
   ): Promise<void> {
     const stored = this.contextUsageByAgent.get(sessionId)?.usedTokens ?? null;
-    const fromLastResult =
-      stored != null && stored > 0
+    const fromLastResult = this.occupancyAwaitingReport.has(sessionId)
+      ? null
+      : stored != null && stored > 0
         ? stored
         : ((await this.latestResultOccupancy(sessionId)) ?? (await this.latestOccupancyTokens(sessionId, 0)));
     const promptTokens = fromLastResult != null && fromLastResult > 0 ? fromLastResult : 0;
@@ -4929,14 +5142,18 @@ export class SessionManager {
     this.setContextUsage(sessionId, usage);
   }
 
-  private noteLiveStreamOccupancy(sessionId: string, msg: unknown): void {
-    const delta = occupancyDeltaFromStreamEvent(msg);
-    if (delta === null) return;
+  private noteReportedOccupancy(sessionId: string, msg: unknown): void {
+    const reported = occupancyTokensFromModelReport(msg);
+    if (!reported) return;
     const live = this.liveContextByAgent.get(sessionId);
     if (!live) return;
-    const firstStream = live.streamedTokens === 0 && live.pendingStreamText.length === 0;
-    live.pendingStreamText += delta;
-    this.publishLiveContext(sessionId, { force: firstStream });
+    if (reported.window && reported.window > 0) {
+      live.windowInput = { ...live.windowInput, sessionObserved: reported.window };
+    }
+    live.promptTokens = reported.used;
+    live.streamedTokens = 0;
+    live.pendingStreamText = "";
+    this.publishLiveContext(sessionId, { force: true });
   }
 
   private async refreshLiveContextAfterPersist(
@@ -5406,13 +5623,13 @@ export class SessionManager {
       throw new Error(`Claude Code CLI is not available on ${currentPlatformKey()}. Configure it in Settings > CLI.`);
     }
     if (isCodexProvider) {
-      if (!codexCliPath || (platformRuntime && !platformRuntime.cliPath)) {
+      if (!codexCliPath) {
         throw new Error(
           `Codex CLI is not available on ${currentPlatformKey()}. Install it with ` +
             `\`${CLI_INSTALL_INFO.codex.recommendedInstallCommand}\`, then refresh Settings > CLI.`,
         );
       }
-      if (platformRuntime && platformRuntime.authPresent === false) {
+      if (!codexAuthPresent()) {
         throw new Error(`Codex CLI is not logged in on ${currentPlatformKey()}. Run \`${CLI_INSTALL_INFO.codex.loginCommand}\` for this OS.`);
       }
     }
@@ -5735,10 +5952,7 @@ export class SessionManager {
             `${historyOutcome.history.overflow.count} turn(s) (seq ${historyOutcome.history.overflow.fromSeq}–` +
             `${historyOutcome.history.overflow.toSeq}) — compacting before dispatch`,
         );
-        // No extra notice row: the compact itself broadcasts
-        // `agent_history_reset` (reason "compact") and `/status` prints the
-        // budget, the overflow range and the diagnostics. A third channel
-        // describing the same event is how the numbers start to differ.
+        await this.appendCompactStatusMessage(sessionId, COMPACT_START_TEXT);
         try {
           // The bound is the row BEFORE this turn's user message — the exact set
           // of rows `priorRows` measured a moment ago. Without it the compact
@@ -5768,13 +5982,20 @@ export class SessionManager {
             "this turn ran a ranged compact before dispatch because the transcript exceeded the history budget",
           );
         } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await this.appendCompactStatusMessage(sessionId, `${COMPACT_FAILURE_PREFIX} ${message}`);
           effectiveHistory.history.diagnostics.push(
-            `the pre-dispatch compact failed (${err instanceof Error ? err.message : String(err)}); ` +
+            `the pre-dispatch compact failed (${message}); ` +
               "the turn is running with the overflow reported rather than silently dropped",
           );
         }
       }
-      if (!occupancyCompactedAtDispatch && this.occupancyNeedsCompact(sessionId, turnPlan)) {
+      if (
+        !occupancyCompactedAtDispatch &&
+        !opts?.peerOrigin &&
+        !opts?.freshnessContinuationForRunId &&
+        this.occupancyNeedsCompact(sessionId, turnPlan)
+      ) {
         const used = this.contextUsageByAgent.get(sessionId)?.usedTokens;
         const window = turnPlan.context.effectiveWindow ?? this.contextUsageByAgent.get(sessionId)?.contextWindow;
         console.log(
@@ -6044,6 +6265,7 @@ export class SessionManager {
         // job, addressable from the other.
         jobs: { jobs: this.jobs, agentId: sessionId, agentName: agent.name, defaultCwd: runtimeCwd },
       };
+      seq = this.adoptLatestMessageSeq(sessionId, runId, seq);
       const stream = takeUntilAbort(runtime.query(runtimeOpts), abort.signal);
       const providerKindForContext = resolvedProvider?.kind ?? "anthropic-local";
       await this.seedLiveContext(
@@ -6054,6 +6276,7 @@ export class SessionManager {
           providerKindForContext,
           resolvedProvider?.id ?? null,
           this.contextUsageByAgent.get(sessionId)?.contextWindow ?? null,
+          findProviderModel(readProviderModelCatalog(resolvedProvider?.metadata), agent.model),
         ),
         mergedSystemPrompt,
       );
@@ -6122,6 +6345,7 @@ export class SessionManager {
           // (the API streams pings, not thinking_delta). Broadcast it so
           // the pane can show "thinking…" instead of looking idle; do not
           // persist — it is a heartbeat, not resume context.
+          this.noteReportedOccupancy(sessionId, msg);
           this.streamWs.flush(sessionId);
           this.hub.sendToSession(sessionId, { type: "message", sessionId, seq: -1, msg: msg as never });
           await yieldEventLoop();
@@ -6131,7 +6355,6 @@ export class SessionManager {
         this.recordLiveTranscript(sessionId, msg);
 
         if (msg.type === "stream_event") {
-          this.noteLiveStreamOccupancy(sessionId, msg);
           this.streamWs.push(sessionId, msg);
           await yieldEventLoop();
           if (abort.signal.aborted || !this.isRunOwner(sessionId, runId)) break;
@@ -6205,14 +6428,7 @@ export class SessionManager {
         let persisted: DbMessage;
         try {
           this.streamWs.flush(sessionId);
-          persisted = await prisma.message.create({
-            data: {
-              agentId: sessionId,
-              seq,
-              type: msg.type,
-              payload: msg as object,
-            },
-          });
+          persisted = await this.persistTurnMessage(sessionId, seq, msg.type, msg as object);
         } catch (cause) {
           throw new MessagePersistenceError(msg.type, cause);
         }
@@ -6260,17 +6476,16 @@ export class SessionManager {
             }
           }
 
-          // Refresh the live context-usage indicator from this result. Occupancy
-          // is prompt + this call's output, so the bar does not drop when the
-          // stream ends. Prefer per-call usage on assistant rows (Claude), else
-          // the result payload's `contextUsage` (OpenAI / Codex). Live occupancy
-          // wins when the provider number is smaller (Codex currently reports
-          // outputTokens: 0). Fall back to a local count of the replayed history.
+          // Refresh occupancy from what the MODEL reported this turn. Prefer
+          // per-call usage on assistant rows (Claude input+cache), else the
+          // result payload's `contextUsage` (OpenAI last response / Codex
+          // total_tokens). Do not take max with a character estimate.
           const windowInput = await this.contextWindowInput(
             agent.model,
             providerKind,
             resolvedProvider?.id ?? null,
             reportedContextWindowFromResult(msg, agent.model) ?? null,
+            findProviderModel(readProviderModelCatalog(resolvedProvider?.metadata), agent.model),
           );
           const live = this.liveContextByAgent.get(sessionId);
           if (live) {
@@ -6284,8 +6499,8 @@ export class SessionManager {
             (await this.latestOccupancyTokens(sessionId, userPersisted?.seq ?? 0)) ??
             occupancyTokensFromResultContextUsage(msg);
           const used =
-            providerTokens !== null
-              ? Math.max(providerTokens, liveUsed)
+            providerTokens !== null && providerTokens > 0
+              ? providerTokens
               : liveUsed > 0
                 ? liveUsed
                 : null;
@@ -6315,7 +6530,9 @@ export class SessionManager {
         });
         await yieldEventLoop();
 
-        seq++;
+        seq = persisted.seq + 1;
+        const liveAfterPersist = this.running.get(sessionId);
+        if (liveAfterPersist?.runId === runId) liveAfterPersist.seq = seq;
         // A result message ends the *foreground* turn, but Claude background
         // subagents may still be running (method A). Finalize only once the
         // result is seen AND no drain-blocking background task remains. If the
@@ -6753,8 +6970,10 @@ export class SessionManager {
           }
         }
         const nextKick = Boolean(autoRecoverAfterRun) || queuedBeforeLoop;
+        const skipCompactForPeerInbox = this.hasQueuedPeerTurn(sessionId);
         if (
           nextKick &&
+          !skipCompactForPeerInbox &&
           !abort.signal.aborted &&
           settledPlan &&
           settledHistoryStrategy &&
@@ -6764,10 +6983,17 @@ export class SessionManager {
           console.log(
             `[history] agent=${sessionId.slice(0, 8)} occupancy compact before next kick`,
           );
-          await this.compactBetweenTurns(cur, settledPlan, settledHistoryStrategy);
+          try {
+            await this.compactBetweenTurns(cur, settledPlan, settledHistoryStrategy);
+          } catch (err) {
+            console.error(
+              `[history] occupancy compact threw before drain for agent=${sessionId.slice(0, 8)}:`,
+              err,
+            );
+          }
         }
         this.running.delete(sessionId);
-        if (autoRecoverAfterRun) {
+        if (autoRecoverAfterRun && !skipCompactForPeerInbox) {
           const recoveryDrainToken = this.beginDrain(sessionId);
           autoRecoveryPromise = this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)
             .catch((err) => {
@@ -6926,6 +7152,28 @@ export class SessionManager {
     if (!entry) return;
     bucket!.delete(reqId);
     entry.resolve(choice);
+    void this.persistAskUserAnswer(sessionId, choice).catch((err) => {
+      console.error(`[ask_user] could not persist answer for ${sessionId}:`, err);
+    });
+  }
+
+  private async persistAskUserAnswer(sessionId: string, choice: string): Promise<void> {
+    const text = choice.trim();
+    if (!text) return;
+    const payload = {
+      type: "user" as const,
+      message: { role: "user" as const, content: text },
+    };
+    const run = this.running.get(sessionId);
+    const preferred = run?.seq ?? this.nextMessageSeq(sessionId);
+    const row = await this.persistTurnMessage(sessionId, preferred, "user", payload);
+    if (run && row.seq >= run.seq) run.seq = row.seq + 1;
+    this.hub.sendToSession(sessionId, {
+      type: "message",
+      sessionId,
+      seq: row.seq,
+      msg: payload as never,
+    });
   }
 
   /** Blocking request/response with a peer.
@@ -7008,7 +7256,7 @@ export class SessionManager {
         "",
         `Why this blocks me: ${reason}`,
         "",
-        `Reply with peer_send(target="${fromAgent.name}", mode="raw", replyToCorrelationId="${askId}", message="<your answer>").`,
+        `Reply with peer_send(target="${fromAgent.name}", replyToCorrelationId="${askId}", message="<your answer>").`,
         "I am waiting inside this turn; do not treat this as a status message.",
       ].join("\n");
       const delivery = await this.sendPeerMessage(fromAgentId, targetId, body, "raw", {
@@ -7603,9 +7851,10 @@ export class SessionManager {
     fromAgentId: string,
     target: string,
     body: string,
-    mode: PeerMode = "raw",
+    _mode: PeerMode = "raw",
     opts: PeerSendOptions = {},
   ): Promise<string> {
+    const mode: PeerMode = "raw";
     const interrupt = opts.interrupt === true;
     const interruptReason = opts.interruptReason?.trim() ?? "";
     if (interrupt && !interruptReason) {
@@ -7638,7 +7887,7 @@ export class SessionManager {
       tool: "peer_send",
       targetAgentId: targetAgent.id,
       targetAgentName: targetAgent.name,
-      peerSendDraft: { body, mode },
+      peerSendDraft: { body, mode: "raw" },
       ...(opts.correlationId ? { correlationId: opts.correlationId } : {}),
       ...(opts.replyToCorrelationId ? { replyToCorrelationId: opts.replyToCorrelationId } : {}),
     };
@@ -7649,18 +7898,12 @@ export class SessionManager {
         return this.formatFreshnessBlockedResult(action, queued);
       }
     }
-    const includeSource =
-      opts.includeSource === true ||
-      ((opts.includeSource === undefined || opts.includeSource === "auto") && mode !== "raw");
+    const includeSource = opts.includeSource === true;
     const sourceSnapshot = await this.fetchPeerSourceSnapshot(fromAgent.id);
-    // The source's output is stored whole and the handoff carries what fits the
-    // RECIPIENT's window. It used to be cut to 8 000/5 000/3 600/1 200
-    // characters depending on the mode, with nothing anywhere holding the rest:
-    // a reviewer could be auditing a prefix while the sender believed the whole
-    // answer had been sent.
     // Only store/present the source snapshot when the handoff will actually
-    // carry it: a raw send drops it, and writing an artifact nobody is told
-    // about would just be a row per message.
+    // carry it. Stored whole, then presented within the recipient's turn
+    // budget; a result that does not fit becomes a preview plus an artifact
+    // handle.
     const sourceOutput = includeSource && sourceSnapshot.sourceOutput
       ? this.presentResult({
           agentId: fromAgent.id,
@@ -7674,12 +7917,10 @@ export class SessionManager {
     const formatted = formatPeerHandoff({
       fromName: fromAgent.name,
       fromId: fromAgent.id,
-      receiverMetadata: targetAgent.metadata,
-      mode,
       body,
       sourceLastOutput: sourceOutput,
       sourceState: sourceSnapshot.sourceRunState,
-      includeSource: opts.includeSource ?? "auto",
+      includeSource: opts.includeSource,
       ...(interrupt ? { interruptReason } : {}),
     });
     const targetWasBusy = this.running.has(targetId) || this.drainingQueues.has(targetId);
@@ -7697,21 +7938,20 @@ export class SessionManager {
     };
     const willReplaceQueuedPeerHandoff = targetWasBusy && this.findQueuedPeerHandoff(targetId, peerOrigin) !== null;
     const duplicateCorrelation = targetWasBusy ? this.findQueuedPeerCorrelationDuplicate(targetId, peerOrigin) : null;
+    const noteSendFailure = (err: unknown) => {
+      console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
+    };
     if (interrupt) {
       await this.interruptForPeerSend(targetId, interruptReason);
-      void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
-        console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
-      });
-      return `interrupted and delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode}, reason=${interruptReason})`;
+      void this.sendMessage(targetId, formatted, { peerOrigin }).catch(noteSendFailure);
+      return `interrupted and delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, reason=${interruptReason})`;
     }
     if (duplicateCorrelation) {
-      return `suppressed duplicate peer_send for "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode}, queuedTurn=${duplicateCorrelation.id}); queued correlation/message already covers this request`;
+      return `suppressed duplicate peer_send for "${targetAgent.name}" (id=${targetId.slice(0, 8)}, queuedTurn=${duplicateCorrelation.id}); queued correlation/message already covers this request`;
     }
-    void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
-      console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
-    });
+    void this.sendMessage(targetId, formatted, { peerOrigin }).catch(noteSendFailure);
     const delivery = willReplaceQueuedPeerHandoff ? "replaced stale queued peer handoff for" : targetWasBusy ? "queued for" : "delivered to";
-    return `${delivery} "${targetAgent.name}" (id=${targetId.slice(0, 8)}, mode=${mode})`;
+    return `${delivery} "${targetAgent.name}" (id=${targetId.slice(0, 8)})`;
   }
 
   private async interruptForPeerSend(

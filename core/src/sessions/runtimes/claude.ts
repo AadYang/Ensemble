@@ -22,6 +22,12 @@ import type { AgentRuntime, RuntimeEvent, RuntimeLivenessReporter, RuntimeOption
 import { takeUntilAbort } from "../abort-iterable.js";
 import { childEnv } from "../../cli-config.js";
 import { claudeLocalRebuildPrompt } from "../local-rebuild-prompt.js";
+import {
+  isModelAtCapacity,
+  MODEL_CAPACITY_MAX_ATTEMPTS,
+  shouldRetryModelCapacity,
+  waitForCapacityRetry,
+} from "./model-capacity.js";
 
 /** Phase 4: spawn the Claude Code child ourselves, so the run has a PROCESS we
  *  can observe.
@@ -331,9 +337,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // handed to the controller by the caller, not used here.
     const observer = makeClaudeSpawner(opts.liveness ?? null, opts.abortController.signal);
     if (observer) opts.liveness?.registerProbe?.(observer.probe);
-    const stream = query({
-      prompt: claudePromptForTurn(opts),
-      options: {
+    const sdkOptions = {
         model: opts.model,
         ...(effort !== undefined ? { effort } : {}),
         permissionMode: opts.permissionMode,
@@ -390,44 +394,121 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // a small auth-env allowlist from user settings above, so agent
         // identity, memory, hooks, and MCP stay controlled by Ensemble.
         settingSources: [],
-      },
-    });
+    };
 
-    // Phase 4: the stream's own ending is a fact worth recording, and WHETHER it
-    // ended abnormally is decided by whether the terminal `result` ever arrived
-    // — not by the loop's exit code, which is normal in both cases.
-    let sawResult = false;
-    let closedByError: string | null = null;
-    // `for await` invokes the generator's `return()` when its CONSUMER throws
-    // while processing a yielded message. That runs this finally block too,
-    // but says nothing about the producer stream. Only reaching the statement
-    // after the loop proves that the SDK iterator itself drained naturally.
-    let drainedNaturally = false;
+    let yieldedVisible = false;
+    let settled = false;
     try {
-      for await (const msg of takeUntilAbort(stream, opts.abortController.signal)) {
-        if ((msg as { type?: string }).type === "result") {
-          sawResult = true;
-          opts.liveness?.resultSeen();
+      for (let attempt = 1; attempt <= MODEL_CAPACITY_MAX_ATTEMPTS; attempt++) {
+        if (opts.abortController.signal.aborted) return;
+        if (attempt > 1) {
+          if (!(await waitForCapacityRetry(opts.abortController.signal, attempt - 1))) return;
+          console.warn(
+            `[claude] model at capacity; retry ${attempt}/${MODEL_CAPACITY_MAX_ATTEMPTS}`,
+          );
         }
-        // SDK's SDKMessage is structurally a superset of shared's SdkMessage
-        // (which uses `[k: string]: unknown`). Cast to widen for the protocol type.
-        yield { type: "sdk_message", payload: msg as unknown as SdkMessage };
+        const stream = query({
+          prompt: claudePromptForTurn(opts),
+          options: sdkOptions,
+        });
+
+        // Phase 4: the stream's own ending is a fact worth recording, and WHETHER it
+        // ended abnormally is decided by whether the terminal `result` ever arrived
+        // — not by the loop's exit code, which is normal in both cases.
+        let sawResult = false;
+        let closedByError: string | null = null;
+        // `for await` invokes the generator's `return()` when its CONSUMER throws
+        // while processing a yielded message. That runs this finally block too,
+        // but says nothing about the producer stream. Only reaching the statement
+        // after the loop proves that the SDK iterator itself drained naturally.
+        let drainedNaturally = false;
+        let retryCapacity = false;
+        try {
+          for await (const msg of takeUntilAbort(stream, opts.abortController.signal)) {
+            const rec = msg as { type?: string };
+            if (rec.type === "result") {
+              const capacityText = claudeResultCapacityMessage(msg);
+              if (
+                capacityText &&
+                shouldRetryModelCapacity({
+                  message: capacityText,
+                  attempt,
+                  yieldedVisible,
+                  aborted: opts.abortController.signal.aborted,
+                })
+              ) {
+                retryCapacity = true;
+                break;
+              }
+              sawResult = true;
+              opts.liveness?.resultSeen();
+            }
+            if (rec.type && rec.type !== "system") yieldedVisible = true;
+            // SDK's SDKMessage is structurally a superset of shared's SdkMessage
+            // (which uses `[k: string]: unknown`). Cast to widen for the protocol type.
+            yield { type: "sdk_message", payload: msg as unknown as SdkMessage };
+          }
+          drainedNaturally = !retryCapacity;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (
+            shouldRetryModelCapacity({
+              message,
+              attempt,
+              yieldedVisible,
+              aborted: opts.abortController.signal.aborted,
+            })
+          ) {
+            retryCapacity = true;
+          } else {
+            closedByError = message;
+            throw err;
+          }
+        } finally {
+          if (opts.captureCompactSummary) stream.close();
+          if (!retryCapacity) {
+            settled = true;
+            // `abnormal` is narrow on purpose: a close the runtime already reported as
+            // an error is explained, and an abort is something WE did. What remains is
+            // a stream that vanished without a result and without an explanation —
+            // the only close that is evidence.
+            opts.liveness?.streamClosed(
+              drainedNaturally && !sawResult && closedByError === null && !opts.abortController.signal.aborted,
+            );
+          }
+        }
+        if (!retryCapacity) return;
       }
-      drainedNaturally = true;
-    } catch (err) {
-      closedByError = err instanceof Error ? err.message : String(err);
-      throw err;
     } finally {
-      if (opts.captureCompactSummary) stream.close();
-      // `abnormal` is narrow on purpose: a close the runtime already reported as
-      // an error is explained, and an abort is something WE did. What remains is
-      // a stream that vanished without a result and without an explanation —
-      // the only close that is evidence.
-      opts.liveness?.streamClosed(
-        drainedNaturally && !sawResult && closedByError === null && !opts.abortController.signal.aborted,
-      );
+      if (!settled && !opts.abortController.signal.aborted) {
+        opts.liveness?.streamClosed(true);
+      }
     }
   }
+}
+
+function claudeResultCapacityMessage(msg: unknown): string | null {
+  if (!msg || typeof msg !== "object") return null;
+  const rec = msg as Record<string, unknown>;
+  if (rec.type !== "result") return null;
+  const parts: string[] = [];
+  if (typeof rec.subtype === "string") parts.push(rec.subtype);
+  if (typeof rec.result === "string") parts.push(rec.result);
+  if (typeof rec.error === "string") parts.push(rec.error);
+  if (rec.error && typeof rec.error === "object") {
+    const nested = (rec.error as { message?: unknown }).message;
+    if (typeof nested === "string") parts.push(nested);
+  }
+  if (Array.isArray(rec.errors)) {
+    for (const e of rec.errors) {
+      if (typeof e === "string") parts.push(e);
+      else if (e && typeof e === "object" && typeof (e as { message?: unknown }).message === "string") {
+        parts.push((e as { message: string }).message);
+      }
+    }
+  }
+  const joined = parts.join("\n");
+  return isModelAtCapacity(joined) ? joined : null;
 }
 
 /** When the CLI is not resuming a session file, `opts.history` is the only

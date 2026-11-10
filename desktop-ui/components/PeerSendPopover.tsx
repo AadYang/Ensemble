@@ -2,13 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { AgentSummary, PeerMode } from "@agentorch/shared";
+import type { AgentSummary } from "@agentorch/shared";
 import { peerContactAllowed, peerIdentityFromSummary } from "@agentorch/shared";
 import { getWS } from "@/lib/ws";
 import { useAgentDirectory, useStore } from "@/store/agents";
 import { useT } from "@/i18n/useT";
-
-const PEER_MODE_OPTIONS: PeerMode[] = ["raw", "continue", "review", "fork"];
 
 export function PeerSendPopover({
   fromAgentId,
@@ -47,7 +45,6 @@ export function PeerSendPopover({
     ? targetId
     : peers[0]?.summary.id ?? "";
   const [text, setText] = useState("");
-  const [mode, setMode] = useState<PeerMode>("raw");
   const [interrupt, setInterrupt] = useState(false);
   const [interruptReason, setInterruptReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -124,7 +121,6 @@ export function PeerSendPopover({
       fromSessionId: fromAgentId,
       targetSessionId: selectedId,
       text: trimmed,
-      mode,
       interrupt,
       ...(interrupt ? { interruptReason: reason } : {}),
     });
@@ -132,7 +128,7 @@ export function PeerSendPopover({
     appendUserTurn(
       fromAgentId,
       interrupt ? `${trimmed}\n\n[urgent interrupt: ${reason}]` : trimmed,
-      { direction: "out", fromName: targetName, mode },
+      { direction: "out", fromName: targetName, mode: "raw" },
     );
     onClose();
   };
@@ -189,33 +185,6 @@ export function PeerSendPopover({
                 ))}
               </select>
             </label>
-            <div className="flex flex-col gap-1">
-              <span className="text-[10px] tracking-wider text-[var(--text-faint)]">
-                {t("peer.popover.modeLabel")}
-              </span>
-              <div className="flex flex-wrap gap-2">
-                {PEER_MODE_OPTIONS.map((m) => (
-                  <label
-                    key={m}
-                    className={`px-2 py-0.5 border cursor-pointer transition-colors ${
-                      mode === m
-                        ? "border-[var(--accent)] text-[var(--accent)]"
-                        : "border-[var(--border)] text-[var(--text-dim)] hover:text-[var(--text)]"
-                    }`}
-                  >
-                    <input
-                      type="radio"
-                      name="peer-mode"
-                      value={m}
-                      checked={mode === m}
-                      onChange={() => setMode(m)}
-                      className="hidden"
-                    />
-                    {t(`peer.mode.${m}`)}
-                  </label>
-                ))}
-              </div>
-            </div>
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}

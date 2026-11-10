@@ -814,7 +814,7 @@ export function AgentSettings({
           >
             <option value="">{t("settings.team.ungrouped")}</option>
             {Object.values(teams)
-              .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+              .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt) || a.name.localeCompare(b.name))
               .map((tm) => (
                 <option key={tm.id} value={tm.id}>
                   {tm.name}

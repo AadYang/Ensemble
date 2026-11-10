@@ -217,6 +217,50 @@ describe("SessionManager cancel + stale-session recovery", () => {
     await expect(questionPromise).resolves.toBe("A");
   });
 
+  it("persists and broadcasts the ask_user answer as a visible user message", async () => {
+    const agent = await prisma.agent.create({ data: { name: "ask-visible-answer" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-ask-visible",
+      abort: new AbortController(),
+      seq: 3,
+      userInput: "please ask the human",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+    const questionPromise = sessions.askUser(agent.id, "Which path?", ["A", "B"]);
+    let asked: { sessionId: string; msg: Broadcast } | undefined;
+    for (let i = 0; i < 20; i += 1) {
+      asked = hub.sessionMessages.find((entry) => entry.msg.type === "user_question");
+      if (asked) break;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(asked?.msg).toMatchObject({ question: "Which path?" });
+    sessions.resolveUserQuestion(agent.id, String(asked?.msg.reqId), "use /tmp/project");
+    await expect(questionPromise).resolves.toBe("use /tmp/project");
+    for (let i = 0; i < 20; i += 1) {
+      const n = await prisma.message.count({ where: { agentId: agent.id, type: "user" } });
+      if (n > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const userRows = await prisma.message.findMany({ where: { agentId: agent.id, type: "user" } });
+    expect(userRows.some((row) => JSON.stringify(row.payload).includes("use /tmp/project"))).toBe(true);
+    expect(
+      hub.sessionMessages.some(
+        (entry) =>
+          entry.msg.type === "message" && JSON.stringify(entry.msg).includes("use /tmp/project"),
+      ),
+    ).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.get(agent.id).seq).toBeGreaterThanOrEqual(4);
+  });
+
   it("runtime force-stop only affects the matching run", async () => {
     const stuck = await prisma.agent.create({ data: { name: "bad-provider-agent" } });
     const other = await prisma.agent.create({ data: { name: "other-agent" } });
@@ -789,10 +833,14 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(nonInteractivePermissionBehavior).toBe("deny");
     expect(calls[2]!.prompt).toBe("ordinary queued turn should wait");
     const userRows = await prisma.message.findMany({ where: { agentId: agent.id, type: "user" }, orderBy: { seq: "asc" } });
-    expect(userRows.map((row) => JSON.stringify(row.payload)).join("\n")).not.toContain("Ensemble freshness check");
+    const userPayload = userRows.map((row) => JSON.stringify(row.payload)).join("\n");
+    expect(userPayload).not.toContain("Ensemble freshness check");
+    expect(userPayload).toContain("peer decision");
+    expect(userPayload).toContain("follow-up peer context");
+    expect(userPayload).toContain("_peerOrigin");
   });
 
-  it("coalesces superseded peer_send handoffs from the same running source and mode", async () => {
+  it("coalesces superseded peer_send handoffs from the same running source when source-output is attached", async () => {
     const source = await prisma.agent.create({ data: { name: "coalesce-source" } });
     const target = await prisma.agent.create({ data: { name: "coalesce-target" } });
     const hub = new StubHub();
@@ -823,13 +871,13 @@ describe("SessionManager cancel + stale-session recovery", () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live snapshot 1" });
-    const first = await sessions.sendPeerMessage(source.id, target.name, "note one", "review");
+    const first = await sessions.sendPeerMessage(source.id, target.name, "note one", "raw", { includeSource: true });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live snapshot 2" });
-    const second = await sessions.sendPeerMessage(source.id, target.name, "note two", "review");
+    const second = await sessions.sendPeerMessage(source.id, target.name, "note two", "raw", { includeSource: true });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (sessions as any).liveTranscripts.set(source.id, { finalized: [], current: "live snapshot 3" });
-    const third = await sessions.sendPeerMessage(source.id, target.name, "note three", "review");
+    const third = await sessions.sendPeerMessage(source.id, target.name, "note three", "raw", { includeSource: true });
     await Promise.resolve();
 
     expect(first).toContain("queued for");
@@ -1019,7 +1067,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
     (sessions as any).clearQueuedTurns(target.id);
   });
 
-  it("does not coalesce peer_send handoffs from different sources or modes", async () => {
+  it("does not coalesce peer_send handoffs from different sources", async () => {
     const sourceA = await prisma.agent.create({ data: { name: "source-a" } });
     const sourceB = await prisma.agent.create({ data: { name: "source-b" } });
     const target = await prisma.agent.create({ data: { name: "coalesce-boundary-target" } });
@@ -1056,8 +1104,8 @@ describe("SessionManager cancel + stale-session recovery", () => {
       autoAllowedTools: new Set<string>(),
     });
 
-    await sessions.sendPeerMessage(sourceA.id, target.name, "review from A", "review");
-    await sessions.sendPeerMessage(sourceB.id, target.name, "review from B", "review");
+    await sessions.sendPeerMessage(sourceA.id, target.name, "review from A", "raw", { includeSource: true });
+    await sessions.sendPeerMessage(sourceB.id, target.name, "review from B", "raw", { includeSource: true });
     await sessions.sendPeerMessage(sourceA.id, target.name, "raw from A", "raw");
     await Promise.resolve();
 
@@ -1161,8 +1209,8 @@ describe("SessionManager cancel + stale-session recovery", () => {
     });
 
     await sessions.sendPeerMessage(sourceA.id, target.name, "first peer note", "raw");
-    await sessions.sendPeerMessage(sourceB.id, target.name, "second peer note", "review");
-    await sessions.sendPeerMessage(sourceA.id, target.name, "third peer note", "fork");
+    await sessions.sendPeerMessage(sourceB.id, target.name, "second peer note", "raw");
+    await sessions.sendPeerMessage(sourceA.id, target.name, "third peer note", "raw");
     await Promise.resolve();
     expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(3);
 
@@ -1182,14 +1230,11 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(drained[0]).toContain('<peer-batch count="3">');
     expect(drained[0]).toContain("--- message 1");
     expect(drained[0]).toContain("From: batch-source-a");
-    expect(drained[0]).toContain("Mode: raw");
     expect(drained[0]).toContain("first peer note");
     expect(drained[0]).toContain("--- message 2");
     expect(drained[0]).toContain("From: batch-source-b");
-    expect(drained[0]).toContain("Mode: review");
     expect(drained[0]).toContain("second peer note");
     expect(drained[0]).toContain("--- message 3");
-    expect(drained[0]).toContain("Mode: fork");
     expect(drained[0]).toContain("third peer note");
     expect(drained[0]).toContain("</peer-batch>");
     expect(await prisma.pendingTurn.count({ where: { agentId: target.id } })).toBe(0);
@@ -1414,7 +1459,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
       event: { type: "content_block_delta", delta: { type: "text_delta", text: "live source output" } },
     });
 
-    const result = await sessions.sendPeerMessage(source.id, target.name, "review latest", "review");
+    const result = await sessions.sendPeerMessage(source.id, target.name, "review latest", "raw", { includeSource: true });
     await Promise.resolve();
 
     expect(result).toContain("queued for");
@@ -1492,7 +1537,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
       autoAllowedTools: new Set<string>(),
     });
 
-    await sessions.sendPeerMessage(source.id, target.name, "continue latest", "continue");
+    await sessions.sendPeerMessage(source.id, target.name, "continue latest", "raw", { includeSource: true });
     await Promise.resolve();
 
     const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
@@ -1570,7 +1615,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
       autoAllowedTools: new Set<string>(),
     });
 
-    await sessions.sendPeerMessage(source.id, target.name, "review latest", "review");
+    await sessions.sendPeerMessage(source.id, target.name, "review latest", "raw", { includeSource: true });
     await Promise.resolve();
 
     const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
@@ -1617,7 +1662,7 @@ describe("SessionManager cancel + stale-session recovery", () => {
       autoAllowedTools: new Set<string>(),
     });
 
-    await sessions.sendPeerMessage(source.id, target.name, "review latest", "review");
+    await sessions.sendPeerMessage(source.id, target.name, "review latest", "raw", { includeSource: true });
     await Promise.resolve();
 
     const queued = await prisma.pendingTurn.findFirst({ where: { agentId: target.id } });
@@ -1756,6 +1801,12 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(meta.lastSessionId).toBeUndefined();
     expect(meta.codexUsageSnapshot).toBeUndefined();
     expect(meta.codexResumeSignature).toBeUndefined();
+    const usageReset = hub.sessionMessages.find((m) => m.msg.type === "context_usage");
+    expect(usageReset?.msg.usage).toBeNull();
+    const planMsg = hub.sessionMessages.find((m) => m.msg.type === "run_plan");
+    const plan = planMsg?.msg.plan as { source?: string; identity?: { modelId?: string } } | undefined;
+    expect(plan?.source).toBe("fresh-resolution");
+    expect(plan?.identity?.modelId).toBe("gpt-5.5");
   });
 
   it("patchAgent preserves permissionMode while clearing resume metadata for model+permission changes", async () => {

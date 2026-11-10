@@ -922,6 +922,9 @@ export const useStore = create<Store>((set) => ({
     set((s) => {
       const existing = s.agents[a.id];
       const turns = existing?.turns ?? [];
+      const identityChanged =
+        Boolean(existing) &&
+        (existing!.summary.model !== a.model || existing!.summary.providerId !== a.providerId);
       // Auto-attach to active pane if it's empty.
       const result = updateActiveWindow(s, (w) => {
         const leaves = listLeaves(w.root);
@@ -930,13 +933,24 @@ export const useStore = create<Store>((set) => ({
         const nextRoot = setPaneAgent(w.root, w.activePaneId, a.id);
         return nextRoot === w.root ? w : { ...w, root: nextRoot };
       });
+      let planByAgent = s.planByAgent;
+      if (identityChanged && s.planByAgent[a.id]) {
+        const { [a.id]: _stale, ...rest } = s.planByAgent;
+        void _stale;
+        planByAgent = rest;
+      }
       return {
         agents: {
           ...s.agents,
-          [a.id]: { summary: a, turns, contextUsage: existing?.contextUsage ?? null },
+          [a.id]: {
+            summary: a,
+            turns,
+            contextUsage: identityChanged ? null : existing?.contextUsage ?? null,
+          },
         },
         activeId: s.activeId ?? a.id,
         ...(result ?? {}),
+        ...(identityChanged ? { planByAgent } : {}),
       };
     }),
 
@@ -1185,8 +1199,8 @@ export const useStore = create<Store>((set) => ({
             .join("");
         }
         if (text) {
-          // Peer handoff: server attaches `_peerOrigin` for non-raw modes; raw mode
-          // stays on the legacy `[from X] body` text format (parsed in ChatPane).
+          // Peer message: server attaches `_peerOrigin`. Historical continue/
+          // review/fork rows still carry their mode for ChatPane badges.
           let peerOrigin: PeerOrigin | undefined;
           const peerMeta = (msg as { _peerOrigin?: { fromAgentName: string; mode: PeerMode } })._peerOrigin;
           if (peerMeta && typeof peerMeta === "object") {

@@ -11,6 +11,7 @@ export function AskUserDialog() {
   const queue = useStore((s) => s.pendingUserQuestions);
   const agents = useAgentDirectory();
   const clearUserQuestion = useStore((s) => s.clearUserQuestion);
+  const appendUserTurn = useStore((s) => s.appendUserTurn);
   const t = useT();
 
   const head: PendingUserQuestion | undefined = queue[0];
@@ -73,6 +74,7 @@ export function AskUserDialog() {
   const onPick = (choice: string) => {
     const text = choice.trim();
     if (!text) return;
+    appendUserTurn(head.sessionId, text);
     ws.send({
       type: "user_answer",
       sessionId: head.sessionId,

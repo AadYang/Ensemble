@@ -42,6 +42,7 @@
 | 多 runtime | Claude 体系走 `@anthropic-ai/claude-agent-sdk` (CLI subprocess)；OpenAI / openai-compat 体系走 `@openai/agents` (in-process)；按 `provider.kind` 在 `chooseRuntime` 路由（W16） | musistudio 翻译层（已删尽） |
 | Provider 协议 | `anthropic-local` (本地 OAuth) / `anthropic` (第三方 anthropic-compat) / `openai-compat`（W16）；bedrock / vertex / autoManaged 老数据自动 disable + migrate banner | LLM 网关 / `autoManaged` |
 | 双形态保留 | sidecar core 单跑仍是 server-only 模式 | 强制只在 Tauri 里跑 |
+| 操作可见性 | 改变会话 / 上下文 / 历史 / 自动续跑的操作必须在该 agent **聊天窗口**留一行人能看见的记录 | 只打日志、只改库、只动占用条 / chip / WS 状态的静默后台操作 |
 
 如果用户提出与上述冲突的新方向，**先暴露冲突**，再行动。
 
@@ -135,6 +136,7 @@
 - **共享类型放 `shared/`**：前后端都要用的（如 `LayoutNode`、`ClientMsg`、`ServerMsg`）放 `shared/` 而不是各自定义。
 - **WebSocket 协议改动**必须同步更新 `shared/src/protocol.ts` 和 [`docs/plans/agent-orchestrator-plan.md`](docs/plans/agent-orchestrator-plan.md) §4.2。
 - **Schema 改动**：node:sqlite 直接写迁移 SQL 到 `core/src/db.ts` 的 `SCHEMA` 常量；改完手动测一次"删 db → 启动 → 自动建表 + 跑一轮基础 CRUD"。
+- **禁止静默操作**：自动 compact、清 session、Loop 续跑、自动恢复等必须在聊天窗口出现可见记录。占用条和 LOOP chip 不算已经告诉用户。写入走该回合的 `seq` 游标，不要另开 `nextMessageSeq` 旁路。
 
 ### 3.3 测试要求
 

@@ -11,9 +11,10 @@ const queuedMessages: unknown[][] = [];
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(() => {
     const msgs = queuedMessages.shift() ?? [];
-    return (async function* () {
+    const stream = (async function* () {
       for (const m of msgs) yield m;
     })();
+    return Object.assign(stream, { close() {} });
   }),
 }));
 
@@ -115,6 +116,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   if (previousClaudeConfigDir === undefined) {
     delete process.env.CLAUDE_CONFIG_DIR;
   } else {
@@ -146,6 +148,31 @@ describe("ClaudeAgentRuntime baseline", () => {
     }
 
     expect(events).toEqual(["system", "stream_event", "assistant", "result"]);
+  });
+
+  it("retries an overloaded result before any user-visible output", async () => {
+    vi.useFakeTimers();
+    queuedMessages.push([
+      { type: "system", subtype: "init", session_id: "abc" },
+      { type: "result", subtype: "error", is_error: true, errors: ["overloaded_error"] },
+    ]);
+    queuedMessages.push([
+      { type: "system", subtype: "init", session_id: "abc" },
+      { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } },
+      { type: "result", subtype: "success" },
+    ]);
+    const events: string[] = [];
+    const rt = new ClaudeAgentRuntime();
+    const done = (async () => {
+      for await (const ev of rt.query(baseOpts())) {
+        if (ev.type === "sdk_message") events.push(String(ev.payload.type));
+      }
+    })();
+    await vi.advanceTimersByTimeAsync(2000);
+    await done;
+    vi.useRealTimers();
+    expect(vi.mocked(query).mock.calls.length).toBe(2);
+    expect(events).toEqual(["system", "system", "assistant", "result"]);
   });
 
   it("puts local-rebuild history into the SDK prompt when no CLI session is resumed", async () => {

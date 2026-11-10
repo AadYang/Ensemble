@@ -42,6 +42,7 @@ const agent: AgentSummary = {
   disabledSkills: [],
   closed: false,
   hasResumeInfo: false,
+  sortOrder: 0,
   createdAt: "2026-09-15T00:00:00.000Z",
 };
 
@@ -50,6 +51,7 @@ const team: TeamSummary = {
   name: "Team",
   description: null,
   memberIds: ["agent-1"],
+  sortOrder: 0,
   createdAt: "2026-09-15T00:00:00.000Z",
 };
 
@@ -74,6 +76,16 @@ describe("gate 7: what the upload carries", () => {
     expect(new Set(Object.keys(uploaded!))).toEqual(
       new Set([...CLOUD_AGENT_FIELDS, ...CLOUD_AGENT_SERVER_FIELDS]),
     );
+  });
+
+  it("uploads the stored sidebar order, not the array index", () => {
+    const snapshot = buildCloudSnapshotFromLocal({
+      agents: [{ ...agent, sortOrder: 7 }],
+      teams: [{ ...team, sortOrder: 3 }],
+      messagesByAgent: {},
+    });
+    expect(snapshot.agents[0]!.sortOrder).toBe(7);
+    expect(snapshot.teams[0]!.sortOrder).toBe(3);
   });
 
   it("signs exactly the fields it uploads", () => {

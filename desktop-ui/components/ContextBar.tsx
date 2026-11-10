@@ -1,7 +1,7 @@
 "use client";
 
 import type { CapabilityViewModel, ContextUsage } from "@agentorch/shared";
-import { contextBarView, CONTEXT_BAR_SEGMENTS } from "@agentorch/shared";
+import { contextBarView, CONTEXT_BAR_SEGMENTS, formatTokens } from "@agentorch/shared";
 import { useT } from "@/i18n/useT";
 
 const TONE_COLOR: Record<string, string> = {
@@ -57,6 +57,22 @@ export function ContextBar({
         </span>
         <span>0%</span>
         <span>0/{planWindow}</span>
+      </span>
+    );
+  }
+
+  const advertised = capability?.planView?.context.advertisedContextWindow;
+  if (advertised && advertised > 0) {
+    const advertisedText = formatTokens(advertised);
+    return (
+      <span
+        className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--text-dim)]"
+        title={t("pane.context.tipUnknownCeiling", { used: "0", advertised: advertisedText })}
+      >
+        <span className="font-mono" style={{ color: TONE_COLOR.dim }}>
+          {EMPTY_GLYPH}
+        </span>
+        <span>{t("pane.context.max", { advertised: advertisedText })}</span>
       </span>
     );
   }

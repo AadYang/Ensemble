@@ -21,7 +21,8 @@ export function CloudAgentTree({
       byTeam.set(key, [...(byTeam.get(key) ?? []), agent]);
     }
     return {
-      teams: teams
+      teams: [...teams]
+        .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name))
         .map((team) => ({
           team,
           agents: (byTeam.get(team.id) ?? []).sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name)),

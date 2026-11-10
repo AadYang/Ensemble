@@ -28,9 +28,42 @@ export interface CodexTurnContext {
   promptTokens: number;
   /** Subset of `promptTokens` that was served from cache (billing only). */
   cachedInputTokens: number;
+  /** Tokens currently in the model's context window. Codex CLI reads
+   *  `last_token_usage.total_tokens` (`tokens_in_context_window`). This is the
+   *  bar's numerator — not input-only, not a local char estimate. */
+  occupancyTokens: number;
   /** Window the backend declared for this model, or null when the event
    *  didn't carry one. */
   contextWindow: number | null;
+}
+
+/** What Codex treats as "tokens in the context window" for one `last_token_usage`.
+ *  Prefer `total_tokens` (what the TUI's occupancy meter reads). When an older
+ *  event omits it, reconstruct input + output; `reasoning_output_tokens` is a
+ *  subset of output unless output is missing. */
+export function occupancyFromLastTokenUsage(last: unknown): number {
+  if (!last || typeof last !== "object") return 0;
+  const rec = last as Record<string, unknown>;
+  const total = asNonNegativeInteger(rec.total_tokens);
+  if (total > 0) return total;
+  const input = asNonNegativeInteger(rec.input_tokens);
+  const output = asNonNegativeInteger(rec.output_tokens);
+  const reasoning = asNonNegativeInteger(rec.reasoning_output_tokens);
+  return input + (output > 0 ? output : reasoning);
+}
+
+export function occupancyFromCodexTokenCountEvent(
+  ev: unknown,
+): { used: number; window: number | null } | null {
+  if (!ev || typeof ev !== "object") return null;
+  const rec = ev as { info?: unknown };
+  const info = rec.info && typeof rec.info === "object" ? rec.info : ev;
+  if (!info || typeof info !== "object") return null;
+  const last = (info as { last_token_usage?: unknown }).last_token_usage;
+  const used = occupancyFromLastTokenUsage(last);
+  if (used <= 0) return null;
+  const window = asNonNegativeInteger((info as { model_context_window?: unknown }).model_context_window);
+  return { used, window: window > 0 ? window : null };
 }
 
 /**
@@ -56,19 +89,19 @@ export function parseCodexTurnContextTail(tail: string): CodexTurnContext | null
     if (!payload || typeof payload !== "object") continue;
     const info = (payload as { type?: unknown; info?: unknown }).info;
     if (!info || typeof info !== "object") continue;
+    const occupancy = occupancyFromCodexTokenCountEvent({ info });
+    if (!occupancy) continue;
     const last = (info as { last_token_usage?: unknown }).last_token_usage;
-    if (!last || typeof last !== "object") continue;
-    const promptTokens = asNonNegativeInteger((last as { input_tokens?: unknown }).input_tokens);
-    if (promptTokens <= 0) continue;
-    const window = asNonNegativeInteger(
-      (info as { model_context_window?: unknown }).model_context_window,
+    const promptTokens = asNonNegativeInteger(
+      last && typeof last === "object" ? (last as { input_tokens?: unknown }).input_tokens : 0,
     );
     return {
-      promptTokens,
+      promptTokens: promptTokens > 0 ? promptTokens : occupancy.used,
       cachedInputTokens: asNonNegativeInteger(
-        (last as { cached_input_tokens?: unknown }).cached_input_tokens,
+        last && typeof last === "object" ? (last as { cached_input_tokens?: unknown }).cached_input_tokens : 0,
       ),
-      contextWindow: window > 0 ? window : null,
+      occupancyTokens: occupancy.used,
+      contextWindow: occupancy.window,
     };
   }
   return null;

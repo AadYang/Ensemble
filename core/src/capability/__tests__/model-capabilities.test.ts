@@ -360,6 +360,46 @@ describe("resolveModelCapabilities", () => {
   // The other half of the same rule: no evidence is not "no support". The plan
   // must not claim a model lacks a level it simply has no data for, because a
   // user-declared token is then allowed through as unverified.
+  it("uses the CLI max_context_window as advertised when the catalog has no confirmed entry", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "gpt-6.1-sol",
+      runtime: "codex",
+      discoveredModel: {
+        id: "gpt-6.1-sol",
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      },
+    });
+    expect(facts.advertisedContextWindow.value).toBe(872_000);
+    expect(facts.advertisedContextWindow.origin).toBe("provider-discovered");
+    expect(facts.advertisedContextWindow.confidence).toBe("observed");
+    expect(facts.runtimeEffectiveWindow.value).toBeUndefined();
+  });
+
+  it("keeps a confirmed catalog advertised figure instead of the CLI backend cap", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      discoveredModel: {
+        id: "gpt-5.6-sol",
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      },
+    });
+    expect(facts.advertisedContextWindow.value).toBe(1_050_000);
+    expect(facts.advertisedContextWindow.origin).toBe("catalog-confirmed");
+  });
+
+  it("uses a Claude CLI contextWindow for an alias the catalog does not know", () => {
+    const { facts } = m.resolveModelCapabilities({
+      model: "some-claude-alias",
+      runtime: "claude",
+      discoveredModel: { id: "some-claude-alias", contextWindow: 1_000_000 },
+    });
+    expect(facts.advertisedContextWindow.value).toBe(1_000_000);
+    expect(facts.advertisedContextWindow.origin).toBe("provider-discovered");
+  });
+
   it("uses the provider catalog's effort ladder for a CLI alias like opus", () => {
     const { facts } = m.resolveModelCapabilities({
       model: "opus",

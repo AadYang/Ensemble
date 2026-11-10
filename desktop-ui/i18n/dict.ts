@@ -108,6 +108,8 @@ const en: Dict = {
   "agent.empty": "no agents yet",
   "agent.bound.tooltip": "currently attached to a pane",
   "agent.notBound.tooltip": "not on screen",
+  "sidebar.reorder.team": "drag to reorder teams",
+  "sidebar.reorder.agent": "drag to reorder agents in this group",
   "agent.badge.background": "BG",
   "agent.badge.background.tip": "background task — a detached subagent spawned by its parent; runs on its own",
   "agent.badge.task": "SUB",
@@ -813,6 +815,8 @@ const zh: Dict = {
   // sidebar agent
   "agent.create": "+ 新建 agent",
   "agent.attachHint": "点击 agent → 绑定到活跃 pane（{paneId}）",
+  "sidebar.reorder.team": "拖动以调整团队顺序",
+  "sidebar.reorder.agent": "拖动以调整本组 agent 顺序",
   "team.create": "+ 团队",
   "team.addMember.title": "给这个团队加成员",
   "team.add.title": `往 "{team}" 加成员`,
