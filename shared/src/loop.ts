@@ -53,6 +53,29 @@ export interface LoopTask {
   done: boolean;
 }
 
+export type ReviewRole = "reviewer" | "developer";
+export type ReviewItemStatus = "open" | "resolved";
+export type ReviewBoardStatus = "open" | "lgtm";
+
+export interface ReviewReply {
+  author: ReviewRole;
+  text: string;
+}
+
+export interface ReviewItem {
+  id: string;
+  status: ReviewItemStatus;
+  title: string;
+  replies: ReviewReply[];
+}
+
+export interface ReviewBoard {
+  status: ReviewBoardStatus;
+  items: ReviewItem[];
+}
+
+export type ReviewToolAction = "read" | "post" | "reply" | "resolve" | "lgtm";
+
 export interface LoopState {
   iter: number;
   innerTurns: number;
@@ -63,6 +86,7 @@ export interface LoopState {
   /** Checked items as of the previous turn; retained for existing saved states. */
   lastDoneCount: number;
   lastProgressFingerprint: string | null;
+  lastRunnerSummary: string;
   iterations: LoopIteration[];
 }
 
@@ -79,6 +103,7 @@ export interface LoopView {
   lastVerifySummary: string;
   lastSnapshot: string | null;
   tasks: LoopTask[];
+  review: ReviewBoard;
   iterations: LoopIteration[];
 }
 
@@ -192,6 +217,7 @@ export function emptyLoopState(): LoopState {
     lastSnapshot: null,
     lastDoneCount: 0,
     lastProgressFingerprint: null,
+    lastRunnerSummary: "",
     iterations: [],
   };
 }
@@ -226,6 +252,7 @@ export function parseLoopState(raw: unknown): LoopState {
     lastDoneCount:
       typeof r.lastDoneCount === "number" && r.lastDoneCount >= 0 ? Math.floor(r.lastDoneCount) : 0,
     lastProgressFingerprint: typeof r.lastProgressFingerprint === "string" ? r.lastProgressFingerprint : null,
+    lastRunnerSummary: typeof r.lastRunnerSummary === "string" ? r.lastRunnerSummary : "",
     iterations,
   };
 }
@@ -237,6 +264,7 @@ export function loopViewOf(input: {
   config: LoopConfig;
   state: LoopState;
   tasks?: LoopTask[];
+  review?: ReviewBoard;
 }): LoopView {
   return {
     agentId: input.agentId,
@@ -251,6 +279,7 @@ export function loopViewOf(input: {
     lastVerifySummary: input.state.lastVerifySummary,
     lastSnapshot: input.state.lastSnapshot,
     tasks: input.tasks ?? [],
+    review: input.review ?? emptyReviewBoard(),
     iterations: input.state.iterations,
   };
 }
@@ -274,6 +303,166 @@ export function tasksToMarkdown(tasks: readonly LoopTask[]): string {
   return lines.join("\n") + "\n";
 }
 
+export function emptyReviewBoard(): ReviewBoard {
+  return { status: "open", items: [] };
+}
+
+function lastReviewAuthor(item: ReviewItem): ReviewRole | null {
+  const last = item.replies[item.replies.length - 1];
+  return last?.author ?? null;
+}
+
+export function reviewBoardApproved(board: ReviewBoard): boolean {
+  return board.status === "lgtm" && board.items.every((item) => item.status === "resolved");
+}
+
+export function nextReviewActor(board: ReviewBoard): ReviewRole | null {
+  if (reviewBoardApproved(board)) return null;
+  const needsDeveloper = board.items.some(
+    (item) => item.status === "open" && lastReviewAuthor(item) !== "developer",
+  );
+  return needsDeveloper ? "developer" : "reviewer";
+}
+
+export function parseReviewMarkdown(text: string): ReviewBoard {
+  const board = emptyReviewBoard();
+  let current: ReviewItem | null = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const status = /^Status:\s*(LGTM|open|awaiting)\s*$/i.exec(line);
+    if (status) {
+      board.status = /^lgtm$/i.test(status[1] ?? "") ? "lgtm" : "open";
+      continue;
+    }
+    if (/^##\s*LGTM\s*$/i.test(line)) {
+      board.status = "lgtm";
+      continue;
+    }
+    const heading = /^##\s+(R\d+)\s+\[(open|resolved)\]\s+(.+?)\s*$/i.exec(line);
+    if (heading) {
+      current = {
+        id: heading[1]!.toUpperCase(),
+        status: heading[2]!.toLowerCase() === "resolved" ? "resolved" : "open",
+        title: heading[3]!.trim(),
+        replies: [],
+      };
+      board.items.push(current);
+      continue;
+    }
+    const reply = /^-\s+(reviewer|developer)\s*:\s*(.*)$/i.exec(line);
+    if (reply && current) {
+      current.replies.push({
+        author: reply[1]!.toLowerCase() === "developer" ? "developer" : "reviewer",
+        text: reply[2]!.trim(),
+      });
+    }
+  }
+  if (board.status === "lgtm" && board.items.some((item) => item.status === "open")) {
+    board.status = "open";
+  }
+  return board;
+}
+
+export function reviewBoardToMarkdown(board: ReviewBoard): string {
+  const lines = ["# LOOP Review Board", "", `Status: ${board.status === "lgtm" ? "LGTM" : "open"}`, ""];
+  for (const item of board.items) {
+    lines.push(`## ${item.id} [${item.status}] ${item.title}`);
+    for (const reply of item.replies) {
+      lines.push(`- ${reply.author}: ${reply.text}`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd() + "\n";
+}
+
+function nextReviewItemId(board: ReviewBoard): string {
+  let max = 0;
+  for (const item of board.items) {
+    const n = Number(/^R(\d+)$/i.exec(item.id)?.[1] ?? 0);
+    if (n > max) max = n;
+  }
+  return `R${max + 1}`;
+}
+
+export function applyReviewAction(
+  board: ReviewBoard,
+  role: ReviewRole,
+  op: { action: ReviewToolAction; itemId?: string; title?: string; text?: string },
+): { ok: true; board: ReviewBoard } | { ok: false; error: string } {
+  if (op.action === "read") return { ok: true, board };
+  if (op.action === "post") {
+    if (role !== "reviewer") return { ok: false, error: "only the reviewer can post a finding; reply under an item instead" };
+    const title = (op.title ?? "").trim() || (op.text ?? "").trim().split(/\r?\n/)[0]?.slice(0, 120) || "finding";
+    const text = (op.text ?? "").trim();
+    if (!text) return { ok: false, error: "post requires text" };
+    const item: ReviewItem = {
+      id: nextReviewItemId(board),
+      status: "open",
+      title,
+      replies: [{ author: "reviewer", text }],
+    };
+    return { ok: true, board: { status: "open", items: [...board.items, item] } };
+  }
+  if (op.action === "reply") {
+    const id = (op.itemId ?? "").trim().toUpperCase();
+    const text = (op.text ?? "").trim();
+    if (!id) return { ok: false, error: "reply requires itemId" };
+    if (!text) return { ok: false, error: "reply requires text" };
+    const idx = board.items.findIndex((item) => item.id.toUpperCase() === id);
+    if (idx < 0) return { ok: false, error: `no review item ${id}` };
+    const items = board.items.map((item, i) =>
+      i === idx ? { ...item, replies: [...item.replies, { author: role, text }] } : item,
+    );
+    return { ok: true, board: { ...board, items } };
+  }
+  if (op.action === "resolve") {
+    if (role !== "reviewer") return { ok: false, error: "only the reviewer can resolve an item" };
+    const id = (op.itemId ?? "").trim().toUpperCase();
+    if (!id) return { ok: false, error: "resolve requires itemId" };
+    const idx = board.items.findIndex((item) => item.id.toUpperCase() === id);
+    if (idx < 0) return { ok: false, error: `no review item ${id}` };
+    const items = board.items.map((item, i) => (i === idx ? { ...item, status: "resolved" as const } : item));
+    return { ok: true, board: { ...board, items } };
+  }
+  if (op.action === "lgtm") {
+    if (role !== "reviewer") return { ok: false, error: "only the reviewer can mark LGTM" };
+    if (board.items.some((item) => item.status === "open")) {
+      return { ok: false, error: "resolve every open item before LGTM" };
+    }
+    return { ok: true, board: { ...board, status: "lgtm" } };
+  }
+  return { ok: false, error: `unknown action ${String(op.action)}` };
+}
+
+export function reviewBoardNotices(prev: ReviewBoard, next: ReviewBoard): string[] {
+  const notices: string[] = [];
+  const prevById = new Map(prev.items.map((item) => [item.id, item]));
+  for (const item of next.items) {
+    const old = prevById.get(item.id);
+    if (!old) {
+      notices.push(`LOOP 审阅黑板 · 新意见 ${item.id}: ${item.title}`);
+      continue;
+    }
+    if (item.replies.length > old.replies.length) {
+      for (const reply of item.replies.slice(old.replies.length)) {
+        notices.push(
+          reply.author === "developer"
+            ? `LOOP 审阅黑板 · ${item.id} 开发已回复`
+            : `LOOP 审阅黑板 · ${item.id} 审阅已回复`,
+        );
+      }
+    }
+    if (old.status === "open" && item.status === "resolved") {
+      notices.push(`LOOP 审阅黑板 · ${item.id} 已结案`);
+    }
+  }
+  if (prev.status !== "lgtm" && next.status === "lgtm") {
+    notices.push("LOOP 审阅黑板 · LGTM");
+  }
+  return notices;
+}
+
 export function fileMarkerHit(text: string, marker: string): boolean {
   const needle = marker.trim() || "## DONE";
   return text.includes(needle) || text.includes("ALL_COMPLETE");
@@ -295,6 +484,11 @@ export function loopStartPrompt(config: LoopConfig): string {
     "- Write ## DONE in TASKS.md only when every item is done and the entire goal is met. Do not write it early.",
     "- Do not stop just because you described a plan.",
   ];
+  if (config.reviewerAgentId) {
+    lines.push(
+      "- After ## DONE, Ensemble opens a LOOP review board. Do not peer_send the reviewer. Use loop_review to read findings and reply under each open item.",
+    );
+  }
   if (config.verifier) {
     lines.push(
       `- Ensemble may run this check: ${config.verifier.kind} ${config.verifier.spec}. Do not write ## DONE if it would fail.`,
@@ -376,7 +570,7 @@ export function decideLoopAfterVerify(input: {
     }
     return {
       action: "awaiting_review",
-      userInput: `Please review this loop against the goal:\n${config.goal}\n\nReply LGTM if it is done, otherwise list what to fix.`,
+      userInput: `Please review this loop on the LOOP review board. Use loop_review. Do not peer_send.\nGoal:\n${config.goal}`,
     };
   }
 

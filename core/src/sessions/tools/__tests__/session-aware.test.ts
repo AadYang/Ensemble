@@ -204,6 +204,7 @@ describe("session-aware tools never gate", () => {
   it.each([
     ["default", "peer_send"],
     ["default", "peer_query"],
+    ["default", "loop_review"],
     ["default", "conversation_search"],
     ["default", "ask_user"],
     ["default", "Task"],

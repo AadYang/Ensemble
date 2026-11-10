@@ -9,6 +9,7 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
   const t = useT();
   const last = loop.lastVerifyOk;
   const done = loop.tasks.filter((task) => task.done).length;
+  const review = loop.review ?? { status: "open" as const, items: [] };
   const [capDraft, setCapDraft] = useState(String(loop.maxIterations));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -97,6 +98,42 @@ export function LoopBoard({ agentId, loop }: { agentId: string; loop: LoopView }
           </span>
         </label>
       ))}
+      {(loop.status === "awaiting_review" || review.items.length > 0 || review.status === "lgtm") && (
+        <>
+          <div className="flex items-center justify-between mt-3 mb-1">
+            <span className="text-[var(--text-faint)] tracking-wider uppercase">{t("loop.board.review")}</span>
+            <span
+              className={
+                review.status === "lgtm" ? "text-[var(--ok)]" : "text-[var(--text-dim)] tabular-nums"
+              }
+            >
+              {review.status === "lgtm"
+                ? t("loop.board.reviewLgtm")
+                : `${review.items.filter((item) => item.status === "open").length}/${review.items.length}`}
+            </span>
+          </div>
+          {review.items.length === 0 && (
+            <div className="text-[var(--text-dim)] mb-2">{t("loop.board.reviewEmpty")}</div>
+          )}
+          {review.items.map((item) => (
+            <details key={item.id} className="border-b border-dashed border-[var(--border)] py-0.5">
+              <summary className="flex justify-between gap-2 cursor-pointer text-[var(--text)] hover:text-[var(--accent)]">
+                <span className="min-w-0 break-words">
+                  {item.id} {item.title}
+                </span>
+                <span className={item.status === "open" ? "text-[var(--warn)] shrink-0" : "text-[var(--ok)] shrink-0"}>
+                  {item.status === "open" ? t("loop.board.reviewOpen") : t("loop.board.reviewResolved")}
+                </span>
+              </summary>
+              <div className="pl-3 pr-1 pb-1 text-[var(--text-dim)] whitespace-pre-wrap break-words">
+                {item.replies.length === 0
+                  ? "—"
+                  : item.replies.map((reply) => `${reply.author}: ${reply.text}`).join("\n")}
+              </div>
+            </details>
+          ))}
+        </>
+      )}
       <div className="text-[var(--text-faint)] tracking-wider uppercase mt-3 mb-1">{t("loop.board.iters")}</div>
       {loop.iterations.map((it, idx) => (
         // `n` restarts after a manual reset, so it is not unique.

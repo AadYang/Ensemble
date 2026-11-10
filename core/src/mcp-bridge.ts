@@ -39,6 +39,7 @@ import {
   type JobToolContext,
 } from "./jobs.js";
 import { backgroundSubagentStartedText } from "./sessions/subagentFinish.js";
+import { LOOP_REVIEW_ACTIONS, LOOP_REVIEW_DESCRIPTION, type LoopReviewArgs } from "./loop-review-tool.js";
 
 export const BRIDGE_TOKEN = randomUUID();
 // The internal Fastify route. Other API routes in core/src/index.ts are
@@ -97,6 +98,7 @@ export interface BridgeHandlers {
     causalRunId?: string;
   }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
+  loopReview?: (args: LoopReviewArgs) => Promise<string>;
   /** Blocking peer question. Parks the tool call until the answer arrives;
    *  a timeout is returned as a tool error, never as a silent success. */
   peerAsk?: (args: {
@@ -160,6 +162,7 @@ export function unregisterHandlers(agentId: string): void {
 export type InternalToolName =
   | "peer_send"
   | "peer_query"
+  | "loop_review"
   | "peer_ask"
   | "conversation_search"
   | "ensemble_help"
@@ -228,6 +231,19 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
         target: String(args.target ?? ""),
         limit: typeof args.limit === "number" ? args.limit : undefined,
       });
+    case "loop_review": {
+      if (!handlers.loopReview) throw new Error("loop_review is not available for this agent");
+      const action = LOOP_REVIEW_ACTIONS.includes(args.action as LoopReviewArgs["action"])
+        ? (args.action as LoopReviewArgs["action"])
+        : "read";
+      return handlers.loopReview({
+        action,
+        itemId: typeof args.itemId === "string" ? args.itemId : undefined,
+        title: typeof args.title === "string" ? args.title : undefined,
+        text: typeof args.text === "string" ? args.text : undefined,
+        runner: typeof args.runner === "string" ? args.runner : undefined,
+      });
+    }
     case "peer_ask": {
       if (!handlers.peerAsk) throw new Error("peer_ask is not available for this agent");
       const result = await handlers.peerAsk({
@@ -364,6 +380,18 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
       limit: z.number().int().min(1).max(50).optional(),
     },
     async (args) => ({ content: [{ type: "text", text: await invoke("peer_query", args) }] }),
+  );
+  mcp.tool(
+    "loop_review",
+    LOOP_REVIEW_DESCRIPTION,
+    {
+      action: z.enum(LOOP_REVIEW_ACTIONS),
+      itemId: z.string().optional(),
+      title: z.string().optional(),
+      text: z.string().optional(),
+      runner: z.string().optional(),
+    },
+    async (args) => ({ content: [{ type: "text", text: await invoke("loop_review", args) }] }),
   );
   mcp.tool(
     "conversation_search",
@@ -559,6 +587,24 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
         },
         async (args) => {
           const text = await peerSend(args);
+          return { content: [{ type: "text", text }] };
+        },
+      );
+    }
+    if (handlers.loopReview) {
+      const loopReview = handlers.loopReview;
+      mcp.tool(
+        "loop_review",
+        LOOP_REVIEW_DESCRIPTION,
+        {
+          action: z.enum(LOOP_REVIEW_ACTIONS),
+          itemId: z.string().optional(),
+          title: z.string().optional(),
+          text: z.string().optional(),
+          runner: z.string().optional(),
+        },
+        async (args) => {
+          const text = await loopReview(args);
           return { content: [{ type: "text", text }] };
         },
       );

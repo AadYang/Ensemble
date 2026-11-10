@@ -125,11 +125,7 @@ const loops = new LoopManager(sessions.jobs, hub, {
   resetRuntimeSession: (id) => sessions.resetRuntimeSession(id),
   persistLoopNotice: (id, text) => sessions.persistLoopNotice(id, text),
   patchAgent: (id, patch) => sessions.patchAgent(id, patch),
-  sendPeerMessage: (from, target, body) =>
-    sessions.sendPeerMessage(from, target, body, "raw", { includeSource: true }),
   toggleAgentSkill: (id, name, action) => sessions.toggleAgentSkill(id, name, action),
-  peerAssistantHighWater: (id) => sessions.peerAssistantHighWater(id),
-  peerQueryLatestAssistant: (id, afterSeq) => sessions.peerQueryLatestAssistant(id, afterSeq),
   isAgentBusy: (id) => sessions.isAgentBusy(id),
 });
 sessions.attachLoops(loops);
@@ -158,6 +154,7 @@ mountMcpBridge(fastify, {
         causalRunId,
       }),
     peerQuery: ({ target, limit }) => sessions.fetchPeerHistory(agentId, target, limit),
+    loopReview: (args) => sessions.loopReview(agentId, args),
     conversationSearch: (args) => sessions.conversationSearch(agentId, args),
   }),
 });

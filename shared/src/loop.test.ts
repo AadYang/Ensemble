@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   LoopConfigError,
+  applyReviewAction,
   decideLoopAfterVerify,
   emptyLoopState,
+  emptyReviewBoard,
   fileMarkerHit,
   loopStartPrompt,
   parseLoopConfig,
+  parseReviewMarkdown,
   parseTasksMarkdown,
+  reviewBoardApproved,
+  reviewBoardToMarkdown,
   reviewLooksLikeLgtm,
   tasksToMarkdown,
 } from "./loop";
@@ -71,6 +76,17 @@ describe("loopStartPrompt", () => {
     expect(text).toContain("TASKS.md");
     expect(text).toContain("first unfinished");
     expect(text).toContain("next iteration");
+  });
+
+  it("tells a reviewed loop to use the board instead of peer_send", () => {
+    const text = loopStartPrompt(
+      parseLoopConfig({
+        goal: "add dark mode",
+        reviewerAgentId: "11111111-1111-4111-8111-111111111111",
+      }),
+    );
+    expect(text).toContain("loop_review");
+    expect(text).toContain("Do not peer_send the reviewer");
   });
 });
 
@@ -254,6 +270,47 @@ describe("tasks markdown", () => {
       { done: false, text: "b" },
     ]);
     expect(parseTasksMarkdown(tasksToMarkdown(parsed))).toEqual(parsed);
+  });
+});
+
+describe("review board markdown", () => {
+  it("round-trips findings and replies", () => {
+    const posted = applyReviewAction(emptyReviewBoard(), "reviewer", {
+      action: "post",
+      title: "missing tests",
+      text: "add a timeout test",
+    });
+    expect(posted.ok).toBe(true);
+    if (!posted.ok) return;
+    const replied = applyReviewAction(posted.board, "developer", {
+      action: "reply",
+      itemId: "R1",
+      text: "added it",
+    });
+    expect(replied.ok).toBe(true);
+    if (!replied.ok) return;
+    const parsed = parseReviewMarkdown(reviewBoardToMarkdown(replied.board));
+    expect(parsed.items).toEqual(replied.board.items);
+    expect(reviewBoardApproved(parsed)).toBe(false);
+  });
+
+  it("refuses LGTM while an item is open", () => {
+    const posted = applyReviewAction(emptyReviewBoard(), "reviewer", {
+      action: "post",
+      title: "nits",
+      text: "fix naming",
+    });
+    expect(posted.ok).toBe(true);
+    if (!posted.ok) return;
+    const lgtm = applyReviewAction(posted.board, "reviewer", { action: "lgtm" });
+    expect(lgtm.ok).toBe(false);
+  });
+
+  it("approves an empty board with LGTM", () => {
+    const lgtm = applyReviewAction(emptyReviewBoard(), "reviewer", { action: "lgtm" });
+    expect(lgtm.ok).toBe(true);
+    if (!lgtm.ok) return;
+    expect(reviewBoardApproved(lgtm.board)).toBe(true);
   });
 });
 

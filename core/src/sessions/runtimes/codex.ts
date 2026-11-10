@@ -787,6 +787,7 @@ export class CodexCliRuntime implements AgentRuntime {
       peerSend: opts.peerSend,
       peerAsk: opts.peerAsk,
       peerQuery: opts.peerQuery,
+      loopReview: opts.loopReview,
       conversationSearch: opts.conversationSearch,
       askUser: opts.askUser,
       spawnTask: opts.spawnTask,
@@ -817,6 +818,7 @@ export class CodexCliRuntime implements AgentRuntime {
       opts.peerSend ||
       opts.peerAsk ||
       opts.peerQuery ||
+      opts.loopReview ||
       opts.conversationSearch ||
       opts.askUser ||
       opts.spawnTask ||

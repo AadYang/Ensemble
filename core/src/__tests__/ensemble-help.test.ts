@@ -74,6 +74,17 @@ describe("buildEnsemblePrimer", () => {
     expect(p).toMatch(/typed text/i);
   });
 
+  it("tells agents to use loop_review instead of peer_send for LOOP review", () => {
+    const p = buildEnsemblePrimer();
+    expect(p).toContain("loop_review");
+    expect(p).toMatch(/NEVER peer_send the reviewer/i);
+    const loop = formatEnsembleHelp("loop");
+    expect(loop).toContain("loop_review");
+    expect(loop).toContain("does NOT inject");
+    const peer = formatEnsembleHelp("peer_messaging");
+    expect(peer).toContain("LOOP review is NOT peer_send");
+  });
+
   it("tells the agent peer_send cannot reach outside the team", () => {
     const p = buildEnsemblePrimer();
     expect(p).toMatch(/TEAM BOUNDARY/i);
