@@ -50,6 +50,16 @@ describe("parseLoopConfig", () => {
     const cfg = parseLoopConfig({ goal: "x", doneWhen: { kind: "exit-0" } });
     expect(cfg.doneWhen).toEqual({ kind: "file-contains", spec: "## DONE" });
   });
+
+  it("selecting a reviewer makes doneWhen wait for LGTM", () => {
+    const cfg = parseLoopConfig({
+      goal: "x",
+      doneWhen: { kind: "file-contains", spec: "## DONE" },
+      reviewerAgentId: "11111111-1111-4111-8111-111111111111",
+    });
+    expect(cfg.doneWhen).toEqual({ kind: "peer-lgtm", spec: "LGTM" });
+    expect(cfg.reviewerAgentId).toBe("11111111-1111-4111-8111-111111111111");
+  });
 });
 
 describe("loopStartPrompt", () => {

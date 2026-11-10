@@ -128,6 +128,9 @@ const loops = new LoopManager(sessions.jobs, hub, {
   sendPeerMessage: (from, target, body) =>
     sessions.sendPeerMessage(from, target, body, "raw", { includeSource: true }),
   toggleAgentSkill: (id, name, action) => sessions.toggleAgentSkill(id, name, action),
+  peerAssistantHighWater: (id) => sessions.peerAssistantHighWater(id),
+  peerQueryLatestAssistant: (id, afterSeq) => sessions.peerQueryLatestAssistant(id, afterSeq),
+  isAgentBusy: (id) => sessions.isAgentBusy(id),
 });
 sessions.attachLoops(loops);
 mountMcpBridge(fastify, {
