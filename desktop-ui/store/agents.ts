@@ -1199,8 +1199,8 @@ export const useStore = create<Store>((set) => ({
             .join("");
         }
         if (text) {
-          // Peer handoff: server attaches `_peerOrigin` for non-raw modes; raw mode
-          // stays on the legacy `[from X] body` text format (parsed in ChatPane).
+          // Peer message: server attaches `_peerOrigin`. Historical continue/
+          // review/fork rows still carry their mode for ChatPane badges.
           let peerOrigin: PeerOrigin | undefined;
           const peerMeta = (msg as { _peerOrigin?: { fromAgentName: string; mode: PeerMode } })._peerOrigin;
           if (peerMeta && typeof peerMeta === "object") {

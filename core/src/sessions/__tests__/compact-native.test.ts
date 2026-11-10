@@ -105,6 +105,9 @@ vi.mock("../runtimes/index.js", async (importOriginal) => ({
 vi.mock("../../cli-config.js", () => ({
   getClaudeCliPath: vi.fn(async () => "mock-claude"),
   getCodexCliPath: vi.fn(async () => "mock-codex"),
+  codexAuthPresent: vi.fn(() => true),
+  CLI_INSTALL_INFO: { claude: "", codex: "" },
+  probeCodexVersion: vi.fn(() => null),
 }));
 
 let prisma: typeof import("../../db.js").prisma;
@@ -210,7 +213,8 @@ describe("compact delegates to the native CLI when a session exists", () => {
 
     const rows = await prisma.message.findMany({ where: { agentId: agent.id }, orderBy: { seq: "asc" } });
     expect(rows.some((row) => JSON.stringify(row.payload).includes("patched the inset"))).toBe(true);
-    expect(rows.some((row) => JSON.stringify(row.payload).includes("native context compacted"))).toBe(true);
+    expect(rows.some((row) => JSON.stringify(row.payload).includes("已自动压缩对话上下文"))).toBe(true);
+    expect(rows.some((row) => JSON.stringify(row.payload).includes("正在压缩对话上下文"))).toBe(true);
     expect(await sessions.listArchivedGenerations(agent.id)).toEqual([]);
   });
 
@@ -475,5 +479,93 @@ describe("compact delegates to the native CLI when a session exists", () => {
     await sessions.sendMessage(agent.id, "openai next");
     expect(captured.every((opts) => opts.prompt !== "/compact")).toBe(true);
     expect(captured.some((opts) => opts.prompt === "openai next")).toBe(true);
+  });
+
+  it("keeps unique seqs when occupancy compact writes a status row before system init", async () => {
+    const root = mkdtempSync(join(tmpdir(), "compact-seq-race-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-seq-race",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    await seedTurns(agent.id);
+    await seedResume(agent.id, agent.systemPrompt ?? "");
+    const sessions = new SessionManager(new StubHub() as never);
+    (sessions as unknown as { setContextUsage: (id: string, usage: object) => void }).setContextUsage(
+      agent.id,
+      { usedTokens: 120_000, contextWindow: 200_000, percent: 60 },
+    );
+    (sessions as unknown as { runtimeResolver: () => unknown }).runtimeResolver = () => ({
+      async *compact(opts: RuntimeOptions) {
+        yield* this.query(opts);
+      },
+      async *query(opts: RuntimeOptions) {
+        captured.push(opts);
+        if (opts.resume && opts.prompt === "/compact") {
+          opts.captureCompactSummary?.("CLI summary of the native session", { trigger: "occupancy" });
+          yield {
+            type: "sdk_message" as const,
+            payload: {
+              type: "system" as const,
+              subtype: "compact_boundary",
+              compact_metadata: { trigger: "occupancy", pre_tokens: 12000 },
+            },
+          };
+          yield {
+            type: "sdk_message" as const,
+            payload: { type: "system" as const, subtype: "status", compact_result: "success" },
+          };
+          yield {
+            type: "sdk_message" as const,
+            payload: { type: "result" as const, subtype: "success", session_id: opts.resume, modelUsage: {} },
+          };
+          return;
+        }
+        yield {
+          type: "sdk_message" as const,
+          payload: { type: "system" as const, subtype: "init", session_id: "after-compact" },
+        };
+        yield {
+          type: "sdk_message" as const,
+          payload: { type: "assistant" as const, message: { content: [{ type: "text", text: "ok" }] } },
+        };
+        yield {
+          type: "sdk_message" as const,
+          payload: { type: "result" as const, subtype: "success", session_id: "after-compact", modelUsage: {} },
+        };
+      },
+    });
+
+    await sessions.sendMessage(agent.id, "next after idle");
+
+    const rows = await prisma.message.findMany({
+      where: { agentId: agent.id },
+      orderBy: { seq: "asc" },
+    });
+    const seqs = rows.map((row) => row.seq);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect(
+      rows.some((row) => {
+        const payload = row.payload as { subtype?: string; text?: string };
+        return row.type === "system" && payload.subtype === "compact_status" && payload.text?.includes("正在压缩");
+      }),
+    ).toBe(true);
+    expect(
+      rows.some((row) => {
+        const payload = row.payload as { subtype?: string; text?: string };
+        return row.type === "system" && payload.subtype === "compact_status" && payload.text?.includes("已自动压缩");
+      }),
+    ).toBe(true);
+    expect(
+      rows.some((row) => {
+        const payload = row.payload as { subtype?: string };
+        return row.type === "system" && payload.subtype === "init";
+      }),
+    ).toBe(true);
+    expect((await prisma.agent.findUnique({ where: { id: agent.id } }))?.status).not.toBe("ERROR");
   });
 });

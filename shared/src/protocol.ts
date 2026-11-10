@@ -36,6 +36,8 @@ export interface TeamSummary {
   /** Member agent ids in creation order. Empty if all members deleted but
    *  the team row itself survived. */
   memberIds: string[];
+  /** Sidebar order among teams. Lower is higher. */
+  sortOrder: number;
   createdAt: string;
 }
 
@@ -83,6 +85,8 @@ export interface AgentSummary {
   disabledSkills: string[];
   closed: boolean;
   hasResumeInfo: boolean;
+  /** Sidebar order among siblings in the same team (or ungrouped). */
+  sortOrder: number;
   createdAt: string;
 }
 
@@ -142,6 +146,8 @@ export type PermissionDecision =
 
 // ---- client → server ----
 
+/** Stored on historical `_peerOrigin` rows. New peer_send is always `"raw"`:
+ *  continue / review / fork were retired — say that in the message body. */
 export type PeerMode = "continue" | "review" | "fork" | "raw";
 export type PeerIncludeSource = boolean | "auto";
 export type PeerCorrelationKind = "decision" | "request";
@@ -174,7 +180,9 @@ export type ClientMsg =
       fromSessionId: string;
       targetSessionId: string;
       text: string;
-      mode: PeerMode;
+      /** Ignored. Kept so an older client that still sends continue/review/fork
+       *  is not refused; delivery is always a plain peer_send. */
+      mode?: PeerMode;
       includeSource?: PeerIncludeSource;
       interrupt?: boolean;
       interruptReason?: string;

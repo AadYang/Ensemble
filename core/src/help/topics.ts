@@ -39,7 +39,7 @@ Asking the human (not a teammate):
     as chat text does not wait.
 
 Inter-agent communication (you have these tools):
-  - peer_send (push: continue / review / fork / raw modes). TEAM BOUNDARY:
+  - peer_send (async push; say what you want in the message). TEAM BOUNDARY:
     teamed agents may only reach teammates listed in TEAM CONTEXT — never an
     agent outside the team, even one with the same name.
   - peer_ask (block this turn until a teammate answers). Not a substitute for
@@ -235,16 +235,12 @@ TEAM BOUNDARY (enforced — the tool refuses anything else):
   - Ungrouped agents may only contact other ungrouped agents.
 
 peer_send (async push — recipient processes as a new user turn):
-  modes:
-    - continue: "carry on my work-in-progress"
-    - review:   "audit what I just produced"
-    - fork:     "same task, different approach — don't retrace my path"
-    - raw:      plain forwarding
-  includeSource defaults to "auto": raw sends only the message; continue,
-  review, and fork include a <<<source-output>>> block with the sender's
-  current or most recent key output — verbatim when it fits the recipient's
-  window, otherwise a first-page preview plus an artifact handle (read the rest
-  with artifact_read; the sender's output is stored whole either way).
+  Put the ask in the message (review this, continue from here, try another
+  approach). includeSource=true attaches a <<<source-output>>> block with the
+  sender's current or most recent key output — verbatim when it fits the
+  recipient's window, otherwise a first-page preview plus an artifact handle
+  (read the rest with artifact_read; the sender's output is stored whole
+  either way). Default is the message only.
   interrupt=true is emergency-only and requires interruptReason. Use it only
   when delayed delivery would make the message stale or cause wrong work.
 
@@ -284,10 +280,10 @@ conversation_search (sync lookup - keyword search across prior text):
   - Filters tool-use/tool-result/raw event noise; only user/assistant text
 
 Typical pattern:
-  agent-A peer_send(target=B, mode=review, body="audit this")
-    → B receives the handoff with A's last output embedded
+  agent-A peer_send(target=B, includeSource=true, message="please audit this")
+    → B receives the message with A's last output attached
     → if B needs more context, B peer_query(target=A, limit=30)
-    → if B needs A to clarify, B peer_send(target=A, mode=raw, body="what did you mean by X")
+    → if B needs A to clarify, B peer_send(target=A, message="what did you mean by X")
 `,
 
   slash_commands: `Available slash commands in Ensemble's chat input:
@@ -376,6 +372,12 @@ same workspace. Members can have different roles (system prompts) AND different
 providers/models — that's the headline use: Claude for one role, GPT for
 another, Codex for a third, all coordinated via peer_send / peer_query.
 
+Sidebar order (UI):
+  - Drag the ⠿ handle on a team header or agent row. Teams reorder among
+    teams; agents reorder among siblings in the same team (or ungrouped).
+  - Dragging does not move an agent into another team — use agent settings
+    for membership. Order is stored; new teams/agents append at the bottom.
+
 How to make one (UI):
   - Click "+ 团队" / "+ team" in the sidebar
   - Fill team name + optional description
@@ -389,6 +391,8 @@ How to make one (HTTP API):
   POST   /api/teams                  { name, description? } → { id }
   GET    /api/teams                  list all teams + memberIds
   PATCH  /api/teams/:id              { name?, description? }
+  PATCH  /api/teams/reorder          { ids: [teamId...] }  full team list, new sidebar order
+  PATCH  /api/agents/reorder         { ids: [agentId...] } siblings in one team (or ungrouped)
   DELETE /api/teams/:id              members revert to ungrouped (NOT deleted)
   Then create agents with create_agent WS message + teamId.
 
@@ -548,11 +552,12 @@ Lifecycle (core LoopManager, hooked from SessionManager.sendMessage finally):
   5. Three consecutive unchanged progress observations → paused.
      Hitting maxIterations → paused.
   6. ## DONE present (and optional command green) → LOOP DONE.
-  7. peer-review: the board must be marked done, then peer_send(mode=review) to
-     the reviewer; status=awaiting_review until LGTM (or reject back to the runner).
+  7. peer-review: the board must be marked done, then peer_send to the
+     reviewer (includeSource attaches the runner's latest output);
+     status=awaiting_review until LGTM (or reject back to the runner).
 
 Team Loop: one TASKS.md board, N isolated runners (they do not peer_send
-continue to each other), optional one reviewer, optional git worktree add to a
+work to each other), optional one reviewer, optional git worktree add to a
 sibling directory. Stopping the loop does NOT delete the worktree.
 
 UI: /loop opens the dialog (goal is a textarea; command check is advanced). Header chip shows iter 3/50 plus

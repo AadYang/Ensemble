@@ -48,7 +48,6 @@ export type LoopHost = {
     fromAgentId: string,
     target: string,
     body: string,
-    mode: "review",
   ) => Promise<string>;
   toggleAgentSkill: (agentId: string, name: string, action: "enable" | "disable" | "auto") => Promise<unknown>;
 };
@@ -442,7 +441,7 @@ export class LoopManager {
       const next = this.upsert(agentId, { status: "awaiting_review", config, state });
       this.broadcast(next);
       if (config.reviewerAgentId) {
-        await this.host.sendPeerMessage(agentId, config.reviewerAgentId, decision.userInput, "review");
+        await this.host.sendPeerMessage(agentId, config.reviewerAgentId, decision.userInput);
       }
       await this.host.persistLoopNotice(agentId, "LOOP awaiting review");
       return null;

@@ -21,26 +21,26 @@ const CTX: ToolContext = { projectRoot: process.cwd() };
 
 describe("makePeerSendTool", () => {
   it("each factory call binds its own callback (no cross-talk)", async () => {
-    const calls: Array<{ which: string; target: string; mode?: string }> = [];
-    const sendA = async (args: { target: string; message: string; mode?: "continue" | "review" | "fork" | "raw" }) => {
-      calls.push({ which: "A", target: args.target, mode: args.mode });
+    const calls: Array<{ which: string; target: string }> = [];
+    const sendA = async (args: { target: string; message: string }) => {
+      calls.push({ which: "A", target: args.target });
       return "delivered by A";
     };
-    const sendB = async (args: { target: string; message: string; mode?: "continue" | "review" | "fork" | "raw" }) => {
-      calls.push({ which: "B", target: args.target, mode: args.mode });
+    const sendB = async (args: { target: string; message: string }) => {
+      calls.push({ which: "B", target: args.target });
       return "delivered by B";
     };
     const toolA = makePeerSendTool(sendA);
     const toolB = makePeerSendTool(sendB);
 
     expect(await toolA.execute({ target: "x", message: "m1" }, CTX)).toBe("delivered by A");
-    expect(await toolB.execute({ target: "y", message: "m2", mode: "review" }, CTX)).toBe("delivered by B");
+    expect(await toolB.execute({ target: "y", message: "m2" }, CTX)).toBe("delivered by B");
     expect(await toolA.execute({ target: "z", message: "m3" }, CTX)).toBe("delivered by A");
 
     expect(calls).toEqual([
-      { which: "A", target: "x", mode: undefined },
-      { which: "B", target: "y", mode: "review" },
-      { which: "A", target: "z", mode: undefined },
+      { which: "A", target: "x" },
+      { which: "B", target: "y" },
+      { which: "A", target: "z" },
     ]);
   });
 

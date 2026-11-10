@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { AgentSummary, LoopView, TeamSummary } from "@agentorch/shared";
 import { useAgentDirectory, useStore, type AgentState } from "@/store/agents";
 import { useT } from "@/i18n/useT";
@@ -8,12 +8,27 @@ import { AgentSettings } from "./AgentSettings";
 import { AddTeamMemberDialog } from "./AddTeamMemberDialog";
 import { TeamSettingsDialog } from "./TeamSettingsDialog";
 import { getDialog } from "@/lib/dialog";
-import { deleteTeam } from "@/lib/team-api";
+import { deleteTeam, listTeams, reorderTeams } from "@/lib/team-api";
+import { listAgents, reorderAgents } from "@/lib/agent-api";
 
 interface TreeNode {
   agent: AgentState;
   children: TreeNode[];
 }
+
+type DragItem =
+  | { kind: "team"; id: string }
+  | { kind: "agent"; id: string; group: string };
+
+type DropHint = { kind: DragItem["kind"]; id: string; after: boolean };
+
+const byDirectoryOrder = (
+  a: { sortOrder: number; name: string; createdAt?: string },
+  b: { sortOrder: number; name: string; createdAt?: string },
+): number =>
+  a.sortOrder - b.sortOrder ||
+  (a.createdAt && b.createdAt ? a.createdAt.localeCompare(b.createdAt) : 0) ||
+  a.name.localeCompare(b.name);
 
 const buildTreeFromList = (list: AgentState[]): TreeNode[] => {
   const idSet = new Set(list.map((a) => a.summary.id));
@@ -28,7 +43,7 @@ const buildTreeFromList = (list: AgentState[]): TreeNode[] => {
   }
   const construct = (parent: string | null): TreeNode[] =>
     (byParent.get(parent) ?? [])
-      .sort((x, y) => x.summary.name.localeCompare(y.summary.name))
+      .sort((x, y) => byDirectoryOrder(x.summary, y.summary))
       .map((a) => ({ agent: a, children: construct(a.summary.id) }));
   return construct(null);
 };
@@ -60,7 +75,7 @@ const groupAgents = (agents: Record<string, AgentState>, teams: Record<string, T
     buckets.set(key, bucket);
   }
   const teamGroups = Object.values(teams)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .sort(byDirectoryOrder)
     .map((team) => ({
       team,
       nodes: buildTreeFromList(buckets.get(team.id) ?? []),
@@ -68,6 +83,45 @@ const groupAgents = (agents: Record<string, AgentState>, teams: Record<string, T
   const ungrouped = buildTreeFromList(buckets.get("_none") ?? []);
   return { teams: teamGroups, ungrouped };
 };
+
+function moveId(ids: string[], draggedId: string, targetId: string, after: boolean): string[] {
+  if (draggedId === targetId) return ids;
+  const next = ids.filter((id) => id !== draggedId);
+  const idx = next.indexOf(targetId);
+  if (idx < 0) return ids;
+  next.splice(after ? idx + 1 : idx, 0, draggedId);
+  return next;
+}
+
+function sameOrder(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
+function siblingGroup(teamId: string | null, parentId: string | null): string {
+  return `${teamId ?? "_none"}:${parentId ?? ""}`;
+}
+
+function hitDropTarget(clientX: number, clientY: number): {
+  kind: DragItem["kind"];
+  id: string;
+  group: string;
+  siblings: string[];
+  after: boolean;
+} | null {
+  const node = document.elementFromPoint(clientX, clientY)?.closest("[data-drop-kind]") as HTMLElement | null;
+  if (!node) return null;
+  const kind = node.dataset.dropKind;
+  const id = node.dataset.dropId;
+  if ((kind !== "team" && kind !== "agent") || !id) return null;
+  const rect = node.getBoundingClientRect();
+  return {
+    kind,
+    id,
+    group: node.dataset.dropGroup ?? "",
+    siblings: (node.dataset.dropSiblings ?? "").split(",").filter(Boolean),
+    after: clientY > rect.top + rect.height / 2,
+  };
+}
 
 export function AgentTree({
   onPick,
@@ -87,6 +141,100 @@ export function AgentTree({
   const [collapsedTeams, setCollapsedTeams] = useState<Record<string, boolean>>({});
   const [addMemberTo, setAddMemberTo] = useState<TeamSummary | null>(null);
   const [editingTeam, setEditingTeam] = useState<TeamSummary | null>(null);
+  const [drop, setDrop] = useState<DropHint | null>(null);
+  const dragRef = useRef<DragItem | null>(null);
+
+  const teamIds = grouped.teams.map(({ team }) => team.id);
+
+  const applyTeamOrder = async (ids: string[]) => {
+    if (sameOrder(ids, teamIds)) return;
+    const upsert = useStore.getState().upsertTeam;
+    const current = useStore.getState().teams;
+    ids.forEach((id, i) => {
+      const cur = current[id];
+      if (cur) upsert({ ...cur, sortOrder: i });
+    });
+    try {
+      await reorderTeams(ids);
+    } catch (err) {
+      console.warn("reorder teams failed", err);
+      try {
+        useStore.getState().setTeams(await listTeams());
+      } catch {
+        /* keep optimistic order */
+      }
+    }
+  };
+
+  const applyAgentOrder = async (ids: string[]) => {
+    const upsert = useStore.getState().upsertAgent;
+    const current = useStore.getState().agents;
+    ids.forEach((id, i) => {
+      const cur = current[id];
+      if (cur) upsert({ ...cur.summary, sortOrder: i });
+    });
+    try {
+      await reorderAgents(ids);
+    } catch (err) {
+      console.warn("reorder agents failed", err);
+      try {
+        for (const summary of await listAgents()) upsert(summary);
+      } catch {
+        /* keep optimistic order */
+      }
+    }
+  };
+
+  const beginDrag = (item: DragItem, e: ReactPointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = item;
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const onMove = (ev: PointerEvent) => {
+      const dragging = dragRef.current;
+      const hit = hitDropTarget(ev.clientX, ev.clientY);
+      if (!dragging || !hit || hit.kind !== dragging.kind || (dragging.kind === "agent" && dragging.group !== hit.group)) {
+        setDrop(null);
+        return;
+      }
+      setDrop((prev) =>
+        prev && prev.kind === hit.kind && prev.id === hit.id && prev.after === hit.after
+          ? prev
+          : { kind: hit.kind, id: hit.id, after: hit.after },
+      );
+    };
+
+    const finish = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      const dragging = dragRef.current;
+      dragRef.current = null;
+      setDrop(null);
+      if (!dragging || ev.type === "pointercancel") return;
+      const hit = hitDropTarget(ev.clientX, ev.clientY);
+      if (!hit || hit.kind !== dragging.kind) return;
+      if (dragging.kind === "team") {
+        void applyTeamOrder(moveId(hit.siblings, dragging.id, hit.id, hit.after));
+        return;
+      }
+      if (dragging.group !== hit.group) return;
+      const next = moveId(hit.siblings, dragging.id, hit.id, hit.after);
+      if (sameOrder(next, hit.siblings)) return;
+      void applyAgentOrder(next);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  };
 
   if (Object.keys(agents).length === 0) {
     return <div className="p-3 text-[var(--text-dim)] text-xs">{t("agent.empty")}</div>;
@@ -109,13 +257,19 @@ export function AgentTree({
     <div className="text-xs">
       {grouped.teams.map(({ team, nodes }) => {
         const collapsed = !!collapsedTeams[team.id];
+        const dropHere = drop?.kind === "team" && drop.id === team.id;
         return (
           <div key={team.id} className="border-b border-[var(--border)]">
             <div
-              className="group w-full text-left px-2 py-1.5 flex items-center gap-2 bg-[var(--bg-pane)]/40 hover:bg-[var(--bg-pane)] cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)]"
+              className={`group w-full text-left px-2 py-1.5 flex items-center gap-2 bg-[var(--bg-pane)]/40 hover:bg-[var(--bg-pane)] cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)] ${
+                dropHere ? (drop.after ? "border-b-2 border-b-[var(--accent)]" : "border-t-2 border-t-[var(--accent)]") : ""
+              }`}
               role="button"
               tabIndex={0}
               aria-expanded={!collapsed}
+              data-drop-kind="team"
+              data-drop-id={team.id}
+              data-drop-siblings={teamIds.join(",")}
               onClick={() => setCollapsedTeams((p) => ({ ...p, [team.id]: !collapsed }))}
               onKeyDown={(e) => {
                 if (e.key !== "Enter" && e.key !== " ") return;
@@ -124,6 +278,10 @@ export function AgentTree({
               }}
               title={team.description ?? team.name}
             >
+              <DragHandle
+                title={t("sidebar.reorder.team")}
+                onBegin={(e) => beginDrag({ kind: "team", id: team.id }, e)}
+              />
               <span className="text-[var(--text)] group-hover:text-[var(--accent)]">{collapsed ? "▸" : "▾"}</span>
               <span className="text-[var(--accent)] text-[10px] tracking-wider uppercase">team</span>
               <span className="font-bold text-[var(--text)] truncate flex-1">{team.name}</span>
@@ -183,11 +341,15 @@ export function AgentTree({
                   key={node.agent.summary.id}
                   node={node}
                   depth={0}
+                  group={siblingGroup(team.id, null)}
+                  siblingIds={nodes.map((n) => n.agent.summary.id)}
                   onPick={onPick}
                   activeId={activeId}
                   boundAgentIds={boundAgentIds}
                   onSettings={setSettingsAgentId}
                   loopsByAgent={loopsByAgent}
+                  drop={drop}
+                  onBeginDrag={beginDrag}
                 />
               ))}
           </div>
@@ -203,11 +365,15 @@ export function AgentTree({
           key={node.agent.summary.id}
           node={node}
           depth={0}
+          group={siblingGroup(null, null)}
+          siblingIds={grouped.ungrouped.map((n) => n.agent.summary.id)}
           onPick={onPick}
           activeId={activeId}
           boundAgentIds={boundAgentIds}
           onSettings={setSettingsAgentId}
           loopsByAgent={loopsByAgent}
+          drop={drop}
+          onBeginDrag={beginDrag}
         />
       ))}
       {settingsAgentId && (
@@ -227,22 +393,49 @@ export function AgentTree({
   );
 }
 
+function DragHandle({
+  title,
+  onBegin,
+}: {
+  title: string;
+  onBegin: (e: ReactPointerEvent) => void;
+}) {
+  return (
+    <span
+      title={title}
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={onBegin}
+      className="shrink-0 cursor-grab touch-none select-none text-[var(--text-faint)] hover:text-[var(--accent)] opacity-40 group-hover:opacity-100"
+    >
+      ⠿
+    </span>
+  );
+}
+
 function TreeRow({
   node,
   depth,
+  group,
+  siblingIds,
   onPick,
   activeId,
   boundAgentIds,
   onSettings,
   loopsByAgent,
+  drop,
+  onBeginDrag,
 }: {
   node: TreeNode;
   depth: number;
+  group: string;
+  siblingIds: string[];
   onPick: (a: AgentSummary) => void;
   activeId: string | null;
   boundAgentIds: ReadonlySet<string>;
   onSettings: (id: string) => void;
   loopsByAgent: Record<string, LoopView>;
+  drop: DropHint | null;
+  onBeginDrag: (item: DragItem, e: ReactPointerEvent) => void;
 }) {
   const a = node.agent.summary;
   const loop = loopsByAgent[a.id];
@@ -253,16 +446,26 @@ function TreeRow({
   // silently disappeared.
   const archived = a.subagentKind !== null && a.closed;
   const t = useT();
+  const dropHere = drop?.kind === "agent" && drop.id === a.id;
+  const childIds = node.children.map((c) => c.agent.summary.id);
   return (
     <>
       <div
         onClick={() => onPick(a)}
         className={`group w-full text-left px-2 py-2 border-b border-[var(--border)] flex items-center gap-2 cursor-pointer ${
           activeId === a.id ? "bg-[var(--bg-pane)]" : "hover:bg-[var(--bg-pane)]/50"
-        }`}
+        } ${dropHere ? (drop.after ? "border-b-2 border-b-[var(--accent)]" : "border-t-2 border-t-[var(--accent)]") : ""}`}
         style={{ paddingLeft: `${0.75 + depth * 0.85}rem` }}
         title={bound ? t("agent.bound.tooltip") : t("agent.notBound.tooltip")}
+        data-drop-kind="agent"
+        data-drop-id={a.id}
+        data-drop-group={group}
+        data-drop-siblings={siblingIds.join(",")}
       >
+        <DragHandle
+          title={t("sidebar.reorder.agent")}
+          onBegin={(e) => onBeginDrag({ kind: "agent", id: a.id, group }, e)}
+        />
         {depth > 0 && <span className="text-[var(--text-faint)]">└</span>}
         <span className={`status-dot ${a.status}`} />
         {a.subagentKind && <SubagentBadge kind={a.subagentKind} />}
@@ -299,11 +502,15 @@ function TreeRow({
           key={c.agent.summary.id}
           node={c}
           depth={depth + 1}
+          group={siblingGroup(a.teamId, a.id)}
+          siblingIds={childIds}
           onPick={onPick}
           activeId={activeId}
           boundAgentIds={boundAgentIds}
           onSettings={onSettings}
           loopsByAgent={loopsByAgent}
+          drop={drop}
+          onBeginDrag={onBeginDrag}
         />
       ))}
     </>

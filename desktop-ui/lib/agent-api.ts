@@ -270,3 +270,12 @@ export async function suggestSubagents(
   const body = (await res.json()) as { suggestions: SubagentSuggestion[] };
   return body.suggestions;
 }
+
+export async function reorderAgents(ids: string[]): Promise<void> {
+  const res = await fetch("/api/agents/reorder", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+  if (!res.ok) throw new Error(`reorderAgents: ${res.status}`);
+}

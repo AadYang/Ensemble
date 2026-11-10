@@ -139,6 +139,16 @@ export async function getCodexCliPath(): Promise<string | null> {
   return (await getCliSettingsHealth()).codex.path;
 }
 
+/** Live login file, not the last provider-health snapshot. Codex keeps one
+ *  auth.json per OS user; cloud/UI metadata can lag behind `codex login`. */
+export function codexAuthPath(): string {
+  return join(homedir(), ".codex", "auth.json");
+}
+
+export function codexAuthPresent(): boolean {
+  return existsSync(codexAuthPath());
+}
+
 function validateExecutablePath(path: string, label: string): void {
   if (!existsSync(path)) throw new Error(`${label} does not exist: ${path}`);
   if (!statSync(path).isFile()) throw new Error(`${label} must be a file: ${path}`);
@@ -221,9 +231,9 @@ function detectCli(kind: CliKind, manualPath: string | null): CliHealth {
   const platformKey = currentPlatformKey();
   const installInfo = cliInstallInfo(kind);
   const configPath = kind === "codex" ? join(homedir(), ".codex") : join(homedir(), ".claude");
-  const authPath = kind === "codex" ? join(configPath, "auth.json") : null;
+  const authPath = kind === "codex" ? codexAuthPath() : null;
   const configPresent = existsSync(configPath);
-  const authPresent = authPath ? existsSync(authPath) : undefined;
+  const authPresent = kind === "codex" ? codexAuthPresent() : undefined;
   const base = {
     platformKey,
     kind,

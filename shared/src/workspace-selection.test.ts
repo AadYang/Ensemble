@@ -45,6 +45,7 @@ describe("workspace entity scope", () => {
         name: "Team A",
         description: null,
         memberIds: ["parent", "child"],
+        sortOrder: 0,
         createdAt: "2026-01-01T00:00:00.000Z",
       },
     ]);
@@ -135,6 +136,7 @@ const baseAgent = {
   disabledSkills: [],
   closed: false,
   hasResumeInfo: false,
+  sortOrder: 0,
   createdAt: "2026-01-01T00:00:00.000Z",
 } satisfies Omit<AgentSummary, "id" | "name" | "parentId" | "teamId">;
 
@@ -151,6 +153,7 @@ const teams: TeamSummary[] = [
     name: "Team A",
     description: null,
     memberIds: ["parent", "child", "other"],
+    sortOrder: 0,
     createdAt: "2026-01-01T00:00:00.000Z",
   },
   {
@@ -158,6 +161,7 @@ const teams: TeamSummary[] = [
     name: "Team B",
     description: null,
     memberIds: ["other"],
+    sortOrder: 1,
     createdAt: "2026-01-01T00:00:00.000Z",
   },
 ];

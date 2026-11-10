@@ -164,7 +164,7 @@ describe("mcpServersToCodexConfig", () => {
     registerHandlers("agent-stdio", {
       peerSend: async (args) => {
         observed = args;
-        return `sent:${args.target}:${args.message}:${args.mode ?? "raw"}`;
+        return `sent:${args.target}:${args.message}`;
       },
     });
 
@@ -179,7 +179,6 @@ describe("mcpServersToCodexConfig", () => {
         payload: JSON.stringify({
           target: "A",
           message: "hello",
-          mode: "raw",
           messageId: "msg-1",
           correlationId: "corr-1",
           correlationKind: "decision",
@@ -188,7 +187,7 @@ describe("mcpServersToCodexConfig", () => {
         }),
       });
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toEqual({ content: "sent:A:hello:raw" });
+      expect(JSON.parse(res.body)).toEqual({ content: "sent:A:hello" });
       expect(observed).toMatchObject({
         messageId: "msg-1",
         correlationId: "corr-1",
@@ -246,7 +245,7 @@ describe("mcpServersToCodexConfig", () => {
     const fastify = Fastify({ logger: false });
     mountMcpBridge(fastify, {
       getFallbackHandlers: (agentId) => ({
-        peerSend: async (args) => `fallback:${agentId}:${args.target}:${args.message}:${args.mode ?? "raw"}`,
+        peerSend: async (args) => `fallback:${agentId}:${args.target}:${args.message}`,
         peerQuery: async () => "fallback-history",
         conversationSearch: async (args) => `fallback-search:${agentId}:${args.query}`,
       }),
@@ -260,11 +259,11 @@ describe("mcpServersToCodexConfig", () => {
           authorization: `Bearer ${BRIDGE_TOKEN}`,
           "content-type": "application/json",
         },
-        payload: JSON.stringify({ target: "Engineer", message: "fix bug", mode: "raw" }),
+        payload: JSON.stringify({ target: "Engineer", message: "fix bug" }),
       });
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({
-        content: "fallback:agent-visible:Engineer:fix bug:raw",
+        content: "fallback:agent-visible:Engineer:fix bug",
       });
 
       const search = await fastify.inject({

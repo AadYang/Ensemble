@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS Agent (
   codexWorkspace TEXT,
   projectRoot TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
+  sortOrder INTEGER NOT NULL DEFAULT 0,
   createdAt INTEGER NOT NULL DEFAULT (unixepoch()),
   updatedAt INTEGER NOT NULL DEFAULT (unixepoch())
 );
@@ -278,6 +279,7 @@ CREATE TABLE IF NOT EXISTS Team (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT,
+  sortOrder INTEGER NOT NULL DEFAULT 0,
   createdAt INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -443,6 +445,8 @@ ensureColumn("UsageEvent", "outputTokensLocal", "INTEGER NOT NULL DEFAULT 0");
 // level (PRAGMA foreign_keys is off for AgentUI compatibility); the cascade
 // behavior is implemented in code by the team delete path.
 ensureColumn("Agent", "teamId", "TEXT");
+ensureColumn("Agent", "sortOrder", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("Team", "sortOrder", "INTEGER NOT NULL DEFAULT 0");
 // Phase 4 rework: how many ResultArtifactChunk rows hold this artifact's body.
 // 0 means the body is in `ResultArtifact.body` — which is every row written
 // before chunked bodies existed, so the default is also the migration.
@@ -555,6 +559,8 @@ export interface Agent {
   projectRoot: string | null;
   /** W21: team membership. NULL = ungrouped (preserves all pre-team behavior). */
   teamId: string | null;
+  /** Sidebar order among siblings (same team + effective parent). */
+  sortOrder: number;
   metadata: unknown;
   createdAt: Date;
   updatedAt: Date;
@@ -564,6 +570,7 @@ export interface Team {
   id: string;
   name: string;
   description: string | null;
+  sortOrder: number;
   createdAt: Date;
 }
 
@@ -737,6 +744,7 @@ const mapAgent = (r: Record<string, unknown>): Agent => ({
   codexWorkspace: (r.codexWorkspace as string | null) ?? null,
   projectRoot: (r.projectRoot as string | null) ?? null,
   teamId: (r.teamId as string | null) ?? null,
+  sortOrder: Number(r.sortOrder ?? 0),
   metadata: parseJson(r.metadata as string),
   createdAt: dateOf(r.createdAt as number),
   updatedAt: dateOf(r.updatedAt as number),
@@ -746,6 +754,7 @@ const mapTeam = (r: Record<string, unknown>): Team => ({
   id: r.id as string,
   name: r.name as string,
   description: (r.description as string | null) ?? null,
+  sortOrder: Number(r.sortOrder ?? 0),
   createdAt: dateOf(r.createdAt as number),
 });
 

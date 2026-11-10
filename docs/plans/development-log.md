@@ -4,6 +4,138 @@
 
 ---
 
+## 2026-11-10 · 操作必须出现在窗口，禁止静默后台
+
+**触发**：自动 compact 撞 seq 之后，用户要求：做方案和功能时，所有操作都要显示在窗口，决不允许后台静默。
+
+**根因**：编排层容易把 compact / 清 session / 自动续跑做成「只改库 + 占用条」，窗口里没有一行，用户以为什么都没发生。旁路 `nextMessageSeq` 既看不见（或一闪而过）又和回合游标抢号。
+
+**改动**：定为硬约束（CLAUDE.md / AGENTS.md / `.cursor/rules/visible-operations.mdc`）。自动 compact 在窗口写「正在压缩… / 已压缩 / 失败」；超预算那条不再只靠 `agent_history_reset`。写入走回合 `seq` 游标。新功能先问「窗口里哪一行是这个操作」。占用条和 LOOP chip 不算已经告诉用户。
+
+**留下的规则**：改变会话 / 上下文 / 历史 / 自动续跑，必须在该 agent 聊天窗口留可见记录。写入走回合 `seq` 游标。
+
+---
+
+## 2026-11-10 · MESSAGE_PERSISTENCE_FAILED UNIQUE(agentId, seq)
+
+**触发**：Loop / 长会话自动 compact 之后，窗口报 `could not persist the system message: UNIQUE constraint failed: Message.agentId, Message.seq`。
+
+**根因**：回合在开头把 `seq` 抄进局部变量。占用 ≥50% 时 dispatch 前 native compact 用 `nextMessageSeq()` 另写一行 compact_status，拿走了回合正要给 runtime 第一条 `system`（init）用的号。旧 job 通知、liveness 进 transcript 是同一类偷号；那两条已经改过，compact 这条漏了。现有 occupancy compact 测试只断言调了 `/compact`，不断言 transcript seq 唯一，所以绿着把这个洞留下了。
+
+**改动**：进 runtime stream 前按 DB max 重对 `seq`。persist 若仍撞 UNIQUE，改用 `max+1` 再写一次，并以实际写入的 seq 往后加。
+
+**留下的规则**：回合活着时不要用另一条 `nextMessageSeq` 写 Message，除非写完立刻把回合游标接到 `row.seq+1`。覆盖 compact 的测试必须断言 seq 不重复，且第一条 runtime 事件是 `system`。
+
+---
+
+## 2026-11-09 · 侧栏拖拽排序全程禁止图标
+
+**触发**：按住 ⠿ 拖团队 / agent，光标一直是禁止，放不下。
+
+**根因**：HTML5 DnD。Tauri WebView2 默认开原生文件拖放，会吃掉页内 dragover；`preventDefault` 到不了，系统就画禁止。这不是「只能同组拖」画出来的，是拖放 API 根本没生效。
+
+**改动**：侧栏改用 pointer 拖手柄（mousedown → 命中行 → mouseup 排序）。不再走 HTML5 drag。同组限制还在。
+
+**留下的规则**：桌面 WebView 里的排序不要用 HTML5 DnD。文件拖进窗口和页内排序不是同一套事件。
+
+---
+
+## 2026-11-09 · Codex 已登录仍报 windows-x64 未登录
+
+**触发**：本机 `~/.codex/auth.json` 在，发消息却 `QUERY_FAILED · Codex CLI is not logged in on windows-x64`。
+
+**根因**：sendMessage 信供应商 metadata 里上次健康检查的 `runtimes[windows-x64].authPresent`。那是快照：健康检查 2.5s 超时、登录发生在快照之后、或 `authPresent = cliFound && auth.json` 在 CLI 一时找不到时把登录也写成 false。本机登录文件不是那份 metadata。
+
+**改动**：发消息只看现场的 `codex` 路径和 `~/.codex/auth.json`。健康检查分开记录 CLI 与登录，不再用「没找到 CLI」冒充「没登录」。
+
+**留下的规则**：能不能跑这一轮以本机现场为准。平台 runtime 快照只给 UI 横幅，不要当发送闸门。
+
+---
+
+## 2026-11-06 · 删除 peer_send 承接 / 审阅 / 换路
+
+**触发**：continue / review / fork 是历史交接模板。用户要审阅、承接、换路时直接写在 peer_send 正文里就够，独立通讯方式没有存在必要。
+
+**根因**：四模式把同一条投递切成不同 prompt 模板和 UI 单选。模型要记 mode 枚举；用户要选 radio。LOOP 审阅角色、团队「审阅」职责不是这套 mode，不能一起删。
+
+**改动**：三路工具（peer-mcp / session-aware / mcp-bridge）去掉 `mode`。`formatPeerHandoff` 只剩 `[from name] body`；`includeSource=true` 才附最新输出（LOOP reviewer 仍走这条）。WS `mode` 可选，旧客户端带 continue/review/fork 也不拒，投递一律 raw。Popover 去掉模式单选。历史 `_peerOrigin.mode` 角标仍渲染。
+
+**留下的规则**：通讯方式不要和角色职责绑死。peer_ask、LOOP verifier、团队审阅职责都还在。新功能三条 runtime 同步删/加。
+
+---
+
+## 2026-11-06 · 侧栏团队 / agent 可拖排序
+
+**触发**：左侧列表按创建时间 / 名字排，用户没法把常用团队或角色放到上面。
+
+**根因**：Agent / Team 没有显示顺序字段。树按 `createdAt` 和 `localeCompare(name)` 排。
+
+**改动**：`sortOrder` 列。侧栏 ⠿ 拖动手柄，团队之间、同一团队（或未编组）的同层 agent 之间可调。不改变团队归属或父子关系。新建的追加在组尾。换组时接到新组末尾。云快照带上存储的 sortOrder。
+
+**留下的规则**：显示顺序不是 TEAM CONTEXT。不要因为拖排序清 resume。跨组移动仍走设置里的 team 下拉。
+
+---
+
+## 2026-11-03 · 上下文条必须跟模型自己报的占用走
+
+**触发**：条上的占用和 CLI 看到的对不上。自己造的百分比对观察腐烂/降智没有价值。
+
+**根因**：Claude 把 output 加进占用（CLI `used_percentage` 不含）；Codex 只用 `input_tokens` 再和 `字符/4` 取 max（CLI 读 `last_token_usage.total_tokens`）；compact / 换模型之后下一回合还去种旧 result。
+
+**改动**：Claude 分子 = input+cache。Codex 分子 = `total_tokens`（缺省时 input+output），分母仍是 rollout 的 `model_context_window`；回合中跟 CLI 一样吃 `token_count`。不再用流式字符估计。clear / compact / 换模型后占用作废，直到模型再报。不抄 CLI 底栏减 12k 再算剩余%——那是 TUI 化妆品，不是窗口里的 token。
+
+**留下的规则**：占用是模型属性。条只转发 runtime 报的数。没有报告就显示不知道，不要编。
+
+---
+
+## 2026-11-03 · 模型满载有限退避重试
+
+**触发**：Codex 报 `QUERY_FAILED · Selected model is at capacity. Please try a different model.` 交互 CLI 很少见，同一 ChatGPT 账号上多个 Codex agent 并发时更容易撞上。
+
+**根因**：这是上游槽位拒绝，不是 Ensemble 误分类。交互 TUI 会重试；`codex exec --json` 是一次性的。SessionManager 现有自愈只管 event-stream lag / thread-writer / context overflow，满载会立刻落成 QUERY_FAILED。
+
+**改动**：runtime 内、发出 error 之前重试，最多 3 次（间隔 2s、4s）。只在还没向用户吐出可见输出时重试；中途 abort 取消等待。Claude 的 `overloaded_error` 和 OpenAI 的 429 / 满载句子走同一套检测，避免三条 runtime 行为分叉。用尽后才把原错误交出去。
+
+**留下的规则**：满载重试放在 runtime 里，不要走 SessionManager 的 autoRecover（那会先落 interrupted / QUERY_FAILED）。已经流过 token 就不要重试，避免重复输出。不要把光秃秃的 `overloaded` 或上下文 `capacity` 当成满载。
+
+---
+
+## 2026-11-03 · 换模型后面板顶栏还显示旧模型
+
+**触发**：`/model` 或设置里换模型后，顶栏第二行的模型名和上下文条仍是上一轮的。
+
+**根因**：顶栏优先读 last-turn `run_plan` 的 `identity.modelId`，占用条也绑在那一轮的 `context_usage` 上。换模型只广播了 `agent_updated`，旧计划和占用没丢。
+
+**改动**：模型或供应商变了就丢掉 last-turn 计划、清空占用，并推一份 `fresh-resolution` 计划。前端在计划和当前配置对不上时改显示 `summary.model`，条不再沿用旧占用。
+
+**留下的规则**：last-turn 计划描述的是已经跑过的那一轮。配置改了就不能再当当前身份用。
+
+---
+
+## 2026-11-02 · CLI catalog 的上下文窗口接到能力层
+
+**触发**：`gpt-6.1-sol` 这类新模型每次都要手填窗口；Codex 刷新已经带回 `context_window` / `max_context_window`，能力层没用。Claude Code 同一条路。
+
+**根因**：`requestedRuntimeWindow` 只认 MODEL_CATALOG 的 `confirmed`。CLI 行上的窗口字段没有进 `ProviderModelInfo`。Codex 默认 `context_window` 是小的 serving size（历史上 272k），声明它等于把后端 cap 按回去。
+
+**改动**：解析 `context_window` / `max_context_window` / percent。advertised 在没有 confirmed catalog 时用 CLI 的 max（没有 max 就用单值，Claude 那种）。声明只写 `max_context_window`（或单值），绝不在有 max 时声明小的 default。confirmed 文档值（gpt-5.6-sol 的 1.05M）仍压过 CLI。effective 继续只认 session-observed / runtime-profile，不拿 advertised 当条。Codex `config.toml` 写 planner 已经闸过的数，跟 `-c` 一致。
+
+**留下的规则**：新模型的窗口从 CLI catalog 来，不要为每个 id 改 MODEL_CATALOG。声明 Codex 的 backend cap，不要声明它的 default serving size。刷新供应商后才会写入新字段。
+
+---
+
+## 2026-11-02 · Codex 刷新后思考档位仍是空的
+
+**触发**：Jumpo经理已换成 `gpt-6.1-sol`，刷新 Codex 供应商后模型名有了，思考强度下拉仍是「尚不知道档位」。
+
+**根因**：当前 `codex debug models` 的 `supported_reasoning_levels` 是 `{effort, description}` 对象数组，不是字符串数组。`levelsOf` 只认 string，梯子被整段丢掉，只留下 `defaultReasoningLevel`。同一行里的 `context_window` / `max_context_window` 也还没接入。
+
+**改动**：解析器同时接受字符串和 `{effort}` 对象。Claude Code 仍是字符串数组，不受影响。刷新后会写入 `low/medium/high/xhigh/max/ultra`。
+
+**留下的规则**：CLI catalog 字段形状会变。不要假设梯子是 `string[]`。上下文窗口从同一份 catalog 接入（见上一条）。
+
+---
+
 ## 2026-10-27 · ask_user 只能点按钮
 
 **触发**：问人时用户没法手填路径、说明或「其他」，只能点模型给的选项。

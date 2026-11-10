@@ -4,8 +4,7 @@
 //     level down, so "the parent did not have to ask for this" must stay true
 //     for the child. A child that reset to `default` stopped every delegated
 //     write on an approval popup its parent would never have shown.
-//  2. IT IS PRIVATE TO ITS SPAWNER. Another agent may not hand work to it
-//     (peer_send's continue/review/fork are task handoffs), and a subagent has
+//  2. IT IS PRIVATE TO ITS SPAWNER. Another agent may not peer_send work to it,
 //     exactly ONE link, pointing up: it may contact the agent that spawned it
 //     and nothing else — not other agents, not siblings, and not subagents of
 //     its own. Refusals name the parent as the right recipient.
@@ -169,14 +168,10 @@ describe("2. a subagent is private to the agent that spawned it", () => {
     const child = await makeSubagent(parent.id, "task:audit");
     const sessions = manager();
 
-    for (const mode of ["continue", "review", "fork", "raw"] as const) {
-      const res = await sessions.sendPeerMessage(other.id, child.id, "please do this", mode);
-      // Refused in every mode: `continue` is a handoff, but even `raw` is
-      // another agent addressing someone else's worker.
-      expect(res.startsWith("error:")).toBe(true);
-      expect(res).toContain("subagent of");
-      expect(res).toContain(parent.name);
-    }
+    const res = await sessions.sendPeerMessage(other.id, child.id, "please do this", "raw");
+    expect(res.startsWith("error:")).toBe(true);
+    expect(res).toContain("subagent of");
+    expect(res).toContain(parent.name);
 
     // The interrupt path is a delivery path too — and it cannot be used to get
     // around the rule.

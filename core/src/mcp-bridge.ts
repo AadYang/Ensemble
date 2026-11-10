@@ -87,7 +87,6 @@ export interface BridgeHandlers {
   peerSend?: (args: {
     target: string;
     message: string;
-    mode?: "continue" | "review" | "fork" | "raw";
     includeSource?: PeerIncludeSource;
     interrupt?: boolean;
     interruptReason?: string;
@@ -212,7 +211,6 @@ async function invokeHandlers(handlers: BridgeHandlers, name: InternalToolName, 
       return handlers.peerSend({
         target: String(args.target ?? ""),
         message: String(args.message ?? ""),
-        mode: args.mode === "continue" || args.mode === "review" || args.mode === "fork" || args.mode === "raw" ? args.mode : undefined,
         includeSource: args.includeSource === true || args.includeSource === false || args.includeSource === "auto" ? args.includeSource : undefined,
         interrupt: args.interrupt === true,
         interruptReason: typeof args.interruptReason === "string" ? args.interruptReason : undefined,
@@ -343,11 +341,10 @@ export function createInternalMcpServer(invoke: InternalToolInvoker): McpServer 
   const mcp = new McpServer({ name: "agentorch-internal", version: "1.0.0" });
   mcp.tool(
     "peer_send",
-    "Send a chat message to another agent. If you are on a team, ONLY teammates listed in TEAM CONTEXT — never an agent outside the team, even one with the same name (that is a different agent; the tool refuses it). Ungrouped agents may only contact other ungrouped agents. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
+    "Send a chat message to another agent. If you are on a team, ONLY teammates listed in TEAM CONTEXT — never an agent outside the team, even one with the same name (that is a different agent; the tool refuses it). Ungrouped agents may only contact other ungrouped agents. Put the ask in the message. includeSource=true attaches the sender's latest output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read); default is the message only. interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
     {
       target: z.string().min(1),
       message: z.string().min(1),
-      mode: z.enum(["continue", "review", "fork", "raw"]).optional(),
       includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
       interrupt: z.boolean().optional(),
       interruptReason: z.string().optional(),
@@ -547,11 +544,10 @@ export function mountMcpBridge(fastify: FastifyInstance, options: McpBridgeOptio
       const peerSend = handlers.peerSend;
       mcp.tool(
         "peer_send",
-        "Send a chat message to another agent. If you are on a team, ONLY teammates listed in TEAM CONTEXT — never an agent outside the team, even one with the same name (that is a different agent; the tool refuses it). Ungrouped agents may only contact other ungrouped agents. Modes: continue|review|fork|raw (default raw). includeSource defaults to auto: raw sends only the message, continue/review/fork include the sender's output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read). interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
+        "Send a chat message to another agent. If you are on a team, ONLY teammates listed in TEAM CONTEXT — never an agent outside the team, even one with the same name (that is a different agent; the tool refuses it). Ungrouped agents may only contact other ungrouped agents. Put the ask in the message. includeSource=true attaches the sender's latest output (verbatim when it fits the recipient's window, otherwise a first page plus an artifact handle readable with artifact_read); default is the message only. interrupt=true is emergency-only and requires interruptReason. Subagents are private to their spawner: an agent spawned by another agent can only be messaged by that spawner, and a subagent can message ONLY that one parent — not other agents, not sibling subagents, not subagents of its own.",
         {
           target: z.string().min(1),
           message: z.string().min(1),
-          mode: z.enum(["continue", "review", "fork", "raw"]).optional(),
           includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
           interrupt: z.boolean().optional(),
           interruptReason: z.string().optional(),

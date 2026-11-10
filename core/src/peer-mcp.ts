@@ -10,7 +10,6 @@ export const PEER_ASK_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_ask`;
 export const PEER_QUERY_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__peer_query`;
 export const CONVERSATION_SEARCH_TOOL_NAME = `mcp__${PEER_MCP_SERVER_NAME}__conversation_search`;
 
-const PEER_MODES = ["continue", "review", "fork", "raw"] as const;
 const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
 
 /** Pure closure over `fromAgentId`. Extracted so the closure-binding
@@ -22,7 +21,6 @@ export function makePeerSendHandler(
 ): (args: {
   target: string;
   message: string;
-  mode?: typeof PEER_MODES[number];
   includeSource?: PeerIncludeSource;
   interrupt?: boolean;
   interruptReason?: string;
@@ -33,7 +31,7 @@ export function makePeerSendHandler(
   causalRunId?: string;
 }) => Promise<string> {
   return async (args) =>
-    sessions.sendPeerMessage(fromAgentId, args.target, args.message, args.mode ?? "raw", {
+    sessions.sendPeerMessage(fromAgentId, args.target, args.message, "raw", {
       includeSource: args.includeSource,
       interrupt: args.interrupt,
       interruptReason: args.interruptReason,
@@ -93,25 +91,19 @@ export function makePeerMcpServer(
       "Send a chat message to another agent. If you are on a team, ONLY teammates",
       "listed in TEAM CONTEXT — never an agent outside the team, even one with the",
       "same name (that is a different agent; the tool refuses it). Ungrouped agents",
-      "may only contact other ungrouped agents. If you received a peer-handoff and",
+      "may only contact other ungrouped agents. If you received a peer message and",
       "need more info, you can peer_send back to the source agent; their reply arrives",
       "as a new turn in your chat.",
       "",
-      "Modes, from the sender's perspective:",
-      "  - continue: hand off your work-in-progress; recipient continues from your trajectory.",
-      "  - review:   ask recipient for a second-opinion audit of your work; quote verbatim.",
-      "  - fork:     same task, different approach; recipient should NOT replicate your path.",
-      "  - raw:      plain message forwarding (default).",
-      "",
-      "Source context defaults to includeSource='auto': raw sends only your message;",
-      "continue/review/fork include a <<<source-output>>> block with your current or most",
-      "recent key output — your whole output when it fits the recipient's window, otherwise",
-      "its first page plus an artifact handle (<<<artifact id=… sha256=… bytes=…>>>) that the",
-      "recipient reads in full with artifact_read. Nothing of it is discarded.",
+      "Put the ask in the message (review this, continue from here, try another approach).",
+      "includeSource=true attaches your latest output as a <<<source-output>>> block —",
+      "verbatim when it fits the recipient's window, otherwise its first page plus an",
+      "artifact handle (<<<artifact id=… sha256=… bytes=…>>>) readable with artifact_read.",
+      "Default is the message only.",
       "",
       "interrupt=true is emergency-only: use it only when delayed delivery would make the",
       "message stale or cause the target to continue incorrectly. You must provide",
-      "interruptReason. Ordinary notifications, questions, and handoffs must not interrupt.",
+      "interruptReason. Ordinary notifications and questions must not interrupt.",
       "",
       "Use the target agent's name (preferred) or its UUID.",
       "Subagents are PRIVATE to their spawner: an agent spawned by another agent (Task /",
@@ -126,17 +118,11 @@ export function makePeerMcpServer(
         .string()
         .min(1)
         .describe("Name of a teammate (preferred) or UUID. Outside your team is refused."),
-      message: z.string().min(1).describe("Body of the message to send."),
-      mode: z
-        .enum(PEER_MODES)
-        .optional()
-        .describe(
-          "Handoff semantics: continue|review|fork|raw. Default 'raw' (plain forwarding).",
-        ),
+      message: z.string().min(1).describe("Body of the message to send. Say what you want the recipient to do."),
       includeSource: z
         .union([z.boolean(), z.literal("auto")])
         .optional()
-        .describe("Whether to include source-output. Default 'auto': raw=false, continue/review/fork=true."),
+        .describe("Whether to attach your latest output. Default false. true includes source-output."),
       interrupt: z
         .boolean()
         .optional()

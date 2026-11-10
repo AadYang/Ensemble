@@ -35,3 +35,12 @@ export async function deleteTeam(id: string): Promise<void> {
   const res = await fetch(`/api/teams/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`deleteTeam: ${res.status}`);
 }
+
+export async function reorderTeams(ids: string[]): Promise<void> {
+  const res = await fetch("/api/teams/reorder", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+  if (!res.ok) throw new Error(`reorderTeams: ${res.status}`);
+}

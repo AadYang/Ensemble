@@ -1,0 +1,12 @@
+---
+description: Agent operations must appear in the chat window; never silent background work.
+alwaysApply: true
+---
+
+# 操作必须出现在窗口
+
+凡改变会话、上下文、历史或自动续跑的操作，必须在该 agent 的聊天窗口留下人能看见的记录（对话行，通常是 `system` 文案）。禁止只打日志、只改库、只发占用条 / chip / WS 状态。
+
+包括：自动 compact、清 session、Loop 下一脚、自动恢复、压缩失败。占用条和 LOOP chip **不算**已经告诉用户。
+
+写进 transcript 时走该回合的 `seq` 游标（写完 +1），不要另开 `nextMessageSeq` 旁路，否则会 UNIQUE 撞号且用户仍可能看不见。

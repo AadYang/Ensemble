@@ -37,7 +37,8 @@ ask to load Claude settingSources / MEMORY.md.
 ↑/↓ in the input box walks through your prior inputs for this agent (CLI-style).
 
 Cross-agent communication tools you have:
-  peer_send  → send a message to another agent (modes: continue / review / fork / raw;
+  peer_send  → send a message to another agent (say what you want in the
+               message; includeSource=true attaches your latest output;
                urgent interrupt is available only with a required reason).
                TEAM BOUNDARY: if you are on a team, you may ONLY contact teammates
                listed in TEAM CONTEXT. Never an agent outside the team — even one

@@ -21,6 +21,7 @@ import type {
 import { WSHub } from "./ws/hub.js";
 import {
   agentRowToSummary,
+  isDirectoryOrderError,
   isReasoningRejection,
   isSettingsInvalidationRejection,
   SessionManager,
@@ -124,7 +125,8 @@ const loops = new LoopManager(sessions.jobs, hub, {
   resetRuntimeSession: (id) => sessions.resetRuntimeSession(id),
   persistLoopNotice: (id, text) => sessions.persistLoopNotice(id, text),
   patchAgent: (id, patch) => sessions.patchAgent(id, patch),
-  sendPeerMessage: (from, target, body, mode) => sessions.sendPeerMessage(from, target, body, mode),
+  sendPeerMessage: (from, target, body) =>
+    sessions.sendPeerMessage(from, target, body, "raw", { includeSource: true }),
   toggleAgentSkill: (id, name, action) => sessions.toggleAgentSkill(id, name, action),
 });
 sessions.attachLoops(loops);
@@ -133,7 +135,6 @@ mountMcpBridge(fastify, {
     peerSend: ({
       target,
       message,
-      mode,
       includeSource,
       interrupt,
       interruptReason,
@@ -143,7 +144,7 @@ mountMcpBridge(fastify, {
       replyToCorrelationId,
       causalRunId,
     }) =>
-      sessions.sendPeerMessage(agentId, target, message, mode, {
+      sessions.sendPeerMessage(agentId, target, message, "raw", {
         includeSource,
         interrupt,
         interruptReason,
@@ -191,7 +192,7 @@ const ClientMsgSchema = z.discriminatedUnion("type", [
     fromSessionId: z.string().uuid(),
     targetSessionId: z.string().uuid(),
     text: z.string().min(1),
-    mode: z.enum(["continue", "review", "fork", "raw"]),
+    mode: z.enum(["continue", "review", "fork", "raw"]).optional(),
     includeSource: z.union([z.boolean(), z.literal("auto")]).optional(),
     interrupt: z.boolean().optional(),
     interruptReason: z.string().optional(),
@@ -799,7 +800,7 @@ async function refreshCodexHealth(): Promise<void> {
   const health = await getCliSettingsHealth();
   const platformKey = currentPlatformKey();
   const cliFound = health.codex.found;
-  const authPresent = cliFound && health.codex.authPresent === true;
+  const authPresent = health.codex.authPresent === true;
 
   // Re-discover the codex catalog once per startup so providers always
   // reflect the user's current ChatGPT tier. Also self-heals rows that an
@@ -1546,8 +1547,30 @@ const TeamPatchSchema = z.object({
   description: z.string().nullable().optional(),
 });
 
+const DirectoryReorderSchema = z.object({
+  ids: z.array(z.string().uuid()),
+});
+
 fastify.get("/teams", async () => {
   return sessions.listTeams();
+});
+
+fastify.patch("/teams/reorder", async (req, reply) => {
+  const parsed = DirectoryReorderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  try {
+    await sessions.reorderTeams(parsed.data.ids);
+  } catch (err) {
+    if (isDirectoryOrderError(err)) {
+      reply.code(err.status);
+      return { error: err.message };
+    }
+    throw err;
+  }
+  return { ok: true };
 });
 
 fastify.post("/teams", async (req, reply) => {
@@ -1631,6 +1654,24 @@ const SettingsImpactSchema = z.object({
   maxRunDurationMs: z.number().int().positive().nullable().optional(),
   projectRoot: z.string().optional().nullable(),
   sandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable().optional(),
+});
+
+fastify.patch("/agents/reorder", async (req, reply) => {
+  const parsed = DirectoryReorderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    reply.code(400);
+    return { error: "invalid", detail: parsed.error.issues };
+  }
+  try {
+    await sessions.reorderAgents(parsed.data.ids);
+  } catch (err) {
+    if (isDirectoryOrderError(err)) {
+      reply.code(err.status);
+      return { error: err.message };
+    }
+    throw err;
+  }
+  return { ok: true };
 });
 
 // What a proposed change would COST, before it is made. Read-only: it resolves
@@ -2725,7 +2766,7 @@ fastify.register(async (instance) => {
             break;
           case "peer_send":
             void sessions
-              .sendPeerMessage(parsed.fromSessionId, parsed.targetSessionId, parsed.text, parsed.mode, {
+              .sendPeerMessage(parsed.fromSessionId, parsed.targetSessionId, parsed.text, "raw", {
                 includeSource: parsed.includeSource,
                 interrupt: parsed.interrupt,
                 interruptReason: parsed.interruptReason,

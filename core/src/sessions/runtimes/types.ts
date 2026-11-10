@@ -206,7 +206,6 @@ export interface RuntimeOptions {
   peerSend?: (args: {
     target: string;
     message: string;
-    mode?: "continue" | "review" | "fork" | "raw";
     includeSource?: PeerIncludeSource;
     interrupt?: boolean;
     interruptReason?: string;
