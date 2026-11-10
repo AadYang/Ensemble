@@ -50,11 +50,43 @@ export type LoopHost = {
     body: string,
   ) => Promise<string>;
   toggleAgentSkill: (agentId: string, name: string, action: "enable" | "disable" | "auto") => Promise<unknown>;
+  peerAssistantHighWater: (agentId: string) => number;
+  peerQueryLatestAssistant: (
+    agentId: string,
+    afterSeq: number,
+  ) => Promise<{ seq: number; text: string } | null>;
+  isAgentBusy: (agentId: string) => boolean;
 };
 
 const VERIFY_TIMEOUT_MS = 120_000;
 const JOB_VERIFY_TIMEOUT_MS = 600_000;
+const REVIEW_WAIT_MS = 30 * 60 * 1000;
+const REVIEW_POLL_MS = 2_000;
 const ACTIVE: ReadonlySet<LoopStatus> = new Set(["running", "paused", "awaiting_review"]);
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const fail = () => {
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    if (signal?.aborted) {
+      fail();
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        fail();
+      },
+      { once: true },
+    );
+  });
+}
 
 function rowView(row: AgentLoop, tasks: LoopTask[] = []): LoopView {
   const config = parseLoopConfig(row.config);
@@ -124,13 +156,19 @@ function worktreePathFor(root: string, agentId: string, agentName: string): { pa
 
 export class LoopManager {
   private readonly verifying = new Set<string>();
+  private readonly reviewWaits = new Map<string, AbortController>();
+  private readonly reviewWaitMs: number;
+  private readonly reviewPollMs: number;
 
   constructor(
     private readonly jobs: JobManager,
     private readonly hub: WSHub,
     private readonly host: LoopHost,
+    timings?: { reviewWaitMs?: number; reviewPollMs?: number },
   ) {
     ensureLoopSkills();
+    this.reviewWaitMs = timings?.reviewWaitMs ?? REVIEW_WAIT_MS;
+    this.reviewPollMs = timings?.reviewPollMs ?? REVIEW_POLL_MS;
   }
 
   view(agentId: string): LoopView | null {
@@ -225,6 +263,7 @@ export class LoopManager {
   async stop(agentId: string): Promise<LoopView | null> {
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row) return null;
+    this.abortReviewWait(agentId);
     const config = parseLoopConfig(row.config);
     await this.restorePermission(agentId, config);
     const next = this.upsert(agentId, { status: "done", config, state: parseLoopState(row.state) });
@@ -233,10 +272,12 @@ export class LoopManager {
   }
 
   async pause(agentId: string): Promise<LoopView | null> {
+    this.abortReviewWait(agentId);
     return this.setStatus(agentId, "paused", "LOOP PAUSED");
   }
 
   async resume(agentId: string): Promise<LoopView | null> {
+    this.abortReviewWait(agentId);
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row) return null;
     const config = parseLoopConfig(row.config);
@@ -336,7 +377,6 @@ export class LoopManager {
   }
 
   async onTurnSettled(agentId: string, opts: { lastText: string }): Promise<{ userInput: string } | null> {
-    await this.finishReview(agentId, opts.lastText);
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row || row.status === "done" || row.status === "failed" || row.status === "idle") return null;
     if (row.status === "paused" || row.status === "awaiting_review") return null;
@@ -388,30 +428,76 @@ export class LoopManager {
     }
   }
 
-  private async finishReview(reviewerId: string, lastText: string): Promise<void> {
-    const runners = prisma.agentLoop.findMany().filter((row) => {
-      if (row.status !== "awaiting_review") return false;
-      try {
-        return parseLoopConfig(row.config).reviewerAgentId === reviewerId;
-      } catch {
-        return false;
-      }
+  private abortReviewWait(agentId: string): void {
+    const ctrl = this.reviewWaits.get(agentId);
+    if (!ctrl) return;
+    ctrl.abort();
+    this.reviewWaits.delete(agentId);
+  }
+
+  private startReviewWait(agentId: string, reviewerId: string, afterSeq: number): void {
+    this.abortReviewWait(agentId);
+    const ctrl = new AbortController();
+    this.reviewWaits.set(agentId, ctrl);
+    void this.runReviewWait(agentId, reviewerId, afterSeq, ctrl.signal).finally(() => {
+      if (this.reviewWaits.get(agentId) === ctrl) this.reviewWaits.delete(agentId);
     });
-    for (const row of runners) {
-      const config = parseLoopConfig(row.config);
-      const state = parseLoopState(row.state);
-      const decision = decideLoopAfterVerify({
-        config,
-        state,
-        verifyOk: true,
-        summary: lastText,
-        markerHit: true,
-        hasDiff: true,
-        reviewText: lastText,
-      });
-      const cont = await this.applyDecision(row.agentId, config, state, decision, true);
-      if (cont) void this.host.sendMessage(row.agentId, cont.userInput);
+  }
+
+  private async runReviewWait(
+    agentId: string,
+    reviewerId: string,
+    afterSeq: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const deadline = Date.now() + this.reviewWaitMs;
+    let reviewText: string | null = null;
+    try {
+      while (Date.now() < deadline) {
+        if (signal.aborted) return;
+        const row = prisma.agentLoop.findUnique({ where: { agentId } });
+        if (!row || row.status !== "awaiting_review") return;
+        if (!this.host.isAgentBusy(reviewerId)) {
+          const hit = await this.host.peerQueryLatestAssistant(reviewerId, afterSeq);
+          if (hit?.text.trim()) {
+            reviewText = hit.text.trim();
+            break;
+          }
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await sleep(Math.min(this.reviewPollMs, remaining), signal);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return;
+      throw err;
     }
+    if (signal.aborted) return;
+    const row = prisma.agentLoop.findUnique({ where: { agentId } });
+    if (!row || row.status !== "awaiting_review") return;
+    const config = parseLoopConfig(row.config);
+    const state = parseLoopState(row.state);
+    if (!reviewText) {
+      const minutes = Math.max(1, Math.round(this.reviewWaitMs / 60_000));
+      await this.host.persistLoopNotice(
+        agentId,
+        `LOOP PAUSED · 审阅 ${minutes} 分钟内未返回`,
+      );
+      const paused = this.upsert(agentId, { status: "paused", config, state });
+      this.broadcast(paused);
+      return;
+    }
+    const decision = decideLoopAfterVerify({
+      config,
+      state,
+      verifyOk: true,
+      summary: reviewText,
+      markerHit: true,
+      hasDiff: true,
+      reviewText,
+    });
+    const cont = await this.applyDecision(agentId, config, state, decision, true);
+    if (cont) void this.host.sendMessage(agentId, cont.userInput);
   }
 
   private async applyDecision(
@@ -440,10 +526,17 @@ export class LoopManager {
     if (decision.action === "awaiting_review") {
       const next = this.upsert(agentId, { status: "awaiting_review", config, state });
       this.broadcast(next);
-      if (config.reviewerAgentId) {
-        await this.host.sendPeerMessage(agentId, config.reviewerAgentId, decision.userInput);
+      const reviewerId = config.reviewerAgentId;
+      const afterSeq = reviewerId ? this.host.peerAssistantHighWater(reviewerId) : 0;
+      if (reviewerId) {
+        await this.host.sendPeerMessage(agentId, reviewerId, decision.userInput);
+        this.startReviewWait(agentId, reviewerId, afterSeq);
       }
-      await this.host.persistLoopNotice(agentId, "LOOP awaiting review");
+      const minutes = Math.max(1, Math.round(this.reviewWaitMs / 60_000));
+      await this.host.persistLoopNotice(
+        agentId,
+        `LOOP 已送审，等待审阅结果（最多 ${minutes} 分钟）`,
+      );
       return null;
     }
 

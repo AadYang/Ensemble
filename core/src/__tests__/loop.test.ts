@@ -31,10 +31,18 @@ function mockHub(): WSHub {
   return { sendToSession: () => undefined, broadcast: () => undefined } as unknown as WSHub;
 }
 
-function mockHost(): LoopHost & { calls: string[] } {
+function mockHost(): LoopHost & {
+  calls: string[];
+  assistantAfter: Map<string, { seq: number; text: string }>;
+  busy: Set<string>;
+} {
   const calls: string[] = [];
+  const assistantAfter = new Map<string, { seq: number; text: string }>();
+  const busy = new Set<string>();
   return {
     calls,
+    assistantAfter,
+    busy,
     sendMessage: async (id, text) => {
       calls.push(`send:${id}:${text.slice(0, 40)}`);
     },
@@ -42,7 +50,7 @@ function mockHost(): LoopHost & { calls: string[] } {
       calls.push(`reset:${id}`);
     },
     persistLoopNotice: async (id, text) => {
-      calls.push(`notice:${id}:${text.slice(0, 40)}`);
+      calls.push(`notice:${id}:${text.slice(0, 80)}`);
     },
     patchAgent: async (id, patch) => {
       calls.push(`patch:${id}:${JSON.stringify(patch)}`);
@@ -54,6 +62,13 @@ function mockHost(): LoopHost & { calls: string[] } {
     toggleAgentSkill: async (id, name, action) => {
       calls.push(`skill:${id}:${name}:${action}`);
     },
+    peerAssistantHighWater: () => 0,
+    peerQueryLatestAssistant: async (id, afterSeq) => {
+      const hit = assistantAfter.get(id);
+      if (!hit || hit.seq <= afterSeq) return null;
+      return hit;
+    },
+    isAgentBusy: (id) => busy.has(id),
   };
 }
 
@@ -328,7 +343,10 @@ describe("LoopManager stop-gate", () => {
     const reviewer = seedAgent("reviewer", root);
     const runner = seedAgent("runner", root);
     const host = mockHost();
-    const mgr = new LoopManager(mockJobs(0, "tests pass"), mockHub(), host);
+    const mgr = new LoopManager(mockJobs(0, "tests pass"), mockHub(), host, {
+      reviewWaitMs: 400,
+      reviewPollMs: 20,
+    });
     await mgr.start(runner.id, {
       goal: "review this",
       verifier: { kind: "peer-review", spec: "npm test" },
@@ -340,9 +358,67 @@ describe("LoopManager stop-gate", () => {
     expect(cont).toBeNull();
     expect(mgr.view(runner.id)?.status).toBe("awaiting_review");
     expect(host.calls.some((c) => c.startsWith(`peer:${runner.id}->${reviewer.id}`))).toBe(true);
+    expect(host.calls.some((c) => c.includes("已送审"))).toBe(true);
 
-    await mgr.onTurnSettled(reviewer.id, { lastText: "LGTM looks good" });
+    host.assistantAfter.set(reviewer.id, { seq: 1, text: "LGTM looks good" });
+    for (let i = 0; i < 20 && mgr.view(runner.id)?.status === "awaiting_review"; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     expect(mgr.view(runner.id)?.status).toBe("done");
+  });
+
+  it("does not treat a busy reviewer's current turn as the review result", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-review-busy-"));
+    const reviewer = seedAgent("busy-reviewer", root);
+    const runner = seedAgent("busy-runner", root);
+    const host = mockHost();
+    host.busy.add(reviewer.id);
+    const mgr = new LoopManager(mockJobs(0, "tests pass"), mockHub(), host, {
+      reviewWaitMs: 250,
+      reviewPollMs: 20,
+    });
+    await mgr.start(runner.id, {
+      goal: "review this",
+      doneWhen: { kind: "file-contains", spec: "## DONE" },
+      reviewerAgentId: reviewer.id,
+    });
+    expect(mgr.view(runner.id)?.config.doneWhen.kind).toBe("peer-lgtm");
+    writeFileSync(join(root, "TASKS.md"), "- [x] all\n\n## DONE\n");
+    await mgr.onTurnSettled(runner.id, { lastText: "please review" });
+    expect(mgr.view(runner.id)?.status).toBe("awaiting_review");
+    host.assistantAfter.set(reviewer.id, { seq: 1, text: "unrelated in-flight work" });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(mgr.view(runner.id)?.status).toBe("awaiting_review");
+    host.busy.delete(reviewer.id);
+    host.assistantAfter.set(reviewer.id, { seq: 2, text: "needs tests, please fix the board" });
+    for (let i = 0; i < 20 && mgr.view(runner.id)?.status === "awaiting_review"; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(mgr.view(runner.id)?.status).toBe("running");
+    expect(host.calls.some((c) => c.startsWith(`send:${runner.id}:`))).toBe(true);
+  });
+
+  it("pauses when the reviewer does not answer within the wait", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ensemble-loop-review-timeout-"));
+    const reviewer = seedAgent("late-reviewer", root);
+    const runner = seedAgent("late-runner", root);
+    const host = mockHost();
+    const mgr = new LoopManager(mockJobs(0, "tests pass"), mockHub(), host, {
+      reviewWaitMs: 80,
+      reviewPollMs: 20,
+    });
+    await mgr.start(runner.id, {
+      goal: "review this",
+      reviewerAgentId: reviewer.id,
+    });
+    writeFileSync(join(root, "TASKS.md"), "- [x] all\n\n## DONE\n");
+    await mgr.onTurnSettled(runner.id, { lastText: "please review" });
+    for (let i = 0; i < 20 && mgr.view(runner.id)?.status === "awaiting_review"; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(mgr.view(runner.id)?.status).toBe("paused");
+    expect(host.calls.some((c) => c.includes("未返回"))).toBe(true);
+    expect(host.calls.filter((c) => c.startsWith(`send:${runner.id}:`))).toHaveLength(1);
   });
 
   it("force-enables the recipe skill on start", async () => {

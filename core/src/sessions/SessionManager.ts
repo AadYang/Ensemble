@@ -1575,6 +1575,42 @@ export class SessionManager {
     await this.persistSystemNotice(sessionId, "loop", text);
   }
 
+  peerAssistantHighWater(agentId: string): number {
+    const row = prisma.message.findFirst({
+      where: { agentId },
+      orderBy: { seq: "desc" },
+    });
+    return row?.seq ?? 0;
+  }
+
+  async peerQueryLatestAssistant(
+    agentId: string,
+    afterSeq: number,
+  ): Promise<{ seq: number; text: string } | null> {
+    const rows = prisma.message.findMany({
+      where: { agentId, type: "assistant" },
+      orderBy: { seq: "desc" },
+      take: 40,
+    });
+    for (const row of rows) {
+      if (row.seq <= afterSeq) continue;
+      const blocks =
+        (row.payload as { message?: { content?: Array<{ type: string; text?: string }> } } | null)
+          ?.message?.content ?? [];
+      const text = blocks
+        .filter((b) => b.type === "text" && typeof b.text === "string")
+        .map((b) => b.text!)
+        .join("")
+        .trim();
+      if (text) return { seq: row.seq, text };
+    }
+    return null;
+  }
+
+  isAgentBusy(agentId: string): boolean {
+    return this.running.has(agentId) || this.drainingQueues.has(agentId);
+  }
+
   private async persistSystemNotice(sessionId: string, subtype: string, text: string): Promise<number> {
     const payload = { type: "system" as const, subtype, text };
     const run = this.running.get(sessionId);
@@ -6969,7 +7005,8 @@ export class SessionManager {
             console.error(`[loop] onTurnSettled failed for ${sessionId}:`, err);
           }
         }
-        const nextKick = Boolean(autoRecoverAfterRun) || queuedBeforeLoop;
+        const loopParked = this.loops?.view(sessionId)?.status === "awaiting_review";
+        const nextKick = !loopParked && (Boolean(autoRecoverAfterRun) || queuedBeforeLoop);
         const skipCompactForPeerInbox = this.hasQueuedPeerTurn(sessionId);
         if (
           nextKick &&
@@ -6993,7 +7030,9 @@ export class SessionManager {
           }
         }
         this.running.delete(sessionId);
-        if (autoRecoverAfterRun && !skipCompactForPeerInbox) {
+        if (loopParked) {
+          // Review wait owns the next kick. Drain would look like another loop turn.
+        } else if (autoRecoverAfterRun && !skipCompactForPeerInbox) {
           const recoveryDrainToken = this.beginDrain(sessionId);
           autoRecoveryPromise = this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)
             .catch((err) => {

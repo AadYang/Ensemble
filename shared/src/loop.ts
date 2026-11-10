@@ -145,6 +145,9 @@ export function parseLoopConfig(raw: unknown): LoopConfig {
   const verifier = parseVerifier(r.verifier);
   let doneWhen = defaultDoneWhen(verifier, r.doneWhen);
   if (!verifier && doneWhen.kind === "exit-0") doneWhen = { ...DEFAULT_LOOP_DONE_WHEN };
+  if (textOf(r.reviewerAgentId) && doneWhen.kind !== "peer-lgtm") {
+    doneWhen = { kind: "peer-lgtm", spec: "LGTM" };
+  }
 
   const maxIterationsRaw = r.maxIterations;
   const maxIterations =
