@@ -217,6 +217,50 @@ describe("SessionManager cancel + stale-session recovery", () => {
     await expect(questionPromise).resolves.toBe("A");
   });
 
+  it("persists and broadcasts the ask_user answer as a visible user message", async () => {
+    const agent = await prisma.agent.create({ data: { name: "ask-visible-answer" } });
+    const hub = new StubHub();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessions = new SessionManager(hub as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (sessions as any).running.set(agent.id, {
+      id: agent.id,
+      runId: "run-ask-visible",
+      abort: new AbortController(),
+      seq: 3,
+      userInput: "please ask the human",
+      startedSeq: 0,
+      startedAt: new Date().toISOString(),
+      pendingTurnHighWaterId: 0,
+      autoAllowedTools: new Set<string>(),
+    });
+    const questionPromise = sessions.askUser(agent.id, "Which path?", ["A", "B"]);
+    let asked: { sessionId: string; msg: Broadcast } | undefined;
+    for (let i = 0; i < 20; i += 1) {
+      asked = hub.sessionMessages.find((entry) => entry.msg.type === "user_question");
+      if (asked) break;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(asked?.msg).toMatchObject({ question: "Which path?" });
+    sessions.resolveUserQuestion(agent.id, String(asked?.msg.reqId), "use /tmp/project");
+    await expect(questionPromise).resolves.toBe("use /tmp/project");
+    for (let i = 0; i < 20; i += 1) {
+      const n = await prisma.message.count({ where: { agentId: agent.id, type: "user" } });
+      if (n > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const userRows = await prisma.message.findMany({ where: { agentId: agent.id, type: "user" } });
+    expect(userRows.some((row) => JSON.stringify(row.payload).includes("use /tmp/project"))).toBe(true);
+    expect(
+      hub.sessionMessages.some(
+        (entry) =>
+          entry.msg.type === "message" && JSON.stringify(entry.msg).includes("use /tmp/project"),
+      ),
+    ).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((sessions as any).running.get(agent.id).seq).toBeGreaterThanOrEqual(4);
+  });
+
   it("runtime force-stop only affects the matching run", async () => {
     const stuck = await prisma.agent.create({ data: { name: "bad-provider-agent" } });
     const other = await prisma.agent.create({ data: { name: "other-agent" } });
@@ -789,7 +833,11 @@ describe("SessionManager cancel + stale-session recovery", () => {
     expect(nonInteractivePermissionBehavior).toBe("deny");
     expect(calls[2]!.prompt).toBe("ordinary queued turn should wait");
     const userRows = await prisma.message.findMany({ where: { agentId: agent.id, type: "user" }, orderBy: { seq: "asc" } });
-    expect(userRows.map((row) => JSON.stringify(row.payload)).join("\n")).not.toContain("Ensemble freshness check");
+    const userPayload = userRows.map((row) => JSON.stringify(row.payload)).join("\n");
+    expect(userPayload).not.toContain("Ensemble freshness check");
+    expect(userPayload).toContain("peer decision");
+    expect(userPayload).toContain("follow-up peer context");
+    expect(userPayload).toContain("_peerOrigin");
   });
 
   it("coalesces superseded peer_send handoffs from the same running source when source-output is attached", async () => {

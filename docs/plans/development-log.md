@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-11-10 · ask_user 手填回答要立刻出现在窗口
+
+**触发**：ask_user 弹窗里手填后发送，聊天窗口当时没有这行，过一会儿才看到（或只出现在工具结果里）。
+
+**根因**：`user_answer` 只唤醒模型。弹窗关了却不 `appendUserTurn`；服务端也不把回答写成 Message。回合还在跑时，聊天框发送还会被当成排队的下一轮，乐观插入被 `status===running` 跳过。
+
+**改动**：弹窗和该 agent 聊天框发送都立刻插入用户行，并走 `user_answer`。服务端用回合 `seq` 把回答落成 user 消息再广播。前端按文本去重，避免双行。
+
+**留下的规则**：人回答问询是窗口里的一次操作。不能只当 tool_result。
+
+---
+
+## 2026-11-10 · peer_send freshness：先收到再改写重发，不要系统提示
+
+**触发**：冲突时发送方既看不到入站、发出去的也没送到。用户要的是以前那条路：先收到对方消息，改发送内容，再发出去。不是窗口里多一行「未送达」。
+
+**根因**：freshness 拦住过期 peer_send 之后，入站被 `suppressUserMessage` 续跑吃掉，聊天记录不写 user 行，窗口等于没收到。回合结束若占用 ≥50% 会先 `compactBetweenTurns`；compact 抛错会跳过 `drainQueuedTurns`，LOOP / Codex 自动续跑也会抢掉 drain。入站没投递，拦下的发送也不会重发。
+
+**改动**：撤掉发送方 `system · peer` 提示。freshness 续跑先把入站 peer 写成可见 user 行（带 `_peerOrigin`），再把拦下的原稿交给模型去改写重发。队列里有 peer 时不先 occupancy compact；compact 失败也不能挡住 drain；有排队入站时 drain 优先于 LOOP / 溢出续跑。
+
+**留下的规则**：peer 冲突的修复是把接收和重发送达，不是加一条失败文案。入站必须出现在窗口。回合收尾的 compact / 自动续跑不能吞掉 pending peer。
+
+---
+
 ## 2026-11-10 · 操作必须出现在窗口，禁止静默后台
 
 **触发**：自动 compact 撞 seq 之后，用户要求：做方案和功能时，所有操作都要显示在窗口，决不允许后台静默。

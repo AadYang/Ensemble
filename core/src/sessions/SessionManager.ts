@@ -1575,17 +1575,19 @@ export class SessionManager {
     await this.persistSystemNotice(sessionId, "loop", text);
   }
 
-  private async persistSystemNotice(sessionId: string, subtype: string, text: string): Promise<void> {
+  private async persistSystemNotice(sessionId: string, subtype: string, text: string): Promise<number> {
     const payload = { type: "system" as const, subtype, text };
-    const row = await prisma.message.create({
-      data: { agentId: sessionId, seq: this.nextMessageSeq(sessionId), type: "system", payload },
-    });
+    const run = this.running.get(sessionId);
+    const preferred = run?.seq ?? this.nextMessageSeq(sessionId);
+    const row = await this.persistTurnMessage(sessionId, preferred, "system", payload);
+    if (run && row.seq >= run.seq) run.seq = row.seq + 1;
     this.hub.sendToSession(sessionId, {
       type: "message",
       sessionId,
       seq: row.seq,
       msg: payload as never,
     });
+    return row.seq;
   }
 
   /** MCP servers that failed to connect during the CURRENT turn, keyed
@@ -3193,8 +3195,8 @@ export class SessionManager {
   ): Promise<boolean> {
     if (strategy === "server-conversation") return false;
     if (!runtimeOwnsNativeCompact(plan.identity.runtime) && strategy !== "local-rebuild") return false;
-    await this.appendCompactStatusMessage(cur.id, COMPACT_START_TEXT);
     try {
+      await this.appendCompactStatusMessage(cur.id, COMPACT_START_TEXT);
       let ok = false;
       if (runtimeOwnsNativeCompact(plan.identity.runtime)) {
         ok = await this.tryNativeCompact(cur, plan, upperBoundSeq);
@@ -3211,7 +3213,14 @@ export class SessionManager {
       console.error(
         `[compact] occupancy compact did not complete for agent=${cur.id.slice(0, 8)}: ${message}`,
       );
-      await this.appendCompactStatusMessage(cur.id, `${COMPACT_FAILURE_PREFIX} ${message}`);
+      try {
+        await this.appendCompactStatusMessage(cur.id, `${COMPACT_FAILURE_PREFIX} ${message}`);
+      } catch (noticeErr) {
+        console.error(
+          `[compact] could not persist compact failure notice for agent=${cur.id.slice(0, 8)}:`,
+          noticeErr,
+        );
+      }
       return false;
     }
   }
@@ -4631,6 +4640,10 @@ export class SessionManager {
     );
   }
 
+  private hasQueuedPeerTurn(sessionId: string): boolean {
+    return this.queuedPeerTurnsSince(sessionId, 0).length > 0;
+  }
+
   private drainQueuedTurns(sessionId: string, drainOpts: DrainQueuedOptions = {}): void {
     if (this.running.has(sessionId) || this.drainingQueues.has(sessionId)) {
       if (Object.keys(drainOpts).length > 0) this.pendingDrainOptions.set(sessionId, drainOpts);
@@ -4673,7 +4686,12 @@ export class SessionManager {
         ? normalizeQueuedTurnOpts(nextRows[0]!.opts)
         : undefined;
     const drainToken = this.beginDrain(sessionId);
-    void this.runMessageNow(sessionId, userInput, runOpts)
+    void (async () => {
+      if (drainOpts.freshnessContinuationRun) {
+        await this.persistVisibleQueuedPeerTurns(sessionId, nextRows);
+      }
+      return this.runMessageNow(sessionId, userInput, runOpts);
+    })()
       .then((result) => {
         for (const resolve of resolvers) resolve(result);
       })
@@ -4684,6 +4702,29 @@ export class SessionManager {
       .finally(() => {
         this.finishDrain(sessionId, drainToken);
       });
+  }
+
+  private async persistVisibleQueuedPeerTurns(sessionId: string, rows: DbPendingTurn[]): Promise<void> {
+    for (const row of rows) {
+      const origin = normalizeQueuedTurnOpts(row.opts)?.peerOrigin;
+      const payload = {
+        type: "user" as const,
+        message: { role: "user" as const, content: row.userInput },
+        ...(origin ? { _peerOrigin: origin } : {}),
+      };
+      const persisted = await this.persistTurnMessage(
+        sessionId,
+        this.nextMessageSeq(sessionId),
+        "user",
+        payload,
+      );
+      this.hub.sendToSession(sessionId, {
+        type: "message",
+        sessionId,
+        seq: persisted.seq,
+        msg: payload as never,
+      });
+    }
   }
 
   private takeNextQueuedTurnSegment(rows: DbPendingTurn[], opts: DrainQueuedOptions = {}): DbPendingTurn[] {
@@ -4991,18 +5032,7 @@ export class SessionManager {
   }
 
   private async appendCompactStatusMessage(sessionId: string, text: string): Promise<number> {
-    const payload = { type: "system" as const, subtype: "compact_status", text };
-    const run = this.running.get(sessionId);
-    const preferred = run?.seq ?? this.nextMessageSeq(sessionId);
-    const row = await this.persistTurnMessage(sessionId, preferred, "system", payload);
-    if (run && row.seq >= run.seq) run.seq = row.seq + 1;
-    this.hub.sendToSession(sessionId, {
-      type: "message",
-      sessionId,
-      seq: row.seq,
-      msg: payload as never,
-    });
-    return row.seq;
+    return this.persistSystemNotice(sessionId, "compact_status", text);
   }
 
   /** Update (or clear) the live context-usage indicator for one agent and push
@@ -5960,7 +5990,12 @@ export class SessionManager {
           );
         }
       }
-      if (!occupancyCompactedAtDispatch && this.occupancyNeedsCompact(sessionId, turnPlan)) {
+      if (
+        !occupancyCompactedAtDispatch &&
+        !opts?.peerOrigin &&
+        !opts?.freshnessContinuationForRunId &&
+        this.occupancyNeedsCompact(sessionId, turnPlan)
+      ) {
         const used = this.contextUsageByAgent.get(sessionId)?.usedTokens;
         const window = turnPlan.context.effectiveWindow ?? this.contextUsageByAgent.get(sessionId)?.contextWindow;
         console.log(
@@ -6935,8 +6970,10 @@ export class SessionManager {
           }
         }
         const nextKick = Boolean(autoRecoverAfterRun) || queuedBeforeLoop;
+        const skipCompactForPeerInbox = this.hasQueuedPeerTurn(sessionId);
         if (
           nextKick &&
+          !skipCompactForPeerInbox &&
           !abort.signal.aborted &&
           settledPlan &&
           settledHistoryStrategy &&
@@ -6946,10 +6983,17 @@ export class SessionManager {
           console.log(
             `[history] agent=${sessionId.slice(0, 8)} occupancy compact before next kick`,
           );
-          await this.compactBetweenTurns(cur, settledPlan, settledHistoryStrategy);
+          try {
+            await this.compactBetweenTurns(cur, settledPlan, settledHistoryStrategy);
+          } catch (err) {
+            console.error(
+              `[history] occupancy compact threw before drain for agent=${sessionId.slice(0, 8)}:`,
+              err,
+            );
+          }
         }
         this.running.delete(sessionId);
-        if (autoRecoverAfterRun) {
+        if (autoRecoverAfterRun && !skipCompactForPeerInbox) {
           const recoveryDrainToken = this.beginDrain(sessionId);
           autoRecoveryPromise = this.runMessageNow(sessionId, autoRecoverAfterRun.userInput, autoRecoverAfterRun.opts)
             .catch((err) => {
@@ -7108,6 +7152,28 @@ export class SessionManager {
     if (!entry) return;
     bucket!.delete(reqId);
     entry.resolve(choice);
+    void this.persistAskUserAnswer(sessionId, choice).catch((err) => {
+      console.error(`[ask_user] could not persist answer for ${sessionId}:`, err);
+    });
+  }
+
+  private async persistAskUserAnswer(sessionId: string, choice: string): Promise<void> {
+    const text = choice.trim();
+    if (!text) return;
+    const payload = {
+      type: "user" as const,
+      message: { role: "user" as const, content: text },
+    };
+    const run = this.running.get(sessionId);
+    const preferred = run?.seq ?? this.nextMessageSeq(sessionId);
+    const row = await this.persistTurnMessage(sessionId, preferred, "user", payload);
+    if (run && row.seq >= run.seq) run.seq = row.seq + 1;
+    this.hub.sendToSession(sessionId, {
+      type: "message",
+      sessionId,
+      seq: row.seq,
+      msg: payload as never,
+    });
   }
 
   /** Blocking request/response with a peer.
@@ -7872,19 +7938,18 @@ export class SessionManager {
     };
     const willReplaceQueuedPeerHandoff = targetWasBusy && this.findQueuedPeerHandoff(targetId, peerOrigin) !== null;
     const duplicateCorrelation = targetWasBusy ? this.findQueuedPeerCorrelationDuplicate(targetId, peerOrigin) : null;
+    const noteSendFailure = (err: unknown) => {
+      console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
+    };
     if (interrupt) {
       await this.interruptForPeerSend(targetId, interruptReason);
-      void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
-        console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
-      });
+      void this.sendMessage(targetId, formatted, { peerOrigin }).catch(noteSendFailure);
       return `interrupted and delivered to "${targetAgent.name}" (id=${targetId.slice(0, 8)}, reason=${interruptReason})`;
     }
     if (duplicateCorrelation) {
       return `suppressed duplicate peer_send for "${targetAgent.name}" (id=${targetId.slice(0, 8)}, queuedTurn=${duplicateCorrelation.id}); queued correlation/message already covers this request`;
     }
-    void this.sendMessage(targetId, formatted, { peerOrigin }).catch((err) => {
-      console.error(`[peer_send] sendMessage to ${targetId} failed:`, err);
-    });
+    void this.sendMessage(targetId, formatted, { peerOrigin }).catch(noteSendFailure);
     const delivery = willReplaceQueuedPeerHandoff ? "replaced stale queued peer handoff for" : targetWasBusy ? "queued for" : "delivered to";
     return `${delivery} "${targetAgent.name}" (id=${targetId.slice(0, 8)})`;
   }

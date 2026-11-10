@@ -382,6 +382,53 @@ describe("compact delegates to the native CLI when a session exists", () => {
     expect(prompts.indexOf("/compact")).toBeLessThan(prompts.indexOf("queued follow-up"));
   });
 
+  it("does not occupancy-compact before draining a queued peer inbox", async () => {
+    nextInputTokens = 120_000;
+    let release!: () => void;
+    firstQueryGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const root = mkdtempSync(join(tmpdir(), "compact-peer-inbox-"));
+    const agent = await prisma.agent.create({
+      data: {
+        name: "cli-peer-inbox-first",
+        model: "deepseek-flash",
+        projectRoot: root,
+        systemPrompt: "You are a test agent.",
+      },
+    });
+    const peer = await prisma.agent.create({ data: { name: "cli-peer-inbox-peer" } });
+    await seedTurns(agent.id);
+    const sessions = new SessionManager(new StubHub() as never);
+    const first = sessions.sendMessage(agent.id, "first turn");
+    for (let i = 0; i < 50 && captured.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(captured[0]?.prompt).toBe("first turn");
+    await prisma.pendingTurn.create({
+      data: {
+        agentId: agent.id,
+        userInput: "[from cli-peer-inbox-peer] hold the send",
+        opts: {
+          peerOrigin: {
+            fromAgentId: peer.id,
+            fromAgentName: peer.name,
+            mode: "raw",
+            messageId: "peer-inbox-1",
+          },
+        },
+      },
+    });
+    release();
+    await first;
+    for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const prompts = captured.map((opts) => opts.prompt);
+    expect(prompts[0]).toBe("first turn");
+    expect(prompts.some((prompt) => prompt.includes("hold the send"))).toBe(true);
+    expect(prompts.indexOf("/compact")).toBe(-1);
+  });
+
   it("compacts natively before dispatching to an idle session at half occupancy", async () => {
     const root = mkdtempSync(join(tmpdir(), "compact-idle-"));
     const agent = await prisma.agent.create({

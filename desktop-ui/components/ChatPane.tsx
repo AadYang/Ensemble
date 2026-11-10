@@ -327,6 +327,10 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
   // for it since the connection opened, which renders as nothing at all.
   const liveness = useStore((s) => s.livenessByAgent[agentId]);
   const loop = useStore((s) => s.loopsByAgent[agentId]);
+  const pendingAskReqId = useStore(
+    (s) => s.pendingUserQuestions.find((q) => q.sessionId === agentId)?.reqId ?? null,
+  );
+  const clearUserQuestion = useStore((s) => s.clearUserQuestion);
   const ingestOlderTurns = useStore((s) => s.ingestOlderTurns);
   const [loopDialogOpen, setLoopDialogOpen] = useState(false);
   const [historyExtra, setHistoryExtra] = useState(0);
@@ -991,6 +995,17 @@ export const ChatPane = memo(function ChatPane({ agentId }: { agentId: string })
     setNextStepHint(null);
     if (text.startsWith("/")) {
       void handleSlash(text);
+      return;
+    }
+    if (pendingAskReqId) {
+      appendUserTurn(agentId, text);
+      ws.send({
+        type: "user_answer",
+        sessionId: agentId,
+        reqId: pendingAskReqId,
+        choice: text,
+      });
+      clearUserQuestion(pendingAskReqId);
       return;
     }
     if (summary.status !== "running") appendUserTurn(agentId, text);
