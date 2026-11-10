@@ -215,6 +215,13 @@ export interface RuntimeOptions {
     replyToCorrelationId?: string;
     causalRunId?: string;
   }) => Promise<string>;
+  loopReview?: (args: {
+    action: "read" | "post" | "reply" | "resolve" | "lgtm";
+    itemId?: string;
+    title?: string;
+    text?: string;
+    runner?: string;
+  }) => Promise<string>;
   peerQuery?: (args: { target: string; limit?: number }) => Promise<string>;
   conversationSearch?: (args: ConversationSearchArgs) => Promise<string>;
   askUser?: (args: { question: string; options: string[] }) => Promise<string>;

@@ -98,6 +98,13 @@ import {
   PEER_QUERY_TOOL_NAME,
   CONVERSATION_SEARCH_TOOL_NAME,
 } from "../peer-mcp.js";
+import {
+  makeLoopReviewMcpServer,
+  makeLoopReviewHandler,
+  LOOP_REVIEW_MCP_SERVER_NAME,
+  LOOP_REVIEW_TOOL_NAME,
+} from "../loop-review-mcp.js";
+import type { LoopReviewArgs } from "../loop-review-tool.js";
 import { makeHelpMcpServer, HELP_MCP_SERVER_NAME, ENSEMBLE_HELP_TOOL_NAME } from "../help-mcp.js";
 import { loadEnabledMcpServers, scopedMcpRows } from "../mcp-scope.js";
 import {
@@ -1575,6 +1582,11 @@ export class SessionManager {
     await this.persistSystemNotice(sessionId, "loop", text);
   }
 
+  async loopReview(fromAgentId: string, args: LoopReviewArgs): Promise<string> {
+    if (!this.loops) return "error: loop review is not available";
+    return this.loops.useReviewTool(fromAgentId, args);
+  }
+
   peerAssistantHighWater(agentId: string): number {
     const row = prisma.message.findFirst({
       where: { agentId },
@@ -2308,7 +2320,8 @@ export class SessionManager {
     lines.push("                                              as a future turn)");
     lines.push("  rebut / disagree / push back ............. peer_send");
     lines.push("  request they do something ................ peer_send");
-    lines.push("  hand off work / ask for a review / redo .. peer_send (say so in the message)");
+    lines.push("  hand off work / redo ..................... peer_send (say so in the message)");
+    lines.push("  LOOP review findings / replies / LGTM .... loop_review (NEVER peer_send)");
     lines.push("  multiple recipients ...................... one peer_send per target");
     lines.push("  read context before deciding ............. peer_query first");
     lines.push("  broadcast a statement to all .............. peer_send to each");
@@ -2326,8 +2339,16 @@ export class SessionManager {
     lines.push("     COMPLETE. Don't ask the user to re-explain.");
     lines.push("  2. Execute YOUR role in service of the team mission, starting now.");
     lines.push("");
+    lines.push("LOOP REVIEW: if a Loop selected a reviewer, findings, replies and");
+    lines.push("LGTM go on the board via loop_review. Do not peer_send the runner");
+    lines.push("or reviewer to carry that thread. Chat LGTM does not finish the loop.");
+    lines.push("ensemble_help loop has the actions.");
+    lines.push("");
     lines.push("END-OF-TURN CHECKLIST (MANDATORY — run this BEFORE ending each");
     lines.push("turn, EVEN IF your text reply already looks complete):");
+    lines.push("");
+    lines.push("  □ Are you in a LOOP review (runner after ## DONE, or the selected");
+    lines.push("    reviewer)? Use loop_review this turn. Do not peer_send the other party.");
     lines.push("");
     lines.push("  □ Does YOUR ROLE description above (or this turn's user request)");
     lines.push("    use any of these verbs in reference to a teammate:");
@@ -5475,6 +5496,7 @@ export class SessionManager {
     const mcpServers = await loadEnabledMcpServers(sessionId);
     void this.ensurePostofficeWatch(sessionId);
     const peerMcp = makePeerMcpServer(this, sessionId);
+    const loopReviewMcp = makeLoopReviewMcpServer(this, sessionId);
     const askUserMcp = makeAskUserMcpServer(this, sessionId);
     const subagentMcp = makeSubagentMcpServer(this, sessionId);
     const helpMcp = makeHelpMcpServer();
@@ -5641,6 +5663,7 @@ export class SessionManager {
     const allMcpServers = {
       ...mcpServers,
       [PEER_MCP_SERVER_NAME]: peerMcp,
+      [LOOP_REVIEW_MCP_SERVER_NAME]: loopReviewMcp,
       [ASK_USER_MCP_SERVER_NAME]: askUserMcp,
       [SUBAGENT_MCP_SERVER_NAME]: subagentMcp,
       [HELP_MCP_SERVER_NAME]: helpMcp,
@@ -5866,12 +5889,14 @@ export class SessionManager {
           "so an over-budget body is refused with SKILL_BUDGET_EXCEEDED rather than injected whole",
       );
       const skillsSection = renderSkillSelection(skillSelection, runtimeKindForSkills);
+      const loopReviewContext = this.loops?.reviewPromptFor(sessionId) ?? "";
 
-      // Order: primer → plan → skills → project instructions → (team context OR
-      // base). Team context already includes the agent's own systemPrompt
-      // verbatim, so when it's present we drop `base` to avoid double role
-      // declarations — and the role tail stays LAST so the agent's identity is
-      // not buried under project rules.
+      // Order: primer → plan → skills → loop review board → project instructions
+      // → (team context OR base). Team context already includes the agent's own
+      // systemPrompt verbatim, so when it's present we drop `base` to avoid
+      // double role declarations — and the role tail stays LAST so the agent's
+      // identity is not buried under project rules. The board snapshot is
+      // per-turn (like skills), not part of the resume hash.
       //
       // ONE injection point for the skill section. On a fresh session it rides
       // in the system prompt; on a native resume the CLI keeps the system prompt
@@ -5896,13 +5921,15 @@ export class SessionManager {
         primer,
         planNotice,
         resumed ? null : skillsSection,
+        resumed ? null : loopReviewContext,
         projectInstructions,
         tailRole,
       ].filter((s) => s && s.length > 0);
       const mergedSystemPrompt = promptParts.join("\n\n---\n\n");
-      const promptForRuntime = resumed && skillsSection
-        ? `${skillsSection}\n\n---\n\n${userInput}`
-        : userInput;
+      const resumePrefix = [resumed ? skillsSection : "", resumed ? loopReviewContext : ""]
+        .filter((s) => s && s.length > 0)
+        .join("\n\n---\n\n");
+      const promptForRuntime = resumePrefix ? `${resumePrefix}\n\n---\n\n${userInput}` : userInput;
 
       // ── the turn's history budget ──────────────────────────────────────
       // One resolver, one answer. The strategy names WHO holds the context
@@ -6137,6 +6164,7 @@ export class SessionManager {
           PEER_ASK_TOOL_NAME,
           PEER_QUERY_TOOL_NAME,
           CONVERSATION_SEARCH_TOOL_NAME,
+          LOOP_REVIEW_TOOL_NAME,
           ASK_USER_TOOL_NAME,
           SUBAGENT_TOOL_NAME,
           ENSEMBLE_HELP_TOOL_NAME,
@@ -6265,6 +6293,7 @@ export class SessionManager {
         // already arrive via allMcpServers (peer + ask-user MCP). The closures
         // bind fromAgentId via the Slice 1.7 handler factories.
         peerSend: makePeerSendHandler(this, sessionId),
+        loopReview: makeLoopReviewHandler(this, sessionId),
         peerQuery: makePeerQueryHandler(this, sessionId),
         conversationSearch: makeConversationSearchHandler(this, sessionId),
         askUser: makeAskUserHandler(this, sessionId),

@@ -38,6 +38,7 @@ import {
   type JobToolContext,
 } from "../../jobs.js";
 import type { AnyNormalizedTool, NormalizedTool } from "./types.js";
+import { LOOP_REVIEW_ACTIONS, LOOP_REVIEW_DESCRIPTION, type LoopReviewArgs } from "../../loop-review-tool.js";
 
 const PEER_CORRELATION_KINDS = ["decision", "request"] as const;
 
@@ -193,6 +194,27 @@ export function makePeerQueryTool(query: PeerQueryCallback): NormalizedTool<type
     parameters: PEER_QUERY_SCHEMA,
     async execute(args) {
       return query(args);
+    },
+  };
+}
+
+type LoopReviewCallback = (args: LoopReviewArgs) => Promise<string>;
+
+const LOOP_REVIEW_SCHEMA = z.object({
+  action: z.enum(LOOP_REVIEW_ACTIONS).describe("read | post | reply | resolve | lgtm"),
+  itemId: z.string().optional().describe("Finding id such as R1. Required for reply and resolve."),
+  title: z.string().optional().describe("Short finding title. post only."),
+  text: z.string().optional().describe("Finding body (post) or reply body (reply)."),
+  runner: z.string().optional().describe("Runner name or UUID when you review more than one loop."),
+});
+
+export function makeLoopReviewTool(review: LoopReviewCallback): NormalizedTool<typeof LOOP_REVIEW_SCHEMA> {
+  return {
+    name: "loop_review",
+    description: LOOP_REVIEW_DESCRIPTION,
+    parameters: LOOP_REVIEW_SCHEMA,
+    async execute(args) {
+      return review(args);
     },
   };
 }

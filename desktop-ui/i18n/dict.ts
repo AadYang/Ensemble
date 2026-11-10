@@ -684,6 +684,11 @@ const en: Dict = {
   "loop.board.setCap": "set",
   "loop.board.resetAttempts": "clear",
   "loop.board.spent": "iteration budget spent — raise the cap or clear the counter, otherwise the next stop pauses immediately",
+  "loop.board.review": "REVIEW.md",
+  "loop.board.reviewEmpty": "no findings yet — the reviewer writes them here",
+  "loop.board.reviewLgtm": "LGTM",
+  "loop.board.reviewOpen": "open",
+  "loop.board.reviewResolved": "resolved",
   "loop.tree.reviewing": "reviewing",
   "loop.tree.runners": "runners",
   "slash.status.notLocal":
@@ -1387,6 +1392,11 @@ const zh: Dict = {
   "loop.board.setCap": "设置",
   "loop.board.resetAttempts": "清零",
   "loop.board.spent": "轮次已用尽 — 调高上限或清零计数，否则下次停下会立刻暂停",
+  "loop.board.review": "审阅黑板",
+  "loop.board.reviewEmpty": "还没有意见 — 审阅会写在这里",
+  "loop.board.reviewLgtm": "已通过",
+  "loop.board.reviewOpen": "未结",
+  "loop.board.reviewResolved": "已结",
   "loop.tree.reviewing": "评审中",
   "loop.tree.runners": "执行中",
   "slash.status.notLocal":

@@ -47,6 +47,8 @@ Inter-agent communication (you have these tools):
   - peer_query (read-only history pull, doesn't run the peer; same team boundary)
   - conversation_search (read-only keyword search over prior user/assistant text;
     default scope team, fallback self when unteamed)
+  - LOOP review is NOT peer_send. If a loop selected a reviewer, findings,
+    replies and LGTM go on the board via loop_review (see the loop topic).
   - These are direct function tools on OpenAI providers, MCP tools on Claude
     providers, and stdio MCP tools on the experimental Codex CLI provider.
   - Codex peer tools are routed through Ensemble's local stdio MCP bridge and
@@ -279,11 +281,17 @@ conversation_search (sync lookup - keyword search across prior text):
   - Returns bounded matches with agent, seq, role, createdAt, and snippet
   - Filters tool-use/tool-result/raw event noise; only user/assistant text
 
-Typical pattern:
+Typical pattern (ordinary chat, NOT a Loop review):
   agent-A peer_send(target=B, includeSource=true, message="please audit this")
     → B receives the message with A's last output attached
     → if B needs more context, B peer_query(target=A, limit=30)
     → if B needs A to clarify, B peer_send(target=A, message="what did you mean by X")
+
+LOOP review is NOT peer_send:
+  runner writes ## DONE → Ensemble opens REVIEW.md
+  reviewer loop_review post / reply / resolve / lgtm
+  runner loop_review reply under each open item
+  Do not peer_send to carry that thread. The board is the thread.
 `,
 
   slash_commands: `Available slash commands in Ensemble's chat input:
@@ -552,9 +560,21 @@ Lifecycle (core LoopManager, hooked from SessionManager.sendMessage finally):
   5. Three consecutive unchanged progress observations → paused.
      Hitting maxIterations → paused.
   6. ## DONE present (and optional command green) → LOOP DONE.
-  7. peer-review: the board must be marked done, then peer_send to the
-     reviewer (includeSource attaches the runner's latest output);
-     status=awaiting_review until LGTM (or reject back to the runner).
+  7. peer-review: TASKS.md must be marked done, then Ensemble opens REVIEW.md.
+     Both sides already know to use loop_review from the primer / this topic /
+     the per-turn LOOP REVIEW BOARD block. Ensemble does NOT peer_send and
+     does NOT inject a "go look at the board" chat turn. status=awaiting_review
+     until the board has no open items and the reviewer marks lgtm. Idle 30
+     minutes with no board progress pauses the loop.
+
+loop_review actions:
+  read     goal + TASKS.md + current findings
+  post     reviewer only; add a finding
+  reply    under itemId (R1, R2, …)
+  resolve  reviewer only; close that finding
+  lgtm     reviewer only; only when every item is resolved (or there are none)
+  Chat LGTM does not finish the loop. If you review more than one runner,
+  pass runner= name or UUID.
 
 Team Loop: one TASKS.md board, N isolated runners (they do not peer_send
 work to each other), optional one reviewer, optional git worktree add to a

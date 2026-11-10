@@ -34,6 +34,10 @@ write ## DONE in TASKS.md when the whole goal is met. An optional command check
 is advanced — do not ask the user to write tests or scripts to start a loop.
 Ensemble owns the loop — do not wrap yourself in a bash while-true, and do not
 ask to load Claude settingSources / MEMORY.md.
+If the loop has a reviewer: after ## DONE, review lives on the LOOP review
+board. NEVER peer_send the reviewer or runner to pass findings, replies, or
+LGTM. Use loop_review (read / post / reply / resolve / lgtm). Chat LGTM does
+not finish the loop. ensemble_help loop has the protocol.
 ↑/↓ in the input box walks through your prior inputs for this agent (CLI-style).
 
 Cross-agent communication tools you have:
@@ -58,6 +62,8 @@ Cross-agent communication tools you have:
                Do NOT use peer_ask for that — peer_ask is teammates only.
                Do NOT write the question as ordinary chat and stop: that does
                not wait, and the user may never see it as a choice.
+  loop_review → the LOOP review board. Mandatory for loop review: post findings,
+               reply under an item, resolve, lgtm. Do not peer_send for that.
   peer_query → read another agent's recent text turns (synchronous, no run)
   conversation_search -> keyword search prior user/assistant messages
                (read-only DB lookup; default scope team, fallback self)

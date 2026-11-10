@@ -17,15 +17,25 @@ import {
   loopViewOf,
   parseLoopConfig,
   parseLoopState,
+  parseReviewMarkdown,
   parseTasksMarkdown,
+  reviewBoardApproved,
+  reviewBoardNotices,
+  reviewBoardToMarkdown,
   tasksToMarkdown,
+  applyReviewAction,
+  emptyReviewBoard,
+  nextReviewActor,
   type LoopConfig,
   type LoopDecision,
   type LoopState,
   type LoopStatus,
   type LoopTask,
+  type ReviewBoard,
+  type ReviewRole,
   type LoopView,
 } from "@agentorch/shared";
+import type { LoopReviewArgs } from "./loop-review-tool.js";
 import { addLoopWorktree, commitLoopSnapshot, loopWorkspaceFingerprint, readGitState } from "./git.js";
 import { inspectProjectRoot, scratchDirFor } from "./sessions/project-root.js";
 import { ensureLoopSkills, loopSkillName } from "./loop-skills.js";
@@ -44,17 +54,7 @@ export type LoopHost = {
       projectRoot?: string | null;
     },
   ) => Promise<unknown>;
-  sendPeerMessage: (
-    fromAgentId: string,
-    target: string,
-    body: string,
-  ) => Promise<string>;
   toggleAgentSkill: (agentId: string, name: string, action: "enable" | "disable" | "auto") => Promise<unknown>;
-  peerAssistantHighWater: (agentId: string) => number;
-  peerQueryLatestAssistant: (
-    agentId: string,
-    afterSeq: number,
-  ) => Promise<{ seq: number; text: string } | null>;
   isAgentBusy: (agentId: string) => boolean;
 };
 
@@ -88,7 +88,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function rowView(row: AgentLoop, tasks: LoopTask[] = []): LoopView {
+function rowView(row: AgentLoop, tasks: LoopTask[] = [], review: ReviewBoard = emptyReviewBoard()): LoopView {
   const config = parseLoopConfig(row.config);
   const state = parseLoopState(row.state);
   return loopViewOf({
@@ -98,6 +98,7 @@ function rowView(row: AgentLoop, tasks: LoopTask[] = []): LoopView {
     config,
     state,
     tasks,
+    review,
   });
 }
 
@@ -115,6 +116,26 @@ function readTasks(root: string | null): LoopTask[] {
 function writeTasks(root: string | null, tasks: LoopTask[]): void {
   if (!root) return;
   writeFileSync(join(root, "TASKS.md"), tasksToMarkdown(tasks), "utf8");
+}
+
+function reviewPath(root: string | null): string | null {
+  return root ? join(root, "REVIEW.md") : null;
+}
+
+function readReview(root: string | null): ReviewBoard {
+  const path = reviewPath(root);
+  if (!path || !existsSync(path)) return emptyReviewBoard();
+  try {
+    return parseReviewMarkdown(readFileSync(path, "utf8"));
+  } catch {
+    return emptyReviewBoard();
+  }
+}
+
+function writeReview(root: string | null, board: ReviewBoard): void {
+  const path = reviewPath(root);
+  if (!path) return;
+  writeFileSync(path, reviewBoardToMarkdown(board), "utf8");
 }
 
 function markerPathText(root: string | null, spec: string): string {
@@ -175,7 +196,8 @@ export class LoopManager {
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
     if (!row) return null;
     const config = parseLoopConfig(row.config);
-    return rowView(row, readTasks(config.boardRoot ?? this.agentRoot(agentId)));
+    const root = config.boardRoot ?? this.agentRoot(agentId);
+    return rowView(row, readTasks(root), readReview(root));
   }
 
   listActive(): LoopView[] {
@@ -184,7 +206,8 @@ export class LoopManager {
       .filter((row) => ACTIVE.has(row.status))
       .map((row) => {
         const config = parseLoopConfig(row.config);
-        return rowView(row, readTasks(config.boardRoot ?? this.agentRoot(row.agentId)));
+        const root = config.boardRoot ?? this.agentRoot(row.agentId);
+        return rowView(row, readTasks(root), readReview(root));
       });
   }
 
@@ -422,6 +445,7 @@ export class LoopManager {
         markerHit,
         hasDiff,
       });
+      if (decision.action === "awaiting_review") state.lastRunnerSummary = opts.lastText;
       return await this.applyDecision(agentId, config, state, decision, verify.ok);
     } finally {
       this.verifying.delete(agentId);
@@ -435,69 +459,229 @@ export class LoopManager {
     this.reviewWaits.delete(agentId);
   }
 
-  private startReviewWait(agentId: string, reviewerId: string, afterSeq: number): void {
+  private startReviewWait(agentId: string): void {
     this.abortReviewWait(agentId);
     const ctrl = new AbortController();
     this.reviewWaits.set(agentId, ctrl);
-    void this.runReviewWait(agentId, reviewerId, afterSeq, ctrl.signal).finally(() => {
+    void this.runReviewWait(agentId, ctrl.signal).finally(() => {
       if (this.reviewWaits.get(agentId) === ctrl) this.reviewWaits.delete(agentId);
     });
   }
 
-  private async runReviewWait(
-    agentId: string,
-    reviewerId: string,
-    afterSeq: number,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const deadline = Date.now() + this.reviewWaitMs;
-    let reviewText: string | null = null;
+  private async runReviewWait(agentId: string, signal: AbortSignal): Promise<void> {
+    let lastFingerprint = "";
+    let lastChange = Date.now();
     try {
-      while (Date.now() < deadline) {
-        if (signal.aborted) return;
+      while (!signal.aborted) {
         const row = prisma.agentLoop.findUnique({ where: { agentId } });
         if (!row || row.status !== "awaiting_review") return;
-        if (!this.host.isAgentBusy(reviewerId)) {
-          const hit = await this.host.peerQueryLatestAssistant(reviewerId, afterSeq);
-          if (hit?.text.trim()) {
-            reviewText = hit.text.trim();
-            break;
-          }
+        const config = parseLoopConfig(row.config);
+        const root = config.boardRoot ?? this.agentRoot(agentId);
+        const board = readReview(root);
+        const fingerprint = createHash("sha256").update(reviewBoardToMarkdown(board)).digest("hex");
+        if (fingerprint !== lastFingerprint) {
+          lastFingerprint = fingerprint;
+          lastChange = Date.now();
         }
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
-        await sleep(Math.min(this.reviewPollMs, remaining), signal);
+        const tick = await this.tickReviewBoard(agentId, board);
+        if (tick === "done" || tick === "paused") return;
+        const reviewerId = config.reviewerAgentId;
+        const expected = nextReviewActor(board);
+        const expectedId = expected === "reviewer" ? reviewerId : expected === "developer" ? agentId : null;
+        const busy = Boolean(expectedId && this.host.isAgentBusy(expectedId));
+        if (!busy && Date.now() - lastChange >= this.reviewWaitMs) {
+          const minutes = Math.max(1, Math.round(this.reviewWaitMs / 60_000));
+          await this.noticeBoth(agentId, reviewerId, `LOOP PAUSED · 审阅黑板 ${minutes} 分钟无进展`);
+          const paused = this.upsert(agentId, {
+            status: "paused",
+            config,
+            state: parseLoopState(row.state),
+          });
+          this.broadcast(paused);
+          return;
+        }
+        await sleep(this.reviewPollMs, signal);
       }
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       throw err;
     }
-    if (signal.aborted) return;
+  }
+
+  private async tickReviewBoard(agentId: string, board: ReviewBoard): Promise<"continue" | "done" | "paused"> {
     const row = prisma.agentLoop.findUnique({ where: { agentId } });
-    if (!row || row.status !== "awaiting_review") return;
+    if (!row || row.status !== "awaiting_review") return "paused";
     const config = parseLoopConfig(row.config);
     const state = parseLoopState(row.state);
-    if (!reviewText) {
-      const minutes = Math.max(1, Math.round(this.reviewWaitMs / 60_000));
-      await this.host.persistLoopNotice(
-        agentId,
-        `LOOP PAUSED · 审阅 ${minutes} 分钟内未返回`,
-      );
-      const paused = this.upsert(agentId, { status: "paused", config, state });
-      this.broadcast(paused);
-      return;
+    if (reviewBoardApproved(board)) {
+      const decision: LoopDecision = { action: "done", summary: "review board LGTM" };
+      await this.applyDecision(agentId, config, state, decision, true);
+      return "done";
     }
-    const decision = decideLoopAfterVerify({
-      config,
-      state,
-      verifyOk: true,
-      summary: reviewText,
-      markerHit: true,
-      hasDiff: true,
-      reviewText,
+    return "continue";
+  }
+
+  reviewPromptFor(agentId: string): string {
+    const blocks: string[] = [];
+    const own = prisma.agentLoop.findUnique({ where: { agentId } });
+    if (own && ACTIVE.has(own.status) && parseLoopConfig(own.config).reviewerAgentId) {
+      blocks.push(this.formatReviewPromptBlock(own, "developer"));
+    }
+    const reviewed = prisma.agentLoop.findMany().filter((row) => {
+      if (row.agentId === agentId || !ACTIVE.has(row.status)) return false;
+      return parseLoopConfig(row.config).reviewerAgentId === agentId;
     });
-    const cont = await this.applyDecision(agentId, config, state, decision, true);
-    if (cont) void this.host.sendMessage(agentId, cont.userInput);
+    for (const row of reviewed) {
+      blocks.push(this.formatReviewPromptBlock(row, "reviewer"));
+    }
+    return blocks.join("\n\n");
+  }
+
+  private formatReviewPromptBlock(row: AgentLoop, role: ReviewRole): string {
+    const config = parseLoopConfig(row.config);
+    const runner = prisma.agent.findUnique({ where: { id: row.agentId } });
+    const root = config.boardRoot ?? this.agentRoot(row.agentId);
+    const board = readReview(root);
+    const open = board.items.filter((item) => item.status === "open");
+    const lines = [
+      "─── LOOP REVIEW BOARD ───",
+      `You are the ${role} (runner: ${runner?.name ?? row.agentId}).`,
+      `Loop status: ${row.status}`,
+      `Goal: ${config.goal.trim()}`,
+      "Do NOT peer_send to exchange this review. Use loop_review. Chat LGTM does not finish the loop.",
+    ];
+    if (row.status !== "awaiting_review") {
+      lines.push("The board opens after ## DONE. Until then keep working TASKS.md.");
+      return lines.join("\n");
+    }
+    if (role === "reviewer") {
+      lines.push("Actions: loop_review read / post / reply / resolve / lgtm. lgtm only when every item is resolved (or there are none).");
+    } else {
+      lines.push("Actions: loop_review read, fix the work, then reply under each open item.");
+    }
+    lines.push(`Open items: ${open.length}/${board.items.length}`);
+    for (const item of open) {
+      lines.push(`- ${item.id} ${item.title}`);
+    }
+    return lines.join("\n");
+  }
+
+  async useReviewTool(fromAgentId: string, args: LoopReviewArgs): Promise<string> {
+    const found = this.resolveReviewTarget(fromAgentId, args.runner);
+    if (!found) {
+      const reviewed = prisma.agentLoop.findMany().filter((row) => {
+        if (!ACTIVE.has(row.status)) return false;
+        return parseLoopConfig(row.config).reviewerAgentId === fromAgentId;
+      });
+      if (reviewed.length > 1) {
+        const names = reviewed.map((row) => {
+          const name = prisma.agent.findUnique({ where: { id: row.agentId } })?.name ?? row.agentId;
+          return `${name} (${row.agentId})`;
+        });
+        return `error: pass runner as a name or UUID. Active boards: ${names.join(", ")}`;
+      }
+      return "error: no active LOOP review board for you (start a loop, or wait until you are the selected reviewer)";
+    }
+    const { row, role } = found;
+    const config = parseLoopConfig(row.config);
+    const root = config.boardRoot ?? this.agentRoot(row.agentId);
+    if (args.action === "read") {
+      return this.formatReviewRead(row, role, root);
+    }
+    if (row.status !== "awaiting_review") {
+      return "error: the review board is only writable while the loop is awaiting review";
+    }
+    const prev = readReview(root);
+    const applied = applyReviewAction(prev, role, {
+      action: args.action,
+      itemId: args.itemId,
+      title: args.title,
+      text: args.text,
+    });
+    if (!applied.ok) return `error: ${applied.error}`;
+    writeReview(root, applied.board);
+    this.broadcast(row);
+    const notices = reviewBoardNotices(prev, applied.board);
+    for (const notice of notices) {
+      await this.noticeBoth(row.agentId, config.reviewerAgentId, notice);
+    }
+    if (row.status === "awaiting_review") {
+      await this.tickReviewBoard(row.agentId, applied.board);
+    }
+    return this.formatReviewRead(row, role, root);
+  }
+
+  private resolveReviewTarget(
+    fromAgentId: string,
+    runner?: string,
+  ): { row: AgentLoop; role: ReviewRole } | null {
+    const wanted = (runner ?? "").trim().toLowerCase();
+    const own = prisma.agentLoop.findUnique({ where: { agentId: fromAgentId } });
+    if (own && ACTIVE.has(own.status) && !wanted) {
+      return { row: own, role: "developer" };
+    }
+    const reviewed = prisma.agentLoop.findMany().filter((row) => {
+      if (!ACTIVE.has(row.status)) return false;
+      return parseLoopConfig(row.config).reviewerAgentId === fromAgentId;
+    });
+    if (wanted) {
+      const hit = reviewed.find((row) => {
+        if (row.agentId.toLowerCase() === wanted) return true;
+        const agent = prisma.agent.findUnique({ where: { id: row.agentId } });
+        return agent?.name.toLowerCase() === wanted;
+      });
+      if (hit) return { row: hit, role: "reviewer" };
+      if (own && ACTIVE.has(own.status) && (own.agentId.toLowerCase() === wanted || prisma.agent.findUnique({ where: { id: own.agentId } })?.name.toLowerCase() === wanted)) {
+        return { row: own, role: "developer" };
+      }
+      return null;
+    }
+    if (reviewed.length === 1) return { row: reviewed[0]!, role: "reviewer" };
+    if (reviewed.length > 1) return null;
+    return null;
+  }
+
+  private formatReviewRead(row: AgentLoop, role: ReviewRole, root: string | null): string {
+    const config = parseLoopConfig(row.config);
+    const runner = prisma.agent.findUnique({ where: { id: row.agentId } });
+    const board = readReview(root);
+    const tasks = markerPathText(root, "TASKS.md").trim() || "(empty)";
+    const open = board.items.filter((item) => item.status === "open").length;
+    const lines = [
+      `role: ${role}`,
+      `runner: ${runner?.name ?? row.agentId} (${row.agentId})`,
+      `loop: ${row.status}`,
+      `goal:\n${config.goal}`,
+      root ? `boardRoot: ${root}` : "boardRoot: (none)",
+      `openItems: ${open}/${board.items.length}`,
+      "",
+      "TASKS.md:",
+      tasks,
+      "",
+      "REVIEW.md:",
+      reviewBoardToMarkdown(board).trimEnd(),
+    ];
+    if (role === "reviewer") {
+      const others = prisma.agentLoop.findMany().filter((other) => {
+        if (other.id === row.id || !ACTIVE.has(other.status)) return false;
+        return parseLoopConfig(other.config).reviewerAgentId === config.reviewerAgentId;
+      });
+      if (others.length > 0) {
+        lines.push("", "other runners on loops you review:");
+        for (const other of others) {
+          const name = prisma.agent.findUnique({ where: { id: other.agentId } })?.name ?? other.agentId;
+          lines.push(`- ${name} (${other.agentId}) status=${other.status}`);
+        }
+      }
+    }
+    return lines.join("\n");
+  }
+
+  private async noticeBoth(runnerId: string, reviewerId: string | undefined, text: string): Promise<void> {
+    await this.host.persistLoopNotice(runnerId, text);
+    if (reviewerId && reviewerId !== runnerId) {
+      await this.host.persistLoopNotice(reviewerId, text);
+    }
   }
 
   private async applyDecision(
@@ -515,6 +699,7 @@ export class LoopManager {
     };
 
     if (decision.action === "pause") {
+      this.abortReviewWait(agentId);
       if (!verifyOk) clearCompletionMarker(config.boardRoot ?? this.agentRoot(agentId), config);
       pushIter("fail", decision.reason);
       const next = this.upsert(agentId, { status: "paused", config, state });
@@ -524,19 +709,17 @@ export class LoopManager {
     }
 
     if (decision.action === "awaiting_review") {
+      const root = config.boardRoot ?? this.agentRoot(agentId);
+      writeReview(root, emptyReviewBoard());
       const next = this.upsert(agentId, { status: "awaiting_review", config, state });
       this.broadcast(next);
-      const reviewerId = config.reviewerAgentId;
-      const afterSeq = reviewerId ? this.host.peerAssistantHighWater(reviewerId) : 0;
-      if (reviewerId) {
-        await this.host.sendPeerMessage(agentId, reviewerId, decision.userInput);
-        this.startReviewWait(agentId, reviewerId, afterSeq);
-      }
       const minutes = Math.max(1, Math.round(this.reviewWaitMs / 60_000));
-      await this.host.persistLoopNotice(
+      await this.noticeBoth(
         agentId,
-        `LOOP 已送审，等待审阅结果（最多 ${minutes} 分钟）`,
+        config.reviewerAgentId,
+        `LOOP 已送审，请在审阅黑板上记录（空闲最多 ${minutes} 分钟）`,
       );
+      this.startReviewWait(agentId);
       return null;
     }
 
@@ -589,6 +772,7 @@ export class LoopManager {
     }
 
     if (decision.action === "done") {
+      this.abortReviewWait(agentId);
       let snapshot: string | null = state.lastSnapshot;
       if (config.snapshot === "git-commit") {
         const root = config.boardRoot ?? this.agentRoot(agentId);
@@ -684,7 +868,8 @@ export class LoopManager {
 
   private broadcast(row: AgentLoop): LoopView {
     const config = parseLoopConfig(row.config);
-    const view = rowView(row, readTasks(config.boardRoot ?? this.agentRoot(row.agentId)));
+    const root = config.boardRoot ?? this.agentRoot(row.agentId);
+    const view = rowView(row, readTasks(root), readReview(root));
     this.hub.sendToSession(row.agentId, { type: "loop_update", sessionId: row.agentId, loop: view });
     if (row.teamId) {
       const members = prisma.agent.findMany({ where: { teamId: row.teamId } }) as Agent[];

@@ -4,6 +4,18 @@
 
 ---
 
+## 2026-11-10 · LOOP 审阅走黑板，不再用 peer_send 来回
+
+**触发**：LOOP 里开发和审阅用 peer_send 交互，消息合并、更新、错位，审阅记录对不上号。
+
+**根因**：审阅是工单（条目 → 回复 → 结案），被塞进聊天通道。`includeSource` 的 peer_send 会合并、freshness 拦截、compact 抢队列。闸门还曾误读审阅者窗口里碰巧结束的那一轮。
+
+**改动**：每场 LOOP 一块 `REVIEW.md` 黑板。三路 `loop_review`（read / post / reply / resolve / lgtm）始终写这场 LOOP 的板，不依赖审阅者 cwd。送审不再 peer_send，也不往聊天里塞「去看黑板」。primer / ensemble_help loop / 团队提示词 / 每回合 LOOP REVIEW BOARD 块让双方自己用黑板。通过条件是无未结项且黑板上 LGTM。空闲 30 分钟无进展才暂停。右侧 Loop 板列出条目和回复；窗口写「已送审 / 新意见 / 已回复 / 结案 / LGTM」。
+
+**留下的规则**：LOOP 审阅不要走 peer_send。聊天里的 LGTM 不算数。`peer_send` 只留给平时对话。
+
+---
+
 ## 2026-11-10 · LOOP 送审必须等审阅结果，不能自己开下一轮
 
 **触发**：LOOP 触发审阅后开发又进入下一轮。审阅还没写完，闸门已经用审阅者当时那一轮的 `lastText` 判了拒绝或通过。
